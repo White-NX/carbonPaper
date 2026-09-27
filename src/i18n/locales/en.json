@@ -284,8 +284,8 @@
         "title": "DirectML inference acceleration",
         "label": "Use graphics acceleration",
         "description": "Use a DirectX 12 compatible graphics device to accelerate recognition and vector processing.",
-        "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "notice": "Note: Running DirectML on the primary GPU may impact gaming performance.",
+        "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "gpu_select": "Select GPU device",
         "gpu_loading": "Detecting GPUs...",
         "gpu_none": "No compatible GPU detected",
@@ -1031,6 +1031,41 @@
     "clear": "Clear",
     "refresh": "Refresh"
   },
+  "delete": {
+    "failure": "Delete failed: {{error}}",
+    "success": "Successfully deleted {{count}} records"
+  },
+  "updateModal": {
+    "title": "New Version Released",
+    "titleCritical": "Critical Update Required",
+    "version": "Version {{version}}",
+    "releaseNotes": "Release Notes",
+    "downloadInstall": "Download & Install",
+    "later": "Later",
+    "background": "Download in Background",
+    "hide": "Hide to Background",
+    "retry": "Retry",
+    "downloading": "Downloading...",
+    "extracting": "Extracting update...",
+    "applying": "Applying update...",
+    "downloadFailed": "Download failed: {{error}}",
+    "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
+  },
+  "save_filters": {
+    "synced": "Saved and synced to monitor service",
+    "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",
+    "saved_local_unsupported": "Saved locally, but current monitor process does not support filter commands. Please restart monitor service",
+    "saved_local_sync_failed": "Saved locally; sync failed: {{error}}"
+  },
+  "autolaunch": {
+    "read_error": "Failed to read autostart status",
+    "enabled": "Added to startup",
+    "disabled": "Removed from startup",
+    "action_failed": "Operation failed: {{error}}"
+  },
+  "analysis": {
+    "load_failed": "Failed to load analysis data: {{error}}"
+  },
   "topbar": {
     "settings": "Settings",
     "hideToTray": "Hide to tray",
@@ -1118,41 +1153,6 @@
       "advancedSearch": "Advanced Search",
       "smartClusters": "Smart Clusters"
     }
-  },
-  "delete": {
-    "failure": "Delete failed: {{error}}",
-    "success": "Successfully deleted {{count}} records"
-  },
-  "updateModal": {
-    "title": "New Version Released",
-    "titleCritical": "Critical Update Required",
-    "version": "Version {{version}}",
-    "releaseNotes": "Release Notes",
-    "downloadInstall": "Download & Install",
-    "later": "Later",
-    "background": "Download in Background",
-    "hide": "Hide to Background",
-    "retry": "Retry",
-    "downloading": "Downloading...",
-    "extracting": "Extracting update...",
-    "applying": "Applying update...",
-    "downloadFailed": "Download failed: {{error}}",
-    "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
-  },
-  "save_filters": {
-    "synced": "Saved and synced to monitor service",
-    "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",
-    "saved_local_unsupported": "Saved locally, but current monitor process does not support filter commands. Please restart monitor service",
-    "saved_local_sync_failed": "Saved locally; sync failed: {{error}}"
-  },
-  "autolaunch": {
-    "read_error": "Failed to read autostart status",
-    "enabled": "Added to startup",
-    "disabled": "Removed from startup",
-    "action_failed": "Operation failed: {{error}}"
-  },
-  "analysis": {
-    "load_failed": "Failed to load analysis data: {{error}}"
   },
   "search": {
     "searchError": "Search failed: {{message}}",
@@ -1579,7 +1579,7 @@
       },
       "applied": {
         "title": "All set",
-        "subtitle": "Anything still downloading continues in the background."
+        "subtitle": "Everything is ready."
       }
     },
     "welcome": {
@@ -1599,13 +1599,20 @@
         }
       },
       "recommended": {
-        "title": "Use recommended settings",
-        "description": "Turns on all smart features and steps aside during games and full-screen apps.",
-        "size": "Downloads about {{size}} MB"
+        "action": "Use recommended settings",
+        "summaryTitle": "Recommended settings will:",
+        "items": {
+          "smart": "Turn on all smart features",
+          "performance": "Step aside during games and full-screen apps",
+          "browsers": "Add the extension to your installed browsers",
+          "autostart": "Start recording when you sign in",
+          "appBound": "Keep organizing after your PC restarts"
+        },
+        "note": "",
+        "noteWithDownload": "Downloads about {{size}} MB of model resources."
       },
       "custom": {
-        "title": "Choose myself",
-        "description": "Go through features, browsers and startup one by one."
+        "action": "Customize"
       }
     },
     "featureModes": {
@@ -1637,8 +1644,8 @@
       }
     },
     "features": {
-      "modeLabel": "Feature level",
-      "policyLabel": "Resource use",
+      "modeLabel": "Which features do you need?",
+      "policyLabel": "What should CarbonPaper do while you game or run on battery?",
       "extraDownload": "Needs an extra download of about {{size}} MB"
     },
     "browsers": {
@@ -1648,11 +1655,11 @@
       "edgeShort": "Edge"
     },
     "browserStartup": {
-      "browsersLabel": "Browser extension",
+      "browsersLabel": "Which browsers should CarbonPaper connect to?",
       "browsersHint": "The extension adds the page address and title to snapshots, so results can open the original page.",
       "detected": "Found on this PC",
       "notDetected": "Not found, can still be installed",
-      "startupLabel": "Startup",
+      "startupLabel": "When should CarbonPaper start working?",
       "launchAtLogin": {
         "label": "Start with Windows",
         "description": "Runs in the background after you sign in."

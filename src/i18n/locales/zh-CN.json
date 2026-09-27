@@ -1579,7 +1579,7 @@
       },
       "applied": {
         "title": "设置完成",
-        "subtitle": "一切就绪。仍在下载的内容会在后台继续。"
+        "subtitle": "一切就绪。"
       }
     },
     "welcome": {
@@ -1599,13 +1599,20 @@
         }
       },
       "recommended": {
-        "title": "使用推荐设置",
-        "description": "开启全部智能功能，并在游戏和全屏时自动让出资源。",
-        "size": "需要下载约 {{size}} MB"
+        "action": "使用推荐设置",
+        "summaryTitle": "推荐设置会：",
+        "items": {
+          "smart": "开启全部智能功能",
+          "performance": "在游戏和全屏时自动让出资源",
+          "browsers": "为已安装的浏览器添加扩展",
+          "autostart": "开机后自动开始记录",
+          "appBound": "电脑重启后继续后台整理"
+        },
+        "note": "",
+        "noteWithDownload": "需要下载约 {{size}} MB 模型资源。"
       },
       "custom": {
-        "title": "自己选择",
-        "description": "逐项查看并调整功能、浏览器和启动方式。"
+        "action": "自定义设置"
       }
     },
     "featureModes": {
@@ -1637,8 +1644,8 @@
       }
     },
     "features": {
-      "modeLabel": "功能等级",
-      "policyLabel": "资源占用",
+      "modeLabel": "你需要哪些功能？",
+      "policyLabel": "玩游戏或使用电池时，CarbonPaper 应该怎么做？",
       "extraDownload": "需要额外下载约 {{size}} MB"
     },
     "browsers": {
@@ -1648,11 +1655,11 @@
       "edgeShort": "Edge"
     },
     "browserStartup": {
-      "browsersLabel": "浏览器扩展",
+      "browsersLabel": "要连接哪些浏览器？",
       "browsersHint": "扩展让快照带上网页地址和标题，搜索结果可以直接打开原网页。",
       "detected": "已在这台电脑上找到",
       "notDetected": "未找到，仍可安装",
-      "startupLabel": "启动",
+      "startupLabel": "CarbonPaper 什么时候开始工作？",
       "launchAtLogin": {
         "label": "开机时自动启动",
         "description": "登录 Windows 后在后台运行。"

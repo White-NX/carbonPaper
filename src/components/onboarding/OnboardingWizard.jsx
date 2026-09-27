@@ -1,14 +1,14 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  Activity,
   AlertCircle,
+  Check,
   CheckCircle2,
+  ChevronRight,
   Circle,
   ClipboardCheck,
   Clock3,
   Copy,
-  Gamepad2,
   Globe,
   Languages,
   Layers,
@@ -17,16 +17,11 @@ import {
   PlayCircle,
   Power,
   RotateCcw,
-  Scale,
   Search,
   ShieldCheck,
-  SlidersHorizontal,
-  Sparkles,
-  Tags,
-  Terminal,
-  Type,
   History,
 } from 'lucide-react';
+import appIcon from '../../../src-tauri/icons/128x128.png';
 import { changeAppLanguage } from '../../i18n';
 import { cn } from '../../lib/utils';
 import { MODEL_DOWNLOAD_MB } from '../../lib/modelSizes';
@@ -34,11 +29,14 @@ import { OverlayShell, ProgressBlock } from '../overlay';
 import { Button, focusRing } from '../ui/Button';
 import { Banner } from '../ui/Banner';
 import { OptionCardGroup, SwitchRow, ToggleCard } from './OptionCards';
-import { RERANKER_MODEL_ID, WIZARD_STEPS, needsReranker } from './onboardingPlan';
+import { RERANKER_MODEL_ID, WIZARD_STEPS, needsReranker, selectedBrowsers } from './onboardingPlan';
 
-const FEATURE_ICONS = { minimal: Type, basic: Tags, smart: Sparkles };
-const POLICY_ICONS = { complete: Activity, balanced: Scale, performance: Gamepad2 };
-const STEP_ICONS = { welcome: Terminal, features: Layers, browserStartup: Globe, review: ClipboardCheck };
+/** The app's own icon, drawn in the header tile in place of a line icon. */
+function AppIcon() {
+  return <img src={appIcon} alt="" aria-hidden="true" className="h-7 w-7" />;
+}
+
+const STEP_ICONS = { welcome: AppIcon, features: Layers, browserStartup: Globe, review: ClipboardCheck };
 
 function StepIndicator({ step, onSelect, locked }) {
   const { t } = useTranslation();
@@ -80,7 +78,7 @@ function LanguageSwitch() {
       {languages.map(([value, label]) => (
         <button key={value} type="button" aria-pressed={i18n.language === value} onClick={() => changeAppLanguage(value)}
           className={cn('rounded-md px-2 py-1 text-xs transition-colors', focusRing,
-            i18n.language === value ? 'bg-ide-accent text-white' : 'text-ide-muted hover:text-ide-text')}>
+            i18n.language === value ? 'bg-ide-panel font-medium text-ide-text shadow-sm' : 'text-ide-muted hover:text-ide-text')}>
           {label}
         </button>
       ))}
@@ -88,51 +86,68 @@ function LanguageSwitch() {
   );
 }
 
+/**
+ * What the app does and what "use recommended settings" will turn on. The
+ * page only informs; the two ways forward are the footer buttons, where every
+ * step keeps its main action.
+ */
 function WelcomeStep({ onboarding, downloadMb }) {
   const { t } = useTranslation();
+  const { recommended } = onboarding;
   const points = [
     ['record', History],
     ['search', Search],
     ['private', Lock],
   ];
+  const includes = [
+    'smart',
+    'performance',
+    recommended && selectedBrowsers(recommended).length > 0 && 'browsers',
+    'autostart',
+    recommended?.appBound && 'appBound',
+  ].filter(Boolean);
   return (
-    <div className="space-y-5">
-      <ul className="grid gap-3 sm:grid-cols-3">
+    <div className="space-y-6">
+      <ul className="grid gap-5 sm:grid-cols-3">
         {points.map(([id, Icon]) => (
-          <li key={id} className="rounded-xl border border-ide-border bg-ide-bg p-3">
-            <Icon className="h-4 w-4 text-ide-accent" aria-hidden="true" />
-            <p className="mt-2 text-sm font-medium text-ide-text">{t(`onboarding.welcome.points.${id}.title`)}</p>
+          <li key={id}>
+            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-ide-accent/10 text-ide-accent">
+              <Icon className="h-4 w-4" aria-hidden="true" />
+            </span>
+            <p className="mt-3 text-sm font-medium text-ide-text">{t(`onboarding.welcome.points.${id}.title`)}</p>
             <p className="mt-1 text-xs leading-relaxed text-ide-muted">{t(`onboarding.welcome.points.${id}.description`)}</p>
           </li>
         ))}
       </ul>
 
-      <div className="grid gap-3 sm:grid-cols-2">
-        <button type="button" onClick={onboarding.applyRecommended}
-          className={cn('group rounded-xl border border-ide-accent bg-ide-accent/10 p-4 text-left transition-colors hover:bg-ide-accent/15', focusRing)}>
-          <span className="flex items-center justify-between">
-            <Sparkles className="h-5 w-5 text-ide-accent" aria-hidden="true" />
-            <span className="rounded-full bg-ide-accent px-2 py-0.5 text-[10px] font-medium text-white">{t('onboarding.recommendedBadge')}</span>
-          </span>
-          <span className="mt-3 block text-sm font-semibold text-ide-text">{t('onboarding.welcome.recommended.title')}</span>
-          <span className="mt-1 block text-xs leading-relaxed text-ide-muted">{t('onboarding.welcome.recommended.description')}</span>
-          {downloadMb > 0 && (
-            <span className="mt-2 block text-[11px] text-ide-accent">{t('onboarding.welcome.recommended.size', { size: downloadMb })}</span>
-          )}
-        </button>
-        <button type="button" onClick={onboarding.next}
-          className={cn('rounded-xl border border-ide-border bg-ide-bg p-4 text-left transition-colors hover:border-ide-accent/40 hover:bg-ide-hover', focusRing)}>
-          <SlidersHorizontal className="h-5 w-5 text-ide-muted" aria-hidden="true" />
-          <span className="mt-3 block text-sm font-semibold text-ide-text">{t('onboarding.welcome.custom.title')}</span>
-          <span className="mt-1 block text-xs leading-relaxed text-ide-muted">{t('onboarding.welcome.custom.description')}</span>
-        </button>
-      </div>
+      <section className="rounded-xl bg-ide-bg p-4">
+        <h3 className="text-xs font-medium text-ide-text">{t('onboarding.welcome.recommended.summaryTitle')}</h3>
+        <ul className="mt-2.5 grid gap-x-6 gap-y-2 sm:grid-cols-2">
+          {includes.map((id) => (
+            <li key={id} className="flex items-center gap-2 text-xs text-ide-text">
+              <Check className="h-3.5 w-3.5 shrink-0 text-ide-accent" aria-hidden="true" />
+              {t(`onboarding.welcome.recommended.items.${id}`)}
+            </li>
+          ))}
+        </ul>
+        <p className="mt-3 text-xs leading-relaxed text-ide-muted">
+          {downloadMb > 0
+            ? t('onboarding.welcome.recommended.noteWithDownload', { size: downloadMb })
+            : t('onboarding.welcome.recommended.note')}
+        </p>
+      </section>
     </div>
   );
 }
 
-function SectionLabel({ children }) {
-  return <p className="mb-2 text-xs font-medium uppercase tracking-wide text-ide-muted">{children}</p>;
+/** A group's question, with an optional line under it. */
+function SectionHeading({ title, hint }) {
+  return (
+    <div className="mb-3">
+      <h3 className="text-sm font-medium text-ide-text">{title}</h3>
+      {hint && <p className="mt-0.5 text-xs leading-relaxed text-ide-muted">{hint}</p>}
+    </div>
+  );
 }
 
 function FeaturesStep({ onboarding }) {
@@ -140,7 +155,6 @@ function FeaturesStep({ onboarding }) {
   const { choices, context, setChoice } = onboarding;
   const featureOptions = ['minimal', 'basic', 'smart'].map((value) => ({
     value,
-    icon: FEATURE_ICONS[value],
     label: t(`onboarding.featureModes.${value}.label`),
     description: t(`onboarding.featureModes.${value}.description`),
     badge: value === 'smart' ? t('onboarding.recommendedBadge') : undefined,
@@ -150,20 +164,19 @@ function FeaturesStep({ onboarding }) {
   }));
   const policyOptions = ['complete', 'balanced', 'performance'].map((value) => ({
     value,
-    icon: POLICY_ICONS[value],
     label: t(`onboarding.policies.${value}.label`),
     description: t(`onboarding.policies.${value}.description`),
     badge: value === 'performance' ? t('onboarding.recommendedBadge') : undefined,
   }));
   return (
-    <div className="space-y-5">
+    <div className="space-y-7">
       <section>
-        <SectionLabel>{t('onboarding.features.modeLabel')}</SectionLabel>
+        <SectionHeading title={t('onboarding.features.modeLabel')} />
         <OptionCardGroup label={t('onboarding.features.modeLabel')} value={choices.featureMode}
           options={featureOptions} onChange={(value) => setChoice('featureMode', value)} />
       </section>
       <section>
-        <SectionLabel>{t('onboarding.features.policyLabel')}</SectionLabel>
+        <SectionHeading title={t('onboarding.features.policyLabel')} />
         <OptionCardGroup label={t('onboarding.features.policyLabel')} value={choices.resourcePolicy}
           options={policyOptions} onChange={(value) => setChoice('resourcePolicy', value)} />
       </section>
@@ -175,13 +188,12 @@ function BrowserStartupStep({ onboarding }) {
   const { t } = useTranslation();
   const { choices, context, setChoice, setBrowser } = onboarding;
   return (
-    <div className="space-y-5">
+    <div className="space-y-7">
       <section>
-        <SectionLabel>{t('onboarding.browserStartup.browsersLabel')}</SectionLabel>
-        <p className="mb-2 text-xs leading-relaxed text-ide-muted">{t('onboarding.browserStartup.browsersHint')}</p>
-        <div className="grid gap-2 sm:grid-cols-2">
+        <SectionHeading title={t('onboarding.browserStartup.browsersLabel')} hint={t('onboarding.browserStartup.browsersHint')} />
+        <div className="grid gap-3 sm:grid-cols-2">
           {['chrome', 'edge'].map((browser) => (
-            <ToggleCard key={browser} icon={Globe} checked={choices.browsers[browser]}
+            <ToggleCard key={browser} checked={choices.browsers[browser]}
               onChange={(on) => setBrowser(browser, on)}
               label={t(`onboarding.browsers.${browser}`)}
               description={context.browsers?.[browser]
@@ -191,7 +203,7 @@ function BrowserStartupStep({ onboarding }) {
         </div>
       </section>
       <section>
-        <SectionLabel>{t('onboarding.browserStartup.startupLabel')}</SectionLabel>
+        <SectionHeading title={t('onboarding.browserStartup.startupLabel')} />
         <div className="divide-y divide-ide-border/60 rounded-xl border border-ide-border bg-ide-bg px-3">
           <SwitchRow icon={Power} checked={choices.launchAtLogin} onChange={(on) => setChoice('launchAtLogin', on)}
             label={t('onboarding.browserStartup.launchAtLogin.label')}
@@ -400,7 +412,17 @@ export default function OnboardingWizard({ onboarding, required, downloadMb }) {
   if (stepId === 'review' && phase !== 'edit') headerKey = phase === 'applied' ? 'applied' : 'applying';
 
   let footer = null;
-  if (stepId === 'features' || stepId === 'browserStartup') {
+  if (stepId === 'welcome') {
+    footer = (
+      <>
+        <Button size="md" onClick={onboarding.next}>{t('onboarding.welcome.custom.action')}</Button>
+        <Button size="md" variant="primary" onClick={onboarding.applyRecommended}>
+          {t('onboarding.welcome.recommended.action')}
+          <ChevronRight className="-mr-1 h-4 w-4" aria-hidden="true" />
+        </Button>
+      </>
+    );
+  } else if (stepId === 'features' || stepId === 'browserStartup') {
     footer = <Button size="md" variant="primary" onClick={onboarding.next}>{t('onboarding.actions.next')}</Button>;
   } else if (stepId === 'review') {
     if (phase === 'edit') footer = <Button size="md" variant="primary" icon={CheckCircle2} onClick={onboarding.apply}>{t('onboarding.actions.finish')}</Button>;
@@ -416,8 +438,8 @@ export default function OnboardingWizard({ onboarding, required, downloadMb }) {
       icon={headerKey === 'applied' ? CheckCircle2 : STEP_ICONS[stepId]}
       title={t(`onboarding.headers.${headerKey}.title`)}
       subtitle={t(`onboarding.headers.${headerKey}.subtitle`)}
-      headerAside={stepId === 'welcome' ? <LanguageSwitch /> : resettable && (
-        <Button size="xs" variant="ghost" icon={RotateCcw} disabled={onboarding.stepIsRecommended(stepId)}
+      headerAside={stepId === 'welcome' ? <LanguageSwitch /> : resettable && !onboarding.stepIsRecommended(stepId) && (
+        <Button size="xs" variant="ghost" icon={RotateCcw}
           onClick={() => onboarding.resetStep(stepId)}>
           {t('onboarding.actions.resetStep')}
         </Button>

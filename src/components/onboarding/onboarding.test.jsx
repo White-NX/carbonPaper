@@ -199,7 +199,7 @@ describe('OnboardingWizard', () => {
   it('goes from welcome to review with one click and finishes there', async () => {
     mockBackend();
     render(<Harness />);
-    fireEvent.click(await screen.findByRole('button', { name: /onboarding\.welcome\.recommended\.title/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'onboarding.welcome.recommended.action' }));
     expect(screen.getByText('onboarding.headers.review.title')).toBeInTheDocument();
     expect(screen.getByText('onboarding.review.requiredComponents')).toBeInTheDocument();
 
@@ -211,14 +211,17 @@ describe('OnboardingWizard', () => {
   it('walks through the custom steps and moves between options with arrow keys', async () => {
     mockBackend();
     render(<Harness />);
-    fireEvent.click(await screen.findByRole('button', { name: /onboarding\.welcome\.custom\.title/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'onboarding.welcome.custom.action' }));
     const smart = screen.getByRole('radio', { name: /onboarding\.featureModes\.smart\.label/ });
     expect(smart).toHaveAttribute('aria-checked', 'true');
+    // "Restore recommended" appears only once something differs from it.
+    expect(screen.queryByRole('button', { name: 'onboarding.actions.resetStep' })).not.toBeInTheDocument();
 
     fireEvent.keyDown(smart, { key: 'ArrowLeft' });
     expect(screen.getByRole('radio', { name: /onboarding\.featureModes\.basic\.label/ })).toHaveAttribute('aria-checked', 'true');
     fireEvent.click(screen.getByRole('button', { name: 'onboarding.actions.resetStep' }));
     expect(screen.getByRole('radio', { name: /onboarding\.featureModes\.smart\.label/ })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByRole('button', { name: 'onboarding.actions.resetStep' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'onboarding.actions.next' }));
     expect(screen.getByText('onboarding.headers.browserStartup.title')).toBeInTheDocument();

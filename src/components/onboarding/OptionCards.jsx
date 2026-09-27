@@ -12,35 +12,45 @@ function Badge({ children }) {
   );
 }
 
-function CardBody({ icon: Icon, label, description, badge, note, selected }) {
+/**
+ * A dot for one-of-several choices and a box for independent ones, so the
+ * shape alone tells whether more than one can be picked.
+ */
+function Indicator({ multiple, selected }) {
+  if (multiple) {
+    return (
+      <span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
+        selected ? 'border-ide-accent bg-ide-accent text-white' : 'border-ide-border bg-ide-panel')}>
+        {selected && <Check className="h-3 w-3" aria-hidden="true" />}
+      </span>
+    );
+  }
+  return (
+    <span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors',
+      selected ? 'border-ide-accent' : 'border-ide-border bg-ide-panel')}>
+      {selected && <span className="h-2 w-2 rounded-full bg-ide-accent" />}
+    </span>
+  );
+}
+
+function CardBody({ label, description, badge, note, selected, multiple }) {
   return (
     <>
-      <div className="flex items-start justify-between gap-2">
-        {Icon && (
-          <span className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition-colors',
-            selected ? 'border-ide-accent/40 bg-ide-accent/15 text-ide-accent' : 'border-ide-border bg-ide-panel text-ide-muted')}>
-            <Icon className="h-4 w-4" aria-hidden="true" />
-          </span>
-        )}
-        <span className="flex items-center gap-1.5">
-          {badge && <Badge>{badge}</Badge>}
-          <span className={cn('flex h-4 w-4 items-center justify-center rounded-full border transition-colors',
-            selected ? 'border-ide-accent bg-ide-accent text-white' : 'border-ide-border')}>
-            {selected && <Check className="h-3 w-3" aria-hidden="true" />}
-          </span>
-        </span>
-      </div>
-      <span className="mt-2 block text-sm font-medium text-ide-text">{label}</span>
-      {description && <span className="mt-1 block text-xs leading-relaxed text-ide-muted">{description}</span>}
-      {note && <span className="mt-2 block text-[11px] font-medium text-ide-accent">{note}</span>}
+      <span className="flex items-center gap-2">
+        <Indicator multiple={multiple} selected={selected} />
+        <span className="text-sm font-medium text-ide-text">{label}</span>
+        {badge && <Badge>{badge}</Badge>}
+      </span>
+      {description && <span className="mt-1 block pl-6 text-xs leading-relaxed text-ide-muted">{description}</span>}
+      {note && <span className="mt-1.5 block pl-6 text-[11px] font-medium text-ide-accent">{note}</span>}
     </>
   );
 }
 
 const cardClass = (selected) => cn(
-  'flex h-full flex-col rounded-xl border p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+  'flex h-full flex-col rounded-xl border px-4 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50',
   focusRing,
-  selected ? 'border-ide-accent bg-ide-accent/5 shadow-sm' : 'border-ide-border bg-ide-bg hover:border-ide-accent/40 hover:bg-ide-hover',
+  selected ? 'border-ide-accent bg-ide-accent/5' : 'border-ide-border hover:border-ide-accent/40 hover:bg-ide-hover',
 );
 
 /**
@@ -61,7 +71,7 @@ export function OptionCardGroup({ label, value, options, onChange, columns = 3 }
   };
 
   return (
-    <div ref={ref} role="radiogroup" aria-label={label} className="grid gap-2"
+    <div ref={ref} role="radiogroup" aria-label={label} className="grid gap-3"
       style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
       {options.map((option, index) => {
         const selected = option.value === value;
@@ -84,7 +94,7 @@ export function ToggleCard({ checked, onChange, disabled, ...body }) {
   return (
     <button type="button" role="checkbox" aria-checked={checked} disabled={disabled}
       onClick={() => onChange(!checked)} className={cardClass(checked)}>
-      <CardBody {...body} selected={checked} />
+      <CardBody {...body} selected={checked} multiple />
     </button>
   );
 }
