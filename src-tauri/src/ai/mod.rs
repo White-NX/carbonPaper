@@ -3,11 +3,14 @@
 //! [`config`] stores endpoints and their encrypted API keys in the policy file,
 //! [`provider`] talks to those endpoints, [`tools`] adapts the MCP contract
 //! tools, and [`agent`] runs the search loop that ties them together.
+//! [`unattended`] is the entry point for runs nobody is watching, such as
+//! future scheduled tasks.
 
 pub mod agent;
 pub mod config;
 pub mod provider;
 pub mod tools;
+pub mod unattended;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

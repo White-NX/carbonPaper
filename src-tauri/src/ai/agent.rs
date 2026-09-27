@@ -16,7 +16,7 @@ use super::config::{ResolvedProvider, ToolCalling};
 use super::provider::{
     self, Cancellation, ChatRequest, Message, ProviderError, StreamEvent, ToolCall, ToolSpec, Usage,
 };
-use super::tools::{self, SnapshotRef};
+use super::tools::{self, SnapshotRef, ToolScope};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentLimits {
@@ -26,6 +26,7 @@ pub struct AgentLimits {
     /// Once cumulative input tokens pass this, the next step must answer.
     pub input_token_budget: u64,
     pub max_answer_tokens: u32,
+    pub tool_scope: ToolScope,
 }
 
 impl Default for AgentLimits {
@@ -35,6 +36,7 @@ impl Default for AgentLimits {
             max_calls_per_step: 6,
             input_token_budget: 200_000,
             max_answer_tokens: 4_096,
+            tool_scope: ToolScope::ReadOnly,
         }
     }
 }
@@ -158,7 +160,7 @@ pub async fn run(
     cancel: &Cancellation,
 ) -> Result<AgentOutcome, ProviderError> {
     let client = provider::http_client().map_err(ProviderError::Network)?;
-    let specs = tools::read_only_specs();
+    let specs = tools::specs(limits.tool_scope);
     let mut outcome = AgentOutcome {
         answer: String::new(),
         snapshots: Vec::new(),
@@ -294,7 +296,7 @@ mod tests {
     #[test]
     fn prefetch_uses_read_only_search_tools_and_embeds_their_results() {
         let calls = prefetch_calls("月亮");
-        let specs = tools::read_only_specs();
+        let specs = tools::specs(ToolScope::ReadOnly);
         assert!(calls
             .iter()
             .all(|call| specs.iter().any(|spec| spec.name == call.name)));

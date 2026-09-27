@@ -18,9 +18,27 @@ const MAX_STRING_CHARS: usize = 1_500;
 /// Fields that cost tokens without helping the model answer.
 const DROPPED_FIELDS: &[&str] = &["image_path", "confidence", "distance", "box_coords"];
 
-/// The read-only contract tools, which is what interactive AI search offers.
-pub fn read_only_specs() -> Vec<ToolSpec> {
-    mcp_contract::read_only_tool_definitions()
+/// Which contract tools a run may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolScope {
+    /// Only tools that read. Interactive search always uses this.
+    #[default]
+    ReadOnly,
+    /// Also the tools in [`mcp_contract::WRITE_TOOL_NAMES`], for tasks the
+    /// user explicitly allowed to change stored data.
+    ReadWrite,
+}
+
+pub fn specs(scope: ToolScope) -> Vec<ToolSpec> {
+    let definitions = match scope {
+        ToolScope::ReadOnly => mcp_contract::read_only_tool_definitions(),
+        ToolScope::ReadWrite => mcp_contract::tool_definitions()
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    definitions
         .into_iter()
         .filter_map(|tool| {
             Some(ToolSpec {
@@ -256,8 +274,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn write_scope_adds_exactly_the_write_tools() {
+        let all: Vec<String> = specs(ToolScope::ReadWrite)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(all, mcp_contract::TOOL_NAMES);
+    }
+
+    #[test]
     fn read_only_specs_exclude_write_tools() {
-        let names: Vec<String> = read_only_specs().into_iter().map(|t| t.name).collect();
+        let names: Vec<String> = specs(ToolScope::ReadOnly)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         assert!(names.contains(&"search_ocr_text".to_string()));
         assert!(!names.iter().any(|n| mcp_contract::is_write_tool(n)));
     }
