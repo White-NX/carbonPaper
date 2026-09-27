@@ -188,7 +188,8 @@
       "capture": "记录与采集",
       "organize": "整理与智能",
       "privacy": "隐私与访问",
-      "maintenance": "存储与维护"
+      "maintenance": "存储与维护",
+      "ai": "AI"
     },
     "security": {
       "protection": {
@@ -959,9 +960,10 @@
       "general": "调整启动方式、资源使用和窗口操作。",
       "capture": "选择记录范围，并连接浏览器扩展。",
       "organize": "选择整理功能和后台处理时机。",
-      "privacy": "管理解锁、后台访问和 AI 助手权限。",
+      "privacy": "管理解锁和后台访问。",
       "advanced": "调整处理性能，并按需查看组件与诊断信息。",
-      "about": "版本、更新与项目信息。"
+      "about": "版本、更新与项目信息。",
+      "ai": "连接你自己的大模型服务，并管理外部 AI 助手的访问权限。"
     },
     "feedback": {
       "loading": "正在读取…",
@@ -1017,6 +1019,38 @@
       "waiting": "等待解锁",
       "error": "异常",
       "stopped": "已停止"
+    },
+    "ai": {
+      "saved": "已保存。",
+      "providers": {
+        "title": "模型服务",
+        "description": "AI 搜索会使用这里的默认服务。支持 OpenAI 兼容接口，包括 DeepSeek、通义千问、Kimi，以及本机运行的 Ollama 和 LM Studio。",
+        "add": "添加服务",
+        "empty": "还没有添加模型服务。添加后即可在搜索页使用 AI 搜索。",
+        "default_badge": "默认",
+        "local_badge": "本机",
+        "limited": "这个模型不能主动查找记录，AI 搜索只能根据一次检索的结果回答。",
+        "make_default": "设为默认",
+        "edit": "编辑",
+        "delete": "删除"
+      },
+      "fields": {
+        "preset": "常用服务",
+        "preset_placeholder": "选择后自动填写地址",
+        "name": "名称",
+        "name_placeholder": "留空则使用模型名",
+        "model": "模型",
+        "base_url": "接口地址",
+        "base_url_hint": "通常以 /v1 结尾。",
+        "api_key": "API 密钥",
+        "api_key_placeholder": "本机服务通常不需要",
+        "api_key_saved": "已保存，留空则保持不变"
+      },
+      "test": {
+        "button": "测试连接",
+        "ok": "连接成功，用时 {{ms}} 毫秒。",
+        "ok_without_tools": "连接成功，用时 {{ms}} 毫秒。不过这个模型不能主动查找记录，AI 搜索的效果会受限。"
+      }
     }
   },
   "common": {
@@ -1742,6 +1776,27 @@
           "description": "电脑重启后，即使还没打开 CarbonPaper，整理工作也能继续进行。"
         }
       }
+    }
+  },
+  "ai": {
+    "errors": {
+      "AUTH_REQUIRED": "需要先解锁 CarbonPaper。",
+      "AI_UNAUTHORIZED": "服务拒绝了请求，请检查 API 密钥。",
+      "AI_NOT_FOUND": "找不到接口或模型，请检查接口地址和模型名。",
+      "AI_RATE_LIMITED": "请求过于频繁或额度已用完，请稍后再试。",
+      "AI_BAD_REQUEST": "服务无法处理这个请求。",
+      "AI_SERVER_ERROR": "服务暂时出错，请稍后再试。",
+      "AI_NETWORK_ERROR": "无法连接到服务，请检查网络和接口地址。",
+      "AI_TIMEOUT": "服务长时间没有响应。",
+      "AI_INVALID_RESPONSE": "服务返回的内容无法识别，它可能不兼容 OpenAI 接口。",
+      "AI_PROVIDER_INCOMPLETE": "请填写接口地址和模型。",
+      "AI_PROVIDER_INVALID_URL": "接口地址需要以 http:// 或 https:// 开头。",
+      "AI_PROVIDER_FIELD_TOO_LONG": "填写的内容过长。",
+      "AI_PROVIDER_KEY_UNREADABLE": "无法读取已保存的 API 密钥，请重新填写。",
+      "AI_NO_PROVIDER": "还没有配置模型服务。",
+      "AI_STEP_LIMIT": "查找步骤过多，已先停止。",
+      "AI_BUSY": "上一次 AI 搜索还在进行。",
+      "unknown": "出现了意外错误。"
     }
   }
 }

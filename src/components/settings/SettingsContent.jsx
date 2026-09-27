@@ -1,6 +1,6 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Settings, Shield, Activity, Image as ImageIcon, Database, HardDrive, Wrench, ScanLine, Sparkles, SlidersHorizontal, Info } from 'lucide-react';
+import { Settings, Shield, Activity, Image as ImageIcon, Database, HardDrive, Wrench, ScanLine, Sparkles, SlidersHorizontal, Info, Bot } from 'lucide-react';
 import MonitorServiceSection from './MonitorServiceSection';
 import GeneralOptionsSection from './GeneralOptionsSection';
 import CaptureFiltersSection from './CaptureFiltersSection';
@@ -13,6 +13,7 @@ import FeaturesSection from './FeaturesSection';
 import LanguageSection from './LanguageSection';
 import BrowserExtensionSection from './BrowserExtensionSection';
 import AiEmbeddingSection from './AiEmbeddingSection';
+import AiProvidersSection from './ai/AiProvidersSection';
 import ProtectedProcessingCard from './advanced/ProtectedProcessingCard';
 import { BackgroundSchedulerCard } from './advanced/InferenceCards';
 import { SettingsButton, SettingsSwitch } from './SettingsControls';
@@ -24,7 +25,7 @@ import { useAdvancedSectionController } from './useAdvancedSectionController';
 import { useTauriEventListener } from '../../hooks/useTauriEventListener';
 
 const TABS = [
-  ['general', Settings], ['capture', ScanLine], ['organize', Sparkles], ['privacy', Shield],
+  ['general', Settings], ['capture', ScanLine], ['organize', Sparkles], ['privacy', Shield], ['ai', Bot],
   ['maintenance', Wrench], ['advanced', SlidersHorizontal], ['about', Info],
 ];
 function initialTab() {
@@ -104,6 +105,9 @@ export default function SettingsContent({
             control={<SettingsSwitch checked={runtime.config?.network_enabled === true} disabled={!runtime.config || runtime.configSaving}
               onChange={() => runtime.handleToggle('network_enabled')} />} /></SettingsGroup>
         </SettingsSection>
+      </>;
+      case 'ai': return <>
+        <AiProvidersSection />
         <AiEmbeddingSection />
       </>;
       case 'maintenance': return <StorageManagementSection storageSegments={segments} totalStorage={c.storage?.total_bytes || 0}

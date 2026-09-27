@@ -188,7 +188,8 @@
       "capture": "Capture",
       "organize": "Organize",
       "privacy": "Privacy & Access",
-      "maintenance": "Maintenance"
+      "maintenance": "Maintenance",
+      "ai": "AI"
     },
     "security": {
       "protection": {
@@ -959,9 +960,10 @@
       "general": "Choose how the app starts, uses resources, and handles windows.",
       "capture": "Choose what to record and connect browser extensions.",
       "organize": "Choose organization features and when to run them.",
-      "privacy": "Manage unlocking, background access, and AI assistant permissions.",
+      "privacy": "Manage unlocking and background access.",
       "advanced": "Adjust processing performance and inspect components when needed.",
-      "about": "Version, updates, and project information."
+      "about": "Version, updates, and project information.",
+      "ai": "Connect your own model service and manage access for external AI assistants."
     },
     "feedback": {
       "loading": "Loading…",
@@ -1017,6 +1019,38 @@
       "waiting": "Waiting for unlock",
       "error": "Error",
       "stopped": "Stopped"
+    },
+    "ai": {
+      "saved": "Saved.",
+      "providers": {
+        "title": "Model services",
+        "description": "AI search uses the default service below. Any OpenAI-compatible endpoint works, including DeepSeek, Qwen, Kimi, and Ollama or LM Studio running on this computer.",
+        "add": "Add service",
+        "empty": "No model service yet. Add one to use AI search.",
+        "default_badge": "Default",
+        "local_badge": "This computer",
+        "limited": "This model cannot look things up on its own, so AI search answers from a single search.",
+        "make_default": "Make default",
+        "edit": "Edit",
+        "delete": "Delete"
+      },
+      "fields": {
+        "preset": "Common services",
+        "preset_placeholder": "Pick one to fill in the address",
+        "name": "Name",
+        "name_placeholder": "Defaults to the model name",
+        "model": "Model",
+        "base_url": "Endpoint address",
+        "base_url_hint": "Usually ends with /v1.",
+        "api_key": "API key",
+        "api_key_placeholder": "Usually not needed for local services",
+        "api_key_saved": "Saved. Leave empty to keep it"
+      },
+      "test": {
+        "button": "Test connection",
+        "ok": "Connected in {{ms}} ms.",
+        "ok_without_tools": "Connected in {{ms}} ms, but this model cannot look things up on its own, so AI search will be limited."
+      }
     }
   },
   "common": {
@@ -1742,6 +1776,27 @@
           "description": "After your PC restarts, organizing continues even before you open CarbonPaper."
         }
       }
+    }
+  },
+  "ai": {
+    "errors": {
+      "AUTH_REQUIRED": "Unlock CarbonPaper first.",
+      "AI_UNAUTHORIZED": "The service rejected the request. Check the API key.",
+      "AI_NOT_FOUND": "Endpoint or model not found. Check the address and model name.",
+      "AI_RATE_LIMITED": "Too many requests or quota used up. Try again later.",
+      "AI_BAD_REQUEST": "The service could not handle this request.",
+      "AI_SERVER_ERROR": "The service had an error. Try again later.",
+      "AI_NETWORK_ERROR": "Could not reach the service. Check the network and address.",
+      "AI_TIMEOUT": "The service stopped responding.",
+      "AI_INVALID_RESPONSE": "The service replied in an unexpected format. It may not be OpenAI-compatible.",
+      "AI_PROVIDER_INCOMPLETE": "Fill in the address and model.",
+      "AI_PROVIDER_INVALID_URL": "The address must start with http:// or https://.",
+      "AI_PROVIDER_FIELD_TOO_LONG": "A field is too long.",
+      "AI_PROVIDER_KEY_UNREADABLE": "The saved API key could not be read. Enter it again.",
+      "AI_NO_PROVIDER": "No model service is set up yet.",
+      "AI_STEP_LIMIT": "Stopped after too many lookup steps.",
+      "AI_BUSY": "The previous AI search is still running.",
+      "unknown": "Something unexpected went wrong."
     }
   }
 }

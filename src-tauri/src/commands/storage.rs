@@ -57,6 +57,10 @@ fn merge_policy_update(
         .ok_or_else(|| "Policy update is not a valid JSON object".to_string())?;
 
     for (key, value) in update_obj {
+        // AI endpoints carry encrypted keys and have their own commands.
+        if key == crate::ai::config::POLICY_KEY {
+            continue;
+        }
         existing_obj.insert(key.clone(), value.clone());
     }
 
@@ -66,6 +70,7 @@ fn merge_policy_update(
 fn redact_policy_for_frontend(policy: &mut serde_json::Value) {
     if let Some(obj) = policy.as_object_mut() {
         obj.remove("mcp_token_encrypted");
+        obj.remove(crate::ai::config::POLICY_KEY);
     }
 }
 
@@ -99,12 +104,14 @@ mod tests {
             "mcp_enabled": true,
             "mcp_port": 23816,
             "mcp_token_encrypted": "secret",
+            "ai": { "providers": [] },
             "sensitive_filter": { "enabled": false },
             "storage_limit": "20"
         });
         let update = json!({
             "storage_limit": "10",
-            "retention_period": "6months"
+            "retention_period": "6months",
+            "ai": null
         });
 
         let merged = merge_policy_update(existing, update).unwrap();
@@ -114,6 +121,7 @@ mod tests {
         assert_eq!(merged["mcp_enabled"], true);
         assert_eq!(merged["mcp_port"], 23816);
         assert_eq!(merged["mcp_token_encrypted"], "secret");
+        assert_eq!(merged["ai"], json!({ "providers": [] }));
         assert_eq!(merged["sensitive_filter"]["enabled"], false);
     }
 
@@ -127,13 +135,15 @@ mod tests {
     fn redact_policy_for_frontend_removes_encrypted_mcp_token() {
         let mut policy = json!({
             "mcp_enabled": true,
-            "mcp_token_encrypted": "secret"
+            "mcp_token_encrypted": "secret",
+            "ai": { "providers": [] }
         });
 
         redact_policy_for_frontend(&mut policy);
 
         assert_eq!(policy["mcp_enabled"], true);
         assert!(policy.get("mcp_token_encrypted").is_none());
+        assert!(policy.get("ai").is_none());
     }
 
     #[test]
