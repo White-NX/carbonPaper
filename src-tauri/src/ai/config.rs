@@ -60,6 +60,10 @@ pub struct AiSettings {
     pub providers: Vec<StoredProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_provider_id: Option<String>,
+    /// The user agreed that screenshot text may be sent to endpoints that are
+    /// not on this computer.
+    #[serde(default)]
+    pub remote_consent: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +82,7 @@ pub struct ProviderView {
 pub struct AiSettingsView {
     pub providers: Vec<ProviderView>,
     pub default_provider_id: Option<String>,
+    pub remote_consent: bool,
 }
 
 /// A provider as edited in settings. `api_key` of `None` keeps the stored key,
@@ -155,6 +160,7 @@ impl AiSettings {
                 })
                 .collect(),
             default_provider_id: self.effective_default_id().map(str::to_string),
+            remote_consent: self.remote_consent,
         }
     }
 
@@ -319,7 +325,10 @@ fn validate(mut input: ProviderInput) -> Result<ProviderInput, String> {
     if input.name.chars().count() > MAX_NAME_CHARS
         || input.base_url.len() > MAX_FIELD_CHARS
         || input.model.len() > MAX_FIELD_CHARS
-        || input.api_key.as_ref().is_some_and(|k| k.len() > MAX_FIELD_CHARS * 4)
+        || input
+            .api_key
+            .as_ref()
+            .is_some_and(|k| k.len() > MAX_FIELD_CHARS * 4)
     {
         return Err("AI_PROVIDER_FIELD_TOO_LONG".into());
     }
@@ -356,7 +365,10 @@ fn derive_key(credential_state: &CredentialManagerState) -> Result<[u8; 32], Str
     Ok(hasher.finalize().into())
 }
 
-fn encrypt_key(credential_state: &CredentialManagerState, plaintext: &str) -> Result<String, String> {
+fn encrypt_key(
+    credential_state: &CredentialManagerState,
+    plaintext: &str,
+) -> Result<String, String> {
     let key = derive_key(credential_state)?;
     let encrypted = encrypt_with_master_key(&key, plaintext.as_bytes())
         .map_err(|e| format!("API key encryption failed: {}", e))?;
@@ -431,6 +443,7 @@ mod tests {
         let mut settings = AiSettings {
             providers: vec![stored("a"), stored("b")],
             default_provider_id: Some("a".into()),
+            remote_consent: false,
         };
         settings.remove("a").unwrap();
         assert_eq!(settings.effective_default_id(), Some("b"));
@@ -450,6 +463,7 @@ mod tests {
                 tool_calling: ToolCalling::Supported,
             }],
             default_provider_id: None,
+            remote_consent: false,
         };
         let json = serde_json::to_string(&settings.view()).unwrap();
         assert!(!json.contains("secret"));

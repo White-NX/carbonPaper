@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
 
 /**
@@ -32,15 +32,35 @@ export function testAiProvider({ id, name, kind, baseUrl, model, apiKey }) {
   }), { autoPrompt: true });
 }
 
+export function grantAiRemoteConsent() {
+  return withAuth(() => invoke('ai_grant_remote_consent'), { autoPrompt: true });
+}
+
+/**
+ * Runs one AI search. `onEvent` receives the agent's progress events; the
+ * promise resolves with the final outcome.
+ */
+export function runAiSearch({ requestId, question, providerId, onEvent }) {
+  return withAuth(() => {
+    const channel = new Channel();
+    channel.onmessage = onEvent;
+    return invoke('ai_search', { requestId, question, providerId: providerId || null, onEvent: channel });
+  }, { autoPrompt: true });
+}
+
+export function cancelAiSearch(requestId) {
+  return invoke('ai_search_cancel', { requestId });
+}
+
 /** Maps a backend error string such as `AI_UNAUTHORIZED: ...` to a message key. */
 export function aiErrorKey(error) {
   const text = String(error?.message ?? error ?? '');
-  const code = text.match(/\b(AI_[A-Z_]+)/)?.[1];
+  const code = text.match(/\b(AI_[A-Z_]+|MAINTENANCE_IN_PROGRESS)/)?.[1];
   const known = [
     'AI_UNAUTHORIZED', 'AI_NOT_FOUND', 'AI_RATE_LIMITED', 'AI_BAD_REQUEST', 'AI_SERVER_ERROR',
     'AI_NETWORK_ERROR', 'AI_TIMEOUT', 'AI_INVALID_RESPONSE', 'AI_PROVIDER_INCOMPLETE',
     'AI_PROVIDER_INVALID_URL', 'AI_PROVIDER_FIELD_TOO_LONG', 'AI_PROVIDER_KEY_UNREADABLE',
-    'AI_NO_PROVIDER', 'AI_STEP_LIMIT', 'AI_BUSY',
+    'AI_NO_PROVIDER', 'AI_BUSY', 'AI_EMPTY_QUESTION', 'AI_PROVIDER_NOT_FOUND', 'MAINTENANCE_IN_PROGRESS',
   ];
   if (text.includes('AUTH_REQUIRED')) return 'ai.errors.AUTH_REQUIRED';
   return known.includes(code) ? `ai.errors.${code}` : 'ai.errors.unknown';

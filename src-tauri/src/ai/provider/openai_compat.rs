@@ -43,7 +43,9 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                     "function": { "name": call.name, "arguments": call.arguments },
                 })).collect::<Vec<_>>(),
             }),
-            Message::ToolResult { call_id, content } => json!({ "role": "tool", "tool_call_id": call_id, "content": content }),
+            Message::ToolResult { call_id, content } => {
+                json!({ "role": "tool", "tool_call_id": call_id, "content": content })
+            }
         })
         .collect();
 

@@ -1359,7 +1359,9 @@
       "ocr_full": "Text search",
       "nl_full": "Picture search",
       "ocr_hint": "Match keywords in recognized text",
-      "nl_hint": "Match screen content with a description"
+      "nl_hint": "Match screen content with a description",
+      "ai": "AI",
+      "ai_hint": "Ask a question and let AI search your history for the answer"
     },
     "processes": {
       "all": "All Processes",
@@ -1796,7 +1798,48 @@
       "AI_NO_PROVIDER": "No model service is set up yet.",
       "AI_STEP_LIMIT": "Stopped after too many lookup steps.",
       "AI_BUSY": "The previous AI search is still running.",
-      "unknown": "Something unexpected went wrong."
+      "unknown": "Something unexpected went wrong.",
+      "AI_EMPTY_QUESTION": "Enter a question.",
+      "AI_PROVIDER_NOT_FOUND": "That model service no longer exists.",
+      "MAINTENANCE_IN_PROGRESS": "Data maintenance is running. Try again later."
+    }
+  },
+  "aiSearch": {
+    "placeholder": "Ask your history, e.g. \"What was the paper I was reading last Friday?\"",
+    "stop": "Stop",
+    "thinking": "Thinking…",
+    "cancelled": "Stopped.",
+    "sources": "Screenshots used",
+    "stopped_early": "This took many lookups, so the AI answered with what it found so far.",
+    "truncated": "The answer was too long and got cut off.",
+    "steps": {
+      "summary": "Looked things up {{count}} times",
+      "results": "{{count}} results",
+      "failed": "Failed",
+      "search_ocr_text": "Searched text for \"{{query}}\"",
+      "search_nl": "Searched images for \"{{query}}\"",
+      "time_range": "Looked at {{start}} to {{end}}",
+      "details": "Read screenshot #{{id}}",
+      "clusters": "Looked at smart clusters",
+      "cluster_content": "Read cluster contents"
+    },
+    "setup": {
+      "title": "Connect a model service first",
+      "description": "AI search runs on your own model service. It can be an online one such as DeepSeek, or Ollama running on this computer.",
+      "button": "Open settings"
+    },
+    "consent": {
+      "title": "Send what the search finds to {{name}}?",
+      "description": "During AI search, screenshot text, window titles and times related to your question are sent to this service so it can write the answer. Sensitive content is handled by the filters under AI assistant access. You can switch to a service running on this computer at any time in settings.",
+      "accept": "Allow and continue"
+    },
+    "landing": {
+      "using": "Using {{name}}",
+      "examples": [
+        "What was I doing yesterday afternoon?",
+        "Which articles about async Rust did I read recently?",
+        "When did I last see that error message?"
+      ]
     }
   }
 }

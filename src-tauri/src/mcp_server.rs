@@ -990,7 +990,10 @@ async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Resul
     Ok(Value::Array(output))
 }
 
-async fn tool_get_snapshot_details(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
+async fn tool_get_snapshot_details(
+    app_handle: &tauri::AppHandle,
+    args: Value,
+) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
 
     let id = args
@@ -1313,7 +1316,10 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
     Ok(Value::Array(cleaned))
 }
 
-async fn tool_get_smart_clusters(app_handle: &tauri::AppHandle, _args: Value) -> Result<Value, String> {
+async fn tool_get_smart_clusters(
+    app_handle: &tauri::AppHandle,
+    _args: Value,
+) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
 
     let storage = app_handle.state::<Arc<StorageState>>();

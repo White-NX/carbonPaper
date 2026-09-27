@@ -1359,7 +1359,9 @@
       "ocr_full": "文字搜索",
       "nl_full": "画面搜索",
       "ocr_hint": "在识别出的文字里找关键词",
-      "nl_hint": "用一句描述匹配画面内容"
+      "nl_hint": "用一句描述匹配画面内容",
+      "ai": "AI",
+      "ai_hint": "用一句话提问，由 AI 在记录里查找并回答"
     },
     "processes": {
       "all": "所有进程",
@@ -1796,7 +1798,48 @@
       "AI_NO_PROVIDER": "还没有配置模型服务。",
       "AI_STEP_LIMIT": "查找步骤过多，已先停止。",
       "AI_BUSY": "上一次 AI 搜索还在进行。",
-      "unknown": "出现了意外错误。"
+      "unknown": "出现了意外错误。",
+      "AI_EMPTY_QUESTION": "请输入问题。",
+      "AI_PROVIDER_NOT_FOUND": "找不到这个模型服务，它可能已被删除。",
+      "MAINTENANCE_IN_PROGRESS": "正在进行数据维护，请稍后再试。"
+    }
+  },
+  "aiSearch": {
+    "placeholder": "问问你的记录，比如「上周五我在看的那篇论文叫什么？」",
+    "stop": "停止",
+    "thinking": "正在思考……",
+    "cancelled": "已停止。",
+    "sources": "参考的截图",
+    "stopped_early": "查找步骤较多，AI 已根据目前找到的内容作答。",
+    "truncated": "回答过长，已被截断。",
+    "steps": {
+      "summary": "查找了 {{count}} 次",
+      "results": "{{count}} 条结果",
+      "failed": "未成功",
+      "search_ocr_text": "搜索文字「{{query}}」",
+      "search_nl": "搜索画面「{{query}}」",
+      "time_range": "查看 {{start}} 至 {{end}} 的记录",
+      "details": "阅读截图 #{{id}}",
+      "clusters": "查看智能归档",
+      "cluster_content": "阅读归档内容"
+    },
+    "setup": {
+      "title": "先连接一个模型服务",
+      "description": "AI 搜索使用你自己的大模型服务。可以是 DeepSeek、通义千问等在线服务，也可以是本机运行的 Ollama。",
+      "button": "前往设置"
+    },
+    "consent": {
+      "title": "允许把搜索到的内容发送给 {{name}}？",
+      "description": "AI 搜索时，与问题相关的截图文字、窗口标题和时间会发送给这个服务，由它整理成回答。敏感内容会按照“AI 助手访问”中的过滤设置处理。你可以随时在设置中改用本机运行的服务。",
+      "accept": "允许并继续"
+    },
+    "landing": {
+      "using": "正在使用 {{name}}",
+      "examples": [
+        "我昨天下午在做什么？",
+        "最近看过的关于 Rust 异步的文章有哪些？",
+        "上次看到那个报错信息是在什么时候？"
+      ]
     }
   }
 }

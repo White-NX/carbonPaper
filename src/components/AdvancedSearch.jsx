@@ -7,6 +7,8 @@ import { TimeRangeChip, ProcessChip, CategoryChip } from './search/SearchFilters
 import { SearchStatsBar } from './search/SearchStatsBar';
 import { SearchResultRow } from './search/SearchResultRow';
 import { SearchLanding, SearchNoResults } from './search/SearchLanding';
+import { AiSearchPanel } from './search/AiSearchPanel';
+import { useAiSearch } from '../hooks/useAiSearch';
 import { PageHeader } from './PageHeader';
 import { useAdvancedSearchController } from '../hooks/useAdvancedSearchController';
 import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
@@ -67,6 +69,13 @@ export function AdvancedSearch({
     t,
   });
   const isMigrating = useHmacMigrationStatus();
+  const [aiActive, setAiActive] = React.useState(false);
+  const ai = useAiSearch({ active: active && aiActive });
+  const handleTabChange = (next) => {
+    setAiActive(next === 'ai');
+    if (next !== 'ai') handleModeChange(next);
+  };
+  const tabs = <SearchModeTabs mode={aiActive ? 'ai' : mode} onChange={handleTabChange} />;
   const [hoveredMarkerIds, setHoveredMarkerIds] = React.useState([]);
 
   const hasResults = results.length > 0;
@@ -93,7 +102,7 @@ export function AdvancedSearch({
       hoveredIds: hoveredMarkerIds,
       fitKey: `ocr:${resultSetKey}`,
     } : null);
-  }, [active, mode, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
+  }, [active, aiActive, mode, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
 
   React.useEffect(() => () => onTimelineSearchChange?.(null), [onTimelineSearchChange]);
 
@@ -187,9 +196,19 @@ export function AdvancedSearch({
     );
   };
 
+  const pageClassName = `flex min-h-0 w-full flex-1 flex-col ${active ? 'opacity-100' : 'pointer-events-none opacity-0'} transition-opacity duration-200`;
+
+  if (aiActive) {
+    return (
+      <div className={pageClassName}>
+        <AiSearchPanel controller={ai} tabs={tabs} onSelectResult={onSelectResult} header={PageHeader} />
+      </div>
+    );
+  }
+
   return (
     <div
-      className={`flex min-h-0 w-full flex-1 flex-col ${active ? 'opacity-100' : 'pointer-events-none opacity-0'} transition-opacity duration-200`}
+      className={pageClassName}
     >
       {isMigrating && (
         <div className="flex items-start gap-4 border border-yellow-500/20 bg-yellow-500/10 p-3">
@@ -214,7 +233,7 @@ export function AdvancedSearch({
         flushBottom
         secondaryRow={(
           <>
-            <SearchModeTabs mode={mode} onChange={handleModeChange} />
+            {tabs}
 
             <div className="flex flex-1 flex-wrap items-center gap-2">
               <TimeRangeChip
