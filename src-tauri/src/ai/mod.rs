@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod config;
+mod context;
 pub mod provider;
 pub mod tools;
 pub mod unattended;

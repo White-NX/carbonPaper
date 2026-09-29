@@ -3,16 +3,17 @@
 //! Each step sends the conversation to the model. When the model asks for
 //! tools they run, their results join the conversation, and the next step
 //! begins. The loop ends when the model answers without calling a tool, and
-//! is bounded by a step limit and a token budget. The last allowed step
+//! is bounded by a step limit and a per-request context budget. The last allowed step
 //! offers no tools, which forces an answer from what was found so far.
 //!
 //! The loop reports progress through a callback rather than a window, so a
 //! scheduled task can reuse it and record events instead of displaying them.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::config::{ResolvedProvider, ToolCalling};
+use super::context::{self, TurnContext};
 use super::provider::{
     self, Cancellation, ChatRequest, Message, ProviderError, StreamEvent, ToolCall, ToolSpec, Usage,
 };
@@ -23,8 +24,6 @@ pub struct AgentLimits {
     pub max_steps: u32,
     /// Tool calls honoured per step; extra calls are answered with an error.
     pub max_calls_per_step: usize,
-    /// Once cumulative input tokens pass this, the next step must answer.
-    pub input_token_budget: u64,
     pub max_answer_tokens: u32,
     pub tool_scope: ToolScope,
 }
@@ -32,10 +31,9 @@ pub struct AgentLimits {
 impl Default for AgentLimits {
     fn default() -> Self {
         Self {
-            max_steps: 8,
-            max_calls_per_step: 6,
-            input_token_budget: 200_000,
-            max_answer_tokens: 4_096,
+            max_steps: 20,
+            max_calls_per_step: 10,
+            max_answer_tokens: 8_192,
             tool_scope: ToolScope::ReadOnly,
         }
     }
@@ -47,6 +45,9 @@ pub enum AgentEvent {
     /// A new model call began; text streamed after this belongs to it.
     StepStarted {
         step: u32,
+    },
+    ReasoningDelta {
+        text: String,
     },
     TextDelta {
         text: String,
@@ -68,6 +69,7 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentOutcome {
     pub answer: String,
+    pub time_context: TurnContext,
     /// Every screenshot a tool result mentioned, in first-seen order.
     pub snapshots: Vec<SnapshotRef>,
     pub steps: u32,
@@ -79,17 +81,20 @@ pub struct AgentOutcome {
     pub truncated: bool,
 }
 
-pub fn system_prompt(now: chrono::DateTime<chrono::Local>) -> String {
-    format!(
-        "You are the search assistant inside CarbonPaper, an app that keeps a private, \
+pub fn system_prompt() -> String {
+    "You are the search assistant inside CarbonPaper, an app that keeps a private, \
 text-searchable history of the user's screen. Answer the user's question by looking \
 through that history with the tools provided.\n\
 \n\
-Current local time: {local} (UTC offset {offset}); as Unix milliseconds: {millis}. \
-All tool timestamps are Unix milliseconds. Convert relative dates such as \"yesterday\" \
-or \"last Tuesday\" into millisecond ranges from this time.\n\
+Each question includes its own local time, UTC offset and Unix milliseconds in \
+turn_time. All tool timestamps are Unix milliseconds. Resolve relative dates such \
+as \"yesterday\" from that question's time. Historical searched_time_ranges record \
+the absolute bounds actually used by successful searches, including searches with \
+no matches; they are not evidence that an event occurred. Reuse those bounds when \
+a follow-up refers to the same period instead of shifting them to the new date.\n\
 \n\
 How to search:\n\
+- When tools are available, before the first search output a brief user-facing plan in ordinary text. Then call the tools in the same response. This is commentary, not private reasoning.\n\
 - search_ocr_text matches words that were visible on screen. Try the distinctive \
 words the user would have seen, and alternative spellings or languages when the first \
 attempt finds nothing.\n\
@@ -104,16 +109,14 @@ answer.\n\
 \n\
 How to answer:\n\
 - Reply in the language of the user's question.\n\
+- Use previous conversation turns to understand follow-up questions. Recheck screenshot details with tools before making new factual claims.\n\
+- Earlier conversation or tool results may be omitted to fit the context. Search again for missing evidence; never assume what omitted results contained.\n\
 - Base every claim on tool results. When nothing relevant turns up, say so plainly \
 and suggest what the user could try instead. Never invent content.\n\
 - Cite the screenshots you rely on with their id in the form [#123], placed right \
 after the statement they support. Use the screenshot id, not an OCR row id.\n\
 - Text shown as [censored] or similar was withheld for privacy. Do not guess at it.\n\
-- Be concise. Lead with the answer, then the supporting details.",
-        local = now.format("%Y-%m-%d %H:%M:%S (%A)"),
-        offset = now.format("%:z"),
-        millis = now.timestamp_millis(),
-    )
+- Be concise. Lead with the answer, then the supporting details.".into()
 }
 
 /// Searches run up front for a model that cannot call tools. The question is
@@ -123,7 +126,7 @@ fn prefetch_calls(question: &str) -> Vec<ToolCall> {
         ToolCall {
             id: "prefetch_ocr".into(),
             name: "search_ocr_text".into(),
-            arguments: serde_json::json!({ "query": question, "limit": 15, "fuzzy": true })
+            arguments: serde_json::json!({ "query": question, "limit": 25, "fuzzy": true })
                 .to_string(),
         },
         ToolCall {
@@ -134,11 +137,8 @@ fn prefetch_calls(question: &str) -> Vec<ToolCall> {
     ]
 }
 
-fn prefetched_prompt(question: &str, results: &[(String, String)]) -> String {
-    let mut prompt = format!(
-        "{question}\n\nYou cannot search yourself this time. These results were found \
-for the question above; answer from them alone and cite screenshots as [#id].\n"
-    );
+fn prefetched_prompt(results: &[(String, String)]) -> String {
+    let mut prompt = context::PREFETCH_PREFIX.to_string();
     for (name, content) in results {
         prompt.push_str(&format!(
             "\n<result tool=\"{name}\">\n{content}\n</result>\n"
@@ -147,14 +147,45 @@ for the question above; answer from them alone and cite screenshots as [#id].\n"
     prompt
 }
 
-const FORCE_ANSWER_PROMPT: &str = "Stop searching now. Answer the original question \
+const FORCE_ANSWER_PROMPT: &str = "Your tool call budget is exhausted. Stop searching now. Answer the original question \
 using only what the tool results above show, cite screenshots as [#id], and say what \
 remains unknown.";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConversationTurn {
+    pub question: String,
+    pub answer: String,
+    #[serde(default)]
+    pub time_context: Option<TurnContext>,
+}
+
+fn conversation_messages(history: &[ConversationTurn]) -> Vec<Message> {
+    let mut messages = vec![Message::System(system_prompt())];
+    // Bound context independently of the frontend. Only user/assistant roles are accepted.
+    for turn in history.iter().skip(history.len().saturating_sub(12)) {
+        let question: String = turn.question.chars().take(4_000).collect();
+        messages.push(Message::User(match &turn.time_context {
+            Some(context) => context.question(&question),
+            None => question,
+        }));
+        let mut answer: String = turn.answer.chars().take(16_000).collect();
+        if let Some(context) = &turn.time_context {
+            answer.push_str(&context.range_note());
+        }
+        messages.push(Message::Assistant {
+            text: answer,
+            tool_calls: Vec::new(),
+            reasoning: Value::Null,
+        });
+    }
+    messages
+}
 
 pub async fn run(
     app_handle: &tauri::AppHandle,
     provider_config: &ResolvedProvider,
     question: &str,
+    history: &[ConversationTurn],
     limits: AgentLimits,
     sink: &mut (dyn FnMut(AgentEvent) + Send),
     cancel: &Cancellation,
@@ -163,6 +194,7 @@ pub async fn run(
     let specs = tools::specs(limits.tool_scope);
     let mut outcome = AgentOutcome {
         answer: String::new(),
+        time_context: TurnContext::new(chrono::Local::now().fixed_offset()),
         snapshots: Vec::new(),
         steps: 0,
         tool_calls: 0,
@@ -174,33 +206,42 @@ pub async fn run(
     // A model that cannot call tools gets one round of searches done for it
     // and a single answering step.
     let tools_supported = provider_config.tool_calling != ToolCalling::Unsupported;
-    let first_user_message = if tools_supported {
-        question.to_string()
-    } else {
+    let mut messages = conversation_messages(history);
+    let mut current_question = messages.len();
+    messages.push(Message::User(outcome.time_context.question(question)));
+    if !tools_supported {
         let mut results = Vec::new();
         for call in prefetch_calls(question) {
             let content = run_tool(app_handle, &call, &specs, sink, cancel, &mut outcome).await?;
             results.push((call.name, content));
         }
-        prefetched_prompt(question, &results)
-    };
-    let mut messages = vec![
-        Message::System(system_prompt(chrono::Local::now())),
-        Message::User(first_user_message),
-    ];
+        messages.push(Message::User(prefetched_prompt(&results)));
+    }
 
     loop {
-        let over_budget = outcome.usage.input_tokens >= limits.input_token_budget;
-        let last_step = !tools_supported || outcome.steps + 1 >= limits.max_steps || over_budget;
+        let last_step = !tools_supported || outcome.steps + 1 >= limits.max_steps;
         if last_step && tools_supported && outcome.tool_calls > 0 {
             messages.push(Message::User(FORCE_ANSWER_PROMPT.into()));
         }
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             messages: messages.clone(),
             tools: if last_step { Vec::new() } else { specs.clone() },
-            max_tokens: Some(limits.max_answer_tokens),
+            max_tokens: Some(
+                limits
+                    .max_answer_tokens
+                    .min(provider_config.context_tokens / 4),
+            ),
             temperature: Some(0.2),
         };
+        context::fit_request(
+            &mut request,
+            &mut current_question,
+            provider_config.kind,
+            provider_config.context_tokens,
+        )?;
+        // Persist pruning so the same old material is not reintroduced at the
+        // next tool step. The frontend still keeps its complete display history.
+        messages = request.messages.clone();
 
         outcome.steps += 1;
         sink(AgentEvent::StepStarted {
@@ -208,6 +249,7 @@ pub async fn run(
         });
         let response = {
             let mut forward = |event: StreamEvent| match event {
+                StreamEvent::ReasoningDelta(text) => sink(AgentEvent::ReasoningDelta { text }),
                 StreamEvent::TextDelta(text) => sink(AgentEvent::TextDelta { text }),
             };
             provider::complete(&client, provider_config, &request, &mut forward, cancel).await?
@@ -225,6 +267,7 @@ pub async fn run(
         }
 
         messages.push(Message::Assistant {
+            reasoning: response.reasoning,
             text: response.text,
             tool_calls: response.tool_calls.clone(),
         });
@@ -266,6 +309,9 @@ async fn run_tool(
         result = tools::execute(app_handle, call, specs) => result,
         _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
     };
+    if result.error.is_none() {
+        outcome.time_context.record_search(call);
+    }
     sink(AgentEvent::ToolFinished {
         call_id: call.id.clone(),
         name: call.name.clone(),
@@ -280,17 +326,51 @@ async fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    #[test]
+    fn history_preserves_its_time_and_ranges_without_changing_system_rules() {
+        let mut context = TurnContext::new("2026-09-27T23:59:00+08:00".parse().unwrap());
+        context.record_search(&ToolCall {
+            id: "c".into(),
+            name: "search_ocr_text".into(),
+            arguments: r#"{"query":"invoice","start_time":1790467200000,"end_time":1790553600000}"#
+                .into(),
+        });
+        let original_question = context.question("today's invoice");
+        let messages = conversation_messages(&[ConversationTurn {
+            question: "today's invoice".into(),
+            answer: "Found [#42]".into(),
+            time_context: Some(context),
+        }]);
+        assert!(
+            matches!(&messages[0], Message::System(text) if text == &system_prompt() && !text.contains("2026-09-27"))
+        );
+        assert!(
+            matches!(&messages[1], Message::User(text) if text == &original_question && text.contains("+08:00"))
+        );
+        assert!(
+            matches!(&messages[2], Message::Assistant { text, tool_calls, reasoning }
+            if text.starts_with("Found [#42]") && text.contains("1790467200000") && tool_calls.is_empty() && reasoning.is_null())
+        );
+        let next = TurnContext::new("2026-09-28T00:01:00+08:00".parse().unwrap());
+        assert!(next.question("an hour earlier?").contains("2026-09-28"));
+        assert!(matches!(&messages[1], Message::User(text) if text.contains("2026-09-27")));
+    }
 
     #[test]
-    fn system_prompt_states_the_time_in_every_form_tools_need() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 9, 27, 18, 30, 0)
-            .unwrap();
-        let prompt = system_prompt(now);
-        assert!(prompt.contains("2026-09-27 18:30:00"));
-        assert!(prompt.contains(&now.timestamp_millis().to_string()));
-        assert!(prompt.contains("[#123]"));
+    fn follow_up_context_is_bounded_and_keeps_citations_in_assistant_turns() {
+        let history: Vec<_> = (0..15)
+            .map(|i| ConversationTurn {
+                question: format!("question {i}"),
+                answer: "Found [#42]".into(),
+                time_context: None,
+            })
+            .collect();
+        let messages = conversation_messages(&history);
+        assert_eq!(messages.len(), 25);
+        assert!(matches!(&messages[1], Message::User(text) if text == "question 3"));
+        assert!(
+            matches!(&messages[2], Message::Assistant { text, tool_calls, reasoning } if text == "Found [#42]" && tool_calls.is_empty() && reasoning.is_null())
+        );
     }
 
     #[test]
@@ -303,9 +383,30 @@ mod tests {
         let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args["query"], "月亮");
 
-        let prompt = prefetched_prompt("q", &[("search_nl".into(), "[1]".into())]);
-        assert!(prompt.starts_with("q\n"));
+        let prompt = prefetched_prompt(&[("search_nl".into(), "[1]".into())]);
+        assert!(prompt.starts_with(context::PREFETCH_PREFIX));
         assert!(prompt.contains("<result tool=\"search_nl\">\n[1]\n</result>"));
+    }
+
+    #[test]
+    fn minimum_context_budget_can_fit_rules_and_the_real_tool_catalog() {
+        let budget = super::super::config::MIN_CONTEXT_TOKENS;
+        let mut request = ChatRequest {
+            messages: vec![
+                Message::System(system_prompt()),
+                Message::User("Find an invoice".into()),
+            ],
+            tools: tools::specs(ToolScope::ReadOnly),
+            max_tokens: Some(AgentLimits::default().max_answer_tokens.min(budget / 4)),
+            ..Default::default()
+        };
+        context::fit_request(
+            &mut request,
+            &mut 1,
+            super::super::config::ProviderKind::Anthropic,
+            budget,
+        )
+        .unwrap();
     }
 
     #[test]

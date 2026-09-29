@@ -126,6 +126,7 @@ pub async fn ai_search(
     runtime: tauri::State<'_, AiRuntimeState>,
     request_id: String,
     question: String,
+    history: Option<Vec<agent::ConversationTurn>>,
     provider_id: Option<String>,
     on_event: tauri::ipc::Channel<AgentEvent>,
 ) -> Result<AgentOutcome, String> {
@@ -164,6 +165,7 @@ pub async fn ai_search(
             &app,
             &resolved,
             &question,
+            history.as_deref().unwrap_or_default(),
             AgentLimits::default(),
             &mut sink,
             &cancel,

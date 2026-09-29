@@ -3,7 +3,7 @@
  * without injecting HTML.
  *
  * Models answer in light Markdown. Only what reads well in a short answer is
- * kept: headings, bullet and numbered lists, paragraphs, bold, inline code,
+ * kept: headings, bullet and numbered lists, paragraphs, tables, bold, inline code,
  * and screenshot citations written as `[#123]`.
  */
 
@@ -31,7 +31,31 @@ export function parseInline(line) {
   return parts;
 }
 
-/** Groups lines into `heading`, `list` and `paragraph` blocks. */
+/** Split table cells, preserving escaped pipes (including those in inline code). */
+function tableCells(line) {
+  const cells = [];
+  let cell = '';
+  let separators = 0;
+  for (const char of line.trim()) {
+    if (char === '|') {
+      const slashes = cell.match(/\\+$/)?.[0].length || 0;
+      if (slashes % 2) {
+        cell = cell.slice(0, -1) + '|';
+        continue;
+      }
+      cells.push(cell.trim());
+      cell = '';
+      separators += 1;
+    } else cell += char;
+  }
+  if (!separators) return null;
+  cells.push(cell.trim());
+  if (line.trim().startsWith('|')) cells.shift();
+  if (cell === '' && line.trim().endsWith('|')) cells.pop();
+  return cells;
+}
+
+/** Groups lines into headings, lists, paragraphs and tables. */
 export function parseAnswer(text) {
   const blocks = [];
   let paragraph = [];
@@ -45,8 +69,29 @@ export function parseAnswer(text) {
     list = null;
   };
 
-  for (const raw of stripReasoning(text).split(/\r?\n/)) {
+  const lines = stripReasoning(text).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i];
     const line = raw.trimEnd();
+    const header = tableCells(line);
+    const delimiter = header && tableCells(lines[i + 1] || '');
+    if (header?.length && delimiter?.length === header.length
+      && delimiter.every((cell) => /^:?-+:?$/.test(cell))) {
+      flushParagraph();
+      flushList();
+      const align = delimiter.map((cell) => cell.endsWith(':')
+        ? (cell.startsWith(':') ? 'center' : 'right') : 'left');
+      const rows = [];
+      i += 1;
+      while (i + 1 < lines.length) {
+        const cells = tableCells(lines[i + 1]);
+        if (!cells) break;
+        rows.push(header.map((_, column) => parseInline(cells[column] || '')));
+        i += 1;
+      }
+      blocks.push({ type: 'table', header: header.map(parseInline), align, rows });
+      continue;
+    }
     const heading = line.match(/^#{1,6}\s+(.*)$/);
     const bullet = line.match(/^\s*(?:[-*•]|(\d+)[.)])\s+(.*)$/);
     if (!line.trim()) {

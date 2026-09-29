@@ -963,7 +963,7 @@
       "privacy": "Manage unlocking and background access.",
       "advanced": "Adjust processing performance and inspect components when needed.",
       "about": "Version, updates, and project information.",
-      "ai": "Connect your own model service and manage access for external AI assistants."
+      "ai": "Connect model service and manage access for external AI assistants."
     },
     "feedback": {
       "loading": "Loading…",
@@ -1022,9 +1022,10 @@
     },
     "ai": {
       "saved": "Saved.",
+      "advanced": "Advanced settings",
       "providers": {
         "title": "Model services",
-        "description": "AI search uses the default service below. OpenAI-compatible endpoints (including DeepSeek, Qwen, Kimi, and Ollama or LM Studio running on this computer) and Anthropic endpoints are supported.",
+        "description": "Configure LLM services. OpenAI-compatible endpoints (including DeepSeek, Qwen, Kimi, and Ollama or LM Studio running on this computer) and Anthropic endpoints are supported.",
         "add": "Add service",
         "empty": "No model service yet. Add one to use AI search.",
         "default_badge": "Default",
@@ -1045,6 +1046,8 @@
         "api_key": "API key",
         "api_key_placeholder": "Usually not needed for local services",
         "api_key_saved": "Saved. Leave empty to keep it",
+        "context_tokens": "Context limit (tokens)",
+        "context_tokens_hint": "Set this to the model's supported context length or lower. Older conversation content is trimmed as the estimated size approaches this limit, with space reserved for the answer.",
         "kind": "Endpoint type",
         "base_url_hint_anthropic": "For the official service, use https://api.anthropic.com."
       },
@@ -1800,6 +1803,8 @@
       "AI_PROVIDER_INCOMPLETE": "Fill in the address and model.",
       "AI_PROVIDER_INVALID_URL": "The address must start with http:// or https://.",
       "AI_PROVIDER_FIELD_TOO_LONG": "A field is too long.",
+      "AI_INVALID_CONTEXT_BUDGET": "Enter a whole number from 8,192 to 2,000,000.",
+      "AI_CONTEXT_LIMIT": "This request exceeds the context limit. Shorten the question or increase the limit in the model service settings.",
       "AI_PROVIDER_KEY_UNREADABLE": "The saved API key could not be read. Enter it again.",
       "AI_NO_PROVIDER": "No model service is set up yet.",
       "AI_STEP_LIMIT": "Stopped after too many lookup steps.",
@@ -1811,6 +1816,8 @@
     }
   },
   "aiSearch": {
+    "send": "Send",
+    "composerHint": "Enter to send · Shift + Enter for a new line",
     "placeholder": "Ask your history, e.g. \"What was the paper I was reading last Friday?\"",
     "stop": "Stop",
     "thinking": "Thinking…",
@@ -1827,7 +1834,12 @@
       "time_range": "Looked at {{start}} to {{end}}",
       "details": "Read screenshot #{{id}}",
       "clusters": "Looked at smart clusters",
-      "cluster_content": "Read cluster contents"
+      "cluster_content": "Read cluster contents",
+      "searches": "Searched {{count}} times",
+      "screenshots": "Read {{count}} screenshots",
+      "records": "Checked history {{count}} times",
+      "archives": "Checked archives {{count}} times",
+      "separator": ", "
     },
     "setup": {
       "title": "Connect a model service first",
@@ -1840,12 +1852,22 @@
       "accept": "Allow and continue"
     },
     "landing": {
+      "title": "What would you like to find?",
       "using": "Using {{name}}",
       "examples": [
         "What was I doing yesterday afternoon?",
         "Which articles about async Rust did I read recently?",
         "When did I last see that error message?"
       ]
+    },
+    "reasoning": "Thinking",
+    "followUp": "Ask a follow-up…",
+    "newConversation": "New conversation",
+    "latestOutput": "Jump to latest",
+    "duration": {
+      "seconds": "Took {{count}} sec",
+      "minutes": "Took {{count}} min",
+      "minutesSeconds": "Took {{minutes}} min {{seconds}} sec"
     }
   }
 }

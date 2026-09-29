@@ -30,6 +30,7 @@ pub enum Message {
     Assistant {
         text: String,
         tool_calls: Vec<ToolCall>,
+        reasoning: Value,
     },
     ToolResult {
         call_id: String,
@@ -60,6 +61,15 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
 }
 
+/// Use the actual protocol shape when budgeting, including tool schemas and
+/// provider-specific reasoning blocks. Credentials are never part of this body.
+pub(crate) fn request_body_for_estimate(kind: ProviderKind, request: &ChatRequest) -> Value {
+    match kind {
+        ProviderKind::OpenaiCompatible => openai_compat::request_body("", request),
+        ProviderKind::Anthropic => anthropic::request_body("", request),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -68,6 +78,8 @@ pub struct Usage {
 
 #[derive(Debug, Clone, Default)]
 pub struct ChatResponse {
+    /// Provider-native reasoning required when continuing a tool turn.
+    pub reasoning: Value,
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
@@ -79,6 +91,7 @@ pub struct ChatResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     TextDelta(String),
+    ReasoningDelta(String),
 }
 
 /// Error categories the interface can explain to the user. The `Display`
@@ -93,6 +106,7 @@ pub enum ProviderError {
     Network(String),
     Timeout,
     Cancelled,
+    ContextLimit,
     InvalidResponse(String),
 }
 
@@ -107,6 +121,7 @@ impl ProviderError {
             Self::Network(_) => "AI_NETWORK_ERROR",
             Self::Timeout => "AI_TIMEOUT",
             Self::Cancelled => "AI_CANCELLED",
+            Self::ContextLimit => "AI_CONTEXT_LIMIT",
             Self::InvalidResponse(_) => "AI_INVALID_RESPONSE",
         }
     }
@@ -344,6 +359,7 @@ mod tests {
             model: "m".into(),
             api_key: Some("secret".into()),
             tool_calling: ToolCalling::Unknown,
+            context_tokens: super::super::config::DEFAULT_CONTEXT_TOKENS,
         }
     }
 
@@ -353,7 +369,11 @@ mod tests {
             ..Default::default()
         };
         let mut streamed = String::new();
-        let mut on_event = |StreamEvent::TextDelta(text): StreamEvent| streamed.push_str(&text);
+        let mut on_event = |event: StreamEvent| {
+            if let StreamEvent::TextDelta(text) = event {
+                streamed.push_str(&text);
+            }
+        };
         let response = complete(
             &http_client().unwrap(),
             provider,

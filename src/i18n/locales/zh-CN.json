@@ -963,7 +963,7 @@
       "privacy": "管理解锁和后台访问。",
       "advanced": "调整处理性能，并按需查看组件与诊断信息。",
       "about": "版本、更新与项目信息。",
-      "ai": "连接你自己的大模型服务，并管理外部 AI 助手的访问权限。"
+      "ai": "连接大模型服务，并管理外部 AI 助手的访问权限。"
     },
     "feedback": {
       "loading": "正在读取…",
@@ -1022,14 +1022,15 @@
     },
     "ai": {
       "saved": "已保存。",
+      "advanced": "高级设置",
       "providers": {
         "title": "模型服务",
-        "description": "AI 搜索会使用这里的默认服务。支持 OpenAI 兼容接口（包括 DeepSeek、通义千问、Kimi，以及本机运行的 Ollama 和 LM Studio）和 Anthropic 接口。",
+        "description": "配置程序使用的大模型服务。支持 OpenAI 兼容接口（包括 DeepSeek、通义千问、Kimi，以及本机运行的 Ollama 和 LM Studio）和 Anthropic 接口。",
         "add": "添加服务",
         "empty": "还没有添加模型服务。添加后即可在搜索页使用 AI 搜索。",
         "default_badge": "默认",
         "local_badge": "本机",
-        "limited": "这个模型不能主动查找记录，AI 搜索只能根据一次检索的结果回答。",
+        "limited": "模型不能主动查找记录，AI 搜索只能根据一次检索的结果回答。",
         "make_default": "设为默认",
         "edit": "编辑",
         "delete": "删除"
@@ -1045,6 +1046,8 @@
         "api_key": "API 密钥",
         "api_key_placeholder": "本机服务通常不需要",
         "api_key_saved": "已保存，留空则保持不变",
+        "context_tokens": "上下文上限（tokens）",
+        "context_tokens_hint": "请设为模型支持的上下文长度或更小的值。预估用量接近上限时，会裁剪较早的对话内容，并为回答预留空间。",
         "kind": "接口类型",
         "base_url_hint_anthropic": "官方服务填写 https://api.anthropic.com 即可。"
       },
@@ -1800,6 +1803,8 @@
       "AI_PROVIDER_INCOMPLETE": "请填写接口地址和模型。",
       "AI_PROVIDER_INVALID_URL": "接口地址需要以 http:// 或 https:// 开头。",
       "AI_PROVIDER_FIELD_TOO_LONG": "填写的内容过长。",
+      "AI_INVALID_CONTEXT_BUDGET": "请输入 8,192 至 2,000,000 之间的整数。",
+      "AI_CONTEXT_LIMIT": "本次请求超过上下文上限。请缩短问题，或在模型服务设置中调高上限。",
       "AI_PROVIDER_KEY_UNREADABLE": "无法读取已保存的 API 密钥，请重新填写。",
       "AI_NO_PROVIDER": "还没有配置模型服务。",
       "AI_STEP_LIMIT": "查找步骤过多，已先停止。",
@@ -1811,7 +1816,9 @@
     }
   },
   "aiSearch": {
-    "placeholder": "问问你的记录，比如「上周五我在看的那篇论文叫什么？」",
+    "send": "发送",
+    "composerHint": "Enter 发送 · Shift + Enter 换行",
+    "placeholder": "询问历史记忆。例如「上周五我在看的那篇论文叫什么？」",
     "stop": "停止",
     "thinking": "正在思考……",
     "cancelled": "已停止。",
@@ -1824,10 +1831,15 @@
       "failed": "未成功",
       "search_ocr_text": "搜索文字「{{query}}」",
       "search_nl": "搜索画面「{{query}}」",
-      "time_range": "查看 {{start}} 至 {{end}} 的记录",
+      "time_range": "浏览 {{start}} 至 {{end}} 的记录",
       "details": "阅读截图 #{{id}}",
       "clusters": "查看智能归档",
-      "cluster_content": "阅读归档内容"
+      "cluster_content": "阅读归档内容",
+      "searches": "搜索了 {{count}} 次",
+      "screenshots": "阅读了 {{count}} 张截图",
+      "records": "浏览了 {{count}} 次记录",
+      "archives": "查看了 {{count}} 次归档",
+      "separator": "，"
     },
     "setup": {
       "title": "先连接一个模型服务",
@@ -1840,12 +1852,21 @@
       "accept": "允许并继续"
     },
     "landing": {
+      "title": "描述你想找回的内容",
       "using": "正在使用 {{name}}",
       "examples": [
         "我昨天下午在做什么？",
-        "最近看过的关于 Rust 异步的文章有哪些？",
-        "上次看到那个报错信息是在什么时候？"
+        "最近看过的关于写作的文章有哪些？"
       ]
+    },
+    "reasoning": "思考过程",
+    "followUp": "追问……",
+    "newConversation": "新对话",
+    "latestOutput": "回到最新内容",
+    "duration": {
+      "seconds": "耗时 {{count}} 秒",
+      "minutes": "耗时 {{count}} 分钟",
+      "minutesSeconds": "耗时 {{minutes}} 分钟 {{seconds}} 秒"
     }
   }
 }

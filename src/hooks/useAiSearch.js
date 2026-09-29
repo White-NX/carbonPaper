@@ -16,6 +16,10 @@ export function useAiSearch({ active }) {
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
   const [steps, setSteps] = useState([]);
+  const [rounds, setRounds] = useState([]);
+  const [turns, setTurns] = useState([]);
+  const [elapsedMs, setElapsedMs] = useState(null);
+  const roundRef = useRef(0);
   const [outcome, setOutcome] = useState(null);
   const [error, setError] = useState(null);
   const requestRef = useRef(null);
@@ -32,19 +36,27 @@ export function useAiSearch({ active }) {
 
   const handleEvent = useCallback((requestId, event) => {
     if (requestRef.current !== requestId) return;
+    const roundId = event.type === 'step_started' ? event.step : roundRef.current;
     switch (event.type) {
       case 'step_started':
-        // Text from an earlier step was commentary before a tool call.
+        roundRef.current = event.step;
+        setRounds((current) => [...current, { id: event.step, text: '', reasoning: '' }]);
         setAnswer('');
         break;
+      case 'reasoning_delta':
+        setRounds((current) => current.map((round) => round.id === roundId
+          ? { ...round, reasoning: round.reasoning + event.text } : round));
+        break;
       case 'text_delta':
+        setRounds((current) => current.map((round) => round.id === roundId
+          ? { ...round, text: round.text + event.text } : round));
         setAnswer((current) => current + event.text);
         break;
       case 'tool_started':
-        setSteps((current) => [...current, { id: event.call_id, name: event.name, arguments: event.arguments, status: 'running' }]);
+        setSteps((current) => [...current, { id: `${roundId}:${event.call_id}`, callId: event.call_id, round: roundId, name: event.name, arguments: event.arguments, status: 'running' }]);
         break;
       case 'tool_finished':
-        setSteps((current) => current.map((step) => (step.id === event.call_id
+        setSteps((current) => current.map((step) => (step.callId === event.call_id && step.round === roundId
           ? { ...step, status: event.ok ? 'done' : 'failed', itemCount: event.item_count, snapshots: event.snapshots }
           : step)));
         break;
@@ -57,22 +69,38 @@ export function useAiSearch({ active }) {
     const trimmed = text.trim();
     if (!trimmed || requestRef.current) return;
     const requestId = `ai-${Date.now()}-${++nextRequest}`;
+    const startedAt = performance.now();
     requestRef.current = requestId;
+    const previous = ['done', 'cancelled', 'error'].includes(status) && question
+      ? [...turns, { question, answer, steps, rounds, outcome, status, error, elapsedMs }] : turns;
+    setTurns(previous);
+    roundRef.current = 0;
+    setRounds([]);
     setQuestion(trimmed);
     setAnswer('');
     setSteps([]);
     setOutcome(null);
     setError(null);
+    setElapsedMs(null);
     setStatus('running');
     try {
-      const result = await runAiSearch({ requestId, question: trimmed, onEvent: (event) => handleEvent(requestId, event) });
+      const result = await runAiSearch({ requestId, question: trimmed, providerId: provider?.id,
+        history: previous.filter((turn) => turn.status === 'done').slice(-12).map((turn) => ({
+          question: turn.question, answer: turn.answer,
+          ...(turn.outcome?.time_context ? { time_context: turn.outcome.time_context } : {}),
+        })),
+        onEvent: (event) => handleEvent(requestId, event) });
       if (requestRef.current !== requestId) return;
       setOutcome(result);
       setAnswer(result.answer);
+      setRounds((current) => current.map((round, index) => index === current.length - 1
+        ? { ...round, text: result.answer } : round));
       setStatus('done');
     } catch (err) {
       if (requestRef.current !== requestId) return;
       const message = String(err?.message ?? err);
+      setSteps((current) => current.map((step) => step.status === 'running'
+        ? { ...step, status: message.includes('AI_CANCELLED') ? 'cancelled' : 'failed' } : step));
       if (message.includes('AI_CANCELLED')) setStatus('cancelled');
       else if (message.includes('AI_REMOTE_CONSENT_REQUIRED')) {
         pendingQuestion.current = trimmed;
@@ -82,9 +110,19 @@ export function useAiSearch({ active }) {
         setStatus('error');
       }
     } finally {
-      if (requestRef.current === requestId) requestRef.current = null;
+      if (requestRef.current === requestId) {
+        setElapsedMs(Math.max(0, performance.now() - startedAt));
+        requestRef.current = null;
+      }
     }
-  }, [handleEvent]);
+  }, [handleEvent, status, question, answer, steps, rounds, outcome, error, turns, elapsedMs, provider?.id]);
+
+  const reset = useCallback(() => {
+    if (requestRef.current) return;
+    setTurns([]); setRounds([]); setQuestion(''); setAnswer('');
+    setSteps([]); setOutcome(null); setError(null); setStatus('idle');
+    setElapsedMs(null);
+  }, []);
 
   const cancel = useCallback(() => {
     const requestId = requestRef.current;
@@ -111,7 +149,7 @@ export function useAiSearch({ active }) {
   }, []);
 
   return {
-    settings, provider, status, question, answer, steps, outcome, error,
-    start, cancel, acceptConsent, declineConsent, reloadSettings,
+    settings, provider, status, question, answer, steps, rounds, turns, outcome, error, elapsedMs,
+    start, reset, cancel, acceptConsent, declineConsent, reloadSettings,
   };
 }

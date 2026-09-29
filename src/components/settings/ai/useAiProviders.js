@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   aiErrorDetail, aiErrorKey, deleteAiProvider, getAiSettings, saveAiProvider, setDefaultAiProvider, testAiProvider,
+  DEFAULT_AI_CONTEXT_TOKENS,
 } from '../../../lib/ai_api';
 
 export const PROVIDER_PRESETS = [
@@ -14,10 +15,10 @@ export const PROVIDER_PRESETS = [
   { id: 'lmstudio', name: 'LM Studio', baseUrl: 'http://localhost:1234/v1', model: '' },
 ];
 
-const emptyDraft = () => ({ id: null, name: '', kind: 'openai_compatible', baseUrl: '', model: '', apiKey: '', hasApiKey: false, keyTouched: false });
+const emptyDraft = () => ({ id: null, name: '', kind: 'openai_compatible', baseUrl: '', model: '', apiKey: '', hasApiKey: false, keyTouched: false, contextTokens: DEFAULT_AI_CONTEXT_TOKENS });
 
 function toInput(draft) {
-  return { ...draft, apiKey: draft.keyTouched ? draft.apiKey : undefined };
+  return { ...draft, apiKey: draft.keyTouched ? draft.apiKey : undefined, contextTokens: Number(draft.contextTokens) };
 }
 
 /** State for the model service list and its inline editor. */
@@ -59,7 +60,7 @@ export function useAiProviders({ t }) {
 
   const startAdd = () => { setDraft(emptyDraft()); setMessage(null); };
   const startEdit = (provider) => {
-    setDraft({ ...emptyDraft(), id: provider.id, name: provider.name, kind: provider.kind, baseUrl: provider.base_url, model: provider.model, hasApiKey: provider.has_api_key });
+    setDraft({ ...emptyDraft(), id: provider.id, name: provider.name, kind: provider.kind, baseUrl: provider.base_url, model: provider.model, hasApiKey: provider.has_api_key, contextTokens: provider.context_tokens ?? DEFAULT_AI_CONTEXT_TOKENS });
     setMessage(null);
   };
   const cancelEdit = () => { setDraft(null); setMessage(null); };

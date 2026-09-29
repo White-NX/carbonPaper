@@ -51,8 +51,12 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
         match message {
             Message::System(text) => system.push(text.as_str()),
             Message::User(text) => push("user", vec![json!({ "type": "text", "text": text })]),
-            Message::Assistant { text, tool_calls } => {
-                let mut blocks = Vec::new();
+            Message::Assistant {
+                text,
+                tool_calls,
+                reasoning,
+            } => {
+                let mut blocks = reasoning.as_array().cloned().unwrap_or_default();
                 if !text.is_empty() {
                     blocks.push(json!({ "type": "text", "text": text }));
                 }
@@ -155,6 +159,7 @@ enum Block {
         name: String,
         input: String,
     },
+    Reasoning(Value),
     Other,
 }
 
@@ -199,6 +204,12 @@ impl StreamAssembler {
                         }
                         Block::Text
                     }
+                    Some("thinking") | Some("redacted_thinking") => {
+                        if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                            on_event(StreamEvent::ReasoningDelta(text.to_string()));
+                        }
+                        Block::Reasoning(block.clone())
+                    }
                     Some("tool_use") => Block::ToolUse {
                         id: block
                             .get("id")
@@ -222,6 +233,26 @@ impl StreamAssembler {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.push_text(text, on_event);
+                        }
+                    }
+                    Some("thinking_delta") | Some("signature_delta") => {
+                        let field = if delta["type"] == "thinking_delta" {
+                            "thinking"
+                        } else {
+                            "signature"
+                        };
+                        let fragment = delta.get(field).and_then(Value::as_str).unwrap_or("");
+                        if let Some(Block::Reasoning(block)) = self.block_mut(index) {
+                            let mut value = block
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            value.push_str(fragment);
+                            block[field] = json!(value);
+                            if field == "thinking" {
+                                on_event(StreamEvent::ReasoningDelta(fragment.to_string()));
+                            }
                         }
                     }
                     Some("input_json_delta") => {
@@ -291,6 +322,18 @@ impl StreamAssembler {
 
     pub(super) fn finish(self) -> ChatResponse {
         ChatResponse {
+            reasoning: Value::Array(
+                self.blocks
+                    .iter()
+                    .filter_map(|(_, block)| {
+                        if let Block::Reasoning(value) = block {
+                            Some(value.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            ),
             text: self.text,
             tool_calls: self
                 .blocks
@@ -342,6 +385,7 @@ mod tests {
                 Message::System("sys".into()),
                 Message::User("q".into()),
                 Message::Assistant {
+                    reasoning: Value::Null,
                     text: String::new(),
                     tool_calls: vec![
                         ToolCall {
@@ -395,8 +439,9 @@ mod tests {
     fn stream_assembles_text_tool_input_and_usage() {
         let mut texts = Vec::new();
         let mut on_event = |event: StreamEvent| {
-            let StreamEvent::TextDelta(text) = event;
-            texts.push(text);
+            if let StreamEvent::TextDelta(text) = event {
+                texts.push(text);
+            }
         };
         let mut assembler = StreamAssembler::default();
         let events = [
@@ -430,6 +475,48 @@ mod tests {
             })
         );
         assert!(!response.truncated);
+    }
+
+    #[test]
+    fn signed_and_redacted_thinking_survive_tool_continuation() {
+        let mut events = Vec::new();
+        let mut assembler = StreamAssembler::default();
+        for event in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Look for invoice"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"nature"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":"I will search."}}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t","name":"search","input":{}}}"#,
+        ] {
+            assembler
+                .apply(event, &mut |event| events.push(event))
+                .unwrap();
+        }
+        let response = assembler.finish();
+        assert_eq!(response.text, "I will search.");
+        assert!(events.contains(&StreamEvent::ReasoningDelta("Look for invoice".into())));
+        assert!(!events.iter().any(|event| matches!(event, StreamEvent::ReasoningDelta(text) if text.contains("sig") || text.contains("opaque"))));
+        let body = request_body(
+            "claude",
+            &ChatRequest {
+                messages: vec![Message::Assistant {
+                    text: response.text,
+                    tool_calls: response.tool_calls,
+                    reasoning: response.reasoning,
+                }],
+                ..Default::default()
+            },
+        );
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(blocks[0]["signature"], "signature");
+        assert_eq!(
+            blocks[1],
+            json!({"type":"redacted_thinking","data":"opaque"})
+        );
+        assert_eq!(blocks[2]["text"], "I will search.");
+        assert_eq!(blocks[3]["id"], "t");
     }
 
     #[test]

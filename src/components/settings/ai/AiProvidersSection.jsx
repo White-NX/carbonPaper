@@ -4,6 +4,7 @@ import { Bot, Check, Pencil, Plus, Trash2, PlugZap } from 'lucide-react';
 import { SettingsButton, SettingsSelect } from '../SettingsControls';
 import { SettingsErrorBanner, SettingsGroup, SettingsSection, SettingsStatus } from '../SettingsPrimitives';
 import { PROVIDER_PRESETS, useAiProviders } from './useAiProviders';
+import { MIN_AI_CONTEXT_TOKENS, MAX_AI_CONTEXT_TOKENS } from '../../../lib/ai_api';
 
 const inputClass = 'w-full min-w-0 rounded-lg border border-ide-border bg-ide-panel px-3 py-2 text-sm placeholder:text-ide-muted disabled:opacity-50';
 
@@ -26,6 +27,8 @@ function ProviderEditor({ c, t }) {
   const { draft, busy } = c;
   const disabled = Boolean(busy);
   const incomplete = !draft.baseUrl.trim() || !draft.model.trim();
+  const contextTokens = Number(draft.contextTokens);
+  const invalidBudget = !Number.isInteger(contextTokens) || contextTokens < MIN_AI_CONTEXT_TOKENS || contextTokens > MAX_AI_CONTEXT_TOKENS;
   return (
     <SettingsGroup className="space-y-3">
       {!draft.id && (
@@ -60,10 +63,19 @@ function ProviderEditor({ c, t }) {
           placeholder={draft.hasApiKey ? t('settings.ai.fields.api_key_saved') : t('settings.ai.fields.api_key_placeholder')}
           onChange={(e) => c.updateDraft({ apiKey: e.target.value })} className={inputClass} />
       </Field>
+      <details className="space-y-3">
+        <summary className="cursor-pointer text-xs font-medium text-ide-muted">{t('settings.ai.advanced')}</summary>
+        <Field label={t('settings.ai.fields.context_tokens')} hint={t('settings.ai.fields.context_tokens_hint')}>
+          <input type="number" min={MIN_AI_CONTEXT_TOKENS} max={MAX_AI_CONTEXT_TOKENS} step="1"
+            value={draft.contextTokens} disabled={disabled} aria-invalid={invalidBudget}
+            onChange={(e) => c.updateDraft({ contextTokens: e.target.value })} className={inputClass} />
+        </Field>
+        {invalidBudget && <p role="alert" className="text-xs text-ide-error">{t('ai.errors.AI_INVALID_CONTEXT_BUDGET')}</p>}
+      </details>
       <div className="flex flex-wrap justify-end gap-2">
         <SettingsButton variant="ghost" disabled={disabled} onClick={c.cancelEdit}>{t('common.cancel')}</SettingsButton>
-        <SettingsButton icon={PlugZap} loading={busy === 'test'} disabled={disabled || incomplete} onClick={c.test}>{t('settings.ai.test.button')}</SettingsButton>
-        <SettingsButton variant="primary" loading={busy === 'save'} disabled={disabled || incomplete} onClick={c.save}>{t('common.save')}</SettingsButton>
+        <SettingsButton icon={PlugZap} loading={busy === 'test'} disabled={disabled || incomplete || invalidBudget} onClick={c.test}>{t('settings.ai.test.button')}</SettingsButton>
+        <SettingsButton variant="primary" loading={busy === 'save'} disabled={disabled || incomplete || invalidBudget} onClick={c.save}>{t('common.save')}</SettingsButton>
       </div>
     </SettingsGroup>
   );
@@ -82,7 +94,7 @@ export default function AiProvidersSection() {
         <SettingsGroup><p className="text-xs leading-relaxed text-ide-muted">{t('settings.ai.providers.empty')}</p></SettingsGroup>
       )}
       {providers.length > 0 && (
-        <SettingsGroup className="divide-y divide-ide-border/60 p-0">
+        <SettingsGroup padding="p-0" className="divide-y divide-ide-border/60">
           {providers.map((provider) => {
             const isDefault = provider.id === c.settings.default_provider_id;
             return (

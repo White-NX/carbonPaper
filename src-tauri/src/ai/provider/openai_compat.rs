@@ -31,18 +31,30 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
         .map(|message| match message {
             Message::System(text) => json!({ "role": "system", "content": text }),
             Message::User(text) => json!({ "role": "user", "content": text }),
-            Message::Assistant { text, tool_calls } if tool_calls.is_empty() => {
+            Message::Assistant {
+                text, tool_calls, ..
+            } if tool_calls.is_empty() => {
                 json!({ "role": "assistant", "content": text })
             }
-            Message::Assistant { text, tool_calls } => json!({
-                "role": "assistant",
-                "content": if text.is_empty() { Value::Null } else { json!(text) },
-                "tool_calls": tool_calls.iter().map(|call| json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": { "name": call.name, "arguments": call.arguments },
-                })).collect::<Vec<_>>(),
-            }),
+            Message::Assistant {
+                text,
+                tool_calls,
+                reasoning,
+            } => {
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { Value::Null } else { json!(text) },
+                    "tool_calls": tool_calls.iter().map(|call| json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": { "name": call.name, "arguments": call.arguments },
+                    })).collect::<Vec<_>>(),
+                });
+                if !reasoning.is_null() {
+                    message["reasoning_content"] = reasoning.clone();
+                }
+                message
+            }
             Message::ToolResult { call_id, content } => {
                 json!({ "role": "tool", "tool_call_id": call_id, "content": content })
             }
@@ -106,6 +118,9 @@ pub(super) async fn complete(
     if is_json {
         let body: Value = response.json().await?;
         let response = parse_full_response(&body)?;
+        if let Some(text) = response.reasoning.as_str() {
+            on_event(StreamEvent::ReasoningDelta(text.to_string()));
+        }
         if !response.text.is_empty() {
             on_event(StreamEvent::TextDelta(response.text.clone()));
         }
@@ -144,6 +159,7 @@ struct PartialCall {
 
 #[derive(Default)]
 pub(super) struct StreamAssembler {
+    reasoning: String,
     text: String,
     calls: Vec<PartialCall>,
     usage: Option<Usage>,
@@ -187,6 +203,14 @@ impl StreamAssembler {
         let Some(delta) = choice.get("delta") else {
             return Ok(false);
         };
+        if let Some(text) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+        {
+            self.reasoning.push_str(text);
+            on_event(StreamEvent::ReasoningDelta(text.to_string()));
+        }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
                 self.text.push_str(text);
@@ -231,6 +255,11 @@ impl StreamAssembler {
 
     pub(super) fn finish(self) -> ChatResponse {
         ChatResponse {
+            reasoning: if self.reasoning.is_empty() {
+                Value::Null
+            } else {
+                json!(self.reasoning)
+            },
             text: self.text,
             tool_calls: self
                 .calls
@@ -294,6 +323,11 @@ fn parse_full_response(body: &Value) -> Result<ChatResponse, ProviderError> {
         })
         .collect();
     Ok(ChatResponse {
+        reasoning: message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .cloned()
+            .unwrap_or(Value::Null),
         text: message
             .get("content")
             .and_then(Value::as_str)
@@ -328,6 +362,7 @@ mod tests {
             messages: vec![
                 Message::System("sys".into()),
                 Message::Assistant {
+                    reasoning: Value::Null,
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
@@ -369,8 +404,9 @@ mod tests {
     fn stream_assembles_text_and_fragmented_tool_calls() {
         let mut texts = Vec::new();
         let mut on_event = |event: StreamEvent| {
-            let StreamEvent::TextDelta(text) = event;
-            texts.push(text);
+            if let StreamEvent::TextDelta(text) = event {
+                texts.push(text);
+            }
         };
         let mut assembler = StreamAssembler::default();
         let chunks = [
@@ -409,6 +445,40 @@ mod tests {
                 output_tokens: 3
             })
         );
+    }
+
+    #[test]
+    fn reasoning_streams_separately_and_survives_tool_continuation() {
+        let mut events = Vec::new();
+        let mut assembler = StreamAssembler::default();
+        for chunk in [
+            r#"{"choices":[{"delta":{"reasoning_content":"Find "}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"invoice","content":"I will search.","tool_calls":[{"id":"a","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        ] {
+            assembler
+                .apply(chunk, &mut |event| events.push(event))
+                .unwrap();
+        }
+        let response = assembler.finish();
+        assert_eq!(response.text, "I will search.");
+        assert_eq!(response.reasoning, "Find invoice");
+        assert_eq!(events[0], StreamEvent::ReasoningDelta("Find ".into()));
+        let request = ChatRequest {
+            messages: vec![Message::Assistant {
+                text: response.text,
+                tool_calls: response.tool_calls,
+                reasoning: response.reasoning,
+            }],
+            ..Default::default()
+        };
+        let body = request_body("deepseek", &request);
+        assert_eq!(body["messages"][0]["reasoning_content"], "Find invoice");
+        assert_eq!(body["messages"][0]["content"], "I will search.");
+        let full = parse_full_response(
+            &json!({"choices":[{"message":{"content":"answer","reasoning_content":"thought"}}]}),
+        )
+        .unwrap();
+        assert_eq!(full.reasoning, "thought");
     }
 
     #[test]

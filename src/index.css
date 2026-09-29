@@ -10,6 +10,31 @@
 @tailwind components;
 @tailwind utilities;
 
+.ai-search-surface { container: ai-search / size; }
+.ai-search-conversation { max-width: 48rem; }
+.ai-search-turn { display: grid; gap: 1.5rem; }
+.ai-search-source-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 150px), 1fr));
+  max-height: min(20rem, 40cqh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+@container ai-search (min-width: 1000px) {
+  .ai-search-conversation { max-width: 76rem; }
+  .ai-search-turn { grid-template-columns: minmax(0, 1fr) 18rem; column-gap: 2rem; align-items: start; }
+  .ai-search-turn-without-sources { grid-template-columns: minmax(0, 48rem); justify-content: center; }
+  .ai-search-sources {
+    position: sticky;
+    top: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100cqh - 2.5rem);
+    border-left: 1px solid var(--ide-border);
+    padding-left: 1rem;
+  }
+  .ai-search-source-grid { min-height: 0; max-height: none; grid-template-columns: minmax(0, 1fr); }
+}
+
 .settings-surface { container-type: inline-size; }
 .settings-storage-overview { flex-direction: row; }
 .settings-choices { grid-template-columns: repeat(var(--settings-columns, 2), minmax(0, 1fr)); }

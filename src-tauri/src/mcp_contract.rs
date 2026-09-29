@@ -4,6 +4,16 @@ use serde_json::{json, Value};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const TOOL_SCHEMA_VERSION: u64 = 2;
+
+/// Contract timestamps are milliseconds; retain compatibility with older
+/// callers that sent seconds. Storage and CLIP filters use Unix seconds.
+pub fn timestamp_seconds(value: f64) -> f64 {
+    if value > 10_000_000_000.0 {
+        value / 1000.0
+    } else {
+        value
+    }
+}
 pub const AGENT_SKILL_ID: &str = "carbonpaper-memory";
 pub const AGENT_SKILL_SOURCE_REPOSITORY: &str = "https://github.com/White-NX/carbonPaperSkill";
 
@@ -194,6 +204,13 @@ pub fn contract_document() -> Value {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn tool_time_bounds_accept_milliseconds_and_legacy_seconds() {
+        assert_eq!(timestamp_seconds(1_790_467_200_000.0), 1_790_467_200.0);
+        assert_eq!(timestamp_seconds(1_790_467_200.0), 1_790_467_200.0);
+        assert_eq!(timestamp_seconds(1_790_467_200_500.0), 1_790_467_200.5);
+    }
 
     #[test]
     fn catalog_names_are_unique_and_match_the_public_name_list() {

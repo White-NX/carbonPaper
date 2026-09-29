@@ -921,16 +921,8 @@ async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Resul
     let max_records = args.get("max_records").and_then(|v| v.as_i64());
 
     // Convert ms to seconds if needed
-    let start_ts = if start_time > 10_000_000_000.0 {
-        start_time / 1000.0
-    } else {
-        start_time
-    };
-    let end_ts = if end_time > 10_000_000_000.0 {
-        end_time / 1000.0
-    } else {
-        end_time
-    };
+    let start_ts = crate::mcp_contract::timestamp_seconds(start_time);
+    let end_ts = crate::mcp_contract::timestamp_seconds(end_time);
 
     let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
@@ -1098,8 +1090,14 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
     let process_names: Option<Vec<String>> = args
         .get("process_names")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let start_time = args.get("start_time").and_then(|v| v.as_f64());
-    let end_time = args.get("end_time").and_then(|v| v.as_f64());
+    let start_time = args
+        .get("start_time")
+        .and_then(|v| v.as_f64())
+        .map(crate::mcp_contract::timestamp_seconds);
+    let end_time = args
+        .get("end_time")
+        .and_then(|v| v.as_f64())
+        .map(crate::mcp_contract::timestamp_seconds);
     let categories: Option<Vec<String>> = args
         .get("categories")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1189,8 +1187,14 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
                 .collect()
         })
         .unwrap_or_default();
-    let start_time = args.get("start_time").and_then(Value::as_f64);
-    let end_time = args.get("end_time").and_then(Value::as_f64);
+    let start_time = args
+        .get("start_time")
+        .and_then(Value::as_f64)
+        .map(crate::mcp_contract::timestamp_seconds);
+    let end_time = args
+        .get("end_time")
+        .and_then(Value::as_f64)
+        .map(crate::mcp_contract::timestamp_seconds);
 
     // Use the same Rust CLIP path as the application search surface.
     let rust = crate::clip_query::try_rust_clip_query(

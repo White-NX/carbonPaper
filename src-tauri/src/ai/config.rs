@@ -20,6 +20,14 @@ const KEY_PREFIX: &str = "v1:";
 const MAX_NAME_CHARS: usize = 64;
 const MAX_FIELD_CHARS: usize = 512;
 
+pub const DEFAULT_CONTEXT_TOKENS: u32 = 32_768;
+pub const MIN_CONTEXT_TOKENS: u32 = 8_192;
+pub const MAX_CONTEXT_TOKENS: u32 = 2_000_000;
+
+pub fn default_context_tokens() -> u32 {
+    DEFAULT_CONTEXT_TOKENS
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -52,6 +60,8 @@ pub struct StoredProvider {
     pub api_key_encrypted: Option<String>,
     #[serde(default)]
     pub tool_calling: ToolCalling,
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,6 +86,7 @@ pub struct ProviderView {
     pub has_api_key: bool,
     pub tool_calling: ToolCalling,
     pub is_local: bool,
+    pub context_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +109,8 @@ pub struct ProviderInput {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
 }
 
 /// Everything needed to send a request, with the key already decrypted.
@@ -108,6 +121,7 @@ pub struct ResolvedProvider {
     pub model: String,
     pub api_key: Option<String>,
     pub tool_calling: ToolCalling,
+    pub context_tokens: u32,
 }
 
 impl std::fmt::Debug for ResolvedProvider {
@@ -157,6 +171,9 @@ impl AiSettings {
                     has_api_key: p.api_key_encrypted.is_some(),
                     tool_calling: p.tool_calling,
                     is_local: is_local_url(&p.base_url),
+                    context_tokens: p
+                        .context_tokens
+                        .clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS),
                 })
                 .collect(),
             default_provider_id: self.effective_default_id().map(str::to_string),
@@ -204,6 +221,7 @@ impl AiSettings {
             existing.kind = input.kind;
             existing.base_url = input.base_url;
             existing.model = input.model;
+            existing.context_tokens = input.context_tokens;
             if let Some(encrypted) = api_key_encrypted {
                 existing.api_key_encrypted = encrypted;
             }
@@ -222,6 +240,7 @@ impl AiSettings {
             model: input.model,
             api_key_encrypted: api_key_encrypted.flatten(),
             tool_calling: ToolCalling::Unknown,
+            context_tokens: input.context_tokens,
         });
         if self.default_provider_id.is_none() {
             self.default_provider_id = Some(id.clone());
@@ -273,6 +292,9 @@ impl AiSettings {
                 .map(|enc| decrypt_key(credential_state, enc))
                 .transpose()?,
             tool_calling: p.tool_calling,
+            context_tokens: p
+                .context_tokens
+                .clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS),
         })
     }
 
@@ -302,11 +324,15 @@ impl AiSettings {
             model: input.model,
             api_key,
             tool_calling: ToolCalling::Unknown,
+            context_tokens: input.context_tokens,
         })
     }
 }
 
 fn validate(mut input: ProviderInput) -> Result<ProviderInput, String> {
+    if !(MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&input.context_tokens) {
+        return Err("AI_INVALID_CONTEXT_BUDGET".into());
+    }
     input.name = input.name.trim().to_string();
     input.base_url = input.base_url.trim().trim_end_matches('/').to_string();
     input.model = input.model.trim().to_string();
@@ -400,6 +426,7 @@ mod tests {
             base_url: base_url.into(),
             model: " qwen3 ".into(),
             api_key: None,
+            context_tokens: DEFAULT_CONTEXT_TOKENS,
         }
     }
 
@@ -417,6 +444,43 @@ mod tests {
         assert_eq!(
             validate(input("ftp://example.com")).unwrap_err(),
             "AI_PROVIDER_INVALID_URL"
+        );
+    }
+
+    #[test]
+    fn context_budget_defaults_for_old_configs_and_validates_edits() {
+        let raw = serde_json::json!({
+            "id": "old", "name": "Old", "base_url": "http://localhost", "model": "m"
+        });
+        let stored: StoredProvider = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(stored.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        let mut edited: ProviderInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(edited.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        for budget in [0, MIN_CONTEXT_TOKENS - 1, MAX_CONTEXT_TOKENS + 1] {
+            edited.context_tokens = budget;
+            assert_eq!(
+                validate(edited.clone()).unwrap_err(),
+                "AI_INVALID_CONTEXT_BUDGET"
+            );
+        }
+        for budget in [MIN_CONTEXT_TOKENS, 128_000, MAX_CONTEXT_TOKENS] {
+            edited.context_tokens = budget;
+            assert_eq!(validate(edited.clone()).unwrap().context_tokens, budget);
+        }
+        let credentials = CredentialManagerState::new(std::env::temp_dir());
+        let mut settings = AiSettings::default();
+        edited.id = None;
+        edited.context_tokens = 64_000;
+        let id = settings.upsert(&credentials, edited.clone()).unwrap();
+        edited.id = Some(id.clone());
+        edited.context_tokens = 128_000;
+        settings.upsert(&credentials, edited).unwrap();
+        let reloaded: AiSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(reloaded.view().providers[0].context_tokens, 128_000);
+        assert_eq!(
+            reloaded.resolve(&credentials, &id).unwrap().context_tokens,
+            128_000
         );
     }
 
@@ -439,6 +503,7 @@ mod tests {
             model: "m".into(),
             api_key_encrypted: None,
             tool_calling: ToolCalling::Unknown,
+            context_tokens: DEFAULT_CONTEXT_TOKENS,
         };
         let mut settings = AiSettings {
             providers: vec![stored("a"), stored("b")],
@@ -461,6 +526,7 @@ mod tests {
                 model: "m".into(),
                 api_key_encrypted: Some("v1:secret".into()),
                 tool_calling: ToolCalling::Supported,
+                context_tokens: DEFAULT_CONTEXT_TOKENS,
             }],
             default_provider_id: None,
             remote_consent: false,
