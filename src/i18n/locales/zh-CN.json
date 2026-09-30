@@ -188,7 +188,8 @@
       "capture": "记录与采集",
       "organize": "整理与智能",
       "privacy": "隐私与访问",
-      "maintenance": "存储与维护"
+      "maintenance": "存储与维护",
+      "ai": "AI"
     },
     "security": {
       "protection": {
@@ -959,9 +960,10 @@
       "general": "调整启动方式、资源使用和窗口操作。",
       "capture": "选择记录范围，并连接浏览器扩展。",
       "organize": "选择整理功能和后台处理时机。",
-      "privacy": "管理解锁、后台访问和 AI 助手权限。",
+      "privacy": "管理解锁和后台访问。",
       "advanced": "调整处理性能，并按需查看组件与诊断信息。",
-      "about": "版本、更新与项目信息。"
+      "about": "版本、更新与项目信息。",
+      "ai": "连接大模型服务，并管理外部 AI 助手的访问权限。"
     },
     "feedback": {
       "loading": "正在读取…",
@@ -1017,6 +1019,56 @@
       "waiting": "等待解锁",
       "error": "异常",
       "stopped": "已停止"
+    },
+    "ai": {
+      "saved": "已保存。",
+      "advanced": "高级设置",
+      "providers": {
+        "title": "模型服务",
+        "description": "选择服务并填写 API 密钥，即可开始使用。也支持本机运行的 Ollama 和 LM Studio。",
+        "add": "添加服务",
+        "empty": "还没有添加模型服务。添加后即可在搜索页使用 AI 搜索。",
+        "default_badge": "默认",
+        "local_badge": "本机",
+        "limited": "模型不能主动查找记录，AI 搜索只能根据一次检索的结果回答。",
+        "make_default": "设为默认",
+        "edit": "编辑",
+        "delete": "删除"
+      },
+      "fields": {
+        "preset": "常用服务",
+        "preset_placeholder": "选择模型服务",
+        "custom_provider": "自定义服务",
+        "name": "名称",
+        "name_placeholder": "留空则使用模型名",
+        "model": "模型",
+        "model_id": "模型 ID",
+        "model_placeholder": "填写模型名称",
+        "base_url": "接口地址",
+        "base_url_hint": "通常以 /v1 结尾。",
+        "api_key": "API 密钥",
+        "api_key_placeholder": "本机服务通常不需要",
+        "api_key_cloud_placeholder": "填写服务商提供的 API 密钥",
+        "api_key_saved": "已保存，留空则保持不变",
+        "context_tokens": "上下文上限（tokens）",
+        "context_tokens_hint": "请设为模型支持的上下文长度或更小的值。预估用量接近上限时，会裁剪较早的对话内容，并为回答预留空间。",
+        "kind": "接口类型",
+        "base_url_hint_anthropic": "官方服务填写 https://api.anthropic.com 即可。"
+      },
+      "test": {
+        "button": "测试连接",
+        "ok": "连接成功，用时 {{ms}} 毫秒。",
+        "ok_without_tools": "连接成功，用时 {{ms}} 毫秒。不过这个模型不能主动查找记录，AI 搜索的效果会受限。"
+      },
+      "kinds": {
+        "openai_compatible": "OpenAI 兼容",
+        "anthropic": "Anthropic"
+      },
+      "models": {
+        "recommended": "推荐模型",
+        "other": "其他模型",
+        "custom": "手动填写模型 ID"
+      }
     }
   },
   "common": {
@@ -1325,7 +1377,9 @@
       "ocr_full": "文字搜索",
       "nl_full": "画面搜索",
       "ocr_hint": "在识别出的文字里找关键词",
-      "nl_hint": "用一句描述匹配画面内容"
+      "nl_hint": "用一句描述匹配画面内容",
+      "ai": "AI",
+      "ai_hint": "用一句话提问，由 AI 在记录里查找并回答"
     },
     "processes": {
       "all": "所有进程",
@@ -1742,6 +1796,86 @@
           "description": "电脑重启后，即使还没打开 CarbonPaper，整理工作也能继续进行。"
         }
       }
+    }
+  },
+  "ai": {
+    "errors": {
+      "AUTH_REQUIRED": "需要先解锁 CarbonPaper。",
+      "AI_UNAUTHORIZED": "服务拒绝了请求，请检查 API 密钥。",
+      "AI_NOT_FOUND": "找不到接口或模型，请检查接口地址和模型名。",
+      "AI_RATE_LIMITED": "请求过于频繁或额度已用完，请稍后再试。",
+      "AI_BAD_REQUEST": "服务无法处理这个请求。",
+      "AI_SERVER_ERROR": "服务暂时出错，请稍后再试。",
+      "AI_NETWORK_ERROR": "无法连接到服务，请检查网络和接口地址。",
+      "AI_TIMEOUT": "服务长时间没有响应。",
+      "AI_INVALID_RESPONSE": "服务返回的内容无法识别，它可能不兼容 OpenAI 接口。",
+      "AI_PROVIDER_INCOMPLETE": "请填写接口地址和模型。",
+      "AI_PROVIDER_INVALID_URL": "接口地址需要以 http:// 或 https:// 开头。",
+      "AI_PROVIDER_FIELD_TOO_LONG": "填写的内容过长。",
+      "AI_INVALID_CONTEXT_BUDGET": "请输入 8,192 至 2,000,000 之间的整数。",
+      "AI_CONTEXT_LIMIT": "本次请求超过上下文上限。请缩短问题，或在模型服务设置中调高上限。",
+      "AI_PROVIDER_KEY_UNREADABLE": "无法读取已保存的 API 密钥，请重新填写。",
+      "AI_NO_PROVIDER": "还没有配置模型服务。",
+      "AI_STEP_LIMIT": "查找步骤过多，已先停止。",
+      "AI_BUSY": "上一次 AI 搜索还在进行。",
+      "unknown": "出现了意外错误。",
+      "AI_EMPTY_QUESTION": "请输入问题。",
+      "AI_PROVIDER_NOT_FOUND": "找不到这个模型服务，它可能已被删除。",
+      "MAINTENANCE_IN_PROGRESS": "正在进行数据维护，请稍后再试。"
+    }
+  },
+  "aiSearch": {
+    "send": "发送",
+    "composerHint": "Enter 发送 · Shift + Enter 换行",
+    "placeholder": "询问历史记忆。例如「上周五我在看的那篇论文叫什么？」",
+    "stop": "停止",
+    "thinking": "正在思考……",
+    "cancelled": "已停止。",
+    "sources": "参考的截图",
+    "stopped_early": "查找步骤较多，AI 已根据目前找到的内容作答。",
+    "truncated": "回答过长，已被截断。",
+    "steps": {
+      "summary": "查找了 {{count}} 次",
+      "results": "{{count}} 条结果",
+      "failed": "未成功",
+      "search_ocr_text": "搜索文字「{{query}}」",
+      "search_nl": "搜索画面「{{query}}」",
+      "time_range": "浏览 {{start}} 至 {{end}} 的记录",
+      "details": "阅读截图 #{{id}}",
+      "clusters": "查看智能归档",
+      "cluster_content": "阅读归档内容",
+      "searches": "搜索了 {{count}} 次",
+      "screenshots": "阅读了 {{count}} 张截图",
+      "records": "浏览了 {{count}} 次记录",
+      "archives": "查看了 {{count}} 次归档",
+      "separator": "，"
+    },
+    "setup": {
+      "title": "先连接一个模型服务",
+      "description": "AI 搜索使用你自己的大模型服务。可以是 DeepSeek、通义千问等在线服务，也可以是本机运行的 Ollama。",
+      "button": "前往设置"
+    },
+    "consent": {
+      "title": "允许把搜索到的内容发送给 {{name}}？",
+      "description": "AI 搜索时，与问题相关的截图文字、窗口标题和时间会发送给这个服务，由它整理成回答。敏感内容会按照“AI 助手访问”中的过滤设置处理。你可以随时在设置中改用本机运行的服务。",
+      "accept": "允许并继续"
+    },
+    "landing": {
+      "title": "描述你想找回的内容",
+      "using": "正在使用 {{name}}",
+      "examples": [
+        "我昨天下午在做什么？",
+        "最近看过的关于写作的文章有哪些？"
+      ]
+    },
+    "reasoning": "思考过程",
+    "followUp": "追问……",
+    "newConversation": "新对话",
+    "latestOutput": "回到最新内容",
+    "duration": {
+      "seconds": "耗时 {{count}} 秒",
+      "minutes": "耗时 {{count}} 分钟",
+      "minutesSeconds": "耗时 {{minutes}} 分钟 {{seconds}} 秒"
     }
   }
 }

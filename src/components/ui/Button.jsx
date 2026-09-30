@@ -33,7 +33,7 @@ export function Button({
   else if (Icon) iconNode = React.isValidElement(Icon) ? Icon : <Icon className="h-3.5 w-3.5" aria-hidden="true" />;
   return (
     <button type="button" disabled={disabled || loading} {...props}
-      className={cn('inline-flex items-center justify-center gap-1.5 rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+      className={cn('inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
         VARIANTS[variant], SIZES[size], focusRing, className)}>
       {iconNode}
       {children}

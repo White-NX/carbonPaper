@@ -3,6 +3,7 @@
 //! This crate wires native capture, encrypted storage, monitor/ML processes, IPC,
 //! commands, tray behavior, and application lifecycle into the desktop runtime.
 
+mod ai;
 mod analysis;
 mod ann_format;
 mod ann_protocol;
@@ -863,6 +864,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(ai::AiRuntimeState::default())
         .manage(settings_window::SettingsWindowState::default())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
@@ -1297,6 +1299,14 @@ pub fn run() {
             commands::database_mode::storage_transition_wal_to_delete,
             analysis::get_analysis_overview,
             // MCP 服务命令
+            commands::ai::ai_get_settings,
+            commands::ai::ai_save_provider,
+            commands::ai::ai_delete_provider,
+            commands::ai::ai_set_default_provider,
+            commands::ai::ai_test_provider,
+            commands::ai::ai_grant_remote_consent,
+            commands::ai::ai_search,
+            commands::ai::ai_search_cancel,
             commands::mcp::mcp_set_enabled,
             commands::mcp::mcp_get_status,
             commands::mcp::mcp_run_smoke_test,

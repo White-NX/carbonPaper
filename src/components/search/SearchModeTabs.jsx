@@ -1,5 +1,5 @@
 import React from 'react';
-import { Type, Image as ImageIcon } from 'lucide-react';
+import { Type, Image as ImageIcon, Bot } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 /**
@@ -7,10 +7,11 @@ import { useTranslation } from 'react-i18next';
  *
  * 「文字」和「画面」是同一批截图的两条平行检索通道，切换会换一批结果，
  * 所以用选项卡而不是两个并列按钮 —— 后者看起来像可以同时打开的开关。
+ * 「AI」由模型代为检索并作答，它只属于高级搜索页，不会改变顶栏搜索框的模式。
  *
  * @param {object} props
- * @param {'ocr' | 'nl'} props.mode 当前模式
- * @param {(mode: 'ocr' | 'nl') => void} props.onChange 切换回调
+ * @param {'ocr' | 'nl' | 'ai'} props.mode 当前模式
+ * @param {(mode: 'ocr' | 'nl' | 'ai') => void} props.onChange 切换回调
  */
 export function SearchModeTabs({ mode, onChange }) {
   const { t } = useTranslation();
@@ -18,6 +19,7 @@ export function SearchModeTabs({ mode, onChange }) {
   const tabs = [
     { value: 'ocr', label: t('advancedSearch.modes.ocr'), hint: t('advancedSearch.modes.ocr_hint'), Icon: Type, disabled: false },
     { value: 'nl', label: t('advancedSearch.modes.nl'), hint: t('advancedSearch.modes.nl_hint'), Icon: ImageIcon, disabled: false },
+    { value: 'ai', label: t('advancedSearch.modes.ai'), hint: t('advancedSearch.modes.ai_hint'), Icon: Bot, disabled: false },
   ];
 
   return (

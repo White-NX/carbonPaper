@@ -1,10 +1,9 @@
 import React, { useId } from 'react';
 import { AlertTriangle, ChevronDown } from 'lucide-react';
 import { SettingsControlLabelContext } from './SettingsControls';
+import { cn } from '../../lib/utils';
 
-function cx(...classes) {
-  return classes.filter(Boolean).join(' ');
-}
+const cx = cn;
 
 export function SettingsCard({
   children,
@@ -43,21 +42,21 @@ export function SettingsSection({ title, description, icon: Icon, children, id, 
   return (
     <section id={id} aria-labelledby={titleId} className="settings-section space-y-3 scroll-mt-6">
       <div className="flex items-start justify-between gap-3 px-1">
-        <div className="min-w-0">
+        <div className="min-w-0 flex-1">
           <h2 id={titleId} className="flex items-center gap-2 text-sm font-semibold text-ide-accent">
             {Icon && <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />}{title}
           </h2>
           {description && <p className="mt-1 text-xs leading-relaxed text-ide-muted">{description}</p>}
         </div>
-        {actions}
+        {actions && <div className="shrink-0">{actions}</div>}
       </div>
       {children}
     </section>
   );
 }
 
-export function SettingsGroup({ children, className = '', ...props }) {
-  return <div className={cx('rounded-xl border border-ide-border bg-ide-bg p-4 text-sm text-ide-text', className)} {...props}>{children}</div>;
+export function SettingsGroup({ children, className = '', padding = 'p-4', ...props }) {
+  return <div className={cx('rounded-xl border border-ide-border bg-ide-bg text-sm text-ide-text', padding, className)} {...props}>{children}</div>;
 }
 
 export function SettingsRow({ label, description, control, children, className = '' }) {

@@ -23,6 +23,7 @@ pub fn check_main_window(window: &tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
+pub mod ai;
 pub mod credential;
 pub mod database_mode;
 pub mod mcp;

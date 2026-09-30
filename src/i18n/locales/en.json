@@ -188,7 +188,8 @@
       "capture": "Capture",
       "organize": "Organize",
       "privacy": "Privacy & Access",
-      "maintenance": "Maintenance"
+      "maintenance": "Maintenance",
+      "ai": "AI"
     },
     "security": {
       "protection": {
@@ -959,9 +960,10 @@
       "general": "Choose how the app starts, uses resources, and handles windows.",
       "capture": "Choose what to record and connect browser extensions.",
       "organize": "Choose organization features and when to run them.",
-      "privacy": "Manage unlocking, background access, and AI assistant permissions.",
+      "privacy": "Manage unlocking and background access.",
       "advanced": "Adjust processing performance and inspect components when needed.",
-      "about": "Version, updates, and project information."
+      "about": "Version, updates, and project information.",
+      "ai": "Connect model service and manage access for external AI assistants."
     },
     "feedback": {
       "loading": "Loading…",
@@ -1017,6 +1019,56 @@
       "waiting": "Waiting for unlock",
       "error": "Error",
       "stopped": "Stopped"
+    },
+    "ai": {
+      "saved": "Saved.",
+      "advanced": "Advanced settings",
+      "providers": {
+        "title": "Model services",
+        "description": "Choose a service and enter your API key to get started. Ollama and LM Studio running on this computer are also supported.",
+        "add": "Add service",
+        "empty": "No model service yet. Add one to use AI search.",
+        "default_badge": "Default",
+        "local_badge": "This computer",
+        "limited": "This model cannot look things up on its own, so AI search answers from a single search.",
+        "make_default": "Make default",
+        "edit": "Edit",
+        "delete": "Delete"
+      },
+      "fields": {
+        "preset": "Common services",
+        "preset_placeholder": "Choose a model service",
+        "custom_provider": "Custom service",
+        "name": "Name",
+        "name_placeholder": "Defaults to the model name",
+        "model": "Model",
+        "model_id": "Model ID",
+        "model_placeholder": "Enter a model name",
+        "base_url": "Endpoint address",
+        "base_url_hint": "Usually ends with /v1.",
+        "api_key": "API key",
+        "api_key_placeholder": "Usually not needed for local services",
+        "api_key_cloud_placeholder": "Enter the API key from your provider",
+        "api_key_saved": "Saved. Leave empty to keep it",
+        "context_tokens": "Context limit (tokens)",
+        "context_tokens_hint": "Set this to the model's supported context length or lower. Older conversation content is trimmed as the estimated size approaches this limit, with space reserved for the answer.",
+        "kind": "Endpoint type",
+        "base_url_hint_anthropic": "For the official service, use https://api.anthropic.com."
+      },
+      "test": {
+        "button": "Test connection",
+        "ok": "Connected in {{ms}} ms.",
+        "ok_without_tools": "Connected in {{ms}} ms, but this model cannot look things up on its own, so AI search will be limited."
+      },
+      "kinds": {
+        "openai_compatible": "OpenAI-compatible",
+        "anthropic": "Anthropic"
+      },
+      "models": {
+        "recommended": "Recommended models",
+        "other": "Other models",
+        "custom": "Enter a model ID manually"
+      }
     }
   },
   "common": {
@@ -1325,7 +1377,9 @@
       "ocr_full": "Text search",
       "nl_full": "Picture search",
       "ocr_hint": "Match keywords in recognized text",
-      "nl_hint": "Match screen content with a description"
+      "nl_hint": "Match screen content with a description",
+      "ai": "AI",
+      "ai_hint": "Ask a question and let AI search your history for the answer"
     },
     "processes": {
       "all": "All Processes",
@@ -1742,6 +1796,87 @@
           "description": "After your PC restarts, organizing continues even before you open CarbonPaper."
         }
       }
+    }
+  },
+  "ai": {
+    "errors": {
+      "AUTH_REQUIRED": "Unlock CarbonPaper first.",
+      "AI_UNAUTHORIZED": "The service rejected the request. Check the API key.",
+      "AI_NOT_FOUND": "Endpoint or model not found. Check the address and model name.",
+      "AI_RATE_LIMITED": "Too many requests or quota used up. Try again later.",
+      "AI_BAD_REQUEST": "The service could not handle this request.",
+      "AI_SERVER_ERROR": "The service had an error. Try again later.",
+      "AI_NETWORK_ERROR": "Could not reach the service. Check the network and address.",
+      "AI_TIMEOUT": "The service stopped responding.",
+      "AI_INVALID_RESPONSE": "The service replied in an unexpected format. It may not be OpenAI-compatible.",
+      "AI_PROVIDER_INCOMPLETE": "Fill in the address and model.",
+      "AI_PROVIDER_INVALID_URL": "The address must start with http:// or https://.",
+      "AI_PROVIDER_FIELD_TOO_LONG": "A field is too long.",
+      "AI_INVALID_CONTEXT_BUDGET": "Enter a whole number from 8,192 to 2,000,000.",
+      "AI_CONTEXT_LIMIT": "This request exceeds the context limit. Shorten the question or increase the limit in the model service settings.",
+      "AI_PROVIDER_KEY_UNREADABLE": "The saved API key could not be read. Enter it again.",
+      "AI_NO_PROVIDER": "No model service is set up yet.",
+      "AI_STEP_LIMIT": "Stopped after too many lookup steps.",
+      "AI_BUSY": "The previous AI search is still running.",
+      "unknown": "Something unexpected went wrong.",
+      "AI_EMPTY_QUESTION": "Enter a question.",
+      "AI_PROVIDER_NOT_FOUND": "That model service no longer exists.",
+      "MAINTENANCE_IN_PROGRESS": "Data maintenance is running. Try again later."
+    }
+  },
+  "aiSearch": {
+    "send": "Send",
+    "composerHint": "Enter to send · Shift + Enter for a new line",
+    "placeholder": "Ask your history, e.g. \"What was the paper I was reading last Friday?\"",
+    "stop": "Stop",
+    "thinking": "Thinking…",
+    "cancelled": "Stopped.",
+    "sources": "Screenshots used",
+    "stopped_early": "This took many lookups, so the AI answered with what it found so far.",
+    "truncated": "The answer was too long and got cut off.",
+    "steps": {
+      "summary": "Looked things up {{count}} times",
+      "results": "{{count}} results",
+      "failed": "Failed",
+      "search_ocr_text": "Searched text for \"{{query}}\"",
+      "search_nl": "Searched images for \"{{query}}\"",
+      "time_range": "Looked at {{start}} to {{end}}",
+      "details": "Read screenshot #{{id}}",
+      "clusters": "Looked at smart clusters",
+      "cluster_content": "Read cluster contents",
+      "searches": "Searched {{count}} times",
+      "screenshots": "Read {{count}} screenshots",
+      "records": "Checked history {{count}} times",
+      "archives": "Checked archives {{count}} times",
+      "separator": ", "
+    },
+    "setup": {
+      "title": "Connect a model service first",
+      "description": "AI search runs on your own model service. It can be an online one such as DeepSeek, or Ollama running on this computer.",
+      "button": "Open settings"
+    },
+    "consent": {
+      "title": "Send what the search finds to {{name}}?",
+      "description": "During AI search, screenshot text, window titles and times related to your question are sent to this service so it can write the answer. Sensitive content is handled by the filters under AI assistant access. You can switch to a service running on this computer at any time in settings.",
+      "accept": "Allow and continue"
+    },
+    "landing": {
+      "title": "What would you like to find?",
+      "using": "Using {{name}}",
+      "examples": [
+        "What was I doing yesterday afternoon?",
+        "Which articles about async Rust did I read recently?",
+        "When did I last see that error message?"
+      ]
+    },
+    "reasoning": "Thinking",
+    "followUp": "Ask a follow-up…",
+    "newConversation": "New conversation",
+    "latestOutput": "Jump to latest",
+    "duration": {
+      "seconds": "Took {{count}} sec",
+      "minutes": "Took {{count}} min",
+      "minutesSeconds": "Took {{minutes}} min {{seconds}} sec"
     }
   }
 }

@@ -3,6 +3,14 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMMAND_TIERS = {
+  'commands::ai::ai_get_settings': 'public',
+  'commands::ai::ai_save_provider': 'session_required',
+  'commands::ai::ai_delete_provider': 'session_required',
+  'commands::ai::ai_set_default_provider': 'session_required',
+  'commands::ai::ai_test_provider': 'session_required',
+  'commands::ai::ai_grant_remote_consent': 'session_required',
+  'commands::ai::ai_search': 'session_required',
+  'commands::ai::ai_search_cancel': 'runtime_public',
   'settings_window::take_settings_monitor_action': 'runtime_public',
   'settings_window::settings_debug_preview': 'session_required',
   'settings_window::open_settings_window': 'lifecycle_public',
