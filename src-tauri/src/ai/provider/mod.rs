@@ -278,6 +278,9 @@ pub async fn test_connection(provider: &ResolvedProvider) -> ConnectionTest {
     };
     let cancel = Cancellation::default();
     let mut ignore = |_event: StreamEvent| {};
+    // Reasoning tokens count toward the output limit on current cloud models.
+    // Leave room for the tool call while respecting small local context budgets.
+    let probe_max_tokens = 4096.min(provider.context_tokens / 2);
 
     let with_tool = ChatRequest {
         messages: vec![Message::User(
@@ -288,10 +291,18 @@ pub async fn test_connection(provider: &ResolvedProvider) -> ConnectionTest {
             description: "Connectivity check. Takes no arguments.".into(),
             parameters: serde_json::json!({ "type": "object", "properties": {} }),
         }],
-        max_tokens: Some(256),
+        max_tokens: Some(probe_max_tokens),
         temperature: Some(0.0),
     };
     match complete(&client, provider, &with_tool, &mut ignore, &cancel).await {
+        Ok(response) if response.truncated => {
+            return finish(
+                ToolCalling::Unknown,
+                Some(ProviderError::InvalidResponse(
+                    "Model reached the output limit during the connection test.".into(),
+                )),
+            );
+        }
         Ok(response) if response.tool_calls.iter().any(|c| c.name == "ping") => {
             return finish(ToolCalling::Supported, None);
         }
@@ -304,11 +315,17 @@ pub async fn test_connection(provider: &ResolvedProvider) -> ConnectionTest {
 
     let plain = ChatRequest {
         messages: vec![Message::User("Reply with the single word OK.".into())],
-        max_tokens: Some(16),
+        max_tokens: Some(probe_max_tokens),
         temperature: Some(0.0),
         ..Default::default()
     };
     match complete(&client, provider, &plain, &mut ignore, &cancel).await {
+        Ok(response) if response.truncated => finish(
+            ToolCalling::Unknown,
+            Some(ProviderError::InvalidResponse(
+                "Model reached the output limit during the connection test.".into(),
+            )),
+        ),
         Ok(_) => finish(ToolCalling::Unsupported, None),
         Err(e) => finish(ToolCalling::Unknown, Some(e)),
     }
@@ -422,6 +439,23 @@ mod tests {
         assert_eq!(streamed, "Hi");
         assert_eq!(response.usage.map(|u| u.input_tokens), Some(3));
         assert_eq!(seen.lock().unwrap().as_slice(), ["secret"]);
+    }
+
+    #[tokio::test]
+    async fn truncated_reasoning_does_not_mark_tools_unsupported() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, _) = serve("/v1/chat/completions", body, "authorization").await;
+        let result = test_connection(&provider(
+            ProviderKind::OpenaiCompatible,
+            format!("{base}/v1"),
+        ))
+        .await;
+        assert!(!result.ok);
+        assert_eq!(result.tool_calling, ToolCalling::Unknown);
+        assert!(result.error.unwrap().starts_with("AI_INVALID_RESPONSE"));
     }
 
     #[tokio::test]

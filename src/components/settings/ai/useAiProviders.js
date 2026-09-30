@@ -3,19 +3,9 @@ import {
   aiErrorDetail, aiErrorKey, deleteAiProvider, getAiSettings, saveAiProvider, setDefaultAiProvider, testAiProvider,
   DEFAULT_AI_CONTEXT_TOKENS,
 } from '../../../lib/ai_api';
+import { CLOUD_AI_CONTEXT_TOKENS, PROVIDER_PRESETS, findProviderPreset } from '../../../lib/ai_provider_catalog';
 
-export const PROVIDER_PRESETS = [
-  { id: 'anthropic', name: 'Claude', kind: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-opus-5' },
-  { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-  { id: 'qwen', name: 'Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
-  { id: 'kimi', name: 'Kimi', baseUrl: 'https://api.moonshot.cn/v1', model: 'kimi-k2-0905-preview' },
-  { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: '' },
-  { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: '' },
-  { id: 'ollama', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', model: '' },
-  { id: 'lmstudio', name: 'LM Studio', baseUrl: 'http://localhost:1234/v1', model: '' },
-];
-
-const emptyDraft = () => ({ id: null, name: '', kind: 'openai_compatible', baseUrl: '', model: '', apiKey: '', hasApiKey: false, keyTouched: false, contextTokens: DEFAULT_AI_CONTEXT_TOKENS });
+const emptyDraft = () => ({ id: null, presetId: '', customModel: false, name: '', kind: 'openai_compatible', baseUrl: '', model: '', apiKey: '', hasApiKey: false, keyTouched: false, contextTokens: DEFAULT_AI_CONTEXT_TOKENS });
 
 function toInput(draft) {
   return { ...draft, apiKey: draft.keyTouched ? draft.apiKey : undefined, contextTokens: Number(draft.contextTokens) };
@@ -60,17 +50,25 @@ export function useAiProviders({ t }) {
 
   const startAdd = () => { setDraft(emptyDraft()); setMessage(null); };
   const startEdit = (provider) => {
-    setDraft({ ...emptyDraft(), id: provider.id, name: provider.name, kind: provider.kind, baseUrl: provider.base_url, model: provider.model, hasApiKey: provider.has_api_key, contextTokens: provider.context_tokens ?? DEFAULT_AI_CONTEXT_TOKENS });
+    const preset = findProviderPreset(provider.kind, provider.base_url);
+    setDraft({ ...emptyDraft(), presetId: preset?.id || 'custom', customModel: !preset?.models.some((model) => model.id === provider.model), id: provider.id, name: provider.name, kind: provider.kind, baseUrl: provider.base_url, model: provider.model, hasApiKey: provider.has_api_key, contextTokens: provider.context_tokens ?? DEFAULT_AI_CONTEXT_TOKENS });
     setMessage(null);
   };
   const cancelEdit = () => { setDraft(null); setMessage(null); };
   const updateDraft = (patch) => setDraft((current) => ({ ...current, ...patch, ...('apiKey' in patch ? { keyTouched: true } : {}) }));
   const applyPreset = (presetId) => {
+    setMessage(null);
+    if (presetId === 'custom') {
+      setDraft({ ...emptyDraft(), presetId });
+      return;
+    }
     const preset = PROVIDER_PRESETS.find((item) => item.id === presetId);
     if (preset) {
-      setDraft((current) => ({
-        ...current, name: preset.name, kind: preset.kind || 'openai_compatible', baseUrl: preset.baseUrl, model: preset.model || current.model,
-      }));
+      setDraft({
+        ...emptyDraft(), presetId, name: preset.name, kind: preset.kind || 'openai_compatible', baseUrl: preset.baseUrl,
+        model: preset.models.find((model) => model.recommended)?.id || '',
+        contextTokens: preset.local ? DEFAULT_AI_CONTEXT_TOKENS : CLOUD_AI_CONTEXT_TOKENS,
+      });
     }
   };
 

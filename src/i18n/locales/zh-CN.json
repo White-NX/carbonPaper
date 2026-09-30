@@ -1025,7 +1025,7 @@
       "advanced": "高级设置",
       "providers": {
         "title": "模型服务",
-        "description": "配置程序使用的大模型服务。支持 OpenAI 兼容接口（包括 DeepSeek、通义千问、Kimi，以及本机运行的 Ollama 和 LM Studio）和 Anthropic 接口。",
+        "description": "选择服务并填写 API 密钥，即可开始使用。也支持本机运行的 Ollama 和 LM Studio。",
         "add": "添加服务",
         "empty": "还没有添加模型服务。添加后即可在搜索页使用 AI 搜索。",
         "default_badge": "默认",
@@ -1037,14 +1037,18 @@
       },
       "fields": {
         "preset": "常用服务",
-        "preset_placeholder": "选择后自动填写地址",
+        "preset_placeholder": "选择模型服务",
+        "custom_provider": "自定义服务",
         "name": "名称",
         "name_placeholder": "留空则使用模型名",
         "model": "模型",
+        "model_id": "模型 ID",
+        "model_placeholder": "填写模型名称",
         "base_url": "接口地址",
         "base_url_hint": "通常以 /v1 结尾。",
         "api_key": "API 密钥",
         "api_key_placeholder": "本机服务通常不需要",
+        "api_key_cloud_placeholder": "填写服务商提供的 API 密钥",
         "api_key_saved": "已保存，留空则保持不变",
         "context_tokens": "上下文上限（tokens）",
         "context_tokens_hint": "请设为模型支持的上下文长度或更小的值。预估用量接近上限时，会裁剪较早的对话内容，并为回答预留空间。",
@@ -1059,6 +1063,11 @@
       "kinds": {
         "openai_compatible": "OpenAI 兼容",
         "anthropic": "Anthropic"
+      },
+      "models": {
+        "recommended": "推荐模型",
+        "other": "其他模型",
+        "custom": "手动填写模型 ID"
       }
     }
   },

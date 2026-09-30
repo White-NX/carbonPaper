@@ -32,24 +32,21 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
             Message::System(text) => json!({ "role": "system", "content": text }),
             Message::User(text) => json!({ "role": "user", "content": text }),
             Message::Assistant {
-                text, tool_calls, ..
-            } if tool_calls.is_empty() => {
-                json!({ "role": "assistant", "content": text })
-            }
-            Message::Assistant {
                 text,
                 tool_calls,
                 reasoning,
             } => {
                 let mut message = json!({
                     "role": "assistant",
-                    "content": if text.is_empty() { Value::Null } else { json!(text) },
-                    "tool_calls": tool_calls.iter().map(|call| json!({
+                    "content": if text.is_empty() && !tool_calls.is_empty() { Value::Null } else { json!(text) },
+                });
+                if !tool_calls.is_empty() {
+                    message["tool_calls"] = tool_calls.iter().map(|call| json!({
                         "id": call.id,
                         "type": "function",
                         "function": { "name": call.name, "arguments": call.arguments },
-                    })).collect::<Vec<_>>(),
-                });
+                    })).collect();
+                }
                 if !reasoning.is_null() {
                     message["reasoning_content"] = reasoning.clone();
                 }
@@ -78,11 +75,31 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
             })
             .collect();
     }
-    if let Some(max_tokens) = request.max_tokens {
-        body["max_tokens"] = json!(max_tokens);
+    let model_id = model.rsplit('/').next().unwrap_or(model);
+    let gpt6_chat = matches!(model_id, "gpt-6-sol" | "gpt-6-luna");
+    // GPT-6 Sol/Luna only support Chat Completions tool calling without reasoning.
+    // Keep this mode on follow-up turns too, including the final answer.
+    if gpt6_chat {
+        body["reasoning_effort"] = json!("none");
     }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
+    if let Some(max_tokens) = request.max_tokens {
+        let key = if gpt6_chat || model_id.starts_with("mimo-v2.6-") {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[key] = json!(max_tokens);
+    }
+    // Current Kimi models fix sampling parameters; GPT-6 also rejects temperature.
+    let fixed_sampling = gpt6_chat
+        || matches!(
+            model_id,
+            "kimi-k3" | "kimi-k2.6" | "kimi-k2.7-code" | "kimi-k2.7-code-highspeed"
+        );
+    if !fixed_sampling {
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature);
+        }
     }
     body
 }
@@ -398,6 +415,80 @@ mod tests {
             request_body("m", &with_tools)["tools"][0]["function"]["name"],
             "t"
         );
+    }
+
+    #[test]
+    fn current_models_use_compatible_generation_parameters() {
+        let request = ChatRequest {
+            max_tokens: Some(8192),
+            temperature: Some(0.2),
+            tools: vec![ToolSpec {
+                name: "search".into(),
+                description: "Find records".into(),
+                parameters: json!({"type": "object"}),
+            }],
+            ..Default::default()
+        };
+        for model in ["gpt-6-luna", "gpt-6-sol", "openai/gpt-6-sol"] {
+            for tools in [request.tools.clone(), Vec::new()] {
+                let body = request_body(
+                    model,
+                    &ChatRequest {
+                        tools,
+                        ..request.clone()
+                    },
+                );
+                assert_eq!(body["reasoning_effort"], "none");
+                assert_eq!(body["max_completion_tokens"], 8192);
+                assert!(body.get("max_tokens").is_none());
+                assert!(body.get("temperature").is_none());
+            }
+        }
+        for model in [
+            "kimi-k3",
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+        ] {
+            let body = request_body(model, &request);
+            assert!(body.get("temperature").is_none());
+            assert_eq!(body["max_tokens"], 8192);
+        }
+        for model in ["mimo-v2.6-flash", "mimo-v2.6-pro"] {
+            let body = request_body(model, &request);
+            assert_eq!(body["max_completion_tokens"], 8192);
+            assert!(body.get("max_tokens").is_none());
+        }
+        for model in [
+            "local-model",
+            "deepseek-flash",
+            "glm-5.3-flash",
+            "qwen3.8-flash",
+        ] {
+            let body = request_body(model, &request);
+            assert_eq!(body["max_tokens"], 8192);
+            assert!(body.get("temperature").is_some());
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_is_preserved_on_assistant_turns_without_tools() {
+        let request = ChatRequest {
+            messages: vec![Message::Assistant {
+                text: "answer".into(),
+                reasoning: json!("previous reasoning"),
+                tool_calls: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let body = request_body("kimi-k3", &request);
+        assert_eq!(body["messages"][0]["content"], "answer");
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            "previous reasoning"
+        );
+        assert!(body["messages"][0].get("tool_calls").is_none());
     }
 
     #[test]

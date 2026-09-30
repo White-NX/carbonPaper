@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { Bot, Check, Pencil, Plus, Trash2, PlugZap } from 'lucide-react';
 import { SettingsButton, SettingsSelect } from '../SettingsControls';
 import { SettingsErrorBanner, SettingsGroup, SettingsSection, SettingsStatus } from '../SettingsPrimitives';
-import { PROVIDER_PRESETS, useAiProviders } from './useAiProviders';
+import { useAiProviders } from './useAiProviders';
+import { PROVIDER_PRESETS } from '../../../lib/ai_provider_catalog';
 import { MIN_AI_CONTEXT_TOKENS, MAX_AI_CONTEXT_TOKENS } from '../../../lib/ai_api';
 
 const inputClass = 'w-full min-w-0 rounded-lg border border-ide-border bg-ide-panel px-3 py-2 text-sm placeholder:text-ide-muted disabled:opacity-50';
@@ -23,30 +24,36 @@ function hostOf(url) {
   try { return new URL(url).host; } catch { return url; }
 }
 
-function ProviderEditor({ c, t }) {
+function ConnectionFields({ c, t, preset }) {
   const { draft, busy } = c;
   const disabled = Boolean(busy);
-  const incomplete = !draft.baseUrl.trim() || !draft.model.trim();
-  const contextTokens = Number(draft.contextTokens);
-  const invalidBudget = !Number.isInteger(contextTokens) || contextTokens < MIN_AI_CONTEXT_TOKENS || contextTokens > MAX_AI_CONTEXT_TOKENS;
+  const models = preset?.models ?? [];
   return (
-    <SettingsGroup className="space-y-3">
-      {!draft.id && (
-        <Field label={t('settings.ai.fields.preset')}>
-          <SettingsSelect value="" disabled={disabled} label={t('settings.ai.fields.preset')} onChange={c.applyPreset}
-            options={[{ value: '', label: t('settings.ai.fields.preset_placeholder') }, ...PROVIDER_PRESETS.map((p) => ({ value: p.id, label: p.name }))]} />
+    <>
+      <Field label={t('settings.ai.fields.name')}>
+        <input value={draft.name} disabled={disabled} placeholder={t('settings.ai.fields.name_placeholder')}
+          onChange={(e) => c.updateDraft({ name: e.target.value })} className={inputClass} />
+      </Field>
+      {models.length > 0 && (
+        <Field label={t('settings.ai.fields.model')}>
+          <select value={draft.customModel ? 'custom' : draft.model} disabled={disabled} className={inputClass}
+            onChange={(e) => c.updateDraft(e.target.value === 'custom' ? { customModel: true } : { model: e.target.value, customModel: false })}>
+            <optgroup label={t('settings.ai.models.recommended')}>
+              {models.filter((model) => model.recommended).map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+            </optgroup>
+            <optgroup label={t('settings.ai.models.other')}>
+              {models.filter((model) => !model.recommended).map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+            </optgroup>
+            <option value="custom">{t('settings.ai.models.custom')}</option>
+          </select>
         </Field>
       )}
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field label={t('settings.ai.fields.name')}>
-          <input value={draft.name} disabled={disabled} placeholder={t('settings.ai.fields.name_placeholder')}
-            onChange={(e) => c.updateDraft({ name: e.target.value })} className={inputClass} />
-        </Field>
-        <Field label={t('settings.ai.fields.model')}>
-          <input value={draft.model} disabled={disabled} placeholder={draft.kind === 'anthropic' ? 'claude-opus-5' : 'deepseek-chat'}
+      {(models.length === 0 || draft.customModel) && (
+        <Field label={t(models.length ? 'settings.ai.fields.model_id' : 'settings.ai.fields.model')}>
+          <input value={draft.model} disabled={disabled} placeholder={t('settings.ai.fields.model_placeholder')}
             onChange={(e) => c.updateDraft({ model: e.target.value })} className={inputClass} spellCheck={false} />
         </Field>
-      </div>
+      )}
       <Field label={t('settings.ai.fields.kind')}>
         <SettingsSelect value={draft.kind} disabled={disabled} label={t('settings.ai.fields.kind')} onChange={(kind) => c.updateDraft({ kind })}
           options={[
@@ -54,24 +61,55 @@ function ProviderEditor({ c, t }) {
             { value: 'anthropic', label: t('settings.ai.kinds.anthropic') },
           ]} />
       </Field>
-      <Field label={t('settings.ai.fields.base_url')} hint={t(draft.kind === 'anthropic' ? 'settings.ai.fields.base_url_hint_anthropic' : 'settings.ai.fields.base_url_hint')}>
+      <Field label={t('settings.ai.fields.base_url')} hint={!preset && t(draft.kind === 'anthropic' ? 'settings.ai.fields.base_url_hint_anthropic' : 'settings.ai.fields.base_url_hint')}>
         <input value={draft.baseUrl} disabled={disabled} placeholder={draft.kind === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.example.com/v1'}
           onChange={(e) => c.updateDraft({ baseUrl: e.target.value })} className={inputClass} spellCheck={false} />
       </Field>
-      <Field label={t('settings.ai.fields.api_key')}>
-        <input type="password" autoComplete="off" value={draft.apiKey} disabled={disabled}
-          placeholder={draft.hasApiKey ? t('settings.ai.fields.api_key_saved') : t('settings.ai.fields.api_key_placeholder')}
-          onChange={(e) => c.updateDraft({ apiKey: e.target.value })} className={inputClass} />
-      </Field>
-      <details className="space-y-3">
-        <summary className="cursor-pointer text-xs font-medium text-ide-muted">{t('settings.ai.advanced')}</summary>
-        <Field label={t('settings.ai.fields.context_tokens')} hint={t('settings.ai.fields.context_tokens_hint')}>
-          <input type="number" min={MIN_AI_CONTEXT_TOKENS} max={MAX_AI_CONTEXT_TOKENS} step="1"
-            value={draft.contextTokens} disabled={disabled} aria-invalid={invalidBudget}
-            onChange={(e) => c.updateDraft({ contextTokens: e.target.value })} className={inputClass} />
+    </>
+  );
+}
+
+function ProviderEditor({ c, t }) {
+  const { draft, busy } = c;
+  const disabled = Boolean(busy);
+  const preset = PROVIDER_PRESETS.find((item) => item.id === draft.presetId);
+  const cloudPreset = Boolean(preset && !preset.local);
+  const hasKey = draft.keyTouched ? Boolean(draft.apiKey.trim()) : draft.hasApiKey;
+  const incomplete = !draft.presetId || !draft.baseUrl.trim() || !draft.model.trim() || (cloudPreset && !hasKey);
+  const contextTokens = Number(draft.contextTokens);
+  const invalidBudget = !Number.isInteger(contextTokens) || contextTokens < MIN_AI_CONTEXT_TOKENS || contextTokens > MAX_AI_CONTEXT_TOKENS;
+  return (
+    <SettingsGroup className="space-y-3">
+      {!draft.id && (
+        <Field label={t('settings.ai.fields.preset')}>
+          <SettingsSelect value={draft.presetId} disabled={disabled} label={t('settings.ai.fields.preset')} onChange={c.applyPreset}
+            options={[
+              { value: '', label: t('settings.ai.fields.preset_placeholder'), disabled: true },
+              ...PROVIDER_PRESETS.map((p) => ({ value: p.id, label: p.name })),
+              { value: 'custom', label: t('settings.ai.fields.custom_provider') },
+            ]} />
         </Field>
-        {invalidBudget && <p role="alert" className="text-xs text-ide-error">{t('ai.errors.AI_INVALID_CONTEXT_BUDGET')}</p>}
-      </details>
+      )}
+      {draft.presetId && (
+        <>
+          {!cloudPreset && <ConnectionFields c={c} t={t} preset={preset} />}
+          <Field label={t('settings.ai.fields.api_key')}>
+            <input type="password" autoComplete="off" value={draft.apiKey} disabled={disabled}
+              placeholder={draft.hasApiKey ? t('settings.ai.fields.api_key_saved') : t(cloudPreset ? 'settings.ai.fields.api_key_cloud_placeholder' : 'settings.ai.fields.api_key_placeholder')}
+              onChange={(e) => c.updateDraft({ apiKey: e.target.value })} className={inputClass} />
+          </Field>
+          <details key={draft.presetId} className="space-y-3">
+            <summary className="cursor-pointer text-xs font-medium text-ide-muted">{t('settings.ai.advanced')}</summary>
+            {cloudPreset && <ConnectionFields c={c} t={t} preset={preset} />}
+            <Field label={t('settings.ai.fields.context_tokens')} hint={t('settings.ai.fields.context_tokens_hint')}>
+              <input type="number" min={MIN_AI_CONTEXT_TOKENS} max={MAX_AI_CONTEXT_TOKENS} step="1"
+                value={draft.contextTokens} disabled={disabled} aria-invalid={invalidBudget}
+                onChange={(e) => c.updateDraft({ contextTokens: e.target.value })} className={inputClass} />
+            </Field>
+            {invalidBudget && <p role="alert" className="text-xs text-ide-error">{t('ai.errors.AI_INVALID_CONTEXT_BUDGET')}</p>}
+          </details>
+        </>
+      )}
       <div className="flex flex-wrap justify-end gap-2">
         <SettingsButton variant="ghost" disabled={disabled} onClick={c.cancelEdit}>{t('common.cancel')}</SettingsButton>
         <SettingsButton icon={PlugZap} loading={busy === 'test'} disabled={disabled || incomplete || invalidBudget} onClick={c.test}>{t('settings.ai.test.button')}</SettingsButton>

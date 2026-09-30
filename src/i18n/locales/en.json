@@ -1025,7 +1025,7 @@
       "advanced": "Advanced settings",
       "providers": {
         "title": "Model services",
-        "description": "Configure LLM services. OpenAI-compatible endpoints (including DeepSeek, Qwen, Kimi, and Ollama or LM Studio running on this computer) and Anthropic endpoints are supported.",
+        "description": "Choose a service and enter your API key to get started. Ollama and LM Studio running on this computer are also supported.",
         "add": "Add service",
         "empty": "No model service yet. Add one to use AI search.",
         "default_badge": "Default",
@@ -1037,14 +1037,18 @@
       },
       "fields": {
         "preset": "Common services",
-        "preset_placeholder": "Pick one to fill in the address",
+        "preset_placeholder": "Choose a model service",
+        "custom_provider": "Custom service",
         "name": "Name",
         "name_placeholder": "Defaults to the model name",
         "model": "Model",
+        "model_id": "Model ID",
+        "model_placeholder": "Enter a model name",
         "base_url": "Endpoint address",
         "base_url_hint": "Usually ends with /v1.",
         "api_key": "API key",
         "api_key_placeholder": "Usually not needed for local services",
+        "api_key_cloud_placeholder": "Enter the API key from your provider",
         "api_key_saved": "Saved. Leave empty to keep it",
         "context_tokens": "Context limit (tokens)",
         "context_tokens_hint": "Set this to the model's supported context length or lower. Older conversation content is trimmed as the estimated size approaches this limit, with space reserved for the answer.",
@@ -1059,6 +1063,11 @@
       "kinds": {
         "openai_compatible": "OpenAI-compatible",
         "anthropic": "Anthropic"
+      },
+      "models": {
+        "recommended": "Recommended models",
+        "other": "Other models",
+        "custom": "Enter a model ID manually"
       }
     }
   },
