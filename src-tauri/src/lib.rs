@@ -865,6 +865,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
         .manage(ai::AiRuntimeState::default())
+        .manage(ai::recap::RecapRuntime::default())
         .manage(settings_window::SettingsWindowState::default())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
@@ -911,6 +912,7 @@ pub fn run() {
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
+                ai::recap::start_scheduler(app.handle().clone());
 
                 build_tray(app)?;
 
@@ -1307,6 +1309,14 @@ pub fn run() {
             commands::ai::ai_grant_remote_consent,
             commands::ai::ai_search,
             commands::ai::ai_search_cancel,
+            commands::recap::recap_get_settings,
+            commands::recap::recap_save_settings,
+            commands::recap::recap_list_days,
+            commands::recap::recap_get_day,
+            commands::recap::recap_generate,
+            commands::recap::recap_cancel,
+            commands::recap::recap_get_progress,
+            commands::recap::recap_correct,
             commands::mcp::mcp_set_enabled,
             commands::mcp::mcp_get_status,
             commands::mcp::mcp_run_smoke_test,

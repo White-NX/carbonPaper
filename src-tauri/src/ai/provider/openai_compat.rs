@@ -176,6 +176,7 @@ struct PartialCall {
 
 #[derive(Default)]
 pub(super) struct StreamAssembler {
+    reasoning_tokens: Option<u64>,
     reasoning: String,
     text: String,
     calls: Vec<PartialCall>,
@@ -210,6 +211,12 @@ impl StreamAssembler {
         }
         if let Some(usage) = parse_usage(chunk.get("usage")) {
             self.usage = Some(usage);
+        }
+        if let Some(tokens) = chunk
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.reasoning_tokens = Some(tokens);
         }
         let Some(choice) = chunk.pointer("/choices/0") else {
             return Ok(false);
@@ -272,6 +279,7 @@ impl StreamAssembler {
 
     pub(super) fn finish(self) -> ChatResponse {
         ChatResponse {
+            reasoning_tokens: self.reasoning_tokens,
             reasoning: if self.reasoning.is_empty() {
                 Value::Null
             } else {
@@ -340,6 +348,9 @@ fn parse_full_response(body: &Value) -> Result<ChatResponse, ProviderError> {
         })
         .collect();
     Ok(ChatResponse {
+        reasoning_tokens: body
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64),
         reasoning: message
             .get("reasoning_content")
             .or_else(|| message.get("reasoning"))

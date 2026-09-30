@@ -4,6 +4,7 @@ import { AdvancedSearch } from './AdvancedSearch';
 import { InspectorImage } from './InspectorImage';
 import DetailCard from './DetailCard';
 import SmartClustersView from './SmartClustersView';
+import RecapView from './recap/RecapView';
 import { Image as ImageIcon, Loader2, Copy, Maximize2, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -415,6 +416,7 @@ export default function MainArea({
           onOpen={() => openStandaloneSnapshotPreview()}
           onClear={clearSnapshotPreviewTabs}
         />
+        {activeTab === 'recap' && <RecapView active isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} />}
       </div>
     </section>
   );

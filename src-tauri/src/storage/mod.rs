@@ -21,6 +21,7 @@ mod mode;
 mod policy;
 mod process;
 mod processing_stage;
+mod recap;
 mod schema;
 mod screenshot;
 mod search;

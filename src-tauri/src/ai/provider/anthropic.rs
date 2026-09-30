@@ -322,6 +322,7 @@ impl StreamAssembler {
 
     pub(super) fn finish(self) -> ChatResponse {
         ChatResponse {
+            reasoning_tokens: None,
             reasoning: Value::Array(
                 self.blocks
                     .iter()

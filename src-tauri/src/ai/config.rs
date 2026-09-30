@@ -364,17 +364,20 @@ fn validate(mut input: ProviderInput) -> Result<ProviderInput, String> {
 /// Endpoints on this machine. Sending screenshot text to them does not leave
 /// the computer, so the privacy notice is skipped for them.
 pub fn is_local_url(base_url: &str) -> bool {
-    let rest = base_url
-        .strip_prefix("http://")
-        .or_else(|| base_url.strip_prefix("https://"))
-        .unwrap_or(base_url);
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or("")
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
     };
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn new_id() -> String {
@@ -491,6 +494,8 @@ mod tests {
         assert!(is_local_url("http://[::1]:8080"));
         assert!(!is_local_url("https://api.deepseek.com"));
         assert!(!is_local_url("http://localhost.evil.com/v1"));
+        assert!(!is_local_url("http://127.example.com/v1"));
+        assert!(!is_local_url("http://localhost@remote.example/v1"));
     }
 
     #[test]

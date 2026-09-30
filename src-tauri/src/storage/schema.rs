@@ -808,6 +808,7 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        Self::init_recap_tables(conn)?;
         let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
         if recovered > 0 {
             tracing::info!(

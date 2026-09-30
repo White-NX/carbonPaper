@@ -78,6 +78,8 @@ pub struct Usage {
 
 #[derive(Debug, Clone, Default)]
 pub struct ChatResponse {
+    /// Optional provider-reported subset of output_tokens; never add it twice.
+    pub reasoning_tokens: Option<u64>,
     /// Provider-native reasoning required when continuing a tool turn.
     pub reasoning: Value,
     pub text: String,
