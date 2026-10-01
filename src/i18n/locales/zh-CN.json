@@ -6,7 +6,7 @@
     "next": "后一天",
     "locked": "解锁后查看每日回顾",
     "welcome": "把一天的经过串起来",
-    "intro": "按时间回顾做过的事情，查看相关任务与原始记录。启用后，每四小时在空闲时整理一次。",
+    "intro": "回顾每个时段做过的事情和任务进展，随时查看具体经过与来源。启用后，每四小时在空闲时整理一次。",
     "configure": "设置每日回顾",
     "schedule": "每四小时整理一次，空闲时自动更新",
     "generating": "正在整理回顾…",
@@ -17,6 +17,9 @@
     "close": "关闭",
     "save": "保存",
     "correct": "纠正关联",
+    "summaryPending": "时段概述待补全，可先查看具体经过。",
+    "summaryUnavailable": "时段概述暂时无法更新，具体经过仍可查看。",
+    "taskInDetails": "这项活动的具体经过可在下方查看。",
     "details": "查看经过与来源",
     "source": "来源记录",
     "locate": "在时间线上定位",
@@ -47,11 +50,11 @@
       "received": "已接收内容",
       "receivedCounts": "思考 {{reasoning}} 字符，回复 {{text}} 字符",
       "requestId": "请求编号",
-      "attempts": { "initial": "生成回顾", "repair": "补全与修复" },
+      "attempts": { "initial": "生成回顾", "repair": "补全与修复", "summary": "归纳时段概述" },
       "stages": {
         "preparing": "准备回顾", "collecting": "读取记录", "screening": "筛选内容",
         "waiting": "等待模型响应", "thinking": "模型正在思考", "writing": "生成回顾正文",
-        "validating": "校验回顾", "saving": "保存回顾", "running": "进行中",
+        "validating": "校验回顾", "summarizing": "归纳时段概述", "saving": "保存回顾", "running": "进行中",
         "ready": "已完成", "partial": "部分内容待补全", "failed": "生成失败",
         "cancelled": "已停止", "paused": "等待空闲后继续"
       }
@@ -68,7 +71,7 @@
     },
     "settings": {
       "title": "每日回顾设置",
-      "description": "每四小时整理新增记录，按实际活动片段展示。自动处理会等待解锁和空闲。",
+      "description": "每四小时整理新增记录，概括这段时间的活动与任务进展。自动处理会等待解锁和空闲。",
       "enabled": "启用每日回顾",
       "provider": "回顾模型",
       "defaultProvider": "使用默认 AI 模型",
@@ -77,7 +80,7 @@
       "request_output_tokens": "单次请求输出上限（含思考，token）",
       "answer_tokens": "回顾正文目标篇幅（token）",
       "dailyTotal": "每日生成总额度：{{total}} token（输入与输出合计）",
-      "budgetHint": "请求输出上限包含模型思考和回顾正文；正文目标篇幅用于控制回顾长度。每批额度涵盖生成和修复请求，实际请求上限还受模型上下文限制。",
+      "budgetHint": "请求输出上限包含模型思考和回顾正文；正文目标篇幅用于控制回顾长度。活动整理与时段归纳分别受每批额度限制，并共用每日额度；实际请求上限还受模型上下文限制。",
       "batch_input_tokens": "每批输入上限（token）",
       "batch_output_tokens": "每批输出上限（token）",
       "daily_input_tokens": "每日生成输入上限（token）",
@@ -93,6 +96,7 @@
       "keyPlaceholder": "输入 API key"
     },
     "errors": {
+      "RECAP_INVALID_SUMMARY": "时段概述未能生成，可查看具体经过或重试。",
       "unknown": "回顾暂时无法更新，请稍后重试。",
       "AUTH_REQUIRED": "请解锁后继续。",
       "MAINTENANCE_IN_PROGRESS": "维护完成后可继续整理。",

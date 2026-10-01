@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { listen } from '@tauri-apps/api/event';
 import { CalendarDays, ChevronLeft, ChevronRight, Loader2, Settings2, Undo2, X } from 'lucide-react';
 import { getAiSettings, grantAiRemoteConsent } from '../../lib/ai_api';
-import { cancelRecap, correctRecap, generateRecap, getRecapDay, getRecapSettings, groupRecapActivities, listRecapDays, localDate, recapErrorKey, saveRecapSettings, sourceResult } from '../../lib/recap_api';
+import { cancelRecap, correctRecap, generateRecap, getRecapDay, getRecapSettings, listRecapDays, localDate, recapErrorKey, saveRecapSettings, sourceResult } from '../../lib/recap_api';
 import RecapSettings from './RecapSettings';
 import RecapProgress from './RecapProgress';
 import useRecapProgress from '../../hooks/useRecapProgress';
@@ -21,6 +21,36 @@ function RecapError({ error }) {
       <p className="mt-2">{t('recap.errorLogHint')}</p>
     </details>
   </>;
+}
+
+function RecapPeriod({ batch, task, time, busy, onTask, onEdit, onOpen }) {
+  const { t } = useTranslation();
+  const activities = batch.activities.filter((a) => !task || a.task_id === task);
+  const topics = (batch.summary?.topics || []).filter((topic) => !task || topic.task_id === task);
+  const titles = [...new Map(activities.map((a) => [a.task_id, a.task_title])).entries()];
+  return <article className="rounded-xl border border-ide-border bg-ide-panel p-4 sm:p-5">
+    <h2 className="text-sm font-semibold tabular-nums">{time(batch.start_ms)}–{time(batch.end_ms)}</h2>
+    {!task && batch.summary && <p className="mt-3 text-sm leading-7">{batch.summary.overview}</p>}
+    {topics.length > 0 ? <ul className="mt-4 space-y-4">{topics.map((topic) => <li key={topic.task_id}>
+      <button className="text-left text-sm font-medium text-ide-accent hover:underline" onClick={() => onTask(topic.task_id)}>{topic.title}</button>
+      <p className="mt-1 text-sm leading-7">{topic.text}</p>
+    </li>)}</ul> : <>
+      <p className="mt-3 text-xs text-ide-muted">{t(batch.summary_error ? 'recap.summaryUnavailable' : batch.summary ? 'recap.taskInDetails' : 'recap.summaryPending')}</p>
+      <div className="mt-3 flex flex-wrap gap-3">{titles.map(([id, title]) => <button key={id} className="text-sm text-ide-accent hover:underline" onClick={() => onTask(id)}>{title}</button>)}</div>
+    </>}
+    <details className="mt-4"><summary className="cursor-pointer text-xs text-ide-muted">{t('recap.details')}</summary>
+      <div className="mt-3 space-y-4">{activities.map((activity) => <div key={activity.id} className="border-l-2 border-ide-border pl-3">
+        <div className="flex flex-wrap items-start justify-between gap-2 text-xs text-ide-muted">
+          <span>{time(activity.start_ms)}{activity.end_ms !== activity.start_ms && `–${time(activity.end_ms)}`}</span>
+          <button onClick={() => onEdit(activity)} disabled={busy} className="text-ide-accent">{t('recap.correct')}</button>
+        </div>
+        <button className="mt-2 text-left text-sm font-medium hover:underline" onClick={() => onTask(activity.task_id)}>{activity.task_title}</button>
+        <p className="mt-1 whitespace-pre-wrap text-sm leading-7">{activity.text}</p>
+        <div className="mt-2 flex flex-wrap gap-2">{activity.sources.map((source) => <button key={source.id} className="max-w-64 truncate rounded border border-ide-border px-2 py-1 text-xs hover:bg-ide-hover" onClick={() => onOpen(source, true)} title={source.window_title}>{time(source.timestamp_ms)} · {source.process_name || t('recap.source')}</button>)}</div>
+        {activity.sources.length > 0 && <button className="mt-2 text-xs text-ide-accent" onClick={() => onOpen(activity.sources[0])}>{t('recap.locate')}</button>}
+      </div>)}</div>
+    </details>
+  </article>;
 }
 
 function CorrectionForm({ editing, threads, busy, onApply, onClose }) {
@@ -96,11 +126,11 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     if (floating && onOpenSnapshotPreview) onOpenSnapshotPreview(result, { sourceLabel: t('recap.title'), sourceType: 'recap' });
     else onSelectScreenshot?.(result);
   };
-  const groups = groupRecapActivities(day?.batches || []).filter((g) => !task || g.task_id === task);
+  const periods = (day?.batches || []).filter((b) => b.activities.some((a) => !task || a.task_id === task));
   const running = busy || day?.running || (progress && !progress.finished_at_ms);
   const issue = error || loadError || progressError || day?.error || '';
-  const batchIssues = day?.batches.filter((batch) => batch.error || batch.status === 'failed') || [];
-  const consentNeeded = issue.includes('AI_REMOTE_CONSENT_REQUIRED') || day?.batches.some((b) => b.error === 'AI_REMOTE_CONSENT_REQUIRED');
+  const batchIssues = day?.batches.filter((batch) => batch.error || batch.summary_error || batch.status === 'failed') || [];
+  const consentNeeded = issue.includes('AI_REMOTE_CONSENT_REQUIRED') || day?.batches.some((b) => b.error === 'AI_REMOTE_CONSENT_REQUIRED' || b.summary_error === 'AI_REMOTE_CONSENT_REQUIRED');
 
   if (!isAuthenticated) return <div className="m-auto p-8 text-sm text-ide-muted">{t('recap.locked')}</div>;
   return <div className="flex min-h-0 flex-1 flex-col text-ide-text">
@@ -122,7 +152,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
           <p className="text-ide-muted">{t(running ? 'recap.generating' : 'recap.schedule')}</p>
           <div className="flex flex-wrap gap-2">
             {day?.can_undo && <button className={buttonClass} disabled={busy} onClick={() => apply({ kind: 'undo' })}><Undo2 className="mr-1 inline h-4 w-4" />{t('recap.undo')}</button>}
-            {running ? <button className={buttonClass} onClick={() => cancelRecap().catch((e) => setError(String(e)))}>{t('recap.stop')}</button> : <><button className={buttonClass} onClick={() => generate()}>{t('recap.generate')}</button>{groups.length > 0 && <button className={buttonClass} onClick={() => generate(true)}>{t('recap.regenerate')}</button>}</>}
+            {running ? <button className={buttonClass} onClick={() => cancelRecap().catch((e) => setError(String(e)))}>{t('recap.stop')}</button> : <><button className={buttonClass} onClick={() => generate()}>{t('recap.generate')}</button>{periods.length > 0 && <button className={buttonClass} onClick={() => generate(true)}>{t('recap.regenerate')}</button>}</>}
           </div>
         </div>
         {task && <div className="flex items-center justify-between rounded-lg bg-ide-panel px-4 py-2 text-sm"><span>{day?.threads.find((thread) => thread.id === task)?.title}</span><button onClick={() => setTask(null)} aria-label={t('recap.allActivities')}><X size={16} /></button></div>}
@@ -131,15 +161,10 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         <RecapProgress progress={progress} batches={day?.batches || []} />
         {batchIssues.map((batch) => <div key={batch.start_ms} role="alert" className="rounded-lg border border-ide-border bg-ide-panel p-4 text-sm">
           <p className="mb-2 font-medium">{time(batch.start_ms)}–{time(batch.end_ms)} · {t(batch.status === 'failed' ? 'recap.failed' : 'recap.partial')}</p>
-          <RecapError error={batch.error || 'RECAP_INVALID_RESPONSE'} />
+          <RecapError error={batch.error || batch.summary_error || 'RECAP_INVALID_RESPONSE'} />
         </div>)}
-        {!running && !issue && batchIssues.length === 0 && groups.length === 0 && <p className="py-8 text-center text-sm text-ide-muted">{t('recap.empty')}</p>}
-        <div className="space-y-3">{groups.map((group) => <article key={group.activities[0].id} className="rounded-xl border border-ide-border bg-ide-panel p-4 sm:p-5">
-          <div className="flex flex-wrap items-start justify-between gap-2"><span className="text-xs tabular-nums text-ide-muted">{time(group.start_ms)}{group.end_ms !== group.start_ms && `–${time(group.end_ms)}`}</span><button className="text-xs text-ide-accent hover:underline" onClick={() => setTask(group.task_id)}>{t('recap.relatedTask', { title: group.task_title })}</button></div>
-          <h2 className="mt-2 text-sm font-semibold">{group.task_title}</h2>
-          <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{[...new Set(group.activities.map((a) => a.text))].join('\n')}</p>
-          <details className="mt-3"><summary className="cursor-pointer text-xs text-ide-muted">{t('recap.details')}</summary><div className="mt-3 space-y-3">{group.activities.map((activity) => <div key={activity.id} className="border-l-2 border-ide-border pl-3"><div className="flex justify-between gap-2 text-xs text-ide-muted"><span>{time(activity.start_ms)}</span><button onClick={() => setEditing(activity)} disabled={busy} className="text-ide-accent">{t('recap.correct')}</button></div><div className="mt-2 flex flex-wrap gap-2">{activity.sources.map((source) => <button key={source.id} className="max-w-64 truncate rounded border border-ide-border px-2 py-1 text-xs hover:bg-ide-hover" onClick={() => open(source, true)} title={source.window_title}>{time(source.timestamp_ms)} · {source.process_name || t('recap.source')}</button>)}</div><button className="mt-2 text-xs text-ide-accent" onClick={() => open(activity.sources[0])}>{t('recap.locate')}</button></div>)}</div></details>
-        </article>)}</div>
+        {!running && !issue && batchIssues.length === 0 && periods.length === 0 && <p className="py-8 text-center text-sm text-ide-muted">{t('recap.empty')}</p>}
+        <div className="space-y-3">{periods.map((batch) => <RecapPeriod key={batch.start_ms} batch={batch} task={task} time={time} busy={busy} onTask={setTask} onEdit={setEditing} onOpen={open} />)}</div>
         {day?.batches.map((batch) => <div key={batch.start_ms}>
           {batch.status === 'partial' && !batch.error && <p className="text-xs text-ide-muted">{time(batch.start_ms)}–{time(batch.end_ms)} · {t('recap.partial')}</p>}
           {batch.records.length > 0 && <details className="mt-2 text-xs text-ide-muted"><summary className="cursor-pointer">{t('recap.allRecords', { start: time(batch.start_ms), end: time(batch.end_ms), count: batch.records.length })}</summary><div className="mt-2 grid max-h-64 gap-1 overflow-y-auto sm:grid-cols-2">{batch.records.map((source) => <button key={source.id} onClick={() => open(source, true)} className="truncate rounded px-2 py-1 text-left hover:bg-ide-hover">{time(source.timestamp_ms)} · {source.window_title || source.process_name || t('recap.source')}</button>)}</div></details>}

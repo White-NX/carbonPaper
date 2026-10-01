@@ -31,6 +31,34 @@ beforeEach(() => {
 });
 
 describe('daily recap page', () => {
+  it('shows one period summary and task progress while keeping occurrence details available', async () => {
+    const batch = day.batches[0];
+    batch.activities.push({ ...batch.activities[0], id: 'a2', text: 'Returned to inspect the validation output.', start_ms: batch.start_ms + 600000 });
+    batch.summary = {
+      overview: 'Reviewed login validation and its reported results.', overview_activity_ids: ['a1', 'a2'],
+      topics: [{ task_id: 'task', title: 'Login validation', text: 'Checked the form and reviewed the validation report.', activity_ids: ['a1', 'a2'] }],
+    };
+    render(<RecapView active isAuthenticated />);
+    expect(await screen.findByText(batch.summary.overview)).toBeVisible();
+    expect(screen.getAllByRole('article')).toHaveLength(1);
+    expect(screen.getByText(batch.summary.topics[0].text)).toBeVisible();
+    const details = screen.getByText('recap.details').closest('details');
+    expect(details).not.toHaveAttribute('open');
+    expect(within(details).getByText('Inspected the form validation.')).toBeInTheDocument();
+    expect(within(details).getByText('Returned to inspect the validation output.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Login validation' }));
+    expect(screen.queryByText(batch.summary.overview)).not.toBeInTheDocument();
+    expect(screen.getByText(batch.summary.topics[0].text)).toBeInTheDocument();
+  });
+  it('keeps cached activity details usable when only summarization fails', async () => {
+    day.batches[0].summary_error = 'RECAP_INVALID_SUMMARY';
+    render(<RecapView active isAuthenticated />);
+    expect(await screen.findByText('recap.summaryUnavailable')).toBeInTheDocument();
+    expect(screen.getByText('Inspected the form validation.')).toBeInTheDocument();
+    expect(within(screen.getByRole('alert')).getByText('recap.errors.RECAP_INVALID_SUMMARY')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.generate' }));
+    await waitFor(() => expect(api.generateRecap).toHaveBeenCalledWith(expect.any(String), false));
+  });
   it('shows a specific failed-period reason and hides the empty welcome message', async () => {
     day.batches[0].status = 'failed';
     day.batches[0].error = 'RECAP_OUTPUT_TRUNCATED';

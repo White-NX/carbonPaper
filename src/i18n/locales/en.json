@@ -17,6 +17,9 @@
     "close": "Close",
     "save": "Save",
     "correct": "Correct association",
+    "summaryPending": "The period summary is pending. Activity details are available below.",
+    "summaryUnavailable": "The period summary could not be updated. Activity details are still available.",
+    "taskInDetails": "Details of this activity are available below.",
     "details": "View activity and sources",
     "source": "Source record",
     "locate": "Locate on timeline",
@@ -47,11 +50,11 @@
       "received": "Content received",
       "receivedCounts": "{{reasoning}} thinking characters, {{text}} reply characters",
       "requestId": "Request ID",
-      "attempts": { "initial": "Generate recap", "repair": "Complete and repair" },
+      "attempts": { "initial": "Generate recap", "repair": "Complete and repair", "summary": "Summarize period" },
       "stages": {
         "preparing": "Preparing recap", "collecting": "Reading records", "screening": "Selecting content",
         "waiting": "Waiting for model", "thinking": "Model is thinking", "writing": "Writing recap",
-        "validating": "Checking recap", "saving": "Saving recap", "running": "In progress",
+        "validating": "Checking recap", "summarizing": "Summarizing period", "saving": "Saving recap", "running": "In progress",
         "ready": "Completed", "partial": "Some content remains incomplete", "failed": "Generation failed",
         "cancelled": "Stopped", "paused": "Waiting for idle"
       }
@@ -68,7 +71,7 @@
     },
     "settings": {
       "title": "Daily recap settings",
-      "description": "Organize new records every four hours and display natural activity periods. Automatic processing waits until the app is unlocked and the computer is idle.",
+      "description": "Summarize activities and task progress in each four-hour period. Automatic processing waits until the app is unlocked and the computer is idle.",
       "enabled": "Enable daily recaps",
       "provider": "Recap model",
       "defaultProvider": "Use the default AI model",
@@ -77,7 +80,7 @@
       "request_output_tokens": "Output limit per request (including thinking, tokens)",
       "answer_tokens": "Target recap text length (tokens)",
       "dailyTotal": "Daily generation budget: {{total}} tokens (input and output combined)",
-      "budgetHint": "The request output limit covers thinking and recap text. The text target controls recap length. Each batch budget covers generation and repair requests; the model context also limits each request.",
+      "budgetHint": "The request output limit covers thinking and recap text. The text target controls recap length. Extraction and period summaries each use a bounded budget and share the daily allowance. The model context also limits each request.",
       "batch_input_tokens": "Input limit per batch (tokens)",
       "batch_output_tokens": "Output limit per batch (tokens)",
       "daily_input_tokens": "Daily generation input limit (tokens)",
@@ -93,6 +96,7 @@
       "keyPlaceholder": "Enter an API key"
     },
     "errors": {
+      "RECAP_INVALID_SUMMARY": "The period summary could not be generated. View activity details or try again.",
       "unknown": "Your recap could not be updated. Please try again later.",
       "AUTH_REQUIRED": "Unlock to continue.",
       "MAINTENANCE_IN_PROGRESS": "Recaps can continue after maintenance.",
