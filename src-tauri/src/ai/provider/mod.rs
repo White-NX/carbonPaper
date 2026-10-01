@@ -59,6 +59,8 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Retain tool schemas in the cached prefix when the last step must answer.
+    pub disable_tools: bool,
 }
 
 /// Use the actual protocol shape when budgeting, including tool schemas and
@@ -295,6 +297,7 @@ pub async fn test_connection(provider: &ResolvedProvider) -> ConnectionTest {
         }],
         max_tokens: Some(probe_max_tokens),
         temperature: Some(0.0),
+        ..Default::default()
     };
     match complete(&client, provider, &with_tool, &mut ignore, &cancel).await {
         Ok(response) if response.truncated => {
@@ -338,6 +341,37 @@ mod tests {
     use super::*;
     use crate::ai::config::{ProviderKind, ToolCalling};
     use axum::{http::HeaderMap, routing::post, Router};
+
+    #[test]
+    fn forced_answers_retain_tool_schemas_and_system_prefix_in_both_protocols() {
+        let mut request = ChatRequest {
+            messages: vec![
+                Message::System("fixed rules".into()),
+                Message::User("question".into()),
+            ],
+            tools: vec![ToolSpec {
+                name: "search".into(),
+                description: "Search".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            ..Default::default()
+        };
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            request.disable_tools = false;
+            let before = request_body_for_estimate(kind, &request);
+            request.disable_tools = true;
+            let after = request_body_for_estimate(kind, &request);
+            assert_eq!(before["tools"], after["tools"]);
+            assert_eq!(before["messages"], after["messages"]);
+            assert_eq!(before["system"], after["system"]);
+            let expected = if kind == ProviderKind::Anthropic {
+                serde_json::json!({"type":"none"})
+            } else {
+                serde_json::json!("none")
+            };
+            assert_eq!(after["tool_choice"], expected);
+        }
+    }
 
     /// Serves `body` as an event stream on a loopback port and records the
     /// credential header each request carried.

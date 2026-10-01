@@ -1,9 +1,10 @@
 //! Encrypted recap payloads, source invalidation and durable request reservations.
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::HashMap;
 
 use super::StorageState;
-use crate::ai::recap::{RecapSettings, RecapUsage};
+use crate::ai::recap::{PrivacyFingerprint, RecapSettings, RecapUsage};
 
 impl StorageState {
     pub(super) fn init_recap_tables(conn: &Connection) -> Result<(), String> {
@@ -21,15 +22,44 @@ impl StorageState {
                 id INTEGER PRIMARY KEY, day TEXT NOT NULL, role TEXT NOT NULL, run_id TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, settled INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS idx_recap_usage_day ON recap_usage(day,role);
-             CREATE INDEX IF NOT EXISTS idx_recap_usage_run ON recap_usage(run_id,role);"
+             CREATE INDEX IF NOT EXISTS idx_recap_usage_run ON recap_usage(run_id,role);
+             CREATE TABLE IF NOT EXISTS recap_summary_jobs (
+                day TEXT PRIMARY KEY, version INTEGER NOT NULL,
+                completed_version INTEGER NOT NULL DEFAULT 0);
+             CREATE TRIGGER IF NOT EXISTS recap_correction_insert AFTER INSERT ON recap_payloads
+                WHEN NEW.kind='corrections' BEGIN
+                INSERT INTO recap_summary_jobs(day,version) VALUES(NEW.day,1)
+                ON CONFLICT(day) DO UPDATE SET version=version+1; END;
+             CREATE TRIGGER IF NOT EXISTS recap_correction_update AFTER UPDATE ON recap_payloads
+                WHEN NEW.kind='corrections' BEGIN
+                INSERT INTO recap_summary_jobs(day,version) VALUES(NEW.day,1)
+                ON CONFLICT(day) DO UPDATE SET version=version+1; END;
+             INSERT OR IGNORE INTO recap_summary_jobs(day,version)
+                SELECT DISTINCT day,1 FROM recap_payloads WHERE kind='corrections';"
         ).map_err(|e| e.to_string())?;
-        // Invalidate the whole source day: later batches may have used earlier
-        // task indices. Corrections and usage survive invalidation.
+        // Real evidence edits invalidate the day: later batches may depend on
+        // earlier task identities. Derived metadata and no-op writes must not
+        // evict expensive recaps. Recreate legacy triggers so upgrades apply.
+        let mut triggers = String::from("SAVEPOINT recap_triggers;");
         for (table, prefix, time_expr) in [
             ("screenshots", "recap_s", "strftime('%s', {row}.created_at)*1000"),
             ("ocr_results", "recap_o", "(SELECT strftime('%s',created_at)*1000 FROM screenshots WHERE id={row}.screenshot_id)"),
             ("screenshot_document_refs", "recap_d", "(SELECT strftime('%s',created_at)*1000 FROM screenshots WHERE id={row}.screenshot_id)"),
         ] {
+            let mut statement = conn.prepare(&format!("PRAGMA table_info({table})")).map_err(|e| e.to_string())?;
+            let columns = statement.query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            let relevant: &[&str] = match table {
+                "screenshots" => &["id", "created_at", "window_title", "process_name", "window_title_enc",
+                    "process_name_enc", "page_url_enc", "content_key_encrypted", "is_deleted"],
+                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "is_deleted"],
+                _ => &["screenshot_id", "ref_enc", "content_key_encrypted"],
+            };
+            let mut changes = relevant.iter().filter(|c| columns.iter().any(|name| name == **c))
+                .map(|c| format!("OLD.{c} IS NOT NEW.{c}")).collect::<Vec<_>>();
+            if table == "screenshots" && columns.iter().any(|c| c == "status") {
+                changes.push("coalesce(OLD.status='aborted',0) IS NOT coalesce(NEW.status='aborted',0)".into());
+            }
             for (event, rows) in [("INSERT", vec!["NEW"]), ("UPDATE", vec!["OLD", "NEW"]), ("DELETE", vec!["OLD"])] {
                 let conditions = rows.iter().map(|row| {
                     let time = time_expr.replace("{row}", row);
@@ -37,13 +67,20 @@ impl StorageState {
                 }).collect::<Vec<_>>().join(" OR ");
                 let purge = if event=="DELETE" || (table=="screenshots" && event=="UPDATE") {
                     let guard = if event=="UPDATE" {"AND OLD.is_deleted=0 AND NEW.is_deleted<>0"}else{""};
-                    format!("DELETE FROM recap_payloads WHERE kind IN ('batch','index','screen') AND day IN (SELECT day FROM recap_days WHERE {conditions}) {guard};")
+                    format!("DELETE FROM recap_payloads WHERE kind IN ('batch','index','screen','summary') AND day IN (SELECT day FROM recap_days WHERE {conditions}) {guard};")
                 }else{String::new()};
-                conn.execute_batch(&format!(
-                    "CREATE TRIGGER IF NOT EXISTS {prefix}_{event} AFTER {event} ON {table} BEGIN
+                let when = if event == "UPDATE" { format!("WHEN {}", changes.join(" OR ")) } else { String::new() };
+                triggers.push_str(&format!(
+                    "DROP TRIGGER IF EXISTS {prefix}_{event};
+                     CREATE TRIGGER {prefix}_{event} AFTER {event} ON {table} {when} BEGIN
                      UPDATE recap_days SET revision=revision+1 WHERE {conditions}; {purge} END;"
-                )).map_err(|e| e.to_string())?;
+                ));
             }
+        }
+        triggers.push_str("RELEASE recap_triggers;");
+        if let Err(error) = conn.execute_batch(&triggers) {
+            let _ = conn.execute_batch("ROLLBACK TO recap_triggers; RELEASE recap_triggers;");
+            return Err(error.to_string());
         }
         Ok(())
     }
@@ -53,18 +90,30 @@ impl StorageState {
         day: &str,
         start: i64,
         end: i64,
-        privacy: &str,
+        privacy: &PrivacyFingerprint,
     ) -> Result<(i64, i64, i64), String> {
         let guard = self.get_connection_named("recap_day_revision")?;
         let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        let previous: Option<String> = conn
+            .query_row(
+                "SELECT privacy_hash FROM recap_days WHERE day=?",
+                [day],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let adopt_legacy = match previous.as_deref() {
+            Some(hash) if hash != privacy.as_str() => privacy.matches_legacy(hash)?,
+            _ => false,
+        };
         let covered =
             crate::ai::recap::batch_bounds(start, end, chrono::Utc::now().timestamp_millis())
                 .last()
                 .map(|(_, b)| *b)
                 .unwrap_or(start);
         conn.execute("INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms) VALUES (?1,?2,?3,?4,?5)
-            ON CONFLICT(day) DO UPDATE SET revision=revision+1,privacy_hash=excluded.privacy_hash
-            WHERE privacy_hash<>excluded.privacy_hash", params![day,start,end,privacy,covered]).map_err(|e| e.to_string())?;
+            ON CONFLICT(day) DO UPDATE SET revision=revision+CASE WHEN ?6 AND privacy_hash=?7 THEN 0 ELSE 1 END,privacy_hash=excluded.privacy_hash
+            WHERE privacy_hash<>excluded.privacy_hash", params![day,start,end,privacy.as_str(),covered,adopt_legacy,previous]).map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE recap_days SET covered_until_ms=max(covered_until_ms,?) WHERE day=?",
             params![covered, day],
@@ -97,6 +146,65 @@ impl StorageState {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())
+    }
+
+    /// Fence a composed read against the revision of the generating run, even
+    /// when the read itself successfully observes a newer, empty day.
+    pub(crate) fn recap_read_at_revision<T>(
+        &self,
+        day: &str,
+        revision: i64,
+        generation: u64,
+        read: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let value = read()?;
+        if !self.recap_revision_matches(day, revision, generation)? {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn recap_pending_summaries(&self) -> Result<HashMap<String, i64>, String> {
+        if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        let guard = self.get_connection_named("recap_pending_summaries")?;
+        let mut stmt = guard
+            .as_ref()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .prepare("SELECT day,version FROM recap_summary_jobs WHERE version>completed_version")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Retain the version counter after completion so neither a restart nor a
+    /// late acknowledgement can erase a newer correction. The payload triggers
+    /// enqueue atomically with its encrypted write, including undo operations.
+    pub(crate) fn recap_finish_summary_update(
+        &self,
+        day: &str,
+        version: i64,
+        generation: u64,
+    ) -> Result<(), String> {
+        if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        let guard = self.get_connection_named("recap_finish_summary_update")?;
+        if self.db_generation() != generation {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        guard
+            .as_ref()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .execute(
+                "UPDATE recap_summary_jobs SET completed_version=version WHERE day=? AND version=?",
+                params![day, version],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub(crate) fn recap_read<T: DeserializeOwned>(
@@ -320,20 +428,147 @@ impl StorageState {
 mod tests {
     use super::*;
     use crate::credential_manager::CredentialManagerState;
+    use crate::sensitive_filter::SensitiveFilterConfig;
     use std::sync::Arc;
+
+    fn privacy(enabled: bool) -> PrivacyFingerprint {
+        PrivacyFingerprint::new(SensitiveFilterConfig {
+            enabled,
+            ..Default::default()
+        })
+        .unwrap()
+    }
 
     fn storage() -> (tempfile::TempDir, StorageState) {
         let temp = tempfile::tempdir().unwrap();
         let credentials = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credentials);
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE screenshots(id INTEGER PRIMARY KEY,created_at TEXT,status TEXT,is_deleted INTEGER DEFAULT 0);
-            CREATE TABLE ocr_results(id INTEGER PRIMARY KEY,screenshot_id INTEGER);
-            CREATE TABLE screenshot_document_refs(screenshot_id INTEGER PRIMARY KEY);").unwrap();
+        conn.execute_batch("CREATE TABLE screenshots(id INTEGER PRIMARY KEY,created_at TEXT,status TEXT,is_deleted INTEGER DEFAULT 0,window_title TEXT,metadata TEXT);
+            CREATE TABLE ocr_results(id INTEGER PRIMARY KEY,screenshot_id INTEGER,text TEXT);
+            CREATE TABLE screenshot_document_refs(screenshot_id INTEGER PRIMARY KEY,ref_enc BLOB,updated_at TEXT);").unwrap();
         StorageState::init_recap_tables(&conn).unwrap();
         *storage.db.lock().unwrap() = Some(conn);
         (temp, storage)
     }
+    #[test]
+    fn composed_reads_reject_a_new_empty_revision_but_allow_corrections() {
+        let (_temp, s) = storage();
+        let day = "2026-01-01";
+        let (start, end) = crate::ai::recap::day_bounds(day).unwrap();
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO screenshots(id,created_at) VALUES(1,'2026-01-01 01:00:00');
+             INSERT INTO ocr_results VALUES(1,1,'original');",
+            )
+            .unwrap();
+        let (revision, _, _) = s
+            .recap_day_revision(day, start, end, &privacy(true))
+            .unwrap();
+        let generation = s.db_generation();
+        // Corrections affect summary fingerprints, not the source fence.
+        s.recap_read_at_revision(day, revision, generation, || {
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "INSERT INTO recap_payloads VALUES('corrections',?1,?1,-1,x'00',x'00')",
+                    [day],
+                )
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // A late OCR write lands after the caller's check. The composed read
+        // succeeds against the new revision and finds no current payloads.
+        let result = s.recap_read_at_revision(day, revision, generation, || {
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .execute("UPDATE ocr_results SET text='late OCR' WHERE id=1", [])
+                .unwrap();
+            let (new_revision, _, _) = s.recap_day_revision(day, start, end, &privacy(true))?;
+            assert!(new_revision > revision);
+            let count: i64 =
+                s.db.lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM recap_payloads WHERE day=?1 AND revision=?2",
+                        params![day, new_revision],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(count, 0);
+            Ok(Vec::<String>::new())
+        });
+        assert_eq!(result.unwrap_err(), "RECAP_SOURCE_CHANGED");
+        // This also fences the empty-loop path when invalidation predates read.
+        assert_eq!(
+            s.recap_read_at_revision(day, revision, generation, || Ok(()))
+                .unwrap_err(),
+            "RECAP_SOURCE_CHANGED"
+        );
+    }
+
+    #[test]
+    fn correction_jobs_migrate_once_and_enqueue_atomically() {
+        let (_temp, s) = storage();
+        let guard = s.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER recap_correction_insert;
+             DROP TRIGGER recap_correction_update;
+             DROP TABLE recap_summary_jobs;
+             INSERT INTO recap_payloads VALUES('corrections','old','old',-1,x'00',x'00');",
+        )
+        .unwrap();
+        StorageState::init_recap_tables(conn).unwrap();
+        let job = || {
+            conn.query_row(
+                "SELECT version,completed_version FROM recap_summary_jobs WHERE day='old'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(job(), (1, 0));
+        conn.execute(
+            "UPDATE recap_summary_jobs SET completed_version=version",
+            [],
+        )
+        .unwrap();
+        StorageState::init_recap_tables(conn).unwrap();
+        assert_eq!(job(), (1, 1));
+        conn.execute_batch(
+            "CREATE TRIGGER reject_job BEFORE UPDATE ON recap_summary_jobs BEGIN
+                SELECT RAISE(ABORT,'injected queue failure'); END;",
+        )
+        .unwrap();
+        assert!(conn
+            .execute("UPDATE recap_payloads SET data=x'01' WHERE key='old'", [])
+            .is_err());
+        let data: Vec<u8> = conn
+            .query_row("SELECT data FROM recap_payloads WHERE key='old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(data, vec![0]);
+        assert_eq!(job(), (1, 1));
+        conn.execute_batch(
+            "DROP TRIGGER reject_job;
+            UPDATE recap_payloads SET data=x'01' WHERE key='old';",
+        )
+        .unwrap();
+        assert_eq!(job(), (2, 1));
+    }
+
     #[test]
     fn pending_and_failed_requests_keep_their_reservations() {
         let (_temp, s) = storage();
@@ -379,7 +614,7 @@ mod tests {
     fn future_captures_do_not_invalidate_closed_periods_but_source_edits_do() {
         let (_temp, s) = storage();
         let (start, end) = crate::ai::recap::day_bounds("2026-01-01").unwrap();
-        s.recap_day_revision("2026-01-01", start, end, "privacy-one")
+        s.recap_day_revision("2026-01-01", start, end, &privacy(true))
             .unwrap();
         let conn = s.db.lock().unwrap();
         let conn = conn.as_ref().unwrap();
@@ -426,20 +661,73 @@ mod tests {
         assert!(revision() > before);
     }
     #[test]
+    fn trigger_upgrade_keeps_recaps_on_noop_and_unrelated_updates_and_purges_summaries_on_delete() {
+        let (_temp, s) = storage();
+        let conn = s.db.lock().unwrap();
+        let conn = conn.as_ref().unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER recap_s_UPDATE;
+            CREATE TRIGGER recap_s_UPDATE AFTER UPDATE ON screenshots BEGIN
+            UPDATE recap_days SET revision=revision+1; END;",
+        )
+        .unwrap();
+        StorageState::init_recap_tables(conn).unwrap();
+        conn.execute_batch("INSERT INTO screenshots(id,created_at,window_title,status) VALUES(1,'2026-01-01 01:00:00','original','ready');
+            INSERT INTO ocr_results VALUES(1,1,'text');
+            INSERT INTO screenshot_document_refs VALUES(1,x'01','old');
+            INSERT INTO recap_days VALUES('day',0,9999999999999,0,'privacy',9999999999999);
+            INSERT INTO recap_payloads VALUES('summary','key','day',0,x'00',x'00');").unwrap();
+        let revision = || {
+            conn.query_row("SELECT revision FROM recap_days WHERE day='day'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        conn.execute_batch(
+            "UPDATE screenshots SET window_title=window_title;
+            UPDATE screenshots SET metadata='background bookkeeping',status='processed';
+            UPDATE ocr_results SET text=text;
+            UPDATE screenshot_document_refs SET updated_at='new';",
+        )
+        .unwrap();
+        assert_eq!(revision(), 0);
+        conn.execute("UPDATE screenshots SET window_title='changed'", [])
+            .unwrap();
+        assert_eq!(revision(), 1);
+        conn.execute("UPDATE ocr_results SET text='edited'", [])
+            .unwrap();
+        assert_eq!(revision(), 2);
+        conn.execute("UPDATE screenshots SET status='aborted'", [])
+            .unwrap();
+        assert_eq!(revision(), 3);
+        conn.execute("UPDATE screenshots SET is_deleted=1", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM recap_payloads WHERE kind='summary'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn privacy_changes_invalidate_and_keyset_paging_has_no_500_row_cutoff() {
         let (_temp, s) = storage();
         let (start, end) = crate::ai::recap::day_bounds("2026-01-01").unwrap();
         let (revision, _, _) = s
-            .recap_day_revision("2026-01-01", start, end, "one")
+            .recap_day_revision("2026-01-01", start, end, &privacy(true))
             .unwrap();
         assert_eq!(
-            s.recap_day_revision("2026-01-01", start, end, "one")
+            s.recap_day_revision("2026-01-01", start, end, &privacy(true))
                 .unwrap()
                 .0,
             revision
         );
         assert!(
-            s.recap_day_revision("2026-01-01", start, end, "two")
+            s.recap_day_revision("2026-01-01", start, end, &privacy(false))
                 .unwrap()
                 .0
                 > revision
@@ -473,6 +761,59 @@ mod tests {
         assert_eq!(ids.last(), Some(&601));
         assert!(!ids.contains(&500));
     }
+    #[test]
+    fn legacy_privacy_upgrade_preserves_current_payloads_without_reviving_stale_ones() {
+        let (_temp, s) = storage();
+        let config = SensitiveFilterConfig::default();
+        let legacy = crate::ai::recap::digest(&serde_json::to_string(&config).unwrap());
+        let saved = serde_json::to_value(config).unwrap();
+        let reloaded = PrivacyFingerprint::new(serde_json::from_value(saved).unwrap()).unwrap();
+        let (start, end) = crate::ai::recap::day_bounds("2026-01-01").unwrap();
+        {
+            let guard = s.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            for (day, revision) in [("current", 5), ("stale", 6)] {
+                conn.execute(
+                    "INSERT INTO recap_days VALUES (?1,?2,?3,?4,?5,?3)",
+                    params![day, start, end, revision, legacy],
+                )
+                .unwrap();
+                for kind in ["batch", "summary", "index"] {
+                    conn.execute(
+                        "INSERT INTO recap_payloads VALUES (?1,?2,?2,5,x'00',x'00')",
+                        params![kind, day],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for (day, revision, visible) in [("current", 5, 3), ("stale", 6, 0)] {
+            assert_eq!(
+                s.recap_day_revision(day, start, end, &reloaded).unwrap().0,
+                revision
+            );
+            let guard = s.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT privacy_hash FROM recap_days WHERE day=?",
+                    [day],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, reloaded.as_str());
+            let count: i64 = conn.query_row("SELECT count(*) FROM recap_payloads p JOIN recap_days d ON p.day=d.day AND p.revision=d.revision WHERE d.day=?",
+                [day], |r| r.get(0)).unwrap();
+            assert_eq!(count, visible);
+        }
+        assert_eq!(
+            s.recap_day_revision("current", start, end, &privacy(false))
+                .unwrap()
+                .0,
+            6
+        );
+    }
+
     #[test]
     fn old_database_generation_cannot_spend_or_settle_against_a_replacement() {
         let (_temp, s) = storage();

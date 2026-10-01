@@ -88,7 +88,10 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = json!(system.join("\n\n"));
+        body["system"] = json!([{
+            "type": "text", "text": system.join("\n\n"),
+            "cache_control": {"type": "ephemeral"}
+        }]);
     }
     if !request.tools.is_empty() {
         body["tools"] = request
@@ -102,6 +105,23 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                 })
             })
             .collect();
+        if request.disable_tools {
+            body["tool_choice"] = json!({"type": "none"});
+        }
+    }
+    // Up to four breakpoints including the stable system rules. User blocks
+    // also include tool results; never modify signed thinking blocks.
+    if let Some(messages) = body["messages"].as_array_mut() {
+        for message in messages
+            .iter_mut()
+            .rev()
+            .filter(|m| m["role"] == "user")
+            .take(3)
+        {
+            if let Some(block) = message["content"].as_array_mut().and_then(|b| b.last_mut()) {
+                block["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
     }
     body
 }
@@ -418,9 +438,10 @@ mod tests {
             }],
             max_tokens: Some(100),
             temperature: Some(0.2),
+            ..Default::default()
         };
         let body = request_body("claude-sonnet-5", &request);
-        assert_eq!(body["system"], "sys");
+        assert_eq!(body["system"][0]["text"], "sys");
         assert!(body.get("temperature").is_none());
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
@@ -518,6 +539,40 @@ mod tests {
         );
         assert_eq!(blocks[2]["text"], "I will search.");
         assert_eq!(blocks[3]["id"], "t");
+    }
+
+    #[test]
+    fn cache_breakpoints_are_bounded_and_follow_user_evidence_without_touching_reasoning() {
+        let mut request = ChatRequest {
+            messages: vec![Message::System("fixed rules".into())],
+            ..Default::default()
+        };
+        for i in 0..8 {
+            request
+                .messages
+                .push(Message::User(format!("question {i}")));
+            request.messages.push(Message::Assistant {
+                text: "answer".into(),
+                tool_calls: vec![],
+                reasoning: json!([{"type":"thinking","thinking":"thought","signature":"signed"}]),
+            });
+        }
+        let body = request_body("claude", &request);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let mut count = 1;
+        for message in body["messages"].as_array().unwrap() {
+            for block in message["content"].as_array().unwrap() {
+                if block.get("cache_control").is_some() {
+                    assert_eq!(message["role"], "user");
+                    count += 1;
+                }
+                if block["type"] == "thinking" {
+                    assert_eq!(block["signature"], "signed");
+                    assert!(block.get("cache_control").is_none());
+                }
+            }
+        }
+        assert_eq!(count, 4);
     }
 
     #[test]

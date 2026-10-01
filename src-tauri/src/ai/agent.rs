@@ -4,7 +4,7 @@
 //! tools they run, their results join the conversation, and the next step
 //! begins. The loop ends when the model answers without calling a tool, and
 //! is bounded by a step limit and a per-request context budget. The last allowed step
-//! offers no tools, which forces an answer from what was found so far.
+//! disables tool calls while retaining their schemas for prompt-cache reuse.
 //!
 //! The loop reports progress through a callback rather than a window, so a
 //! scheduled task can reuse it and record events instead of displaying them.
@@ -15,7 +15,8 @@ use serde_json::Value;
 use super::config::{ResolvedProvider, ToolCalling};
 use super::context::{self, TurnContext};
 use super::provider::{
-    self, Cancellation, ChatRequest, Message, ProviderError, StreamEvent, ToolCall, ToolSpec, Usage,
+    self, Cancellation, ChatRequest, ChatResponse, Message, ProviderError, StreamEvent, ToolCall,
+    ToolSpec, Usage,
 };
 use super::tools::{self, SnapshotRef, ToolScope};
 
@@ -147,7 +148,8 @@ fn prefetched_prompt(results: &[(String, String)]) -> String {
     prompt
 }
 
-const FORCE_ANSWER_PROMPT: &str = "Your tool call budget is exhausted. Stop searching now. Answer the original question \
+const FORCE_ANSWER_PROMPT: &str =
+    "Your tool call budget is exhausted. Stop searching now. Answer the original question \
 using only what the tool results above show, cite screenshots as [#id], and say what \
 remains unknown.";
 
@@ -161,8 +163,10 @@ pub struct ConversationTurn {
 
 fn conversation_messages(history: &[ConversationTurn]) -> Vec<Message> {
     let mut messages = vec![Message::System(system_prompt())];
-    // Bound context independently of the frontend. Only user/assistant roles are accepted.
-    for turn in history.iter().skip(history.len().saturating_sub(12)) {
+    // Evict four turns at a time, keeping a stable prefix between evictions.
+    // Enforce the bound even if a caller bypasses the frontend.
+    let start = history.len().saturating_sub(12).div_ceil(4) * 4;
+    for turn in history.iter().skip(start) {
         let question: String = turn.question.chars().take(4_000).collect();
         messages.push(Message::User(match &turn.time_context {
             Some(context) => context.question(&question),
@@ -220,18 +224,23 @@ pub async fn run(
 
     loop {
         let last_step = !tools_supported || outcome.steps + 1 >= limits.max_steps;
-        if last_step && tools_supported && outcome.tool_calls > 0 {
+        if last_step && tools_supported {
             messages.push(Message::User(FORCE_ANSWER_PROMPT.into()));
         }
         let mut request = ChatRequest {
             messages: messages.clone(),
-            tools: if last_step { Vec::new() } else { specs.clone() },
+            tools: if tools_supported {
+                specs.clone()
+            } else {
+                Vec::new()
+            },
             max_tokens: Some(
                 limits
                     .max_answer_tokens
                     .min(provider_config.context_tokens / 4),
             ),
             temperature: Some(0.2),
+            disable_tools: last_step && tools_supported,
         };
         context::fit_request(
             &mut request,
@@ -243,21 +252,16 @@ pub async fn run(
         // next tool step. The frontend still keeps its complete display history.
         messages = request.messages.clone();
 
-        outcome.steps += 1;
-        sink(AgentEvent::StepStarted {
-            step: outcome.steps,
-        });
-        let response = {
-            let mut forward = |event: StreamEvent| match event {
-                StreamEvent::ReasoningDelta(text) => sink(AgentEvent::ReasoningDelta { text }),
-                StreamEvent::TextDelta(text) => sink(AgentEvent::TextDelta { text }),
-            };
-            provider::complete(&client, provider_config, &request, &mut forward, cancel).await?
-        };
-        if let Some(usage) = response.usage {
-            outcome.usage.input_tokens += usage.input_tokens;
-            outcome.usage.output_tokens += usage.output_tokens;
-        }
+        let response = complete_step(
+            &client,
+            provider_config,
+            request,
+            last_step,
+            sink,
+            cancel,
+            &mut outcome,
+        )
+        .await?;
 
         if response.tool_calls.is_empty() || last_step {
             outcome.answer = response.text;
@@ -289,6 +293,73 @@ pub async fn run(
         }
     }
 }
+
+/// The final step may need one extra HTTP request for hosts that reject or
+/// ignore tool_choice. It never executes more tools. Report each request as its
+/// own step so streamed text from a rejected answer cannot mix with its retry.
+async fn complete_step(
+    client: &reqwest::Client,
+    config: &ResolvedProvider,
+    mut request: ChatRequest,
+    last_step: bool,
+    sink: &mut (dyn FnMut(AgentEvent) + Send),
+    cancel: &Cancellation,
+    outcome: &mut AgentOutcome,
+) -> Result<ChatResponse, ProviderError> {
+    loop {
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        outcome.steps += 1;
+        sink(AgentEvent::StepStarted {
+            step: outcome.steps,
+        });
+        let result = {
+            let mut forward = |event| match event {
+                StreamEvent::ReasoningDelta(text) => sink(AgentEvent::ReasoningDelta { text }),
+                StreamEvent::TextDelta(text) => sink(AgentEvent::TextDelta { text }),
+            };
+            provider::complete(client, config, &request, &mut forward, cancel).await
+        };
+        if let Ok(response) = &result {
+            if let Some(usage) = response.usage {
+                outcome.usage.input_tokens += usage.input_tokens;
+                outcome.usage.output_tokens += usage.output_tokens;
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        if last_step
+            && request.disable_tools
+            && !request.tools.is_empty()
+            && (matches!(&result, Err(ProviderError::BadRequest(_)))
+                || matches!(&result, Ok(response) if !response.tool_calls.is_empty()))
+        {
+            // Clearing both fields makes this fallback available only once.
+            // Keep the already fitted, paired tool history and answer prompt.
+            request.tools.clear();
+            request.disable_tools = false;
+            continue;
+        }
+        let response = result?;
+        if last_step && !response.tool_calls.is_empty() {
+            return Err(ProviderError::InvalidResponse(
+                "Model requested tools when a final answer was required.".into(),
+            ));
+        }
+        if response.tool_calls.is_empty() && response.text.trim().is_empty() {
+            return Err(ProviderError::InvalidResponse(
+                "Model returned an empty answer.".into(),
+            ));
+        }
+        return Ok(response);
+    }
+}
+
+#[cfg(test)]
+#[path = "agent/request_tests.rs"]
+mod request_tests;
 
 /// Runs one tool call, reporting it to `sink` and recording what it found.
 async fn run_tool(
@@ -366,10 +437,29 @@ mod tests {
             })
             .collect();
         let messages = conversation_messages(&history);
-        assert_eq!(messages.len(), 25);
-        assert!(matches!(&messages[1], Message::User(text) if text == "question 3"));
+        assert_eq!(messages.len(), 23);
+        assert!(matches!(&messages[1], Message::User(text) if text == "question 4"));
         assert!(
             matches!(&messages[2], Message::Assistant { text, tool_calls, reasoning } if text == "Found [#42]" && tool_calls.is_empty() && reasoning.is_null())
+        );
+    }
+
+    #[test]
+    fn bounded_history_keeps_its_prefix_between_chunk_evictions() {
+        let history: Vec<_> = (0..17)
+            .map(|i| ConversationTurn {
+                question: format!("question {i}"),
+                answer: "answer".into(),
+                time_context: None,
+            })
+            .collect();
+        for length in 13..=16 {
+            let messages = conversation_messages(&history[..length]);
+            assert!(matches!(&messages[1], Message::User(text) if text == "question 4"));
+            assert!(messages.len() <= 25);
+        }
+        assert!(
+            matches!(&conversation_messages(&history)[1], Message::User(text) if text == "question 8")
         );
     }
 

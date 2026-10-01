@@ -209,6 +209,28 @@ pub struct RecapBatch {
     pub error: Option<String>,
     #[serde(default)]
     pub attempts: Vec<RecapAttempt>,
+    /// Derived from corrected activities, loaded from its own encrypted cache.
+    #[serde(default)]
+    pub summary: Option<RecapSummary>,
+    #[serde(default)]
+    pub summary_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecapSummary {
+    pub overview: String,
+    pub overview_activity_ids: Vec<String>,
+    pub topics: Vec<RecapTopic>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecapTopic {
+    pub task_id: String,
+    /// Resolved locally from the corrected task, never invented by the model.
+    #[serde(default)]
+    pub title: String,
+    pub text: String,
+    pub activity_ids: Vec<String>,
 }
 
 /// Bounded previews are private recap data and are persisted only inside the
@@ -461,6 +483,8 @@ mod tests {
             coverage: 2,
             error: None,
             attempts: vec![],
+            summary: None,
+            summary_error: None,
             activities: vec![RecapActivity {
                 id: "regenerated".into(),
                 task_id: "new-model-id".into(),

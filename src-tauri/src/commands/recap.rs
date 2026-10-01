@@ -228,6 +228,7 @@ pub async fn recap_correct(
             history.undo.remove(0);
         }
     }
+    // The storage trigger queues summary updates in the same transaction.
     storage_state.recap_write("corrections", &date, &date, -1, generation, &history)?;
     let _ = app.emit("recap-changed", &date);
     recap::read_day(&app, &date)

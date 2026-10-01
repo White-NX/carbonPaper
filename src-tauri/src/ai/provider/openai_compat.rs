@@ -74,6 +74,9 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                 })
             })
             .collect();
+        if request.disable_tools {
+            body["tool_choice"] = json!("none");
+        }
     }
     let model_id = model.rsplit('/').next().unwrap_or(model);
     let gpt6_chat = matches!(model_id, "gpt-6-sol" | "gpt-6-luna");
