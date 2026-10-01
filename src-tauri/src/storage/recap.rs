@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 
-use super::StorageState;
+use super::{BackgroundReadError, StorageState};
 use crate::ai::recap::{PrivacyFingerprint, RecapSettings, RecapUsage};
 
 impl StorageState {
@@ -318,6 +318,76 @@ impl StorageState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string());
         rows
+    }
+
+    /// Read only icon metadata from already-filtered recap sources. Extension
+    /// metadata stores a website favicon in process_icon, so exclude it here.
+    pub(crate) fn recap_process_icon(&self, ids: &[i64]) -> Result<Option<String>, String> {
+        if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        for chunk in ids.chunks(128) {
+            let rows = {
+                let guard = self.get_connection_named("recap_process_icon")?;
+                let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT metadata,metadata_enc,content_key_encrypted FROM screenshots
+                     WHERE id IN ({placeholders}) AND is_deleted=0
+                     AND (status IS NULL OR status<>'aborted')
+                     AND (source IS NULL OR source<>'extension')
+                     AND (metadata IS NOT NULL OR metadata_enc IS NOT NULL)
+                     ORDER BY id DESC"
+                    ))
+                    .map_err(|e| e.to_string())?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(chunk), |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                rows
+            };
+            // Decrypt outside the database mutex; stop as soon as an icon is found.
+            for (plain, encrypted, key) in rows {
+                if !self.is_session_valid() {
+                    return Err("AUTH_REQUIRED".into());
+                }
+                let mut bytes = match (encrypted, key) {
+                    (Some(data), Some(key)) => {
+                        match self.decrypt_payload_with_row_key_silent(&data, &key) {
+                            Ok(bytes) => bytes,
+                            Err(BackgroundReadError::AuthRequired) => {
+                                return Err("AUTH_REQUIRED".into())
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    (None, _) => plain.unwrap_or_default().into_bytes(),
+                    _ => continue,
+                };
+                #[derive(serde::Deserialize)]
+                struct IconMetadata {
+                    process_icon: Option<String>,
+                }
+                let metadata = serde_json::from_slice::<IconMetadata>(&bytes);
+                Self::zeroize_bytes(&mut bytes);
+                if let Some(icon) = metadata
+                    .ok()
+                    .and_then(|m| m.process_icon)
+                    .filter(|i| !i.trim().is_empty())
+                {
+                    return Ok(Some(icon));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn recap_page_url(&self, id: i64) -> Result<String, String> {

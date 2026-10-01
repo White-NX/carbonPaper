@@ -47,6 +47,51 @@ fn storage_credentials(data_dir: PathBuf) -> Arc<CredentialManagerState> {
 }
 
 #[test]
+fn recap_icons_read_encrypted_metadata_skip_favicons_and_require_unlock() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = storage_credentials(temp.path().to_path_buf());
+    let storage = StorageState::new(temp.path().to_path_buf(), credentials.clone());
+    storage.initialize().unwrap();
+    let save = |hash: &str, source: &str, metadata: Value| {
+        let request = serde_json::from_value(json!({
+            "image_data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1WQAAAAASUVORK5CYII=",
+            "image_hash": hash, "width": 1, "height": 1,
+            "process_name": "Editor", "source": source, "metadata": metadata,
+        })).unwrap();
+        storage
+            .save_screenshot(&request)
+            .unwrap()
+            .screenshot_id
+            .unwrap()
+    };
+    let native = save("native", "capture", json!({"process_icon": "native-icon"}));
+    let missing = save("missing", "capture", json!({"process_icon": null}));
+    let extension = save(
+        "extension",
+        "extension",
+        json!({"process_icon": "website-icon"}),
+    );
+    assert_eq!(
+        storage
+            .recap_process_icon(&[extension, missing, native])
+            .unwrap()
+            .as_deref(),
+        Some("native-icon")
+    );
+    assert_eq!(
+        storage.recap_process_icon(&[extension, missing]).unwrap(),
+        None
+    );
+    assert_eq!(storage.recap_process_icon(&[native + 1000]).unwrap(), None);
+    credentials.invalidate_session();
+    assert_eq!(
+        storage.recap_process_icon(&[native]).unwrap_err(),
+        "AUTH_REQUIRED"
+    );
+    storage.shutdown().unwrap();
+}
+
+#[test]
 fn correction_jobs_survive_restart_and_only_acknowledge_the_processed_version() {
     let temp = tempfile::tempdir().unwrap();
     let credentials = storage_credentials(temp.path().to_path_buf());

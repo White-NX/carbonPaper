@@ -1,175 +1,226 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { listen } from '@tauri-apps/api/event';
-import { CalendarDays, ChevronLeft, ChevronRight, Loader2, Settings2, Undo2, X } from 'lucide-react';
-import { getAiSettings, grantAiRemoteConsent } from '../../lib/ai_api';
-import { cancelRecap, correctRecap, generateRecap, getRecapDay, getRecapSettings, listRecapDays, localDate, recapErrorKey, saveRecapSettings, sourceResult } from '../../lib/recap_api';
-import RecapSettings from './RecapSettings';
-import RecapProgress from './RecapProgress';
-import useRecapProgress from '../../hooks/useRecapProgress';
+import { ArrowLeft, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, MoreHorizontal, Pencil, RefreshCw, Undo2 } from 'lucide-react';
+import { grantAiRemoteConsent } from '../../lib/ai_api';
+import { cancelRecap, correctRecap, generateRecap, localDate } from '../../lib/recap_api';
+import { openSettingsWindow } from '../../lib/settings_api';
+import useRecapDay from '../../hooks/useRecapDay';
+import { Button } from '../ui/Button';
+import { CorrectionDialog, DiagnosticsDialog, RecapError, SourcesDialog } from './RecapDialogs';
+import { SourceThumbnail, useRecapSourceAction } from './RecapSources';
+import RecapRecords from './RecapRecords';
+import RecapRunStatus from './RecapRunStatus';
+import RecapApps from './RecapApps';
 
-const buttonClass = 'rounded-lg border border-ide-border px-3 py-2 text-sm hover:bg-ide-hover disabled:opacity-40';
-const inputClass = 'w-full rounded-lg border border-ide-border bg-ide-bg px-3 py-2 text-sm';
-
-function RecapError({ error }) {
-  const { t } = useTranslation();
-  return <>
-    <p>{t(recapErrorKey(error), { defaultValue: t('recap.errors.unknown') })}</p>
-    <details className="mt-2 text-xs text-ide-muted">
-      <summary className="cursor-pointer">{t('recap.errorDetails')}</summary>
-      <pre className="mt-2 whitespace-pre-wrap break-words font-mono">{String(error)}</pre>
-      <p className="mt-2">{t('recap.errorLogHint')}</p>
-    </details>
-  </>;
+function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    ref.current?.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
+    const outside = (event) => { if (!ref.current?.contains(event.target)) setOpen(false); };
+    document.addEventListener('pointerdown', outside);
+    return () => document.removeEventListener('pointerdown', outside);
+  }, [open]);
+  return <div ref={ref} className="relative" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}
+    onKeyDown={(event) => {
+      if (event.key === 'Escape' && open) { event.stopPropagation(); setOpen(false); ref.current?.querySelector('button')?.focus(); }
+      if (open && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const buttons = [...ref.current.querySelectorAll('[role="menuitem"]:not(:disabled)')];
+        const index = buttons.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
+        buttons[next]?.focus();
+      }
+    }}>
+    <Button variant="ghost" icon={Icon} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>{text && label}</Button>
+    {open && <div role="menu" aria-label={label} className="absolute right-0 top-full z-30 mt-1 min-w-44 rounded-xl border border-ide-border bg-ide-panel p-1.5 shadow-lg">
+      {items.map((item) => <button key={item.label} type="button" role="menuitem" disabled={item.disabled}
+        className="recap-focus block w-full rounded-md px-3 py-2 text-left text-xs hover:bg-ide-hover disabled:opacity-40"
+        onClick={() => { ref.current?.querySelector('button')?.focus(); setOpen(false); item.onClick(); }}>{item.label}</button>)}
+    </div>}
+  </div>;
 }
 
-function RecapPeriod({ batch, task, time, busy, onTask, onEdit, onOpen }) {
+function Period({ batch, time, onTask, onDetails }) {
   const { t } = useTranslation();
-  const activities = batch.activities.filter((a) => !task || a.task_id === task);
-  const topics = (batch.summary?.topics || []).filter((topic) => !task || topic.task_id === task);
-  const titles = [...new Map(activities.map((a) => [a.task_id, a.task_title])).entries()];
-  return <article className="rounded-xl border border-ide-border bg-ide-panel p-4 sm:p-5">
-    <h2 className="text-sm font-semibold tabular-nums">{time(batch.start_ms)}–{time(batch.end_ms)}</h2>
-    {!task && batch.summary && <p className="mt-3 text-sm leading-7">{batch.summary.overview}</p>}
-    {topics.length > 0 ? <ul className="mt-4 space-y-4">{topics.map((topic) => <li key={topic.task_id}>
-      <button className="text-left text-sm font-medium text-ide-accent hover:underline" onClick={() => onTask(topic.task_id)}>{topic.title}</button>
-      <p className="mt-1 text-sm leading-7">{topic.text}</p>
-    </li>)}</ul> : <>
-      <p className="mt-3 text-xs text-ide-muted">{t(batch.summary_error ? 'recap.summaryUnavailable' : batch.summary ? 'recap.taskInDetails' : 'recap.summaryPending')}</p>
-      <div className="mt-3 flex flex-wrap gap-3">{titles.map(([id, title]) => <button key={id} className="text-sm text-ide-accent hover:underline" onClick={() => onTask(id)}>{title}</button>)}</div>
-    </>}
-    <details className="mt-4"><summary className="cursor-pointer text-xs text-ide-muted">{t('recap.details')}</summary>
-      <div className="mt-3 space-y-4">{activities.map((activity) => <div key={activity.id} className="border-l-2 border-ide-border pl-3">
-        <div className="flex flex-wrap items-start justify-between gap-2 text-xs text-ide-muted">
-          <span>{time(activity.start_ms)}{activity.end_ms !== activity.start_ms && `–${time(activity.end_ms)}`}</span>
-          <button onClick={() => onEdit(activity)} disabled={busy} className="text-ide-accent">{t('recap.correct')}</button>
-        </div>
-        <button className="mt-2 text-left text-sm font-medium hover:underline" onClick={() => onTask(activity.task_id)}>{activity.task_title}</button>
-        <p className="mt-1 whitespace-pre-wrap text-sm leading-7">{activity.text}</p>
-        <div className="mt-2 flex flex-wrap gap-2">{activity.sources.map((source) => <button key={source.id} className="max-w-64 truncate rounded border border-ide-border px-2 py-1 text-xs hover:bg-ide-hover" onClick={() => onOpen(source, true)} title={source.window_title}>{time(source.timestamp_ms)} · {source.process_name || t('recap.source')}</button>)}</div>
-        {activity.sources.length > 0 && <button className="mt-2 text-xs text-ide-accent" onClick={() => onOpen(activity.sources[0])}>{t('recap.locate')}</button>}
-      </div>)}</div>
-    </details>
+  const topics = batch.summary?.topics?.length ? batch.summary.topics : [...new Map(batch.activities.map((activity) => [activity.task_id, activity])).values()].map((activity) => ({ task_id: activity.task_id, title: activity.task_title, text: activity.text }));
+  const problem = batch.error || batch.summary_error;
+  return <article className="recap-period">
+    <div className="recap-period-time"><span className="recap-time-dot" /><h2 className="text-xs font-medium tabular-nums text-ide-muted">{time(batch.start_ms)}–{time(batch.end_ms)}</h2></div>
+    <div className="min-w-0 pb-9">
+      {batch.summary?.overview && <p className={`${batch.apps?.length ? 'mb-2' : 'mb-5'} whitespace-pre-wrap text-sm leading-7`}>{batch.summary.overview}</p>}
+      <RecapApps apps={batch.apps} />
+      {problem ? <div className="mb-3 flex flex-wrap items-center gap-3"><RecapError error={problem} /><button className="recap-focus rounded text-xs text-ide-muted hover:text-ide-text" onClick={onDetails}>{t('recap.generationDetails')}</button></div>
+        : !batch.summary && topics.length > 0 && <p className="mb-3 text-xs text-ide-muted">{t('recap.overviewPending')}</p>}
+      {topics.length > 0 ? <div className="divide-y divide-ide-border/60 border-y border-ide-border/60">
+        {topics.map((topic) => <button key={topic.task_id} data-recap-task={topic.task_id} data-recap-entry={`${batch.start_ms}:${topic.task_id}`} onClick={() => onTask(topic.task_id, batch.start_ms)}
+          className="recap-focus group flex w-full items-center gap-5 px-3 py-4 text-left transition-colors hover:bg-ide-hover">
+          <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{topic.title}</span><span className="mt-1.5 line-clamp-2 text-[13px] leading-relaxed text-ide-muted">{topic.text}</span></span>
+          <ChevronRight className="h-4 w-4 shrink-0 text-ide-muted transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
+        </button>)}
+      </div> : !problem && <p className="text-sm text-ide-muted">{t(batch.status === 'pending' ? 'recap.waitingPeriod' : 'recap.noActivities')}</p>}
+    </div>
   </article>;
 }
 
-function CorrectionForm({ editing, threads, busy, onApply, onClose }) {
+function Landing({ enabled, hasClosedPeriod, loading, error, onConfigure, onGenerate, onRetry, running }) {
   const { t } = useTranslation();
-  const [kind, setKind] = useState('rename');
-  const [title, setTitle] = useState(editing.task_title);
-  const [target, setTarget] = useState('');
-  const submit = (event) => {
-    event.preventDefault();
-    if (kind === 'rename') onApply({ kind, task_id: editing.task_id, title });
-    if (kind === 'merge') onApply({ kind, from: editing.task_id, into: target });
-    if (kind === 'move') onApply({ kind, activity_id: editing.id, task_id: target || null, title });
-  };
-  return <form onSubmit={submit} className="space-y-3 rounded-lg border border-ide-border bg-ide-panel p-4" aria-label={t('recap.correct')}>
-    <label className="block text-xs"><span>{t('recap.correction.action')}</span><select className={inputClass} value={kind} onChange={(e) => setKind(e.target.value)}>{['rename', 'merge', 'move'].map((k) => <option key={k} value={k}>{t(`recap.correction.${k}`)}</option>)}</select></label>
-    {kind !== 'rename' && <label className="block text-xs"><span>{t('recap.correction.target')}</span><select className={inputClass} value={target} required={kind === 'merge'} onChange={(e) => setTarget(e.target.value)}><option value="">{t(kind === 'move' ? 'recap.correction.newTask' : 'recap.correction.choose')}</option>{threads.filter((thread) => thread.id !== editing.task_id).map((thread) => <option key={thread.id} value={thread.id}>{thread.title}</option>)}</select></label>}
-    {(kind === 'rename' || (kind === 'move' && !target)) && <label className="block text-xs"><span>{t('recap.correction.title')}</span><input className={inputClass} required maxLength={120} value={title} onChange={(e) => setTitle(e.target.value)} /></label>}
-    <div className="flex justify-end gap-2"><button type="button" onClick={onClose} className={buttonClass}>{t('recap.close')}</button><button disabled={busy} className={buttonClass}>{t('recap.save')}</button></div>
-  </form>;
+  if (loading) return <div aria-label={t('recap.loading')} role="status" className="space-y-10 py-8">
+    {[0, 1, 2].map((key) => <div key={key} className="recap-period motion-safe:animate-pulse"><div className="h-3 w-20 rounded bg-ide-active" /><div className="space-y-4"><div className="h-3 w-4/5 rounded bg-ide-active" /><div className="h-3 w-3/5 rounded bg-ide-active" /><div className="h-3 w-2/3 rounded bg-ide-active" /></div></div>)}
+  </div>;
+  return <div className="mx-auto max-w-xl py-12 sm:py-20">
+    <div className="mb-6 flex h-12 w-12 items-center justify-center rounded-xl border border-ide-border bg-ide-panel text-ide-accent"><CalendarDays className="h-6 w-6" /></div>
+    <h2 className="text-xl font-semibold tracking-tight">{t(!enabled ? 'recap.welcome' : 'recap.emptyTitle')}</h2>
+    <p className="mt-3 max-w-lg text-sm leading-7 text-ide-muted">{t(!enabled ? 'recap.intro' : hasClosedPeriod ? 'recap.emptyDescription' : 'recap.waitingDescription')}</p>
+    <div className="mt-6">
+      {error ? <Button onClick={onRetry}>{t('common.retry')}</Button> : !enabled ? <Button variant="primary" onClick={onConfigure}>{t('recap.configure')}</Button>
+        : hasClosedPeriod && !running && <Button variant="primary" icon={RefreshCw} onClick={onGenerate}>{t('recap.generateFirst')}</Button>}
+    </div>
+  </div>;
 }
 
 export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview }) {
   const { t, i18n } = useTranslation();
   const [date, setDate] = useState(localDate);
-  const [day, setDay] = useState(null);
-  const [settings, setSettings] = useState(null);
-  const [ai, setAi] = useState(null);
-  const [days, setDays] = useState([]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [loadError, setLoadError] = useState('');
-  const [showSettings, setShowSettings] = useState(false);
   const [task, setTask] = useState(null);
+  const [tab, setTab] = useState('recap');
+  const [period, setPeriod] = useState('');
   const [editing, setEditing] = useState(null);
-  const { progress, error: progressError } = useRecapProgress(date, active, isAuthenticated);
-  const current = useRef({ date, active, isAuthenticated });
-  current.current = { date, active, isAuthenticated };
-  const time = (ms) => new Date(ms).toLocaleTimeString(i18n.language, { hour: '2-digit', minute: '2-digit' });
-  const load = useCallback(async () => {
-    const requestDate = current.current.date;
-    if (!current.current.active || !current.current.isAuthenticated) return;
-    try {
-      const result = await getRecapDay(requestDate);
-      if (current.current.date === requestDate && current.current.isAuthenticated) { setDay(result); setLoadError(''); }
-    } catch (e) { if (current.current.date === requestDate) { setDay(null); setLoadError(String(e)); } }
-  }, []);
+  const [sources, setSources] = useState(null);
+  const [diagnostics, setDiagnostics] = useState(false);
+  const [operation, setOperation] = useState('');
+  const [error, setError] = useState('');
+  const [liveRunning, setLiveRunning] = useState(false);
+  const [notice, setNotice] = useState('');
+  const { day, settings, days, error: loadError, refresh } = useRecapDay(date, active, isAuthenticated);
+  const action = useRecapSourceAction(onSelectScreenshot, onOpenSnapshotPreview);
+  const scroll = useRef(null);
+  const positions = useRef({});
+  const recordsPosition = useRef(0);
+  const focusTask = useRef(null);
+  const originEntry = useRef(null);
+  const epoch = useRef(0);
+  const formatter = useMemo(() => new Intl.DateTimeFormat(i18n.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }), [i18n.language]);
+  const time = useCallback((ms) => formatter.format(new Date(ms)), [formatter]);
+  const route = task ? `task:${task}` : tab;
+  const batches = day?.batches || [];
+  const activities = useMemo(() => (day?.batches || []).flatMap((batch) => batch.activities).filter((activity) => activity.task_id === task).sort((a, b) => a.start_ms - b.start_ms), [day, task]);
+  const selected = day?.threads.find((thread) => thread.id === task);
+  const loaded = Boolean(day);
+  const hasContent = batches.some((batch) => batch.activities.length || batch.error || batch.summary || batch.summary_error);
+  const running = operation === 'generate' || liveRunning || Boolean(day?.running);
+  const issue = error || loadError || day?.error;
+  const consentNeeded = String(issue).includes('AI_REMOTE_CONSENT_REQUIRED') || batches.some((batch) => [batch.error, batch.summary_error].some((value) => value?.includes('AI_REMOTE_CONSENT_REQUIRED')));
+  const latest = Math.max(0, ...batches.map((batch) => batch.updated_at_ms || 0));
+  const back = useCallback(() => { focusTask.current = { task, entry: originEntry.current }; setTask(null); }, [task]);
+  const enterTask = (id, start) => { originEntry.current = `${start}:${id}`; setTask(id); };
+
   useEffect(() => {
-    setDay(null); setTask(null); setEditing(null); setError(''); setLoadError('');
-    if (!active || !isAuthenticated) { if (!isAuthenticated) { setSettings(null); setAi(null); } return undefined; }
-    let live = true;
-    Promise.all([getRecapSettings(), getAiSettings(), listRecapDays()]).then(([s, a, dates]) => { if (live) { setSettings(s); setAi(a); setDays(dates); } }).catch((e) => { if (live) setError(String(e)); });
-    load();
-    const timer = setInterval(load, 15000);
-    window.addEventListener('focus', load);
-    const subscription = listen('recap-changed', load);
-    return () => { live = false; clearInterval(timer); window.removeEventListener('focus', load); subscription.then((unlisten) => unlisten()); };
-  }, [active, isAuthenticated, date, load]);
+    epoch.current += 1;
+    setTask(null); setEditing(null); setSources(null); setDiagnostics(false); setOperation(''); setError(''); setNotice(''); setLiveRunning(false);
+    setTab('recap'); setPeriod(''); positions.current = {}; recordsPosition.current = 0;
+  }, [date, isAuthenticated]);
+  useEffect(() => {
+    if (!active) return undefined;
+    const escape = (event) => {
+      if (event.key === 'Escape' && task && !editing && !sources && !diagnostics && !event.defaultPrevented) { event.preventDefault(); back(); }
+    };
+    window.addEventListener('keydown', escape);
+    return () => window.removeEventListener('keydown', escape);
+  }, [active, task, editing, sources, diagnostics, back]);
+  useLayoutEffect(() => {
+    if (!active || !scroll.current) return;
+    scroll.current.scrollTop = positions.current[route] || 0;
+    if (!task && focusTask.current) {
+      const entries = [...scroll.current.querySelectorAll('[data-recap-task]')];
+      const entry = entries.find((node) => node.dataset.recapEntry === focusTask.current.entry) || entries.find((node) => node.dataset.recapTask === focusTask.current.task);
+      entry?.focus({ preventScroll: true });
+      focusTask.current = null;
+    }
+  }, [active, route, task, loaded]);
 
-  const run = async (work) => {
-    setBusy(true); setError('');
-    try { await work(); } catch (e) { setError(String(e)); } finally { setBusy(false); }
+  const run = async (kind, work) => {
+    if (operation) return;
+    const token = epoch.current;
+    setOperation(kind); setError('');
+    try { await work(); if (token === epoch.current) await refresh(); }
+    catch (cause) { if (token === epoch.current) setError(String(cause)); }
+    finally { if (token === epoch.current) setOperation(''); }
   };
-  const generate = (force = false) => run(async () => {
-    const requested = date;
-    await generateRecap(requested, force);
-    await load();
-  });
-  const apply = (correction) => run(async () => { await correctRecap(date, correction); setEditing(null); setTask(null); await load(); });
-  const save = (draft) => run(async () => { setSettings(await saveRecapSettings(draft)); setShowSettings(false); await load(); });
-  const shift = (delta) => { const d = new Date(`${date}T12:00:00`); d.setDate(d.getDate() + delta); setDate(localDate(d)); };
-  const open = (source, floating = false) => {
-    const result = sourceResult(source);
-    if (floating && onOpenSnapshotPreview) onOpenSnapshotPreview(result, { sourceLabel: t('recap.title'), sourceType: 'recap' });
-    else onSelectScreenshot?.(result);
+  const generate = (force = false) => run('generate', () => generateRecap(date, force));
+  const configure = () => openSettingsWindow('organize', 'daily-recap').catch((cause) => setError(String(cause)));
+  const shift = (delta) => { const value = new Date(`${date}T12:00:00`); value.setDate(value.getDate() + delta); setDate(localDate(value)); };
+  const editTask = (kind) => setEditing({ kind, task_id: task, task_title: selected?.title || activities[0]?.task_title || '', epoch: epoch.current });
+  const correctionSaved = async (correction, token) => {
+    if (token !== epoch.current) return;
+    setEditing(null); setNotice(t('recap.corrected'));
+    if (correction.kind === 'merge') setTask(correction.into);
+    await refresh();
   };
-  const periods = (day?.batches || []).filter((b) => b.activities.some((a) => !task || a.task_id === task));
-  const running = busy || day?.running || (progress && !progress.finished_at_ms);
-  const issue = error || loadError || progressError || day?.error || '';
-  const batchIssues = day?.batches.filter((batch) => batch.error || batch.summary_error || batch.status === 'failed') || [];
-  const consentNeeded = issue.includes('AI_REMOTE_CONSENT_REQUIRED') || day?.batches.some((b) => b.error === 'AI_REMOTE_CONSENT_REQUIRED' || b.summary_error === 'AI_REMOTE_CONSENT_REQUIRED');
+  const undo = () => run('undo', async () => { await correctRecap(date, { kind: 'undo' }); setNotice(''); });
 
+  if (!active) return null;
   if (!isAuthenticated) return <div className="m-auto p-8 text-sm text-ide-muted">{t('recap.locked')}</div>;
-  return <div className="flex min-h-0 flex-1 flex-col text-ide-text">
-    <header className="flex flex-wrap items-center justify-between gap-3 border-b border-ide-border px-5 py-4">
-      <div className="flex items-center gap-2"><CalendarDays className="h-5 w-5 text-ide-accent" /><h1 className="text-base font-semibold">{t('recap.title')}</h1></div>
-      <div className="flex flex-wrap items-center gap-2">
-        <button className={buttonClass} aria-label={t('recap.previous')} onClick={() => shift(-1)}><ChevronLeft size={16} /></button>
-        <input type="date" aria-label={t('recap.date')} max={localDate()} value={date} onChange={(e) => { if (e.target.value) setDate(e.target.value); }} className="rounded-lg border border-ide-border bg-ide-panel px-2 py-1.5 text-sm" list="recap-dates" />
-        <datalist id="recap-dates">{days.map((d) => <option key={d} value={d} />)}</datalist>
-        <button className={buttonClass} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)}><ChevronRight size={16} /></button>
-        <button className={buttonClass} aria-label={t('recap.settings.title')} disabled={!settings} onClick={() => setShowSettings((v) => !v)}><Settings2 size={16} /></button>
+  return <div className="recap-surface relative flex min-h-0 flex-1 flex-col bg-ide-bg text-ide-text">
+    <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 gap-y-2 border-b border-ide-border bg-ide-panel px-5 py-3">
+      {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
+        : <h1 className="flex items-center gap-2 text-sm font-semibold"><CalendarDays className="h-4 w-4 text-ide-accent" />{t('recap.title')}</h1>}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
+        <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
+          className="recap-focus min-w-0 rounded-lg border border-ide-border bg-ide-panel px-2 py-1.5 text-xs tabular-nums" />
+        <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
+        <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
+        {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
+        {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
+          { label: t('recap.correction.rename'), onClick: () => editTask('rename'), disabled: !selected },
+          { label: t('recap.correction.merge'), onClick: () => editTask('merge'), disabled: !selected || day.threads.length < 2 },
+        ]} /> : settings?.enabled && <>
+          {running ? <Button onClick={() => cancelRecap().catch((cause) => setError(String(cause)))}>{t('recap.stop')}</Button>
+            : hasContent && <Button icon={RefreshCw} disabled={Boolean(operation) || !batches.length} onClick={() => generate()}>{t('recap.generate')}</Button>}
+          <ActionMenu label={t('recap.more')} items={[
+            { label: t('recap.regenerate'), onClick: () => generate(true), disabled: running || Boolean(operation) || !batches.length },
+            { label: t('recap.generationDetails'), onClick: () => setDiagnostics(true) },
+            { label: t('recap.undo'), onClick: undo, disabled: !day?.can_undo || Boolean(operation) },
+          ]} />
+        </>}
       </div>
     </header>
-    <div className="min-h-0 flex-1 overflow-y-auto p-5"><div className="mx-auto max-w-4xl space-y-5">
-      {showSettings && settings && <RecapSettings settings={settings} providers={ai?.providers || []} busy={busy} onSave={save} onClose={() => setShowSettings(false)} usage={day?.usage} />}
-      {(issue || consentNeeded) && <div role="alert" className="rounded-lg border border-ide-border p-3 text-sm"><RecapError error={issue || 'AI_REMOTE_CONSENT_REQUIRED'} />{consentNeeded && <div className="mt-3 space-y-2"><p>{t('recap.remoteConsent')}</p><button className={buttonClass} disabled={busy} onClick={() => run(async () => { setAi(await grantAiRemoteConsent()); await generateRecap(date); await load(); })}>{t('recap.allowRemote')}</button></div>}</div>}
-      {!settings?.enabled ? <div className="rounded-xl border border-ide-border bg-ide-panel p-6"><h2 className="font-medium">{t('recap.welcome')}</h2><p className="mt-2 text-sm leading-relaxed text-ide-muted">{t('recap.intro')}</p><button className={`${buttonClass} mt-4`} disabled={!settings} onClick={() => setShowSettings(true)}>{t('recap.configure')}</button></div> : <>
-        <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
-          <p className="text-ide-muted">{t(running ? 'recap.generating' : 'recap.schedule')}</p>
-          <div className="flex flex-wrap gap-2">
-            {day?.can_undo && <button className={buttonClass} disabled={busy} onClick={() => apply({ kind: 'undo' })}><Undo2 className="mr-1 inline h-4 w-4" />{t('recap.undo')}</button>}
-            {running ? <button className={buttonClass} onClick={() => cancelRecap().catch((e) => setError(String(e)))}>{t('recap.stop')}</button> : <><button className={buttonClass} onClick={() => generate()}>{t('recap.generate')}</button>{periods.length > 0 && <button className={buttonClass} onClick={() => generate(true)}>{t('recap.regenerate')}</button>}</>}
-          </div>
-        </div>
-        {task && <div className="flex items-center justify-between rounded-lg bg-ide-panel px-4 py-2 text-sm"><span>{day?.threads.find((thread) => thread.id === task)?.title}</span><button onClick={() => setTask(null)} aria-label={t('recap.allActivities')}><X size={16} /></button></div>}
-        {editing && <CorrectionForm key={editing.id} editing={editing} threads={day?.threads || []} busy={busy} onApply={apply} onClose={() => setEditing(null)} />}
-        {running && !progress && <div className="flex items-center gap-2 text-sm text-ide-muted"><Loader2 className="h-4 w-4 animate-spin" />{t('recap.generating')}</div>}
-        <RecapProgress progress={progress} batches={day?.batches || []} />
-        {batchIssues.map((batch) => <div key={batch.start_ms} role="alert" className="rounded-lg border border-ide-border bg-ide-panel p-4 text-sm">
-          <p className="mb-2 font-medium">{time(batch.start_ms)}–{time(batch.end_ms)} · {t(batch.status === 'failed' ? 'recap.failed' : 'recap.partial')}</p>
-          <RecapError error={batch.error || batch.summary_error || 'RECAP_INVALID_RESPONSE'} />
-        </div>)}
-        {!running && !issue && batchIssues.length === 0 && periods.length === 0 && <p className="py-8 text-center text-sm text-ide-muted">{t('recap.empty')}</p>}
-        <div className="space-y-3">{periods.map((batch) => <RecapPeriod key={batch.start_ms} batch={batch} task={task} time={time} busy={busy} onTask={setTask} onEdit={setEditing} onOpen={open} />)}</div>
-        {day?.batches.map((batch) => <div key={batch.start_ms}>
-          {batch.status === 'partial' && !batch.error && <p className="text-xs text-ide-muted">{time(batch.start_ms)}–{time(batch.end_ms)} · {t('recap.partial')}</p>}
-          {batch.records.length > 0 && <details className="mt-2 text-xs text-ide-muted"><summary className="cursor-pointer">{t('recap.allRecords', { start: time(batch.start_ms), end: time(batch.end_ms), count: batch.records.length })}</summary><div className="mt-2 grid max-h-64 gap-1 overflow-y-auto sm:grid-cols-2">{batch.records.map((source) => <button key={source.id} onClick={() => open(source, true)} className="truncate rounded px-2 py-1 text-left hover:bg-ide-hover">{time(source.timestamp_ms)} · {source.window_title || source.process_name || t('recap.source')}</button>)}</div></details>}
-        </div>)}
-      </>}
-    </div></div>
+    <RecapRunStatus key={date} date={date} active={active} onRunning={setLiveRunning} onComplete={refresh} />
+    {!task && settings?.enabled && <div className="flex shrink-0 items-center justify-between border-b border-ide-border px-6">
+      <div role="tablist" aria-label={t('recap.title')} className="flex gap-5">{['recap', 'records'].map((value) => <button key={value} role="tab" tabIndex={tab === value ? 0 : -1} id={`recap-tab-${value}`} aria-controls={`recap-panel-${value}`} aria-selected={tab === value}
+        className={`recap-focus border-b-2 py-3 text-xs font-medium ${tab === value ? 'border-ide-accent text-ide-accent' : 'border-transparent text-ide-muted hover:text-ide-text'}`}
+        onKeyDown={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); const next = event.key === 'Home' ? 'recap' : event.key === 'End' ? 'records' : value === 'recap' ? 'records' : 'recap'; setTab(next); document.getElementById(`recap-tab-${next}`)?.focus(); } }}
+        onClick={() => setTab(value)}>{t(value === 'recap' ? 'recap.overview' : 'recap.records')}</button>)}</div>
+      {latest > 0 && <span className="hidden text-[11px] text-ide-muted sm:block">{t('recap.updated', { time: time(latest) })}</span>}
+    </div>}
+    {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
+    {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
+    {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}
+    {!task && tab === 'records' && settings?.enabled ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
+      <RecapRecords date={date} batches={batches} active={active} action={action} time={time} period={period} onPeriod={setPeriod} position={recordsPosition} />
+    </div> : <div ref={scroll} id="recap-panel-recap" role={!task ? 'tabpanel' : undefined} aria-labelledby={!task && settings?.enabled ? 'recap-tab-recap' : undefined}
+      className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-7" onScroll={(event) => { positions.current[route] = event.currentTarget.scrollTop; }}>
+      <div className="mx-auto max-w-[1120px]">
+        {task ? <div className="mx-auto max-w-[880px]">
+          <div className="mb-8"><p className="mb-2 text-xs text-ide-muted">{date} · {t('recap.eventHistory')}</p><h1 className="break-words text-xl font-semibold leading-relaxed">{selected?.title || activities[0]?.task_title || t('recap.eventUnavailable')}</h1></div>
+          {activities.length === 0 && <p className="text-sm text-ide-muted">{t('recap.eventEmpty')}</p>}
+          {activities.map((activity) => <article key={activity.id} className="border-t border-ide-border/70 py-6">
+            <div className="mb-3 flex items-center justify-between gap-3"><time className="text-xs font-medium tabular-nums text-ide-muted">{time(activity.start_ms)}{activity.start_ms !== activity.end_ms && `–${time(activity.end_ms)}`}</time>
+              <Button variant="ghost" icon={Pencil} onClick={() => setEditing({ ...activity, kind: 'move', epoch: epoch.current })}>{t('recap.adjust')}</Button></div>
+            <p className="whitespace-pre-wrap break-words text-sm leading-7">{activity.text}</p>
+            {activity.sources.length > 0 && <div className="mt-4"><div className="grid max-w-lg grid-cols-3 gap-3">{activity.sources.slice(0, 3).map((source) => <SourceThumbnail key={source.id} source={source} action={action} time={time} />)}</div>
+              <button className="recap-focus mt-3 rounded text-xs text-ide-muted hover:text-ide-accent" onClick={() => setSources(activity.sources)}>{t('recap.viewSources', { count: activity.sources.length })}</button>
+            </div>}
+          </article>)}
+        </div> : !settings?.enabled || !hasContent || !day ? <Landing enabled={settings?.enabled} hasClosedPeriod={batches.length > 0} loading={(!settings || !day) && !loadError}
+          error={loadError} running={running} onConfigure={configure} onGenerate={() => generate()} onRetry={refresh} />
+          : <div className="recap-timeline">{batches.filter((batch) => batch.activities.length || batch.summary || batch.error || batch.summary_error || (batch.record_count ?? batch.records?.length) > 0).map((batch) => <Period key={batch.start_ms} batch={batch} time={time} onTask={enterTask} onDetails={() => setDiagnostics(true)} />)}</div>}
+      </div>
+    </div>}
+    {editing && <CorrectionDialog key={`${editing.kind}:${editing.id || editing.task_id}`} date={date} editing={editing} threads={day?.threads || []} onClose={() => setEditing(null)} onSaved={(correction) => correctionSaved(correction, editing.epoch)} />}
+    {sources && <SourcesDialog sources={sources} action={action} time={time} onClose={() => setSources(null)} />}
+    {diagnostics && <DiagnosticsDialog date={date} onClose={() => setDiagnostics(false)} />}
   </div>;
 }

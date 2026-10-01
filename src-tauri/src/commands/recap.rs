@@ -18,6 +18,7 @@ pub async fn recap_get_settings(
     Ok(storage_state
         .recap_read::<RecapSettings>("settings", "settings", None)?
         .unwrap_or_default()
+        .with_app_language()
         .view())
 }
 
@@ -30,7 +31,7 @@ pub async fn recap_save_settings(
     mut settings: RecapSettings,
 ) -> Result<RecapSettings, String> {
     check_auth_required(&credential_state)?;
-    settings = settings.current_defaults();
+    settings = settings.current_defaults().with_app_language();
     let generation = storage_state.db_generation();
     let old: RecapSettings = storage_state
         .recap_read("settings", "settings", None)?
@@ -77,11 +78,37 @@ pub async fn recap_get_day(
     app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     date: String,
-) -> Result<RecapDay, String> {
+    include_records: Option<bool>,
+    include_attempts: Option<bool>,
+) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
-    tokio::task::spawn_blocking(move || recap::read_day(&app, &date))
-        .await
-        .map_err(|_| "RECAP_WORKER_FAILED")?
+    tokio::task::spawn_blocking(move || {
+        recap::read_day_view(
+            &app,
+            &date,
+            include_records.unwrap_or(true),
+            include_attempts.unwrap_or(true),
+        )
+    })
+    .await
+    .map_err(|_| "RECAP_WORKER_FAILED")?
+}
+
+/// Authentication: required. Pages the filtered, revision-checked source directory.
+#[tauri::command]
+pub async fn recap_get_records(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    date: String,
+    batch_start_ms: Option<i64>,
+    cursor: Option<String>,
+) -> Result<RecapRecordPage, String> {
+    check_auth_required(&credential_state)?;
+    tokio::task::spawn_blocking(move || {
+        recap::read_records(&app, &date, batch_start_ms, cursor.as_deref())
+    })
+    .await
+    .map_err(|_| "RECAP_WORKER_FAILED")?
 }
 
 /// Authentication: required. Stream notifications only trigger this protected read.
@@ -90,9 +117,16 @@ pub async fn recap_get_progress(
     app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     date: String,
+    include_attempts: Option<bool>,
 ) -> Result<Option<RecapProgress>, String> {
     check_auth_required(&credential_state)?;
-    recap::read_progress(&app, &date)
+    let mut progress = recap::read_progress(&app, &date)?;
+    if !include_attempts.unwrap_or(true) {
+        if let Some(progress) = progress.as_mut() {
+            progress.attempts.clear();
+        }
+    }
+    Ok(progress)
 }
 
 /// Authentication: required. Generates closed four-hour windows only.

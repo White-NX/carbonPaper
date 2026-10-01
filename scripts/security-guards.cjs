@@ -7,6 +7,7 @@ const COMMAND_TIERS = {
   'commands::recap::recap_save_settings': 'session_required',
   'commands::recap::recap_list_days': 'session_required',
   'commands::recap::recap_get_day': 'session_required',
+  'commands::recap::recap_get_records': 'session_required',
   'commands::recap::recap_generate': 'session_required',
   'commands::recap::recap_correct': 'session_required',
   'commands::recap::recap_cancel': 'runtime_public',

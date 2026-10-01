@@ -7,8 +7,9 @@ const write = (command, args) => withAuth(() => invoke(command, args), { autoPro
 export const getRecapSettings = () => read('recap_get_settings');
 export const saveRecapSettings = (settings) => write('recap_save_settings', { settings });
 export const listRecapDays = () => read('recap_list_days');
-export const getRecapDay = (date) => read('recap_get_day', { date });
-export const getRecapProgress = (date) => read('recap_get_progress', { date });
+export const getRecapDay = (date, options = {}) => read('recap_get_day', { date, ...options });
+export const getRecapRecords = (date, batchStartMs = null, cursor = null) => read('recap_get_records', { date, batchStartMs, cursor });
+export const getRecapProgress = (date, options = {}) => read('recap_get_progress', { date, ...options });
 export const generateRecap = (date, force = false) => write('recap_generate', { date, force });
 export const cancelRecap = () => invoke('recap_cancel');
 export const correctRecap = (date, correction) => write('recap_correct', { date, correction });

@@ -161,8 +161,17 @@ fn tray_texts() -> &'static TrayTexts {
 }
 
 pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result<(), String> {
-    registry_config::set_string("language", &normalize_app_language(language))?;
+    let language = normalize_app_language(language);
+    let previous =
+        normalize_app_language(&registry_config::get_string("language").unwrap_or_default());
+    registry_config::set_string("language", &language)?;
     refresh_tray_menu(app);
+    if language != previous {
+        if let Some(recap) = app.try_state::<ai::recap::RecapRuntime>() {
+            recap.cancel();
+        }
+        let _ = app.emit("recap-changed", ());
+    }
     Ok(())
 }
 
@@ -1313,6 +1322,7 @@ pub fn run() {
             commands::recap::recap_save_settings,
             commands::recap::recap_list_days,
             commands::recap::recap_get_day,
+            commands::recap::recap_get_records,
             commands::recap::recap_generate,
             commands::recap::recap_cancel,
             commands::recap::recap_get_progress,

@@ -184,7 +184,7 @@ pub(super) fn privacy_hash(app: &tauri::AppHandle) -> Result<String, String> {
     Ok(privacy_fingerprint(app)?.as_str().to_owned())
 }
 
-fn privacy_fingerprint(app: &tauri::AppHandle) -> Result<PrivacyFingerprint, String> {
+pub(super) fn privacy_fingerprint(app: &tauri::AppHandle) -> Result<PrivacyFingerprint, String> {
     PrivacyFingerprint::new(app.state::<Arc<SensitiveFilterState>>().get_config())
 }
 
@@ -268,8 +268,9 @@ pub fn read_day(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> 
         .unwrap_or_default();
     let threads = apply_corrections(&mut batches, &corrections.current);
     let settings: RecapSettings = storage
-        .recap_read("settings", "settings", None)?
-        .unwrap_or_default();
+        .recap_read::<RecapSettings>("settings", "settings", None)?
+        .unwrap_or_default()
+        .with_app_language();
     for batch in &mut batches {
         let key = format!("{date}:{}", batch.start_ms);
         summary::attach(
@@ -1002,7 +1003,8 @@ async fn generate_inner(
     let settings = storage
         .recap_read::<RecapSettings>("settings", "settings", None)?
         .unwrap_or_default()
-        .current_defaults();
+        .current_defaults()
+        .with_app_language();
     settings.validate()?;
     if !settings.enabled {
         return Err("RECAP_DISABLED".into());

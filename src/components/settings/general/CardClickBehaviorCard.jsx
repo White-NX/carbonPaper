@@ -5,6 +5,7 @@ import DropdownSelect from './DropdownSelect';
 export default function CardClickBehaviorCard({
   cardClickBehaviorSearch,
   cardClickBehaviorClusters,
+  cardClickBehaviorRecap,
   onSetCardClickBehavior,
 }) {
   const { t } = useTranslation();
@@ -23,6 +24,11 @@ export default function CardClickBehaviorCard({
       </div>
 
       <div className="space-y-3 pl-4 border-l-2 border-ide-border">
+        <div className="flex items-center justify-between gap-4">
+          <label className="text-xs text-ide-text font-medium">{t('recap.title')}</label>
+          <DropdownSelect label={t('recap.title')} value={cardClickBehaviorRecap || 'standalone'}
+            onChange={(value) => onSetCardClickBehavior('recap', value)} options={options} />
+        </div>
         <div className="flex items-center justify-between gap-4">
           <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.searchLabel')}</label>
           <DropdownSelect

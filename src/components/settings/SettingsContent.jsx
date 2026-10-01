@@ -10,6 +10,7 @@ import StorageManagementSection from './StorageManagementSection';
 import AboutSection from './AboutSection';
 import AdvancedSection from './AdvancedSection';
 import FeaturesSection from './FeaturesSection';
+import RecapSection from './RecapSection';
 import LanguageSection from './LanguageSection';
 import BrowserExtensionSection from './BrowserExtensionSection';
 import AiEmbeddingSection from './AiEmbeddingSection';
@@ -93,7 +94,7 @@ export default function SettingsContent({
           pendingApply={c.pendingApply} savingFilters={c.savingFilters} saveFiltersMessage={c.saveFiltersMessage} />
         <BrowserExtensionSection />
       </>;
-      case 'organize': return <FeaturesSection monitorStatus={c.monitorStatus} />;
+      case 'organize': return <><FeaturesSection monitorStatus={c.monitorStatus} /><RecapSection /></>;
       case 'privacy': return <>
         <SecuritySection sessionTimeout={sessionTimeout} onSessionTimeoutChange={onSessionTimeoutChange}
           isSessionValid={isSessionValid} onLockSession={onLockSession} />

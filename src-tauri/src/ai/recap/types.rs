@@ -79,6 +79,13 @@ impl Default for ScreeningSettings {
 }
 
 impl RecapSettings {
+    /// The stored recap language is legacy data; the application preference is authoritative.
+    pub(crate) fn with_app_language(mut self) -> Self {
+        let language = crate::registry_config::get_string("language").unwrap_or_default();
+        self.language = crate::i18n::supported_locale(&language);
+        self
+    }
+
     /// Upgrade only the complete, untouched legacy budget tuple. Explicitly
     /// customized limits remain authoritative, including small output budgets.
     pub fn current_defaults(mut self) -> Self {
@@ -538,6 +545,27 @@ mod tests {
         assert!(!serde_json::to_string(&view)
             .unwrap()
             .contains("private-test-key"));
+    }
+    #[test]
+    fn app_language_overrides_legacy_recap_language_without_changing_other_settings() {
+        let app_language = crate::i18n::supported_locale(
+            &crate::registry_config::get_string("language").unwrap_or_default(),
+        );
+        let settings: RecapSettings = serde_json::from_value(serde_json::json!({
+            "language": if app_language == "en" { "zh-CN" } else { "en" },
+            "enabled": true,
+            "answer_tokens": 2048,
+            "screening": { "api_key": "private-test-key" }
+        }))
+        .unwrap();
+        let effective = settings.with_app_language();
+        assert_eq!(effective.language, app_language);
+        assert!(effective.enabled);
+        assert_eq!(effective.answer_tokens, 2048);
+        assert_eq!(
+            effective.screening.api_key.as_deref(),
+            Some("private-test-key")
+        );
     }
     #[test]
     fn legacy_default_budgets_upgrade_but_custom_and_current_budgets_survive() {

@@ -74,6 +74,7 @@ fn navigation_target(tab: Option<String>, section: Option<String>) -> Navigation
                 "general"
                     | "capture"
                     | "organize"
+                    | "ai"
                     | "privacy"
                     | "maintenance"
                     | "advanced"

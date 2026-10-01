@@ -416,7 +416,7 @@ export default function MainArea({
           onOpen={() => openStandaloneSnapshotPreview()}
           onClear={clearSnapshotPreviewTabs}
         />
-        {activeTab === 'recap' && <RecapView active isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} />}
+        <RecapView active={activeTab === 'recap'} isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} />
       </div>
     </section>
   );

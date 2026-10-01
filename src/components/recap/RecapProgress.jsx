@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
 import { Reasoning } from '../search/AiSearchPanel';
 import { recapErrorKey } from '../../lib/recap_api';
+import { ProgressBlock } from '../overlay/ProgressBlock';
 
 function duration(start, end) {
   const seconds = Math.max(0, Math.floor((end - start) / 1000));
@@ -32,7 +33,7 @@ export default function RecapProgress({ progress, batches = [] }) {
       </div>
       {progress.total_batches > 0 && <>
         <p className="text-xs text-ide-muted">{t('recap.progress.completed', { count: progress.completed_batches, total: progress.total_batches })}{running && progress.batch_start_ms != null && ` · ${t('recap.progress.period', { start: time(progress.batch_start_ms) })}`}</p>
-        <progress aria-label={t('recap.progress.completedLabel')} className="h-1.5 w-full accent-ide-accent" max={progress.total_batches} value={progress.completed_batches} />
+        <ProgressBlock label={t('recap.progress.completedLabel')} current={progress.completed_batches} total={progress.total_batches} showCount={false} />
       </>}
     </div>}
     {attempts.length > 0 && <details>

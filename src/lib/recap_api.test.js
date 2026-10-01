@@ -1,11 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { correctRecap, generateRecap, getRecapDay, getRecapProgress, groupRecapActivities, sourceResult } from './recap_api';
+import { correctRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, groupRecapActivities, sourceResult } from './recap_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((action) => action()) }));
 
 describe('recap API and occurrence display', () => {
+  it('uses authenticated light reads and passes pagination scope without prompting', async () => {
+    await getRecapDay('2026-10-01', { includeRecords: false, includeAttempts: false });
+    expect(invoke).toHaveBeenLastCalledWith('recap_get_day', { date: '2026-10-01', includeRecords: false, includeAttempts: false });
+    await getRecapRecords('2026-10-01', 123, 'cursor');
+    expect(invoke).toHaveBeenLastCalledWith('recap_get_records', { date: '2026-10-01', batchStartMs: 123, cursor: 'cursor' });
+    expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: false });
+    await getRecapProgress('2026-10-01', { includeAttempts: false });
+    expect(invoke).toHaveBeenLastCalledWith('recap_get_progress', { date: '2026-10-01', includeAttempts: false });
+  });
   it('polls without opening an authentication dialog and protects edits', async () => {
     await getRecapDay('2026-09-01');
     expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: false });

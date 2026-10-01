@@ -23,7 +23,7 @@ describe('recap activity display', () => {
   it('uses current attempts over the saved batch and shows real period progress', () => {
     const live = { ...attempt, id: 'new:initial', reasoning: 'New thought', error: null };
     render(<RecapProgress progress={{ started_at_ms: 1000, finished_at_ms: 12000, stage: 'ready', total_batches: 5, completed_batches: 5, attempts: [live] }} batches={[{ start_ms: attempt.batch_start_ms, attempts: [attempt] }]} />);
-    expect(screen.getByRole('progressbar')).toHaveAttribute('value', '5');
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByText('New thought')).toBeInTheDocument();
     expect(screen.queryByText(attempt.reasoning)).not.toBeInTheDocument();
   });
