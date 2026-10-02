@@ -1,13 +1,17 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, MoreHorizontal, Pencil, RefreshCw, Undo2 } from 'lucide-react';
+import { ArrowLeft, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, FileText, Merge, MoreHorizontal, Pencil, RefreshCw, Trash2, Undo2 } from 'lucide-react';
 import { grantAiRemoteConsent } from '../../lib/ai_api';
-import { cancelRecap, correctRecap, generateRecap, localDate } from '../../lib/recap_api';
+import { cancelRecap, correctRecap, deleteRecap, generateRecap, localDate } from '../../lib/recap_api';
+import { ConfirmDialog } from '../ConfirmDialog';
 import { openSettingsWindow } from '../../lib/settings_api';
 import useRecapDay from '../../hooks/useRecapDay';
 import { Button } from '../ui/Button';
+import { MenuItem, MenuPanel } from '../ui/Menu';
 import { CorrectionDialog, DiagnosticsDialog, RecapError, SourcesDialog } from './RecapDialogs';
 import { SourceThumbnail, useRecapSourceAction } from './RecapSources';
+import { PageHeader } from '../PageHeader';
+import { RecapTabs } from './RecapTabs';
 import RecapRecords from './RecapRecords';
 import RecapRunStatus from './RecapRunStatus';
 import RecapApps from './RecapApps';
@@ -33,12 +37,16 @@ function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false })
         buttons[next]?.focus();
       }
     }}>
-    <Button variant="ghost" icon={Icon} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>{text && label}</Button>
-    {open && <div role="menu" aria-label={label} className="absolute right-0 top-full z-30 mt-1 min-w-44 rounded-xl border border-ide-border bg-ide-panel p-1.5 shadow-lg">
-      {items.map((item) => <button key={item.label} type="button" role="menuitem" disabled={item.disabled}
-        className="recap-focus block w-full rounded-md px-3 py-2 text-left text-xs hover:bg-ide-hover disabled:opacity-40"
-        onClick={() => { ref.current?.querySelector('button')?.focus(); setOpen(false); item.onClick(); }}>{item.label}</button>)}
-    </div>}
+    {text ? <Button variant="ghost" icon={Icon} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>{label}</Button>
+      : <button type="button" aria-label={label} title={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}
+        className="recap-focus grid h-6 w-6 place-items-center rounded text-ide-muted transition-opacity hover:bg-ide-hover hover:text-ide-text">
+        <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+      </button>}
+    {open && <MenuPanel role="menu" aria-label={label}>
+      {items.map(({ icon: ItemIcon, ...item }) => <MenuItem key={item.label} role="menuitem" disabled={item.disabled} danger={item.danger}
+        icon={ItemIcon && <ItemIcon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />} className="recap-focus"
+        onClick={() => { ref.current?.querySelector('button')?.focus(); setOpen(false); item.onClick(); }}>{item.label}</MenuItem>)}
+    </MenuPanel>}
   </div>;
 }
 
@@ -89,6 +97,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   const [editing, setEditing] = useState(null);
   const [sources, setSources] = useState(null);
   const [diagnostics, setDiagnostics] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [operation, setOperation] = useState('');
   const [error, setError] = useState('');
   const [liveRunning, setLiveRunning] = useState(false);
@@ -118,6 +127,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
 
   useEffect(() => {
     epoch.current += 1;
+    setConfirmDelete(false);
     setTask(null); setEditing(null); setSources(null); setDiagnostics(false); setOperation(''); setError(''); setNotice(''); setLiveRunning(false);
     setTab('recap'); setPeriod(''); positions.current = {}; recordsPosition.current = 0;
   }, [date, isAuthenticated]);
@@ -149,6 +159,21 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     finally { if (token === epoch.current) setOperation(''); }
   };
   const generate = (force = false) => run('generate', () => generateRecap(date, force));
+  const remove = () => {
+    if (running || operation) return;
+    const token = epoch.current;
+    return run('delete', async () => {
+      try {
+        await deleteRecap(date);
+        if (token === epoch.current) {
+          setTask(null); setTab('recap'); setPeriod(''); setNotice('');
+          positions.current = {}; recordsPosition.current = 0;
+        }
+      } finally {
+        if (token === epoch.current) setConfirmDelete(false);
+      }
+    });
+  };
   const configure = () => openSettingsWindow('organize', 'daily-recap').catch((cause) => setError(String(cause)));
   const shift = (delta) => { const value = new Date(`${date}T12:00:00`); value.setDate(value.getDate() + delta); setDate(localDate(value)); };
   const editTask = (kind) => setEditing({ kind, task_id: task, task_title: selected?.title || activities[0]?.task_title || '', epoch: epoch.current });
@@ -163,38 +188,48 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   if (!active) return null;
   if (!isAuthenticated) return <div className="m-auto p-8 text-sm text-ide-muted">{t('recap.locked')}</div>;
   return <div className="recap-surface relative flex min-h-0 flex-1 flex-col bg-ide-bg text-ide-text">
-    <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 gap-y-2 border-b border-ide-border bg-ide-panel px-5 py-3">
-      {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
-        : <h1 className="flex items-center gap-2 text-sm font-semibold"><CalendarDays className="h-4 w-4 text-ide-accent" />{t('recap.title')}</h1>}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
-        <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
-          className="recap-focus min-w-0 rounded-lg border border-ide-border bg-ide-panel px-2 py-1.5 text-xs tabular-nums" />
-        <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
-        <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
-        {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
-        {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
-          { label: t('recap.correction.rename'), onClick: () => editTask('rename'), disabled: !selected },
-          { label: t('recap.correction.merge'), onClick: () => editTask('merge'), disabled: !selected || day.threads.length < 2 },
-        ]} /> : settings?.enabled && <>
-          {running ? <Button onClick={() => cancelRecap().catch((cause) => setError(String(cause)))}>{t('recap.stop')}</Button>
-            : hasContent && <Button icon={RefreshCw} disabled={Boolean(operation) || !batches.length} onClick={() => generate()}>{t('recap.generate')}</Button>}
-          <ActionMenu label={t('recap.more')} items={[
-            { label: t('recap.regenerate'), onClick: () => generate(true), disabled: running || Boolean(operation) || !batches.length },
-            { label: t('recap.generationDetails'), onClick: () => setDiagnostics(true) },
-            { label: t('recap.undo'), onClick: undo, disabled: !day?.can_undo || Boolean(operation) },
-          ]} />
-        </>}
+    <PageHeader
+      as="header"
+      bordered
+      flushBottom={Boolean(!task && settings?.enabled)}
+      secondaryRow={!task && settings?.enabled ? (
+        <>
+          <RecapTabs tab={tab} onChange={setTab} />
+          {latest > 0 && (
+            <span className="ml-auto hidden text-[11px] text-ide-muted sm:block">
+              {t('recap.updated', { time: time(latest) })}
+            </span>
+          )}
+        </>
+      ) : undefined}
+    >
+      <div className="flex flex-1 flex-wrap items-center justify-between gap-x-5 gap-y-2">
+        {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
+          : <h1 className="flex items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 text-ide-accent" />{t('recap.title')}</h1>}
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
+          <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
+            className="recap-focus h-[30px] min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
+          <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
+          <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
+          {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
+          {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
+            { label: t('recap.correction.rename'), icon: Pencil, onClick: () => editTask('rename'), disabled: !selected },
+            { label: t('recap.correction.merge'), icon: Merge, onClick: () => editTask('merge'), disabled: !selected || day.threads.length < 2 },
+          ]} /> : (settings?.enabled || hasContent || days.includes(date)) && <>
+            {running ? <Button onClick={() => cancelRecap().catch((cause) => setError(String(cause)))}>{t('recap.stop')}</Button>
+              : hasContent && settings?.enabled && <Button icon={RefreshCw} disabled={Boolean(operation) || !batches.length} onClick={() => generate()}>{t('recap.generate')}</Button>}
+            <ActionMenu label={t('recap.more')} items={[
+              { label: t('recap.regenerate'), icon: RefreshCw, onClick: () => generate(true), disabled: !settings?.enabled || running || Boolean(operation) || !batches.length },
+              { label: t('recap.generationDetails'), icon: FileText, onClick: () => setDiagnostics(true) },
+              { label: t('recap.undo'), icon: Undo2, onClick: undo, disabled: !day?.can_undo || Boolean(operation) },
+              { label: t('recap.delete'), icon: Trash2, danger: true, onClick: () => setConfirmDelete(true), disabled: running || Boolean(operation) || !day || !(hasContent || days.includes(date)) },
+            ]} />
+          </>}
+        </div>
       </div>
-    </header>
+    </PageHeader>
     <RecapRunStatus key={date} date={date} active={active} onRunning={setLiveRunning} onComplete={refresh} />
-    {!task && settings?.enabled && <div className="flex shrink-0 items-center justify-between border-b border-ide-border px-6">
-      <div role="tablist" aria-label={t('recap.title')} className="flex gap-5">{['recap', 'records'].map((value) => <button key={value} role="tab" tabIndex={tab === value ? 0 : -1} id={`recap-tab-${value}`} aria-controls={`recap-panel-${value}`} aria-selected={tab === value}
-        className={`recap-focus border-b-2 py-3 text-xs font-medium ${tab === value ? 'border-ide-accent text-ide-accent' : 'border-transparent text-ide-muted hover:text-ide-text'}`}
-        onKeyDown={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); const next = event.key === 'Home' ? 'recap' : event.key === 'End' ? 'records' : value === 'recap' ? 'records' : 'recap'; setTab(next); document.getElementById(`recap-tab-${next}`)?.focus(); } }}
-        onClick={() => setTab(value)}>{t(value === 'recap' ? 'recap.overview' : 'recap.records')}</button>)}</div>
-      {latest > 0 && <span className="hidden text-[11px] text-ide-muted sm:block">{t('recap.updated', { time: time(latest) })}</span>}
-    </div>}
     {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
     {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
     {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}
@@ -222,5 +257,9 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     {editing && <CorrectionDialog key={`${editing.kind}:${editing.id || editing.task_id}`} date={date} editing={editing} threads={day?.threads || []} onClose={() => setEditing(null)} onSaved={(correction) => correctionSaved(correction, editing.epoch)} />}
     {sources && <SourcesDialog sources={sources} action={action} time={time} onClose={() => setSources(null)} />}
     {diagnostics && <DiagnosticsDialog date={date} onClose={() => setDiagnostics(false)} />}
+    <ConfirmDialog isOpen={confirmDelete} title={t('recap.deleteTitle')} message={t('recap.deleteMessage', { date })}
+      confirmLabel={t('recap.delete')} cancelLabel={t('common.cancel')} confirmVariant="danger"
+      loading={operation === 'delete'} loadingLabel={t('recap.deleting')}
+      onConfirm={remove} onCancel={() => setConfirmDelete(false)} />
   </div>;
 }

@@ -22,6 +22,23 @@ pub struct RecapRuntime {
     progress: Mutex<ProgressState>,
 }
 impl RecapRuntime {
+    pub fn delete_day(&self, storage: &StorageState, date: &str) -> Result<(), String> {
+        let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running.is_some() {
+            return Err("AI_BUSY".into());
+        }
+        storage.recap_delete_day(date, storage.db_generation())?;
+        self.errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(date);
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if progress.snapshot.as_ref().is_some_and(|p| p.date == date) {
+            *progress = ProgressState::default();
+        }
+        Ok(())
+    }
+
     fn update_progress(
         &self,
         app: &tauri::AppHandle,
@@ -1000,6 +1017,9 @@ async fn generate_inner(
 ) -> Result<RecapDay, String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let generation = storage.db_generation();
+    if automatic && storage.recap_is_deleted(&date)? {
+        return read_day(&app, &date);
+    }
     let settings = storage
         .recap_read::<RecapSettings>("settings", "settings", None)?
         .unwrap_or_default()
@@ -1035,6 +1055,9 @@ async fn generate_inner(
     };
     ctx.check()?;
     let bounds = batch_bounds(start, end, chrono::Utc::now().timestamp_millis());
+    if !automatic {
+        storage.recap_allow_generation(&date, generation)?;
+    }
     {
         let runtime = app.state::<RecapRuntime>();
         let mut progress = runtime.progress.lock().unwrap_or_else(|e| e.into_inner());

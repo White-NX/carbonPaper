@@ -1325,6 +1325,7 @@ pub fn run() {
             commands::recap::recap_get_records,
             commands::recap::recap_generate,
             commands::recap::recap_cancel,
+            commands::recap::recap_delete,
             commands::recap::recap_get_progress,
             commands::recap::recap_correct,
             commands::mcp::mcp_set_enabled,

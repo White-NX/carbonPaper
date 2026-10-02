@@ -1,5 +1,9 @@
 {
   "recap": {
+    "delete": "删除回顾",
+    "deleteTitle": "删除当天的回顾？",
+    "deleteMessage": "将永久删除 {{date}} 的回顾及修改内容，原始记录会保留。之后可手动重新生成当天的回顾。",
+    "deleting": "正在删除…",
     "overview": "回顾",
     "records": "原始记录",
     "period": "时段",

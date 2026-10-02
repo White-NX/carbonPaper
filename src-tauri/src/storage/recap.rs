@@ -18,6 +18,7 @@ impl StorageState {
                 revision INTEGER NOT NULL, data BLOB NOT NULL, row_key BLOB NOT NULL,
                 PRIMARY KEY(kind,key));
              CREATE INDEX IF NOT EXISTS idx_recap_payload_day ON recap_payloads(day);
+             CREATE TABLE IF NOT EXISTS recap_deleted_days (day TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS recap_usage (
                 id INTEGER PRIMARY KEY, day TEXT NOT NULL, role TEXT NOT NULL, run_id TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, settled INTEGER NOT NULL DEFAULT 0);
@@ -281,7 +282,7 @@ impl StorageState {
         let mut stmt = guard
             .as_ref()
             .ok_or("RECAP_STORAGE_UNAVAILABLE")?
-            .prepare("SELECT day FROM recap_days ORDER BY day DESC LIMIT 730")
+            .prepare("SELECT day FROM recap_days WHERE day NOT IN (SELECT day FROM recap_deleted_days) ORDER BY day DESC LIMIT 730")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| r.get(0))
@@ -289,6 +290,63 @@ impl StorageState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string());
         rows
+    }
+
+    pub(crate) fn recap_delete_day(&self, day: &str, generation: u64) -> Result<(), String> {
+        if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        let mut guard = self.get_connection_named("recap_delete_day")?;
+        if generation != self.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        let tx = guard
+            .as_mut()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .transaction()
+            .map_err(|e| e.to_string())?;
+        Self::delete_recap_rows(&tx, day)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    fn delete_recap_rows(conn: &Connection, day: &str) -> Result<(), String> {
+        // Keep the revision monotonic and retain spent budgets. Reading the day
+        // must not revive old results or enable additional requests for free.
+        for sql in [
+            "UPDATE recap_days SET revision=revision+1 WHERE day=?",
+            "DELETE FROM recap_payloads WHERE day=?",
+            "DELETE FROM recap_summary_jobs WHERE day=?",
+            "INSERT OR IGNORE INTO recap_deleted_days(day) VALUES (?)",
+        ] {
+            conn.execute(sql, [day]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recap_is_deleted(&self, day: &str) -> Result<bool, String> {
+        let guard = self.get_connection_named("recap_is_deleted")?;
+        guard
+            .as_ref()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM recap_deleted_days WHERE day=?)",
+                [day],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn recap_allow_generation(&self, day: &str, generation: u64) -> Result<(), String> {
+        let guard = self.get_connection_named("recap_allow_generation")?;
+        if generation != self.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        guard
+            .as_ref()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .execute("DELETE FROM recap_deleted_days WHERE day=?", [day])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Keyset pagination includes every record, including rows at identical timestamps.
@@ -521,6 +579,57 @@ mod tests {
         *storage.db.lock().unwrap() = Some(conn);
         (temp, storage)
     }
+    #[test]
+    fn deleting_a_day_purges_private_payloads_and_preserves_sources_and_budget() {
+        let (_temp, s) = storage();
+        let generation = s.db_generation();
+        {
+            let mut guard = s.db.lock().unwrap();
+            let conn = guard.as_mut().unwrap();
+            conn.execute_batch(
+                "INSERT INTO screenshots(id,created_at) VALUES(1,'2026-01-01 01:00:00');
+                INSERT INTO recap_days VALUES('2026-01-01',0,1,7,'privacy',1);
+                INSERT INTO recap_days VALUES('2026-01-02',1,2,0,'privacy',2);
+                INSERT INTO recap_usage VALUES(1,'2026-01-01','generation','run',100,10,1);
+                INSERT INTO recap_payloads VALUES('settings','settings','',-1,x'00',x'00');
+                INSERT INTO recap_payloads VALUES('batch','other','2026-01-02',0,x'00',x'00');",
+            )
+            .unwrap();
+            for kind in ["batch", "summary", "index", "screen", "corrections"] {
+                conn.execute(
+                    "INSERT INTO recap_payloads VALUES(?1,?1,'2026-01-01',7,x'00',x'00')",
+                    [kind],
+                )
+                .unwrap();
+            }
+            let tx = conn.transaction().unwrap();
+            StorageState::delete_recap_rows(&tx, "2026-01-01").unwrap();
+            tx.commit().unwrap();
+            for (table, expected) in [
+                ("recap_payloads", 2),
+                ("recap_summary_jobs", 0),
+                ("recap_usage", 1),
+                ("screenshots", 1),
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, expected, "{table}");
+            }
+        }
+        assert!(s.recap_is_deleted("2026-01-01").unwrap());
+        assert!(!s
+            .recap_revision_matches("2026-01-01", 7, generation)
+            .unwrap());
+        assert_eq!(s.recap_list_days().unwrap(), vec!["2026-01-02"]);
+        s.recap_allow_generation("2026-01-01", generation).unwrap();
+        assert!(!s.recap_is_deleted("2026-01-01").unwrap());
+        assert_eq!(
+            s.recap_delete_day("2026-01-01", generation).unwrap_err(),
+            "AUTH_REQUIRED"
+        );
+    }
+
     #[test]
     fn composed_reads_reject_a_new_empty_revision_but_allow_corrections() {
         let (_temp, s) = storage();

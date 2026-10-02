@@ -141,6 +141,26 @@ pub async fn recap_generate(
     recap::generate(app, date, force.unwrap_or(false), false).await
 }
 
+/// Authentication: required. Deletes this day's recap and suppresses automatic regeneration.
+#[tauri::command]
+pub async fn recap_delete(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    date: String,
+) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+    recap::day_bounds(&date)?;
+    if crate::maintenance::is_active() {
+        return Err("MAINTENANCE_IN_PROGRESS".into());
+    }
+    app.state::<RecapRuntime>()
+        .delete_day(&storage_state, &date)?;
+    let _ = app.emit("recap-changed", ());
+    let _ = app.emit("recap-progress", ());
+    Ok(())
+}
+
 /// Authentication: not required. Only cancels an already-running recap.
 #[tauri::command]
 pub async fn recap_cancel(runtime: tauri::State<'_, RecapRuntime>) -> Result<bool, String> {

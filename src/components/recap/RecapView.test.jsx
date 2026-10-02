@@ -13,7 +13,7 @@ vi.mock('../../lib/settings_api', () => ({ openSettingsWindow: vi.fn(async () =>
 vi.mock('../../lib/ai_api', () => ({ getAiSettings: vi.fn(async () => ({ providers: [{ id: 'p', name: 'Local model' }], remote_consent: false })), grantAiRemoteConsent: vi.fn(async () => ({ providers: [], remote_consent: true })) }));
 vi.mock('../../lib/recap_api', async (original) => ({
   ...await original(), getRecapSettings: vi.fn(), getRecapDay: vi.fn(), getRecapProgress: vi.fn(), getRecapRecords: vi.fn(), listRecapDays: vi.fn(async () => []),
-  generateRecap: vi.fn(), cancelRecap: vi.fn(async () => true), correctRecap: vi.fn(), saveRecapSettings: vi.fn(),
+  generateRecap: vi.fn(), deleteRecap: vi.fn(), cancelRecap: vi.fn(async () => true), correctRecap: vi.fn(), saveRecapSettings: vi.fn(),
 }));
 
 let day;
@@ -51,6 +51,44 @@ describe('daily recap page', () => {
   });
   const enterEvent = async () => fireEvent.click(await screen.findByRole('button', { name: /Review login flow/ }));
   const more = () => fireEvent.click(screen.getByRole('button', { name: 'recap.more' }));
+
+  it('confirms deletion with the shared dialog and refreshes the day and date list', async () => {
+    api.listRecapDays.mockResolvedValue([api.localDate()]);
+    render(<RecapView active isAuthenticated />);
+    await screen.findByText('Inspected the form validation.');
+    more();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'recap.delete' }));
+    expect(screen.getByRole('dialog', { name: 'recap.deleteTitle' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'common.cancel' }));
+    expect(api.deleteRecap).not.toHaveBeenCalled();
+    more();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'recap.delete' }));
+    api.deleteRecap.mockImplementationOnce(async () => {
+      api.getRecapDay.mockResolvedValue({ ...day, batches: [], threads: [], can_undo: false });
+      api.listRecapDays.mockResolvedValue([]);
+    });
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'recap.delete' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(api.deleteRecap).toHaveBeenCalledWith(api.localDate());
+    expect(await screen.findByText('recap.waitingDescription')).toBeVisible();
+    expect(document.querySelectorAll('#recap-dates option')).toHaveLength(0);
+    expect(screen.queryByText('Inspected the form validation.')).not.toBeInTheDocument();
+  });
+
+  it('retains the recap when deletion fails and disables deletion during generation', async () => {
+    api.deleteRecap.mockRejectedValueOnce(new Error('AI_BUSY'));
+    const { rerender } = render(<RecapView active isAuthenticated />);
+    await screen.findByText('Inspected the form validation.');
+    more();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'recap.delete' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'recap.delete' }));
+    expect(await screen.findByText('recap.errors.AI_BUSY')).toBeVisible();
+    expect(screen.getByText('Inspected the form validation.')).toBeVisible();
+    day.running = true;
+    rerender(<RecapView active isAuthenticated />);
+    more();
+    expect(screen.getByRole('menuitem', { name: 'recap.delete' })).toBeDisabled();
+  });
 
   it('shows the period overview and opens a full event history without hidden source nodes', async () => {
     const batch = day.batches[0];

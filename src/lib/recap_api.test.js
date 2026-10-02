@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { correctRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, groupRecapActivities, sourceResult } from './recap_api';
+import { correctRecap, deleteRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, groupRecapActivities, sourceResult } from './recap_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((action) => action()) }));
 
 describe('recap API and occurrence display', () => {
+  it('protects deletion and addresses only the selected date', async () => {
+    await deleteRecap('2026-09-01');
+    expect(invoke).toHaveBeenLastCalledWith('recap_delete', { date: '2026-09-01' });
+    expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: true });
+  });
   it('uses authenticated light reads and passes pagination scope without prompting', async () => {
     await getRecapDay('2026-10-01', { includeRecords: false, includeAttempts: false });
     expect(invoke).toHaveBeenLastCalledWith('recap_get_day', { date: '2026-10-01', includeRecords: false, includeAttempts: false });
