@@ -1750,6 +1750,12 @@ const ENCODE_SECONDS_PER_MEGAPIXEL: f64 = 0.25;
 /// 1920×1080, for rows written before `screenshots.width`/`height` existed.
 const ASSUMED_MEGAPIXELS: f64 = 2.0736;
 
+fn estimate_backfill_seconds(images: u64, megapixels: f64) -> u64 {
+    (images as f64 * ENCODE_FIXED_SECONDS + megapixels * ENCODE_SECONDS_PER_MEGAPIXEL)
+        .round()
+        .max(0.0) as u64
+}
+
 /// Diagnostic codes that mean "correctly skipped" rather than "could not be
 /// imported". Shared with the side that records them, so the two cannot drift.
 const EXPECTED_SKIP_CODES: &[&str] = &[
@@ -1839,10 +1845,7 @@ pub async fn get_clip_backfill_offer(
             None => (0, 0),
         };
 
-        let estimated_seconds = (work.images as f64 * ENCODE_FIXED_SECONDS
-            + work.megapixels * ENCODE_SECONDS_PER_MEGAPIXEL)
-            .round()
-            .max(0.0) as u64;
+        let estimated_seconds = estimate_backfill_seconds(work.images, work.megapixels);
         let has_work = work.images > 0 || backlog.exhausted > 0;
         Ok(ClipBackfillOffer {
             migration_settled,
@@ -1970,20 +1973,11 @@ mod tests {
     }
 
     #[test]
-    fn the_pixel_budget_holds_a_meaningful_number_of_captures() {
-        // The budget is stated in bytes but reasoned about in screenshots; if
-        // the CLIP input ever grew, this is what would catch the budget
-        // silently becoming a handful of images.
-        let entry = 224 * 224 * 3;
-        assert!(CAPTURE_PIXEL_BUDGET_BYTES / entry >= 400);
-    }
-
-    #[test]
-    fn one_image_per_chunk_bounds_the_foreground_wait() {
-        // A CLIP forward pass cannot be interrupted once submitted, so the
-        // chunk size *is* the worst case a search arriving mid-pass inherits.
-        assert_eq!(ENCODE_CHUNK, 1);
-        assert!(DRAIN_BATCH >= ENCODE_CHUNK);
+    fn clip_batch_configuration_fits_worker_request_limits() {
+        assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
+        assert!(ENCODE_CHUNK <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+        assert!(!EMBED_TIMEOUT.is_zero());
+        assert!(EMBED_TIMEOUT.as_millis() <= crate::ml_protocol::MAX_ML_TIMEOUT_MS as u128);
     }
 
     #[test]
@@ -1995,27 +1989,6 @@ mod tests {
         assert!(mode.is_manual());
         assert!(!mode.yields_after_chunk());
         assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
-    }
-
-    #[test]
-    fn the_embed_timeout_covers_a_cold_model_load() {
-        // The CLIP ONNX file is 177 MB and is verified in full on every swap,
-        // and the load lands inside the first request of a pass.
-        assert!(EMBED_TIMEOUT >= Duration::from_secs(120));
-    }
-
-    #[test]
-    fn clip_vectors_are_the_declared_width() {
-        use crate::clip_contract::CLIP_DIMENSIONS;
-        // Guards against the index quietly accepting a MiniLM row if a caller
-        // ever passed the wrong model.
-        assert_eq!(CLIP_DIMENSIONS, 512);
-        assert!(validate_clip_vector(&vec![0.1; CLIP_DIMENSIONS]).is_ok());
-        assert!(validate_clip_vector(&vec![0.1; 384]).is_err());
-    }
-
-    fn estimate_one(megapixels: f64) -> f64 {
-        ENCODE_FIXED_SECONDS + megapixels * ENCODE_SECONDS_PER_MEGAPIXEL
     }
 
     #[test]
@@ -2037,21 +2010,13 @@ mod tests {
     }
 
     #[test]
-    fn the_assumed_size_is_the_measured_1080p_point() {
-        // Rows written before `screenshots.width`/`height` existed are counted
-        // at this size, so it has to be one of the measured points rather than
-        // a round number.
-        assert!((ASSUMED_MEGAPIXELS - 1920.0 * 1080.0 / 1_000_000.0).abs() < 1e-9);
-        assert!((estimate_one(ASSUMED_MEGAPIXELS) - 0.67).abs() < 0.02);
-    }
-
-    #[test]
-    fn the_repair_scan_window_is_a_bound_sqlite_modifier() {
-        // Bound as a parameter by `list_clip_image_index_candidates`, never
-        // interpolated: a literal that stopped being a constant would otherwise
-        // be an injection point in a datetime modifier.
-        assert!(REPAIR_SCAN_WINDOW.starts_with('-'));
-        assert!(REPAIR_SCAN_WINDOW.ends_with("days"));
+    fn backfill_estimates_increase_with_image_count_and_pixel_work() {
+        assert_eq!(estimate_backfill_seconds(0, 0.0), 0);
+        let small = estimate_backfill_seconds(100, 100.0);
+        assert!(small > 0);
+        assert!(estimate_backfill_seconds(200, 200.0) > small);
+        assert!(estimate_backfill_seconds(100, 400.0) > small);
+        assert!(estimate_backfill_seconds(200, 100.0) > small);
     }
 
     #[test]

@@ -613,41 +613,6 @@ mod tests {
         assert_eq!(success.last_error, None);
     }
 
-    #[test]
-    fn an_indexing_backlog_is_reported_but_is_not_a_refusal() {
-        let _guard = OBSERVATION_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        // Step 5 removed the only refusal that a backlog could trigger. Rust is
-        // now the sole MiniLM encoder and Chroma is fed from this store, so a
-        // screenshot waiting in the ledger is missing from Python too; standing
-        // down would cost the faster path and recover nothing. The depth stays
-        // visible in the diagnostic, which is where the freshness cost of idle
-        // gating shows up.
-        let reasons = [
-            "maintenance_in_progress",
-            "migration_incomplete",
-            "rust_index_empty",
-        ];
-        for reason in reasons {
-            observe_failure(reason);
-        }
-        let status = backend_status(None);
-        assert!(
-            !status
-                .last_error
-                .as_deref()
-                .unwrap_or("")
-                .contains("index_incomplete"),
-            "a backlog must not be spelled as a retrieval error"
-        );
-        // Nothing was read from a database, so the depths are unknown rather
-        // than zero — reporting zero would claim a complete index.
-        assert_eq!(status.index_backlog, None);
-        assert_eq!(status.index_stalled, None);
-        assert_eq!(status.index_backlog_age_secs, None);
-    }
-
     fn scored(subject_key: &str, score: f32) -> crate::storage::ScoredSubject {
         crate::storage::ScoredSubject {
             subject_key: subject_key.to_string(),

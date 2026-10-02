@@ -765,17 +765,21 @@ mod tests {
     }
 
     #[test]
-    fn ann_probe_accepts_a_different_valid_neighbor() {
-        assert!(validate_ann_search_result(&[2], &[0.99], 3).is_ok());
-    }
-
-    #[test]
-    fn ann_probe_rejects_invalid_results() {
-        assert!(validate_ann_search_result(&[], &[], 3).is_err());
-        assert!(validate_ann_search_result(&[0], &[0.99], 3).is_err());
-        assert!(validate_ann_search_result(&[4], &[0.99], 3).is_err());
-        assert!(validate_ann_search_result(&[1], &[f32::NAN], 3).is_err());
-        assert!(validate_ann_search_result(&[1], &[], 3).is_err());
+    fn ann_probe_validates_neighbors_and_scores() {
+        for (label, keys, scores, valid) in [
+            ("different valid neighbor", vec![2], vec![0.99], true),
+            ("empty", vec![], vec![], false),
+            ("zero key", vec![0], vec![0.99], false),
+            ("out of range", vec![4], vec![0.99], false),
+            ("non-finite", vec![1], vec![f32::NAN], false),
+            ("missing score", vec![1], vec![], false),
+        ] {
+            assert_eq!(
+                validate_ann_search_result(&keys, &scores, 3).is_ok(),
+                valid,
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -785,40 +789,5 @@ mod tests {
         assert!(validate_ann_recovered_probe(&expected, &recovered, 1).unwrap() > 0.99);
         assert!(validate_ann_recovered_probe(&expected, &[0.8, -0.6], 1).is_err());
         assert!(validate_ann_recovered_probe(&expected, &recovered, 0).is_err());
-    }
-
-    #[test]
-    fn creates_a_sidecar_for_builder_smoke_test() {
-        let Some(path) = std::env::var_os("CARBONPAPER_ANN_TEST_SIDECAR") else {
-            return;
-        };
-        let path = std::path::PathBuf::from(path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let vectors = vec![
-            // These first two normalized vectors deliberately reproduce the
-            // production failure: after I8 quantization, raw inner product can
-            // rank key 2 above the key-1 probe even though they are near-equal.
-            // The builder self-test must accept that ANN tie break while still
-            // proving key 1 itself survived serialization via `Index::get`.
-            vec![0.18817376, -0.6422276, 0.4634306, 0.58083254],
-            vec![0.1680381, -0.6528201, 0.46298614, 0.57552844],
-            vec![0.0, 0.0, 1.0, 0.0],
-        ];
-        let header = Header::for_snapshot(
-            99,
-            7,
-            keys.len() as u64,
-            4,
-            "clip_image",
-            "clip",
-            "rev",
-            96,
-            3,
-        )
-        .unwrap();
-        write_flat_file(&path, &header, &keys, &vectors).unwrap();
     }
 }

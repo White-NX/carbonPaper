@@ -2119,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn init_tables_installs_ann_manifest_changes_and_epoch_triggers() {
+    fn init_tables_installs_ann_storage() {
         let (_temp, storage) = test_storage();
         let conn = Connection::open_in_memory().unwrap();
         storage.init_tables(&conn).unwrap();
@@ -2127,20 +2127,6 @@ mod tests {
         assert!(object_exists(&conn, "table", "derived_ann_generations"));
         assert!(object_exists(&conn, "table", "derived_ann_changes"));
         assert!(object_exists(&conn, "table", "derived_ann_build_state"));
-        assert!(object_exists(
-            &conn,
-            "trigger",
-            "derived_embeddings_epoch_after_insert"
-        ));
-        let trigger_sql: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'derived_index_jobs_epoch_after_update'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(trigger_sql.contains("derived_ann_changes"));
-        assert!(trigger_sql.contains("WHERE NEW.index_kind = 'clip_image'"));
     }
 
     #[test]

@@ -540,7 +540,11 @@ mod tests {
         };
         tokio::task::yield_now().await;
         cancel.cancel();
-        waiter.await.unwrap();
-        cancel.cancelled().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            waiter.await.unwrap();
+            cancel.cancelled().await;
+        })
+        .await
+        .expect("cancellation must wake current and future waiters");
     }
 }

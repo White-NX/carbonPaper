@@ -198,14 +198,23 @@ mod tests {
     }
 
     #[test]
-    fn a_downscale_squashes_rather_than_crops() {
-        // A non-square source must fill the whole square target. If this ever
-        // became a center crop, the capture path and the worker would still
-        // agree, but both would disagree with the Python oracle.
-        let source = gradient(640, 160);
+    fn downscaling_preserves_both_edges_of_a_non_square_source() {
+        let source = RgbImage::from_fn(640, 160, |x, _| {
+            if x < 80 {
+                image::Rgb([255, 0, 0])
+            } else if x >= 560 {
+                image::Rgb([0, 0, 255])
+            } else {
+                image::Rgb([0, 255, 0])
+            }
+        });
         let resized = pillow_bicubic_resize_rgb(&source, 224, 224);
-        assert_eq!(resized.width(), 224);
-        assert_eq!(resized.height(), 224);
+        assert_eq!(resized.dimensions(), (224, 224));
+        for y in [0, 112, 223] {
+            assert_eq!(resized.get_pixel(0, y).0, [255, 0, 0]);
+            assert_eq!(resized.get_pixel(112, y).0, [0, 255, 0]);
+            assert_eq!(resized.get_pixel(223, y).0, [0, 0, 255]);
+        }
     }
 
     #[test]

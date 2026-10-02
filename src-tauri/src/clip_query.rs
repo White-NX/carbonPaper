@@ -762,10 +762,31 @@ mod tests {
     }
 
     #[test]
-    fn the_similarity_floor_matches_the_frozen_oracle() {
-        // `monitor/oracle/golden-v1.json` pins 0.32 for both
-        // `clip_vector_search` and every `search_nl` case.
-        assert_eq!(CLIP_MIN_SIMILARITY, 0.32);
+    fn similarity_filter_excludes_low_scores_before_attempting_private_metadata_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(crate::credential_manager::CredentialManagerState::new(
+            temp.path().to_path_buf(),
+        ));
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        for (score, requires_read) in [(0.31, false), (0.32, true), (0.33, true)] {
+            let rows = vec![crate::storage::ScoredSubject {
+                subject_key: "unreadable".into(),
+                score,
+            }];
+            let result = filter_scored(
+                &storage,
+                rows,
+                &[],
+                None,
+                None,
+                Instant::now() + Duration::from_secs(5),
+            );
+            if requires_read {
+                assert!(result.is_err(), "score {score} reaches the protected read");
+            } else {
+                assert!(result.unwrap().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -829,31 +850,34 @@ mod tests {
     }
 
     #[test]
-    fn ann_candidate_search_uses_only_fetch_double_and_quadruple() {
-        assert_eq!(ann_candidate_attempts(100), vec![100, 200, 400]);
-        assert_eq!(ann_candidate_attempts(2_000), vec![2_000, 4_000, 4_096]);
-        assert_eq!(ann_candidate_attempts(4_096), vec![4_096]);
-
-        let calls = RefCell::new(Vec::new());
-        let exact_calls = Cell::new(0);
-        let result = search_candidates(
-            100,
-            10,
-            Instant::now() + Duration::from_secs(1),
-            |requested| {
-                calls.borrow_mut().push(requested);
-                Ok(CandidateSource::Ann(scored(requested)))
-            },
-            |_| Ok(Vec::new()),
-            || {
-                exact_calls.set(exact_calls.get() + 1);
-                Ok(scored(100))
-            },
-        )
-        .unwrap();
-        assert!(result.is_empty());
-        assert_eq!(*calls.borrow(), vec![100, 200, 400]);
-        assert_eq!(exact_calls.get(), 1);
+    fn ann_expansion_is_bounded_and_exhaustion_runs_exactly_one_fallback() {
+        for fetch in [100, 2_000, crate::clip_ann::ANN_MAX_CANDIDATES] {
+            let calls = RefCell::new(Vec::new());
+            let exact_calls = Cell::new(0);
+            let result = search_candidates(
+                fetch,
+                10,
+                Instant::now() + Duration::from_secs(5),
+                |requested| {
+                    calls.borrow_mut().push(requested);
+                    Ok(CandidateSource::Ann(scored(requested)))
+                },
+                |_| Ok(Vec::new()),
+                || {
+                    exact_calls.set(exact_calls.get() + 1);
+                    Ok(scored(fetch))
+                },
+            )
+            .unwrap();
+            assert!(result.is_empty());
+            let calls = calls.into_inner();
+            assert_eq!(calls.first(), Some(&fetch));
+            assert!(calls.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(calls
+                .iter()
+                .all(|n| *n <= crate::clip_ann::ANN_MAX_CANDIDATES));
+            assert_eq!(exact_calls.get(), 1);
+        }
     }
 
     #[test]

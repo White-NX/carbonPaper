@@ -31,6 +31,15 @@ impl ProgressState {
     }
 
     pub fn update(&mut self, force: bool, update: impl FnOnce(&mut RecapProgress)) -> bool {
+        self.update_at(Instant::now(), force, update)
+    }
+
+    fn update_at(
+        &mut self,
+        now: Instant,
+        force: bool,
+        update: impl FnOnce(&mut RecapProgress),
+    ) -> bool {
         let Some(snapshot) = self.snapshot.as_mut() else {
             return false;
         };
@@ -40,9 +49,9 @@ impl ProgressState {
         if force
             || self
                 .last_notify
-                .is_none_or(|t| t.elapsed() >= NOTIFY_INTERVAL)
+                .is_none_or(|t| now.saturating_duration_since(t) >= NOTIFY_INTERVAL)
         {
-            self.last_notify = Some(Instant::now());
+            self.last_notify = Some(now);
             true
         } else {
             false
@@ -213,11 +222,13 @@ mod tests {
     #[test]
     fn snapshot_updates_survive_notification_throttling_and_a_new_run_resets_them() {
         let mut state = ProgressState::default();
+        let now = Instant::now();
         state.start("2026-09-30".into(), 1);
-        assert!(state.update(true, |p| p.total_batches = 5));
-        assert!(!state.update(false, |p| p.completed_batches = 1));
+        assert!(state.update_at(now, true, |p| p.total_batches = 5));
+        assert!(!state.update_at(now, false, |p| p.completed_batches = 1));
         assert_eq!(state.snapshot.as_ref().unwrap().completed_batches, 1);
-        assert!(state.update(true, |p| p.stage = "ready".into()));
+        assert!(state.update_at(now, true, |p| p.stage = "ready".into()));
+        assert!(state.update_at(now + NOTIFY_INTERVAL, false, |p| p.completed_batches = 2));
         state.start("2026-10-01".into(), 2);
         assert_eq!(state.snapshot.as_ref().unwrap().completed_batches, 0);
         assert_eq!(state.generation, 2);

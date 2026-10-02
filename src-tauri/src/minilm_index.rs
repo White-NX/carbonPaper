@@ -583,38 +583,65 @@ async fn stand_aside_for_foreground(
         return None;
     }
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
-    let started = Instant::now();
+    wait_for_foreground_with(
+        deadline,
+        waited,
+        MANUAL_FOREGROUND_WAIT_BUDGET,
+        || {
+            (
+                semantic.foreground_waiting(),
+                run.stopped_by_user(),
+                crate::maintenance::is_active(),
+            )
+        },
+        Instant::now,
+        || tokio::time::sleep(crate::semantic_runtime::FOREGROUND_POLL_INTERVAL),
+    )
+    .await
+}
+
+async fn wait_for_foreground_with<F, Fut>(
+    deadline: Instant,
+    waited: &mut Duration,
+    wait_budget: Duration,
+    mut signals: impl FnMut() -> (bool, bool, bool),
+    mut now: impl FnMut() -> Instant,
+    mut sleep: F,
+) -> Option<&'static str>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if !signals().0 {
+        return None;
+    }
+    let started = now();
     tracing::info!("[SEMANTIC:INDEX] manual run standing aside for a foreground query");
     let outcome = loop {
-        if run.stopped_by_user() {
+        let (foreground, stopped, maintaining) = signals();
+        if stopped {
             break Some(STOPPED_BY_USER);
         }
-        if crate::maintenance::is_active() {
+        if maintaining {
             break Some(MAINTENANCE_STARTED);
         }
-        let now = Instant::now();
-        if now >= deadline {
+        let current = now();
+        if current >= deadline {
             break Some(DEADLINE_REACHED);
         }
-        if *waited + now.duration_since(started) >= MANUAL_FOREGROUND_WAIT_BUDGET {
+        if *waited + current.duration_since(started) >= wait_budget {
             break Some(WAITED_OUT_BY_FOREGROUND);
         }
-        if !semantic.foreground_waiting() {
+        if !foreground {
             break None;
         }
-        tokio::time::sleep(crate::semantic_runtime::FOREGROUND_POLL_INTERVAL).await;
+        sleep().await;
     };
-    *waited += started.elapsed();
+    let elapsed = now().duration_since(started);
+    *waited += elapsed;
     match outcome {
-        None => tracing::info!(
-            "[SEMANTIC:INDEX] manual run resuming after {:.1}s; the foreground query is done",
-            started.elapsed().as_secs_f64()
-        ),
-        Some(reason) => tracing::info!(
-            "[SEMANTIC:INDEX] manual run ending while stood aside: {reason} \
-             (waited {:.1}s in total)",
-            waited.as_secs_f64()
-        ),
+        None => tracing::info!("[SEMANTIC:INDEX] manual run resuming after {:.1}s; the foreground query is done", elapsed.as_secs_f64()),
+        Some(reason) => tracing::info!("[SEMANTIC:INDEX] manual run ending while stood aside: {reason} (waited {:.1}s in total)", waited.as_secs_f64()),
     }
     outcome
 }
@@ -1434,21 +1461,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retention_is_a_bound_sqlite_modifier_not_an_interpolated_one() {
-        // Both queries bind this as a parameter. A literal that ever stopped
-        // being a constant would otherwise be a SQL injection point in a
-        // datetime modifier, which is easy to miss.
-        assert!(SEMANTIC_TEXT_RETENTION.starts_with('-'));
-        assert!(SEMANTIC_TEXT_RETENTION.ends_with(" days"));
-    }
-
-    #[test]
-    fn a_batch_fits_the_protocol_limit() {
-        // Each chunk of the claimed batch goes through one `embed_text` call,
-        // and a chunk is carved out of a claim, so both have to fit.
-        assert!(ENCODE_CHUNK <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
-        assert!(ENCODE_CHUNK <= DRAIN_BATCH);
+    fn indexing_configuration_respects_protocol_and_deadline_envelopes() {
+        assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
         assert!(DRAIN_BATCH <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+        assert!(MAX_ATTEMPTS > 0 && RETRY_BACKOFF_MINUTES > 0);
+        assert!(!EMBED_TIMEOUT.is_zero() && EMBED_TIMEOUT <= MANUAL_DEADLINE);
+        assert!(MANUAL_FOREGROUND_WAIT_BUDGET < MANUAL_DEADLINE);
     }
 
     #[test]
@@ -1497,67 +1515,71 @@ mod tests {
         assert_ne!(empty.source_fingerprint, with_text.source_fingerprint);
     }
 
-    #[test]
-    fn the_retry_budget_and_backoff_outlast_a_single_idle_window() {
-        // A failing model load must not spend all five attempts inside one
-        // night of idleness, which would leave the subject `exhausted` by
-        // morning over a transient fault.
-        assert!(MAX_ATTEMPTS >= 3);
-        assert!(RETRY_BACKOFF_MINUTES >= 15);
+    #[tokio::test]
+    async fn foreground_pauses_share_a_wait_budget_across_the_manual_run() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let seconds = Cell::new(0u64);
+        let mut waited = Duration::ZERO;
+        let result = wait_for_foreground_with(
+            start + Duration::from_secs(20),
+            &mut waited,
+            Duration::from_secs(5),
+            || (seconds.get() < 3, false, false),
+            || start + Duration::from_secs(seconds.get()),
+            || {
+                seconds.set(seconds.get() + 1);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(result, None);
+        assert_eq!(waited, Duration::from_secs(3));
+        let result = wait_for_foreground_with(
+            start + Duration::from_secs(20),
+            &mut waited,
+            Duration::from_secs(5),
+            || (true, false, false),
+            || start + Duration::from_secs(seconds.get()),
+            || {
+                seconds.set(seconds.get() + 1);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(result, Some(WAITED_OUT_BY_FOREGROUND));
+        assert_eq!(waited, Duration::from_secs(5));
     }
 
-    #[test]
-    fn the_manual_deadline_outlasts_the_work_it_is_guarding() {
-        // The old assertion here paired a subject budget with this deadline and
-        // argued that neither bound alone was sufficient — a deadline on its own
-        // "makes the amount of work done depend on machine speed, which is not
-        // something the user can see before clicking". That argument was
-        // answered rather than dropped: the run now reports its progress
-        // against the backlog it started with, so how far it gets is something
-        // the user watches instead of predicts, and the stop button ends it
-        // whenever they have seen enough.
-        //
-        // What is left to assert is that the runaway guard cannot fire in the
-        // middle of the first chunk it allowed to start, which would leave a
-        // cold model load having bought nothing.
-        assert!(MANUAL_DEADLINE >= EMBED_TIMEOUT);
-    }
-
-    #[test]
-    fn a_manual_run_cannot_wait_out_its_own_deadline() {
-        // The counterpart of the runaway guard: a run that stands aside for
-        // every foreground query it meets has to keep enough of its deadline to
-        // reach the worker, or the click spends thirty minutes and reports
-        // "deadline_reached, 0 indexed" — the indexer looking broken when it was
-        // only being polite.
-        assert!(MANUAL_FOREGROUND_WAIT_BUDGET < MANUAL_DEADLINE);
-        // And it has to outlast one whole reranked calibration query, or the
-        // ordinary collision — search, then index — ends the run instead of
-        // sequencing it. The same bound `smart_cluster_scoring.rs` holds its
-        // forced drain to, against the same measured per-document cost.
-        let worst_query = Duration::from_millis(1180)
-            * (crate::rerank::MAX_RERANK_RESULTS * crate::rerank::RERANK_OVERFETCH);
-        assert!(MANUAL_FOREGROUND_WAIT_BUDGET > worst_query);
-    }
-
-    #[test]
-    fn a_run_that_stood_aside_is_not_reported_as_a_slow_one() {
-        // The two ways a manual run can end without indexing anything, and the
-        // reason they are separate strings: one says the machine could not keep
-        // up, the other says the machine was busy with this user's own searches.
-        // Collapsing them would send somebody looking for a performance problem
-        // that is not there.
-        assert_ne!(WAITED_OUT_BY_FOREGROUND, DEADLINE_REACHED);
-        // And the reason a drain resumes from must not read as either of the
-        // reasons it ends on, or `drain_until_done` either loops on a stop or
-        // ends on a query it should have waited for.
-        for ends_the_run in [
-            STOPPED_BY_USER,
-            MAINTENANCE_STARTED,
-            DEADLINE_REACHED,
-            WAITED_OUT_BY_FOREGROUND,
+    #[tokio::test]
+    async fn foreground_wait_preserves_stop_maintenance_and_deadline_reasons() {
+        let start = Instant::now();
+        for (stopped, maintenance, deadline, expected) in [
+            (
+                true,
+                false,
+                start + Duration::from_secs(10),
+                STOPPED_BY_USER,
+            ),
+            (
+                false,
+                true,
+                start + Duration::from_secs(10),
+                MAINTENANCE_STARTED,
+            ),
+            (false, false, start, DEADLINE_REACHED),
         ] {
-            assert_ne!(ends_the_run, FOREGROUND_QUERY_STOP);
+            let mut waited = Duration::ZERO;
+            let result = wait_for_foreground_with(
+                deadline,
+                &mut waited,
+                Duration::from_secs(5),
+                || (true, stopped, maintenance),
+                || start,
+                || -> std::future::Ready<()> { panic!("terminal conditions must not sleep") },
+            )
+            .await;
+            assert_eq!(result, Some(expected));
         }
     }
 

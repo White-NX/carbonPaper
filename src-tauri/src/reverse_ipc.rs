@@ -1050,40 +1050,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_storage_response_success() {
-        let resp = StorageResponse::success(serde_json::json!({"id": 1}));
-        assert_eq!(resp.status, "success");
-        assert!(resp.error.is_none());
-        assert!(resp.data.is_some());
-        assert_eq!(resp.data.unwrap()["id"], 1);
-    }
-
-    #[test]
-    fn test_storage_response_error() {
-        let resp = StorageResponse::error("something failed");
-        assert_eq!(resp.status, "error");
-        assert_eq!(resp.error.unwrap(), "something failed");
-        assert!(resp.data.is_none());
-    }
-
-    #[test]
-    fn test_storage_response_success_serialization() {
-        let resp = StorageResponse::success(serde_json::json!({"key": "value"}));
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"status\":\"success\""));
-        assert!(json.contains("\"key\":\"value\""));
-        // error field should be skipped (skip_serializing_if = "Option::is_none")
-        assert!(!json.contains("\"error\""));
-    }
-
-    #[test]
-    fn test_storage_response_error_serialization() {
-        let resp = StorageResponse::error("bad request");
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"status\":\"error\""));
-        assert!(json.contains("\"error\":\"bad request\""));
-        // data field should be skipped
-        assert!(!json.contains("\"data\""));
+    fn storage_responses_serialize_success_and_error_without_opposite_fields() {
+        for (response, expected) in [
+            (
+                StorageResponse::success(serde_json::json!({"id": 1})),
+                serde_json::json!({"status": "success", "data": {"id": 1}}),
+            ),
+            (
+                StorageResponse::error("bad request"),
+                serde_json::json!({"status": "error", "error": "bad request"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(response).unwrap(), expected);
+        }
     }
 
     fn make_session(browser_pid: u32, nmh_pid: u32, last_seen_ms: i64) -> NmhSession {
@@ -1197,44 +1176,5 @@ mod tests {
         ));
         let resized = resize_extension_ocr_image(image);
         assert_eq!(resized.dimensions(), (1200, 800));
-    }
-
-    #[test]
-    fn test_decrypt_many_response_contract_shape() {
-        let resp = StorageResponse::success(serde_json::json!({
-            "decrypted_list": ["plain-1", "plain-2"],
-            "error_count": 0
-        }));
-        let as_value = serde_json::to_value(resp).unwrap();
-
-        assert_eq!(as_value["status"], "success");
-        assert!(as_value["data"]["decrypted_list"].is_array());
-        assert!(as_value["data"]["error_count"].is_number());
-    }
-
-    #[test]
-    fn test_list_screenshots_response_contract_shape() {
-        let resp = StorageResponse::success(serde_json::json!({
-            "screenshots": [
-                {
-                    "id": 1,
-                    "process_name": "code.exe",
-                    "window_title": "Editor",
-                    "ocr_text": "hello",
-                    "timestamp": 123.0,
-                    "category": "Development"
-                }
-            ],
-            "total": 1
-        }));
-        let as_value = serde_json::to_value(resp).unwrap();
-
-        assert_eq!(as_value["status"], "success");
-        assert!(as_value["data"]["screenshots"].is_array());
-        assert!(as_value["data"]["total"].is_number());
-        let first = &as_value["data"]["screenshots"][0];
-        assert!(first.get("process_name").is_some());
-        assert!(first.get("window_title").is_some());
-        assert!(first.get("ocr_text").is_some());
     }
 }

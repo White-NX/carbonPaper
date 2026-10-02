@@ -1135,13 +1135,13 @@ mod tests {
     fn test_read_pipe_frame_rejects_frames_above_limit() {
         let oversized = ((IPC_MAX_MESSAGE_BYTES + 1) as u32).to_le_bytes();
         let error = read_pipe_frame(&mut oversized.as_slice()).unwrap_err();
-        assert!(error.to_string().contains("max 16777216"));
+        assert!(error.kind() == std::io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn test_write_pipe_frame_rejects_frames_above_limit() {
         let body = vec![0u8; IPC_MAX_MESSAGE_BYTES + 1];
         let error = write_pipe_frame(&mut Vec::new(), &body).unwrap_err();
-        assert!(error.to_string().contains("max 16777216"));
+        assert!(error.kind() == std::io::ErrorKind::InvalidData);
     }
 }

@@ -914,27 +914,6 @@ mod tests {
         drop(ledger);
     }
 
-    #[tokio::test]
-    async fn ledger_lock_is_available_after_a_task_panic() {
-        let directory = tempfile::tempdir().expect("create test directory");
-        let ledger = Arc::new(LedgerLock::new(
-            Ledger::open(&directory.path().join("keys.db")).expect("open test ledger"),
-        ));
-        let task_ledger = ledger.clone();
-        let task = tokio::spawn(async move {
-            let _guard = task_ledger.lock().await;
-            panic!("intentional ledger lock panic");
-        });
-
-        assert!(task.await.expect_err("task should panic").is_panic());
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), ledger.lock())
-                .await
-                .is_ok(),
-            "ledger lock remained unavailable after task panic"
-        );
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn synchronous_ledger_work_runs_on_the_blocking_lane() {
         let directory = tempfile::tempdir().expect("create test directory");

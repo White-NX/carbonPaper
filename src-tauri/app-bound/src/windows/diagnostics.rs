@@ -191,26 +191,26 @@ mod tests {
         );
         let output = fs::read_to_string(directory.path().join(LOG_DIRECTORY).join(LOG_FILE))
             .expect("read timed log");
-        assert!(output.ends_with(" error=app_bound_unavailable total_ms=8000 verify_ms=2000 ledger_wait_ms=5990 worker_wait_ms=10 ledger_exec_ms=0\n"));
-        let fields: Vec<_> = output
+
+        let fields: std::collections::HashMap<_, _> = output
             .split_whitespace()
-            .map(|field| field.split('=').next().unwrap())
+            .map(|field| field.split_once('=').expect("key=value log field"))
             .collect();
-        assert_eq!(
-            fields,
-            [
-                "time_unix",
-                "level",
-                "event",
-                "stage",
-                "error",
-                "total_ms",
-                "verify_ms",
-                "ledger_wait_ms",
-                "worker_wait_ms",
-                "ledger_exec_ms"
-            ]
-        );
+        for (key, expected) in [
+            ("level", "warn"),
+            ("event", "connection_failed"),
+            ("stage", "finish_consumer"),
+            ("error", "app_bound_unavailable"),
+            ("total_ms", "8000"),
+            ("verify_ms", "2000"),
+            ("ledger_wait_ms", "5990"),
+            ("worker_wait_ms", "10"),
+            ("ledger_exec_ms", "0"),
+        ] {
+            assert_eq!(fields.get(key), Some(&expected), "{key}");
+        }
+        assert!(fields["time_unix"].parse::<u64>().is_ok());
+        assert_eq!(fields.len(), 10, "no extra fields may expose private data");
     }
 
     #[test]

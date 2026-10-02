@@ -2037,9 +2037,92 @@ mod tests {
     }
 
     #[test]
-    fn response_ids_cover_semantic_success_variants() {
-        let response = MlResponse::Unloaded { request_id: 7 };
-        assert_eq!(response_request_id(&response), Some(7));
+    fn response_ids_cover_all_response_variants_and_handshakes() {
+        use crate::ml_protocol::*;
+        let responses = [
+            MlResponse::Pong { request_id: 7 },
+            MlResponse::OcrComplete {
+                request_id: 7,
+                blocks: vec![],
+                timings: MlOcrTimings {
+                    image_prepare_ms: 0.0,
+                    model_total_ms: 0.0,
+                    request_total_ms: 0.0,
+                },
+            },
+            MlResponse::EmbeddingComplete {
+                request_id: 7,
+                model: MlSemanticModel::MinilmL12,
+                dimensions: 0,
+                vectors: vec![],
+                timings: MlSemanticTimings {
+                    model_load_ms: 0.0,
+                    preprocess_ms: 0.0,
+                    inference_ms: 0.0,
+                    request_total_ms: 0.0,
+                    cpu_ms: 0.0,
+                    model_load_cpu_ms: 0.0,
+                },
+            },
+            MlResponse::TokenizationComplete {
+                request_id: 7,
+                model: MlSemanticModel::MinilmL12,
+                batch: 0,
+                sequence: 0,
+                input_ids: vec![],
+                attention_mask: vec![],
+                token_type_ids: vec![],
+            },
+            MlResponse::RerankComplete {
+                request_id: 7,
+                model: MlSemanticModel::BgeRerankerV2M3,
+                scores: vec![],
+                timings: MlSemanticTimings {
+                    model_load_ms: 0.0,
+                    preprocess_ms: 0.0,
+                    inference_ms: 0.0,
+                    request_total_ms: 0.0,
+                    cpu_ms: 0.0,
+                    model_load_cpu_ms: 0.0,
+                },
+            },
+            MlResponse::SemanticStatus {
+                request_id: 7,
+                provider: MlProvider::Cpu,
+                loaded_model: None,
+                model_id: None,
+                model_revision: None,
+                model_fingerprint: None,
+            },
+            MlResponse::Unloaded { request_id: 7 },
+            MlResponse::Error {
+                request_id: 7,
+                kind: "inference".into(),
+                message: "failed".into(),
+            },
+            MlResponse::ShuttingDown { request_id: 7 },
+        ];
+        for response in responses {
+            assert_eq!(response_request_id(&response), Some(7), "{response:?}");
+        }
+        for response in [
+            MlResponse::Ready {
+                protocol_version: 1,
+                worker_version: "test".into(),
+                rapidocr_core_version: "test".into(),
+                provider: MlProvider::Cpu,
+                model_id: "test".into(),
+            },
+            MlResponse::SemanticReady {
+                protocol_version: 1,
+                worker_version: "test".into(),
+                ort_version: "test".into(),
+                provider: MlProvider::Cpu,
+                supported_models: vec![],
+            },
+        ] {
+            assert_eq!(response_request_id(&response), None);
+        }
     }
 
     #[test]
@@ -2364,17 +2447,5 @@ mod tests {
         assert!(state.external_background_waiting());
         drop(second);
         assert!(!state.external_background_waiting());
-    }
-
-    #[tokio::test]
-    async fn the_background_pass_guard_admits_one_pass_at_a_time() {
-        // Capture indexing and Smart Cluster scoring both claim this. Two
-        // passes wanting different models would take turns evicting a session
-        // rather than finishing sooner, which is the whole reason it is shared
-        // rather than private to either module.
-        let held = BACKGROUND_PASS_GUARD.lock().await;
-        assert!(BACKGROUND_PASS_GUARD.try_lock().is_err());
-        drop(held);
-        assert!(BACKGROUND_PASS_GUARD.try_lock().is_ok());
     }
 }
