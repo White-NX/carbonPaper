@@ -1476,12 +1476,18 @@ impl StorageState {
             "#,
         )?;
 
+        // Startup recovery must not fetch every live screenshot just to read
+        // status. Keep this index limited to pending rows, with equality keys
+        // first so the planner selects it even before ANALYZE has run.
         conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_screenshots_deleted_created_at ON screenshots(is_deleted, created_at);
             CREATE INDEX IF NOT EXISTS idx_screenshots_process_deleted_created_at ON screenshots(process_name, is_deleted, created_at);
             CREATE INDEX IF NOT EXISTS idx_ocr_deleted_screenshot ON ocr_results(is_deleted, screenshot_id);
             CREATE INDEX IF NOT EXISTS idx_screenshots_deleted_category ON screenshots(is_deleted, category);
+            CREATE INDEX IF NOT EXISTS idx_screenshots_startup_pending
+                ON screenshots(status, is_deleted, id)
+                WHERE status = 'pending' AND is_deleted = 0;
             "#,
         )
         .map_err(|e| format!("Failed to create soft-delete indexes: {}", e))?;
