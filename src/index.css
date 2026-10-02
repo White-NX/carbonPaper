@@ -10,6 +10,28 @@
 @tailwind components;
 @tailwind utilities;
 
+.recap-surface { container: recap / inline-size; }
+.recap-focus:focus-visible, .recap-input:focus-visible {
+  outline: 2px solid var(--ide-accent);
+  outline-offset: 3px;
+}
+.recap-input {
+  width: 100%;
+  border: 1px solid var(--ide-border);
+  border-radius: 8px;
+  background: var(--ide-bg);
+  color: var(--ide-text);
+  padding: 8px 12px;
+}
+.recap-input:focus-visible { outline-offset: 0; }
+.recap-period { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 24px; }
+.recap-period-time { position: relative; padding-top: 6px; }
+.recap-time-dot { position: absolute; top: 11px; right: -13px; width: 5px; height: 5px; border-radius: 50%; background: var(--ide-border); }
+@container recap (max-width: 720px) {
+  .recap-period { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .recap-time-dot { display: none; }
+}
+
 .ai-search-surface { container: ai-search / size; }
 .ai-search-conversation { max-width: 48rem; }
 .ai-search-turn { display: grid; gap: 1.5rem; }

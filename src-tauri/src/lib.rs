@@ -161,8 +161,17 @@ fn tray_texts() -> &'static TrayTexts {
 }
 
 pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result<(), String> {
-    registry_config::set_string("language", &normalize_app_language(language))?;
+    let language = normalize_app_language(language);
+    let previous =
+        normalize_app_language(&registry_config::get_string("language").unwrap_or_default());
+    registry_config::set_string("language", &language)?;
     refresh_tray_menu(app);
+    if language != previous {
+        if let Some(recap) = app.try_state::<ai::recap::RecapRuntime>() {
+            recap.cancel();
+        }
+        let _ = app.emit("recap-changed", ());
+    }
     Ok(())
 }
 
@@ -865,6 +874,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
         .manage(ai::AiRuntimeState::default())
+        .manage(ai::recap::RecapRuntime::default())
         .manage(settings_window::SettingsWindowState::default())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
@@ -911,6 +921,7 @@ pub fn run() {
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
+                ai::recap::start_scheduler(app.handle().clone());
 
                 build_tray(app)?;
 
@@ -1307,6 +1318,15 @@ pub fn run() {
             commands::ai::ai_grant_remote_consent,
             commands::ai::ai_search,
             commands::ai::ai_search_cancel,
+            commands::recap::recap_get_settings,
+            commands::recap::recap_save_settings,
+            commands::recap::recap_list_days,
+            commands::recap::recap_get_day,
+            commands::recap::recap_get_records,
+            commands::recap::recap_generate,
+            commands::recap::recap_cancel,
+            commands::recap::recap_get_progress,
+            commands::recap::recap_correct,
             commands::mcp::mcp_set_enabled,
             commands::mcp::mcp_get_status,
             commands::mcp::mcp_run_smoke_test,

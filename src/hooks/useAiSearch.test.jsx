@@ -109,6 +109,19 @@ describe('AI conversation', () => {
     expect(result.current.turns[0].steps).toHaveLength(1);
   });
 
+  it('keeps a stable bounded history prefix across several follow-ups', async () => {
+    const { result } = await setup();
+    for (let i = 0; i <= 17; i += 1) {
+      act(() => { result.current.start(`question ${i}`); });
+      const history = runAiSearch.mock.lastCall[0].history;
+      expect(history.length).toBeLessThanOrEqual(12);
+      if (i >= 13 && i <= 16) expect(history[0].question).toBe('question 4');
+      if (i === 17) expect(history[0].question).toBe('question 8');
+      await act(async () => finish({ answer: `answer ${i}`, snapshots: [] }));
+    }
+    expect(result.current.turns).toHaveLength(17);
+  });
+
   it('stops pending tool indicators and ignores late events after cancellation', async () => {
     const { result } = await setup();
     let reject;

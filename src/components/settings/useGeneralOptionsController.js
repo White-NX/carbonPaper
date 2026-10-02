@@ -79,6 +79,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
   });
   const [cardClickBehaviorSearch, setCardClickBehaviorSearch] = useState(() => localStorage.getItem('cardClickBehavior_search') || 'preview');
   const [cardClickBehaviorClusters, setCardClickBehaviorClusters] = useState(() => localStorage.getItem('cardClickBehavior_clusters') || 'standalone');
+  const [cardClickBehaviorRecap, setCardClickBehaviorRecap] = useState(() => localStorage.getItem('cardClickBehavior_recap') || 'standalone');
 
   useEffect(() => {
     if (active) getLightweightConfig().then(setLightweightConfigState).catch((error) => setOptionError(t('settings.feedback.readFailed')));
@@ -237,6 +238,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
     setPreference(`cardClickBehavior_${scope}`, value);
     if (scope === 'search') setCardClickBehaviorSearch(value);
     if (scope === 'clusters') setCardClickBehaviorClusters(value);
+    if (scope === 'recap') setCardClickBehaviorRecap(value);
   };
 
   const derivedResourcePolicy = getResourcePolicy(powerSavingMode, gameModeEnabled);
@@ -263,6 +265,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
     lightweightConfig,
     cardClickBehaviorSearch,
     cardClickBehaviorClusters,
+    cardClickBehaviorRecap,
     resourcePolicy,
     resourcePolicyOptions,
     selectedResourcePolicy,

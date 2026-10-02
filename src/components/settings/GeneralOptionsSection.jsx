@@ -24,6 +24,7 @@ export default function GeneralOptionsSection({
     lightweightConfig,
     cardClickBehaviorSearch,
     cardClickBehaviorClusters,
+    cardClickBehaviorRecap,
     resourcePolicy,
     resourcePolicyOptions,
     selectedResourcePolicy,
@@ -69,6 +70,7 @@ export default function GeneralOptionsSection({
         <CardClickBehaviorCard
           cardClickBehaviorSearch={cardClickBehaviorSearch}
           cardClickBehaviorClusters={cardClickBehaviorClusters}
+          cardClickBehaviorRecap={cardClickBehaviorRecap}
           onSetCardClickBehavior={setCardClickBehavior}
         />
       </SettingsGroup>

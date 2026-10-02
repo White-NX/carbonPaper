@@ -2,6 +2,7 @@
 //! user's persisted CarbonPaper key or require an authentication dialog.
 
 use super::*;
+mod recap;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::{
     NCryptCreatePersistedKey, NCryptEncrypt, NCryptFinalizeKey, NCryptFreeObject,

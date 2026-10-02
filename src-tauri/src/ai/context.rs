@@ -123,7 +123,13 @@ pub(super) fn fit_request(
     context_tokens: u32,
 ) -> Result<(), ProviderError> {
     let allowance = input_allowance(request, context_tokens);
-    while estimated_input_tokens(kind, request) > allowance {
+    if estimated_input_tokens(kind, request) <= allowance {
+        return Ok(());
+    }
+    // Once compaction is necessary, make room for several more tool steps.
+    // Pruning only just enough would rewrite the distant prefix on every step.
+    let target = allowance * 4 / 5;
+    while estimated_input_tokens(kind, request) > target {
         if *current_question > 1 {
             request.messages.drain(1..3);
             *current_question -= 2;
@@ -168,6 +174,9 @@ pub(super) fn fit_request(
             }
         }
         if !reduced {
+            if estimated_input_tokens(kind, request) <= allowance {
+                return Ok(());
+            }
             return Err(ProviderError::ContextLimit);
         }
     }

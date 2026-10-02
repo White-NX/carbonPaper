@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { emitTo } from '@tauri-apps/api/event';
 import { withAuth } from './auth_api';
 
 export function isSettingsWindow() {
@@ -6,7 +7,11 @@ export function isSettingsWindow() {
 }
 
 export function openSettingsWindow(tab, section) {
-  return invoke('open_settings_window', { tab: tab || localStorage.getItem('settings.lastTab') || 'general', section: section || null });
+  const target = { tab: tab || localStorage.getItem('settings.lastTab') || 'general', section: section || null };
+  // The native open command belongs to the main window. Navigation inside an
+  // existing settings window stays local and preserves the visited page drafts.
+  if (isSettingsWindow()) return emitTo('settings', 'settings-navigate', target);
+  return invoke('open_settings_window', target);
 }
 
 export function notifySettingsChanged(keys) {

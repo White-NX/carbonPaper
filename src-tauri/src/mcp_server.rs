@@ -429,10 +429,10 @@ async fn handle_tools_call(
 
 /// A record withheld because the filter mode is [`FilterMode::Reject`].
 #[derive(Debug)]
-struct Rejected;
+pub(crate) struct Rejected;
 
 /// One-line identity fields such as window titles: replaced, never removed.
-fn filter_identity(
+pub(crate) fn filter_identity(
     filter: &SensitiveFilterState,
     mode: FilterMode,
     text: &str,
@@ -482,7 +482,7 @@ fn filter_joined_text(
 }
 
 /// URLs are checked after percent-decoding and replaced whole when flagged.
-fn filter_url(
+pub(crate) fn filter_url(
     filter: &SensitiveFilterState,
     mode: FilterMode,
     url: &str,
@@ -498,7 +498,7 @@ fn filter_url(
 /// The OCR blocks of one screenshot. Each block is checked with the labels of
 /// its neighbours, because forms put "身份证号" and the number in separate
 /// blocks.
-fn filter_ocr_blocks(
+pub(crate) fn filter_ocr_blocks(
     filter: &SensitiveFilterState,
     mode: FilterMode,
     blocks: Vec<OcrResult>,

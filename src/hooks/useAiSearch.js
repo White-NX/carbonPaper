@@ -84,8 +84,12 @@ export function useAiSearch({ active }) {
     setElapsedMs(null);
     setStatus('running');
     try {
+      const completed = previous.filter((turn) => turn.status === 'done');
+      // Match the backend's four-turn eviction chunks, retaining the same
+      // oldest context over several follow-ups instead of shifting each time.
+      const historyStart = Math.ceil(Math.max(0, completed.length - 12) / 4) * 4;
       const result = await runAiSearch({ requestId, question: trimmed, providerId: provider?.id,
-        history: previous.filter((turn) => turn.status === 'done').slice(-12).map((turn) => ({
+        history: completed.slice(historyStart).map((turn) => ({
           question: turn.question, answer: turn.answer,
           ...(turn.outcome?.time_context ? { time_context: turn.outcome.time_context } : {}),
         })),

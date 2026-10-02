@@ -139,7 +139,10 @@ mod tests {
     #[test]
     fn earlier_users_get_whats_new_once() {
         assert_eq!(decide_mode(0, true), OnboardingMode::WhatsNew);
-        assert_eq!(decide_mode(ONBOARDING_VERSION - 1, true), OnboardingMode::WhatsNew);
+        assert_eq!(
+            decide_mode(ONBOARDING_VERSION - 1, true),
+            OnboardingMode::WhatsNew
+        );
         assert_eq!(decide_mode(ONBOARDING_VERSION, true), OnboardingMode::None);
     }
 
@@ -150,7 +153,10 @@ mod tests {
         if ONBOARDING_VERSION > 1 {
             assert_eq!(decide_mode(1, false), OnboardingMode::WhatsNew);
         }
-        assert_eq!(decide_mode(ONBOARDING_VERSION + 3, false), OnboardingMode::None);
+        assert_eq!(
+            decide_mode(ONBOARDING_VERSION + 3, false),
+            OnboardingMode::None
+        );
     }
 
     #[test]
