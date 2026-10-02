@@ -2328,96 +2328,88 @@ mod tests {
     }
 
     #[test]
-    fn test_hamming_distance_identical() {
-        let hash = [0u64; 4];
-        assert_eq!(hamming_distance(&hash, &hash), 0);
+    fn hamming_distance_counts_bits_across_every_word() {
+        for (label, left, right, expected) in [
+            ("identical", [0; 4], [0; 4], 0),
+            ("all bits", [0; 4], [u64::MAX; 4], 256),
+            ("low bit", [0; 4], [1, 0, 0, 0], 1),
+            ("last word", [0; 4], [0, 0, 0, 1 << 63], 1),
+            ("mixed", [1, 2, 4, 8], [3, 2, 0, 8], 2),
+        ] {
+            assert_eq!(hamming_distance(&left, &right), expected, "{label}");
+            assert_eq!(
+                hamming_distance(&right, &left),
+                expected,
+                "{label}: symmetry"
+            );
+        }
     }
 
     #[test]
-    fn test_hamming_distance_all_different() {
-        let a = [0u64; 4];
-        let b = [u64::MAX; 4];
-        assert_eq!(hamming_distance(&a, &b), 256);
+    fn process_paths_resolve_to_normalized_names() {
+        for (path, expected) in [
+            (r"C:\Program Files\app.exe", "app.exe"),
+            ("", ""),
+            ("notepad.exe", "notepad.exe"),
+            (r"C:\Windows\System32\Notepad.EXE", "notepad.exe"),
+        ] {
+            assert_eq!(get_process_name_from_path(path), expected, "{path}");
+        }
     }
 
     #[test]
-    fn test_hamming_distance_one_bit() {
-        let a = [0u64; 4];
-        let mut b = [0u64; 4];
-        b[0] = 1;
-        assert_eq!(hamming_distance(&a, &b), 1);
+    fn image_hash_uses_the_persisted_lowercase_md5_format() {
+        for (input, expected) in [
+            (b"hello".as_slice(), "5d41402abc4b2a76b9719d911017c592"),
+            (b"".as_slice(), "d41d8cd98f00b204e9800998ecf8427e"),
+        ] {
+            assert_eq!(md5_hash(input), expected, "input={input:?}");
+        }
     }
 
     #[test]
-    fn test_get_process_name_from_path_exe() {
-        // get_process_name_from_path returns lowercase
-        assert_eq!(
-            get_process_name_from_path(r"C:\Program Files\app.exe"),
-            "app.exe"
-        );
+    fn dhash_distinguishes_gradient_direction_from_uniform_images() {
+        for size in [8, 16] {
+            for value in [0, 127, 255] {
+                let image = RgbImage::from_pixel(size + 1, size, image::Rgb([value; 3]));
+                assert_eq!(
+                    compute_dhash(&image, size),
+                    [0; 4],
+                    "uniform {value}, size {size}"
+                );
+            }
+            let ascending =
+                RgbImage::from_fn(size + 1, size, |x, _| image::Rgb([(x * 12) as u8; 3]));
+            let descending = image::imageops::flip_horizontal(&ascending);
+            let up = compute_dhash(&ascending, size);
+            let down = compute_dhash(&descending, size);
+            assert_eq!(up, [0; 4], "ascending, size {size}");
+            assert_eq!(
+                hamming_distance(&up, &down),
+                size * size,
+                "descending, size {size}"
+            );
+        }
     }
 
     #[test]
-    fn test_get_process_name_from_path_empty() {
-        assert_eq!(get_process_name_from_path(""), "");
-    }
-
-    #[test]
-    fn test_get_process_name_from_path_no_dir() {
-        assert_eq!(get_process_name_from_path("notepad.exe"), "notepad.exe");
-    }
-
-    #[test]
-    fn test_get_process_name_from_path_mixed_case() {
-        assert_eq!(
-            get_process_name_from_path(r"C:\Windows\System32\Notepad.EXE"),
-            "notepad.exe"
-        );
-    }
-
-    #[test]
-    fn test_md5_hash_known() {
-        assert_eq!(md5_hash(b"hello"), "5d41402abc4b2a76b9719d911017c592");
-    }
-
-    #[test]
-    fn test_md5_hash_empty() {
-        assert_eq!(md5_hash(b""), "d41d8cd98f00b204e9800998ecf8427e");
-    }
-
-    #[test]
-    fn test_compute_dhash_uniform_image() {
-        // A uniform white image should produce all-zero hash (no gradient differences)
-        let img = RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
-        let hash = compute_dhash(&img, 8);
-        assert_eq!(hash, [0u64; 4]);
-    }
-
-    #[test]
-    fn test_compute_dhash_uniform_black() {
-        let img = RgbImage::from_pixel(16, 16, image::Rgb([0, 0, 0]));
-        let hash = compute_dhash(&img, 8);
-        assert_eq!(hash, [0u64; 4]);
-    }
-
-    #[test]
-    fn test_is_redundant_empty_history() {
-        let hash = [0u64; 4];
-        assert!(!is_redundant(&hash, &[], 10));
-    }
-
-    #[test]
-    fn test_is_redundant_identical() {
-        let hash = [0u64; 4];
-        assert!(is_redundant(&hash, &[hash], 10));
-    }
-
-    #[test]
-    fn test_is_redundant_above_threshold() {
-        let a = [0u64; 4];
-        let b = [u64::MAX; 4]; // distance = 256
-                               // threshold=10: distance(256) >= threshold(10) so NOT redundant
-        assert!(!is_redundant(&a, &[b], 10));
+    fn redundancy_requires_a_history_match_strictly_below_the_threshold() {
+        let current = [0; 4];
+        for (label, history, threshold, expected) in [
+            ("no history", vec![], 2, false),
+            ("identical", vec![current], 2, true),
+            ("below", vec![[1, 0, 0, 0]], 2, true),
+            ("boundary", vec![[3, 0, 0, 0]], 2, false),
+            ("above", vec![[7, 0, 0, 0]], 2, false),
+            ("later match", vec![[7, 0, 0, 0], current], 2, true),
+            ("zero threshold", vec![current], 0, false),
+        ] {
+            assert_eq!(
+                is_redundant(&current, &history, threshold),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]

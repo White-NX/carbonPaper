@@ -140,6 +140,7 @@ mod tests {
 
     #[test]
     fn vector_validation_pins_the_clip_width() {
+        assert_eq!(CLIP_DIMENSIONS, 512, "persisted CLIP vector space");
         assert!(validate_clip_vector(&vec![0.25; CLIP_DIMENSIONS]).is_ok());
         // A MiniLM row must not be writable into the image index.
         assert!(validate_clip_vector(&vec![0.25; 384]).is_err());

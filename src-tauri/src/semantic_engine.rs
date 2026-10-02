@@ -1048,21 +1048,28 @@ mod tests {
     }
 
     #[test]
-    fn numpy_pairwise_sum_uses_the_eight_lane_reduction_order() {
-        let values = (0..124).map(|value| value as f32 / 7.0).collect::<Vec<_>>();
-        let expected = values.chunks_exact(8).fold([0f32; 8], |mut lanes, chunk| {
-            for lane in 0..8 {
-                lanes[lane] += chunk[lane];
-            }
-            lanes
-        });
-        let remainder_start = values.len() - values.len() % 8;
-        let mut expected_sum = ((expected[0] + expected[1]) + (expected[2] + expected[3]))
-            + ((expected[4] + expected[5]) + (expected[6] + expected[7]));
-        for value in &values[remainder_start..] {
-            expected_sum += *value;
+    fn float32_reduction_matches_independent_numpy_fixtures() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            input_bits: Vec<u32>,
+            sum_bits: u32,
         }
-        assert_eq!(numpy_pairwise_sum(&values), expected_sum);
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("fixtures/numpy-sum.json")).unwrap();
+        for case in fixture.cases {
+            let input: Vec<f32> = case.input_bits.into_iter().map(f32::from_bits).collect();
+            assert_eq!(
+                numpy_pairwise_sum(&input),
+                f32::from_bits(case.sum_bits),
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]

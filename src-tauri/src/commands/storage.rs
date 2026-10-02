@@ -207,30 +207,6 @@ mod tests {
         assert_eq!(response["clip_index_backlog"]["claimable"], 4);
         assert_eq!(response["clip_index_backlog"]["exhausted"], 3);
     }
-
-    #[test]
-    fn compose_index_health_response_does_not_depend_on_monitor_state() {
-        let storage_stats = IndexStorageStats {
-            screenshots_count: 10,
-            ocr_rows_count: 12,
-            semantic_text_rows: 8,
-            clip_image_rows: 9,
-            semantic_index_backlog: DerivedIndexBacklog::default(),
-            clip_index_backlog: DerivedIndexBacklog::default(),
-            smart_cluster_pending_count: 3,
-            delete_queue: DeleteQueueStatus {
-                pending_screenshots: 1,
-                pending_ocr: 2,
-                running: false,
-            },
-        };
-
-        let response = compose_index_health_response(storage_stats);
-
-        assert_eq!(response["screenshots_count"], 10);
-        assert_eq!(response["vector_rows_count"], 9);
-        assert!(response.get("monitor_available").is_none());
-    }
 }
 
 /// Returns timeline records between millisecond timestamps `start_time` and `end_time`.

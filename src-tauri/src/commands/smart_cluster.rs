@@ -412,39 +412,23 @@ mod tests {
     use crate::rerank::ScorerIdentity;
 
     #[test]
-    fn a_calibration_threshold_is_stamped_with_the_backend_that_served_the_query() {
+    fn calibration_provenance_matches_only_the_serving_backend() {
         let current = ScorerIdentity::current();
-        let rust = scorer_stamp_for_backend(Some("rust")).expect("rust is a known backend");
-        assert!(current.matches_stored(
-            Some(&rust.model_id),
-            Some(&rust.model_revision),
-            Some(&rust.variant),
-            Some(&rust.provider),
-        ));
-    }
-
-    #[test]
-    fn a_python_served_calibration_never_passes_for_the_rust_scorer() {
-        // The whole point of taking the backend from the response: a reranked
-        // Older clients can still submit a threshold produced by Python. It
-        // must never be trusted against Rust logits.
-        let current = ScorerIdentity::current();
-        let python = scorer_stamp_for_backend(Some("python")).expect("python is a known backend");
-        assert!(!current.matches_stored(
-            Some(&python.model_id),
-            Some(&python.model_revision),
-            Some(&python.variant),
-            Some(&python.provider),
-        ));
-    }
-
-    #[test]
-    fn an_unknown_backend_records_no_provenance_at_all() {
-        // Not an invented identity: leaving the columns NULL is indistinguishable
-        // from a threshold written before provenance existed, which is exactly
-        // the state the worker repairs by re-deriving.
-        assert!(scorer_stamp_for_backend(None).is_none());
-        assert!(scorer_stamp_for_backend(Some("")).is_none());
-        assert!(scorer_stamp_for_backend(Some("directml")).is_none());
+        for (backend, compatible) in [("rust", true), ("python", false)] {
+            let stamp = scorer_stamp_for_backend(Some(backend)).unwrap();
+            assert_eq!(
+                current.matches_stored(
+                    Some(&stamp.model_id),
+                    Some(&stamp.model_revision),
+                    Some(&stamp.variant),
+                    Some(&stamp.provider)
+                ),
+                compatible,
+                "{backend}"
+            );
+        }
+        for unknown in [None, Some(""), Some("directml")] {
+            assert!(scorer_stamp_for_backend(unknown).is_none(), "{unknown:?}");
+        }
     }
 }

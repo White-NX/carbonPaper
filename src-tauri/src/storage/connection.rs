@@ -826,13 +826,46 @@ mod tests {
     }
 
     #[test]
-    fn independent_connection_drops_before_activity_permit() {
+    fn independent_connection_closes_while_its_activity_permit_is_still_held() {
+        struct OnConnectionClose {
+            gate: ActivityGate,
+            observations: Arc<Mutex<Vec<bool>>>,
+        }
+        impl Drop for OnConnectionClose {
+            fn drop(&mut self) {
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .push(self.gate.try_write("close_probe").is_none());
+            }
+        }
         let gate = ActivityGate::default();
-        let conn = Connection::open_in_memory().expect("open database");
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let probe = OnConnectionClose {
+            gate: gate.clone(),
+            observations: observations.clone(),
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        // SQLite destroys a registered function's captured state when it closes.
+        conn.create_scalar_function(
+            "close_probe",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                let _ = &probe;
+                Ok(1i64)
+            },
+        )
+        .unwrap();
         let reader = IndependentReadConnection::new(conn, gate.read("test_connection"));
-        assert_eq!(reader.is_autocommit(), true);
+        assert!(observations.lock().unwrap().is_empty());
         drop(reader);
-        assert!(gate.try_write("test_maintenance").is_some());
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![true],
+            "connection must close before maintenance is admitted"
+        );
+        assert!(gate.try_write("after_close").is_some());
     }
 
     #[test]

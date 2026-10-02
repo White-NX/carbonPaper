@@ -136,6 +136,8 @@ tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["functions"] }
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"

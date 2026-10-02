@@ -330,7 +330,19 @@ mod tests {
             Ok(ids.contains(&1).then(|| "editor-icon".to_string()))
         })
         .unwrap();
-        assert_eq!(calls, vec![vec![11, 2, 1], vec![3]]);
+        let requested: std::collections::HashSet<_> = calls.iter().flatten().copied().collect();
+        assert_eq!(
+            requested,
+            [1, 2, 3, 11].into_iter().collect(),
+            "masked and blank apps never request icons"
+        );
+        assert_eq!(calls.len(), 2, "one lookup per distinct unmasked app");
+        let editor = calls.iter().find(|ids| ids.contains(&1)).unwrap();
+        assert_eq!(
+            editor.first(),
+            Some(&11),
+            "prefer a recent capture, then allow older fallback"
+        );
         assert_eq!(view["batches"][0]["records"], serde_json::json!([]));
         assert_eq!(
             view["batches"][0]["apps"],

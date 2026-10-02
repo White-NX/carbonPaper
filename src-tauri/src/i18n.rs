@@ -88,9 +88,13 @@ mod tests {
 
     #[test]
     fn falls_back_from_regional_locale() {
+        assert_ne!(
+            t("en", "notifications.ocr_model_repair.action"),
+            "notifications.ocr_model_repair.action"
+        );
         assert_eq!(
             t("en-US", "notifications.ocr_model_repair.action"),
-            "Repair model"
+            t("en", "notifications.ocr_model_repair.action")
         );
     }
 

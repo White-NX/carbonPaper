@@ -1977,15 +1977,19 @@ mod tests {
     }
 
     #[test]
-    fn test_db_key_generation() {
-        let public_key = b"12345678901234567890123456789012";
-        let db_key = derive_db_key_from_master(public_key);
-
-        assert_eq!(db_key.len(), 32); // SHA-256 outputs 32 bytes
-
-        let hex_key = db_key_to_hex(&db_key);
-        assert!(hex_key.starts_with("x'"));
-        assert!(hex_key.ends_with("'"));
+    fn derived_database_keys_are_deterministic_distinct_and_sqlcipher_formatted() {
+        let first = derive_db_key_from_master(&[1; 32]);
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, derive_db_key_from_master(&[1; 32]));
+        assert_ne!(first, derive_db_key_from_master(&[2; 32]));
+        let encoded = db_key_to_hex(&first);
+        let content = encoded
+            .strip_prefix("x'")
+            .unwrap()
+            .strip_suffix("'")
+            .unwrap();
+        assert_eq!(content.len(), 64);
+        assert_eq!(hex::decode(content).unwrap(), first);
     }
 
     #[test]
@@ -2010,32 +2014,6 @@ mod tests {
             decrypted,
             Vec::<u8>::new(),
             "Round-trip of empty plaintext should produce empty Vec"
-        );
-    }
-
-    #[test]
-    fn test_db_key_deterministic() {
-        let master_key = b"some-master-key-for-testing-1234";
-        let key1 = derive_db_key_from_master(master_key);
-        let key2 = derive_db_key_from_master(master_key);
-        assert_eq!(
-            key1, key2,
-            "derive_db_key_from_master should be deterministic"
-        );
-    }
-
-    #[test]
-    fn test_db_key_to_hex_format() {
-        let key = b"12345678901234567890123456789012";
-        let db_key = derive_db_key_from_master(key);
-        let hex_str = db_key_to_hex(&db_key);
-        assert!(hex_str.starts_with("x'"), "hex key should start with x'");
-        assert!(hex_str.ends_with("'"), "hex key should end with '");
-        // db_key is 32 bytes = 64 hex chars, plus "x'" prefix and "'" suffix = 67 chars total
-        assert_eq!(
-            hex_str.len(),
-            67,
-            "hex key should be x' + 64 hex chars + ' = 67 chars"
         );
     }
 }

@@ -930,6 +930,205 @@ async fn run_batch(
     state
         .unverifiable_thresholds
         .store(resolution.unverifiable as u64, Ordering::SeqCst);
+    with_resolved_thresholds(resolution, |targets, scoring_configuration| async move {
+        if targets.is_empty() {
+            // Every enabled cluster has been given up on: its saved examples cannot
+            // produce a threshold under this scorer, and nothing but a
+            // recalibration will change that. Draining is the same call the
+            // no-enabled-clusters branch above makes, for the same reason — these
+            // ids will never be scored, and holding them would leave a queue that
+            // grows with every capture, a status line that claims work is pending,
+            // and a pass that wakes to re-discover the same verdict every minute.
+            // The warning banner keeps saying which clusters need attention, and a
+            // rescan re-enqueues the window once they have it.
+            let revisions = storage.archive_scoring_source_revisions(generation, &inputs.ids)?;
+            let (deleted, remaining) = commit_pending(
+                app,
+                state,
+                storage,
+                generation,
+                revisions,
+                scoring_configuration,
+                forced,
+            )
+            .await?;
+            if deleted > 0 {
+                crate::background_activity::index_progress(deleted);
+            }
+            let mut progress = BatchProgress::completed(remaining > 0);
+            progress.deleted = deleted;
+            return Ok(progress);
+        }
+
+        let anchors = embed_anchors(app, &semantic, storage.clone(), &targets).await?;
+
+        // The batch is scored and committed in small groups rather than as one
+        // unit. What forces this is that the pass can be interrupted at any point —
+        // the user comes back and the idle gate closes, a foreground query takes
+        // the worker, a forced drain is cancelled — and a queue entry is only safe
+        // to delete once every enabled cluster has had its turn at it. Committing
+        // the whole batch at the end meant an interrupted pass left all 32 ids
+        // queued, and `peek_smart_cluster_pending_batch` orders by `queued_at ASC`,
+        // so the next pass began at the same head. On a machine whose idle windows
+        // are shorter than one batch takes to score, the queue never advanced past
+        // its first entries: work already done was thrown away and repeated, and
+        // newly captured screenshots were never reached.
+        //
+        // A group is bounded in `(snapshot × cluster)` pairs, not snapshots,
+        // because the pairs are what cost cross-encoder time. Grouping cannot move
+        // a score: a cross-encoder evaluates each `(query, document)` pair on its
+        // own, and the prefilter compares one stored vector against one anchor.
+        let group_size = commit_group_size(targets.len());
+        let mut assigned = 0u64;
+        let mut deleted = 0u64;
+        let mut interrupted: Option<&'static str> = None;
+        for group in inputs.ids.chunks(group_size) {
+            let revisions = storage.archive_scoring_source_revisions(generation, group)?;
+            let mut group_assignments = Vec::new();
+            if let Some(reason) = stand_down_reason(app, state, forced) {
+                tracing::debug!(
+                    "[SMART_CLUSTER] leaving the batch before a commit group: {reason}"
+                );
+                interrupted = Some(reason);
+                break;
+            }
+            let documents = load_documents(storage.clone(), group).await?;
+            if documents.is_empty() {
+                // Every snapshot in this group was deleted between enqueue and now;
+                // the queue entries have nothing left to describe.
+                let (committed, _) = commit_pending(
+                    app,
+                    state,
+                    storage.clone(),
+                    generation,
+                    revisions,
+                    scoring_configuration.clone(),
+                    forced,
+                )
+                .await?;
+                if committed > 0 {
+                    crate::background_activity::index_progress(committed);
+                    deleted = deleted.saturating_add(committed);
+                }
+                continue;
+            }
+            let vectors =
+                load_prefilter_vectors(storage.clone(), documents.keys().copied()).await?;
+
+            for target in &targets {
+                // Requests can be cancelled in flight. Completed groups stay
+                // committed; an interrupted group is scored again on the next pass.
+                if let Some(reason) = stand_down_reason(app, state, forced) {
+                    tracing::debug!("[SMART_CLUSTER] leaving the batch between clusters: {reason}");
+                    interrupted = Some(reason);
+                    break;
+                }
+                let Some(anchor) = anchors.get(&target.id) else {
+                    continue;
+                };
+                let candidates = prefilter(anchor, &vectors, &documents);
+                if candidates.is_empty() {
+                    continue;
+                }
+                let docs: Vec<String> = candidates.iter().map(|id| documents[id].clone()).collect();
+                let scores = match crate::rerank::rerank_documents(
+                    app,
+                    &semantic,
+                    &target.anchor_text,
+                    &docs,
+                    crate::rerank::RerankBudget::Total(RERANK_TIMEOUT),
+                    // Background for a forced drain too; see [`SCORING_PRIORITY`].
+                    SCORING_PRIORITY,
+                    // Not the query the calibration page is watching, so it neither
+                    // advances that page's progress bar nor answers its stop button.
+                    None,
+                )
+                .await
+                {
+                    Ok(scores) => scores,
+                    Err(error) if crate::rerank::is_yield(&error) => {
+                        // Not a failure: a foreground query arrived and this pass
+                        // gave up the worker before submitting the next chunk. Only
+                        // the current group stays queued.
+                        tracing::debug!(
+                            "[SMART_CLUSTER] standing down for a foreground query; \
+                         the current group stays queued"
+                        );
+                        interrupted = Some(FOREGROUND_QUERY_STOP);
+                        break;
+                    }
+                    Err(error) => {
+                        // Keep this whole group queued so the failed target is
+                        // never skipped when the retry succeeds.
+                        return Err(format!(
+                        "rerank_failed: cluster {} could not score its pending snapshots: {error}",
+                        target.id
+                    ));
+                    }
+                };
+                group_assignments.extend(
+                    matching_scores(target, &candidates, &scores)?
+                        .into_iter()
+                        .map(|(id, score)| (target.id, id, score)),
+                );
+            }
+            if interrupted.is_some() {
+                // Committed groups stay committed; this one is scored again next
+                // pass, which is the whole of what standing down now costs.
+                break;
+            }
+            crate::background_policy::check_current()?;
+            if stand_down_reason(app, state, forced).is_some() {
+                return Err("background_paused: scoring pass stopped".into());
+            }
+            let write_storage = storage.clone();
+            let configuration = scoring_configuration.clone();
+            let execution = crate::background_policy::current_execution();
+            let (committed, recorded) = tokio::task::spawn_blocking(move || {
+                if let Some(lease) = &execution {
+                    lease.check()?;
+                }
+                write_storage.commit_archive_scoring_group(
+                    generation,
+                    &revisions,
+                    &configuration,
+                    &group_assignments,
+                    execution.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            state.assigned_total.fetch_add(recorded, Ordering::SeqCst);
+            assigned += recorded;
+            if committed > 0 {
+                crate::background_activity::index_progress(committed);
+                deleted = deleted.saturating_add(committed);
+            }
+        }
+
+        if assigned > 0 {
+            tracing::info!("[SMART_CLUSTER] recorded {assigned} assignment(s)");
+        }
+        match interrupted {
+            Some(reason) => Ok(BatchProgress::stopped(reason)),
+            None => {
+                let mut progress = BatchProgress::completed(inputs.remaining > 0);
+                progress.deleted = deleted;
+                Ok(progress)
+            }
+        }
+    })
+    .await
+}
+
+async fn with_resolved_thresholds<F, Fut>(
+    resolution: ThresholdResolution,
+    run: F,
+) -> Result<BatchProgress, String>
+where
+    F: FnOnce(Vec<SmartClusterScoringTarget>, Vec<SmartClusterScoringTarget>) -> Fut,
+    Fut: std::future::Future<Output = Result<BatchProgress, String>>,
+{
     if let Some(reason) = resolution.interrupted {
         // Resolution stood down part-way, so `usable` is a prefix of the
         // enabled clusters rather than all of them. Scoring against a prefix
@@ -947,189 +1146,7 @@ async fn run_batch(
     }
     let targets = resolution.usable;
     let scoring_configuration = resolution.configuration;
-    if targets.is_empty() {
-        // Every enabled cluster has been given up on: its saved examples cannot
-        // produce a threshold under this scorer, and nothing but a
-        // recalibration will change that. Draining is the same call the
-        // no-enabled-clusters branch above makes, for the same reason — these
-        // ids will never be scored, and holding them would leave a queue that
-        // grows with every capture, a status line that claims work is pending,
-        // and a pass that wakes to re-discover the same verdict every minute.
-        // The warning banner keeps saying which clusters need attention, and a
-        // rescan re-enqueues the window once they have it.
-        let revisions = storage.archive_scoring_source_revisions(generation, &inputs.ids)?;
-        let (deleted, remaining) = commit_pending(
-            app,
-            state,
-            storage,
-            generation,
-            revisions,
-            scoring_configuration,
-            forced,
-        )
-        .await?;
-        if deleted > 0 {
-            crate::background_activity::index_progress(deleted);
-        }
-        let mut progress = BatchProgress::completed(remaining > 0);
-        progress.deleted = deleted;
-        return Ok(progress);
-    }
-
-    let anchors = embed_anchors(app, &semantic, storage.clone(), &targets).await?;
-
-    // The batch is scored and committed in small groups rather than as one
-    // unit. What forces this is that the pass can be interrupted at any point —
-    // the user comes back and the idle gate closes, a foreground query takes
-    // the worker, a forced drain is cancelled — and a queue entry is only safe
-    // to delete once every enabled cluster has had its turn at it. Committing
-    // the whole batch at the end meant an interrupted pass left all 32 ids
-    // queued, and `peek_smart_cluster_pending_batch` orders by `queued_at ASC`,
-    // so the next pass began at the same head. On a machine whose idle windows
-    // are shorter than one batch takes to score, the queue never advanced past
-    // its first entries: work already done was thrown away and repeated, and
-    // newly captured screenshots were never reached.
-    //
-    // A group is bounded in `(snapshot × cluster)` pairs, not snapshots,
-    // because the pairs are what cost cross-encoder time. Grouping cannot move
-    // a score: a cross-encoder evaluates each `(query, document)` pair on its
-    // own, and the prefilter compares one stored vector against one anchor.
-    let group_size = commit_group_size(targets.len());
-    let mut assigned = 0u64;
-    let mut deleted = 0u64;
-    let mut interrupted: Option<&'static str> = None;
-    for group in inputs.ids.chunks(group_size) {
-        let revisions = storage.archive_scoring_source_revisions(generation, group)?;
-        let mut group_assignments = Vec::new();
-        if let Some(reason) = stand_down_reason(app, state, forced) {
-            tracing::debug!("[SMART_CLUSTER] leaving the batch before a commit group: {reason}");
-            interrupted = Some(reason);
-            break;
-        }
-        let documents = load_documents(storage.clone(), group).await?;
-        if documents.is_empty() {
-            // Every snapshot in this group was deleted between enqueue and now;
-            // the queue entries have nothing left to describe.
-            let (committed, _) = commit_pending(
-                app,
-                state,
-                storage.clone(),
-                generation,
-                revisions,
-                scoring_configuration.clone(),
-                forced,
-            )
-            .await?;
-            if committed > 0 {
-                crate::background_activity::index_progress(committed);
-                deleted = deleted.saturating_add(committed);
-            }
-            continue;
-        }
-        let vectors = load_prefilter_vectors(storage.clone(), documents.keys().copied()).await?;
-
-        for target in &targets {
-            // Requests can be cancelled in flight. Completed groups stay
-            // committed; an interrupted group is scored again on the next pass.
-            if let Some(reason) = stand_down_reason(app, state, forced) {
-                tracing::debug!("[SMART_CLUSTER] leaving the batch between clusters: {reason}");
-                interrupted = Some(reason);
-                break;
-            }
-            let Some(anchor) = anchors.get(&target.id) else {
-                continue;
-            };
-            let candidates = prefilter(anchor, &vectors, &documents);
-            if candidates.is_empty() {
-                continue;
-            }
-            let docs: Vec<String> = candidates.iter().map(|id| documents[id].clone()).collect();
-            let scores = match crate::rerank::rerank_documents(
-                app,
-                &semantic,
-                &target.anchor_text,
-                &docs,
-                crate::rerank::RerankBudget::Total(RERANK_TIMEOUT),
-                // Background for a forced drain too; see [`SCORING_PRIORITY`].
-                SCORING_PRIORITY,
-                // Not the query the calibration page is watching, so it neither
-                // advances that page's progress bar nor answers its stop button.
-                None,
-            )
-            .await
-            {
-                Ok(scores) => scores,
-                Err(error) if crate::rerank::is_yield(&error) => {
-                    // Not a failure: a foreground query arrived and this pass
-                    // gave up the worker before submitting the next chunk. Only
-                    // the current group stays queued.
-                    tracing::debug!(
-                        "[SMART_CLUSTER] standing down for a foreground query; \
-                         the current group stays queued"
-                    );
-                    interrupted = Some(FOREGROUND_QUERY_STOP);
-                    break;
-                }
-                Err(error) => {
-                    // Keep this whole group queued so the failed target is
-                    // never skipped when the retry succeeds.
-                    return Err(format!(
-                        "rerank_failed: cluster {} could not score its pending snapshots: {error}",
-                        target.id
-                    ));
-                }
-            };
-            group_assignments.extend(
-                matching_scores(target, &candidates, &scores)?
-                    .into_iter()
-                    .map(|(id, score)| (target.id, id, score)),
-            );
-        }
-        if interrupted.is_some() {
-            // Committed groups stay committed; this one is scored again next
-            // pass, which is the whole of what standing down now costs.
-            break;
-        }
-        crate::background_policy::check_current()?;
-        if stand_down_reason(app, state, forced).is_some() {
-            return Err("background_paused: scoring pass stopped".into());
-        }
-        let write_storage = storage.clone();
-        let configuration = scoring_configuration.clone();
-        let execution = crate::background_policy::current_execution();
-        let (committed, recorded) = tokio::task::spawn_blocking(move || {
-            if let Some(lease) = &execution {
-                lease.check()?;
-            }
-            write_storage.commit_archive_scoring_group(
-                generation,
-                &revisions,
-                &configuration,
-                &group_assignments,
-                execution.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-        state.assigned_total.fetch_add(recorded, Ordering::SeqCst);
-        assigned += recorded;
-        if committed > 0 {
-            crate::background_activity::index_progress(committed);
-            deleted = deleted.saturating_add(committed);
-        }
-    }
-
-    if assigned > 0 {
-        tracing::info!("[SMART_CLUSTER] recorded {assigned} assignment(s)");
-    }
-    match interrupted {
-        Some(reason) => Ok(BatchProgress::stopped(reason)),
-        None => {
-            let mut progress = BatchProgress::completed(inputs.remaining > 0);
-            progress.deleted = deleted;
-            Ok(progress)
-        }
-    }
+    run(targets, scoring_configuration).await
 }
 
 /// How many snapshots are scored against every enabled cluster before the
@@ -1218,6 +1235,41 @@ async fn resolve_thresholds(
     scorer: &ScorerIdentity,
     forced: bool,
 ) -> ThresholdResolution {
+    resolve_thresholds_with(
+        targets,
+        scorer,
+        || {
+            if crate::background_policy::is_background() {
+                if let Some(lease) = crate::background_policy::current_execution() {
+                    lease.revoke("waiting_for_idle");
+                }
+                Some("waiting_for_idle")
+            } else {
+                stand_down_reason(app, state, forced)
+            }
+        },
+        |target| {
+            let storage = storage.clone();
+            async move { rederive_threshold(app, semantic, storage, &target, scorer).await }
+        },
+        |id, fingerprint| mark_unverifiable(storage.clone(), id, fingerprint),
+    )
+    .await
+}
+
+async fn resolve_thresholds_with<F, Fut, M, Mark>(
+    targets: Vec<SmartClusterScoringTarget>,
+    scorer: &ScorerIdentity,
+    mut stop_reason: impl FnMut() -> Option<&'static str>,
+    mut rederive: F,
+    mut mark: M,
+) -> ThresholdResolution
+where
+    F: FnMut(SmartClusterScoringTarget) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<f64>, String>>,
+    M: FnMut(i64, String) -> Mark,
+    Mark: std::future::Future<Output = Result<(), String>>,
+{
     let fingerprint = scorer.fingerprint();
     let mut resolution = ThresholdResolution {
         configuration: Vec::with_capacity(targets.len()),
@@ -1245,14 +1297,7 @@ async fn resolve_thresholds(
             resolution.configuration.push(target);
             continue;
         }
-        if crate::background_policy::is_background() {
-            if let Some(lease) = crate::background_policy::current_execution() {
-                lease.revoke("waiting_for_idle");
-            }
-            resolution.interrupted = Some("waiting_for_idle");
-            return resolution;
-        }
-        if let Some(reason) = stand_down_reason(app, state, forced) {
+        if let Some(reason) = stop_reason() {
             tracing::debug!(
                 "[SMART_CLUSTER] stopping threshold resolution before cluster {}: {reason}",
                 target.id
@@ -1260,7 +1305,7 @@ async fn resolve_thresholds(
             resolution.interrupted = Some(reason);
             break;
         }
-        match rederive_threshold(app, semantic, storage.clone(), &target, scorer).await {
+        match rederive(target.clone()).await {
             Ok(Some(threshold)) => {
                 tracing::info!(
                     "[SMART_CLUSTER] re-derived threshold for cluster {} under the current scorer: {:.4} -> {threshold:.4}",
@@ -1285,7 +1330,7 @@ async fn resolve_thresholds(
                     "[SMART_CLUSTER] cluster {} has no usable calibration examples; giving up on its threshold until it is recalibrated",
                     target.id
                 );
-                match mark_unverifiable(storage.clone(), target.id, fingerprint.clone()).await {
+                match mark(target.id, fingerprint.clone()).await {
                     Ok(()) => target.rederive_failed_scorer = Some(fingerprint.clone()),
                     Err(error) => {
                         // The verdict is a cost optimization, not a correctness
@@ -1824,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_retry_and_failure_states_survive_worker_state_loss() {
+    fn scheduler_snapshots_restore_retry_and_failure_status() {
         let state = Arc::new(SmartClusterWorkerState::default());
         let retry = scheduler_task("retry_wait", true, 2, Some("temporary inference failure"));
         let retry_value = status_value(&state, 4, Some(&retry));
@@ -1930,13 +1975,22 @@ mod tests {
     }
 
     #[test]
-    fn the_prefilter_cutoff_and_batch_sizes_match_the_python_worker() {
-        // These three constants decided every threshold now on disk. Changing
-        // any of them changes which pairs are scored at all, which no stored
-        // threshold accounts for.
-        assert_eq!(PREFILTER_THRESHOLD, 0.40);
-        assert_eq!(IDLE_BATCH, 32);
-        assert_eq!(FORCED_BATCH, 128);
+    fn prefilter_applies_the_calibrated_cutoff_to_documented_vectors() {
+        let anchor = vec![1.0f32, 0.0];
+        let vectors: HashMap<i64, Vec<f32>> = [(1, 0.39f32), (2, 0.40), (3, 0.41), (4, 1.0)]
+            .into_iter()
+            .map(|(id, score)| (id, vec![score, (1.0 - score * score).sqrt()]))
+            .collect();
+        let documents = [
+            (1, "below".to_string()),
+            (2, "boundary".to_string()),
+            (3, "above".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut hits = prefilter(&anchor, &vectors, &documents);
+        hits.sort_unstable();
+        assert_eq!(hits, vec![2, 3]);
     }
 
     #[test]
@@ -1970,21 +2024,6 @@ mod tests {
     }
 
     #[test]
-    fn no_pass_in_this_module_holds_the_worker_through_a_foreground_query() {
-        // Both modes run their cross-encoder calls under the background
-        // contract, which is what bounds a foreground query's wait at one
-        // document rather than at one commit group. A forced drain is still
-        // different, but in scheduling — a bigger batch, no idle gate, and a
-        // pass that waits and resumes — not in what it does to the worker while
-        // somebody is blocked on it.
-        //
-        // This is the invariant `rerank.rs::FOREGROUND_RERANK_CHUNK` leans on
-        // to justify fourteen inter-chunk gaps where there used to be one.
-        assert_eq!(SCORING_PRIORITY, crate::rerank::RerankPriority::Background);
-        assert_ne!(SCORING_PRIORITY, crate::rerank::RerankPriority::Foreground);
-    }
-
-    #[test]
     fn the_batch_shrinks_as_enabled_clusters_multiply() {
         assert_eq!(batch_size_for(false, 1), IDLE_BATCH);
         assert_eq!(batch_size_for(true, 1), FORCED_BATCH);
@@ -1995,38 +2034,19 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_group_is_bounded_by_pairs_so_an_interruption_costs_the_same_either_way() {
-        // What an interrupted pass repeats is a group, and what a group costs
-        // is its cross-encoder pairs — so the snapshot count falls as clusters
-        // multiply rather than the work per group rising with them.
-        assert_eq!(commit_group_size(1), MAX_COMMIT_PAIRS as usize);
-        assert_eq!(commit_group_size(2), 8);
-        assert_eq!(commit_group_size(16), 1);
-        // Never zero, which would make `chunks()` panic and the pass never run.
-        assert_eq!(commit_group_size(0), MAX_COMMIT_PAIRS as usize);
-        assert_eq!(commit_group_size(100_000), 1);
-    }
-
-    #[test]
-    fn a_batch_is_committed_in_more_than_one_group() {
-        // The point of the group: an idle batch that is interrupted part-way
-        // must leave the groups it finished deleted from the queue. If a group
-        // could span a whole batch, an interruption would put the pass back at
-        // the same queue head — `peek_smart_cluster_pending_batch` orders by
-        // `queued_at ASC` — and the queue would never advance on a machine
-        // whose idle windows are shorter than a batch.
-        for clusters in [1usize, 2, 3, 8, 64, 200] {
-            let batch = batch_size_for(false, clusters) as usize;
+    fn commit_groups_bound_pair_work_and_always_make_progress() {
+        let cap = MAX_COMMIT_PAIRS as usize;
+        for clusters in [0, 1, 2, cap, cap + 1, 100_000] {
             let group = commit_group_size(clusters);
-            assert!(group >= 1, "clusters={clusters}");
+            assert!(group > 0);
             assert!(
-                group < batch,
-                "clusters={clusters} batch={batch} group={group}"
+                group * clusters.max(1) <= cap.max(clusters),
+                "clusters={clusters}, group={group}"
             );
+            if clusters > cap {
+                assert_eq!(group, 1);
+            }
         }
-        // Concretely, at the shipped idle batch of 32 with one cluster enabled,
-        // a pass commits twice rather than once.
-        assert_eq!(batch_size_for(false, 1) as usize / commit_group_size(1), 2);
     }
 
     #[test]
@@ -2097,53 +2117,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_recorded_verdict_stops_the_re_derivation_from_being_attempted_again() {
-        // The expensive half of a failed re-derivation is the 570 MB
-        // cross-encoder load, and a cluster whose positive examples were
-        // deleted fails identically every time. `resolve_thresholds` reaches
-        // `rederive_threshold` only when neither test below holds, so these two
-        // are what keep an idle machine from reloading the model once a minute
-        // forever.
-        let fingerprint = ScorerIdentity::current().fingerprint();
-        let given_up = legacy_target(1, Some(fingerprint.clone()));
+    #[tokio::test]
+    async fn threshold_resolution_retries_only_when_the_failed_scorer_changes() {
+        let scorer = ScorerIdentity::current();
+        let mut derived = Vec::new();
+        let mut marked = Vec::new();
+        let resolution = resolve_thresholds_with(
+            vec![
+                legacy_target(1, Some(scorer.fingerprint())),
+                legacy_target(2, Some("old-scorer".into())),
+                legacy_target(3, None),
+            ],
+            &scorer,
+            || None,
+            |target| {
+                derived.push(target.id);
+                std::future::ready(Ok(None))
+            },
+            |id, fingerprint| {
+                marked.push((id, fingerprint));
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(derived, vec![2, 3]);
         assert_eq!(
-            given_up.rederive_failed_scorer.as_deref(),
-            Some(fingerprint.as_str())
+            marked,
+            vec![(2, scorer.fingerprint()), (3, scorer.fingerprint())]
         );
-
-        // A verdict recorded under a different scorer is not this build's
-        // verdict, so the cluster gets its one attempt here.
-        let other_scorer =
-            legacy_target(2, Some("bge-reranker-v2-m3|r1|uint8|directml".to_string()));
-        assert_ne!(
-            other_scorer.rederive_failed_scorer.as_deref(),
-            Some(fingerprint.as_str())
-        );
-
-        // And a cluster that has never been given up on always gets one.
-        assert_eq!(legacy_target(3, None).rederive_failed_scorer, None);
+        assert!(resolution.usable.is_empty());
+        let repeated = resolve_thresholds_with(
+            resolution.configuration,
+            &scorer,
+            || None,
+            |_| -> std::future::Ready<Result<Option<f64>, String>> {
+                panic!("unchanged failed scorers must not invoke the model")
+            },
+            |_, _| std::future::ready(Ok(())),
+        )
+        .await;
+        assert_eq!(repeated.unverifiable, 3);
     }
 
     #[test]
-    fn the_fingerprint_distinguishes_every_field_that_moves_the_logits() {
+    fn scorer_fingerprints_change_with_each_score_defining_field() {
         let current = ScorerIdentity::current();
-        let mut directml = current.clone();
-        directml.provider = "directml".to_string();
-        assert_ne!(current.fingerprint(), directml.fingerprint());
-
-        let mut other_revision = current.clone();
-        other_revision.model_revision = format!("{}-next", current.model_revision);
-        assert_ne!(current.fingerprint(), other_revision.fingerprint());
-    }
-
-    #[test]
-    fn only_positive_examples_can_produce_a_threshold() {
-        // `rederive_threshold` short-circuits on exactly this before it reranks
-        // anything, which is what makes the give-up cheap rather than a model
-        // load followed by `compute_threshold` returning None.
-        assert!(compute_threshold(&[], &[-2.0, -3.0]).is_none());
-        assert!(compute_threshold(&[-1.0], &[-2.0]).is_some());
+        for field in ["model", "revision", "variant", "provider"] {
+            let mut changed = current.clone();
+            match field {
+                "model" => changed.model_id.push_str("-other"),
+                "revision" => changed.model_revision.push_str("-other"),
+                "variant" => changed.variant.push_str("-other"),
+                "provider" => changed.provider.push_str("-other"),
+                _ => unreachable!(),
+            }
+            assert_ne!(current.fingerprint(), changed.fingerprint(), "{field}");
+        }
     }
 
     fn cached_target(cached: CachedAnchorVector) -> SmartClusterScoringTarget {
@@ -2204,35 +2233,66 @@ mod tests {
         assert_ne!(anchor_text_hash("receipts"), anchor_text_hash("receipts "));
     }
 
-    #[test]
-    fn an_interrupted_threshold_resolution_is_not_a_verdict_on_the_whole_set() {
-        // The field exists so `run_batch` can tell "these are the usable
-        // clusters" from "these are the clusters I got to before stopping".
-        // Scoring against the second and then deleting the queue entries would
-        // silently cost every cluster the resolution had not reached yet its
-        // view of those screenshots — and unlike a skipped batch, nothing would
-        // ever bring them back.
-        let complete = ThresholdResolution {
-            configuration: Vec::new(),
-            usable: vec![legacy_target(1, None)],
-            unverifiable: 0,
-            retry_error: None,
-            interrupted: None,
-        };
-        assert!(complete.interrupted.is_none());
+    #[tokio::test]
+    async fn incomplete_threshold_resolution_never_consumes_the_pending_batch() {
+        for failure in [
+            format!("{}: foreground", crate::rerank::YIELDED_TO_FOREGROUND),
+            "inference failed".into(),
+        ] {
+            let scorer = ScorerIdentity::current();
+            let mut derived = 0;
+            let resolution = resolve_thresholds_with(
+                vec![legacy_target(1, None), legacy_target(2, None)],
+                &scorer,
+                || None,
+                |_| {
+                    derived += 1;
+                    std::future::ready(if derived == 1 {
+                        Ok(Some(0.5))
+                    } else {
+                        Err(failure.clone())
+                    })
+                },
+                |_, _| std::future::ready(Ok(())),
+            )
+            .await;
+            assert_eq!(
+                resolution.usable.len(),
+                1,
+                "a successful prefix is insufficient"
+            );
+            let mut pending = vec![10, 11];
+            let outcome = with_resolved_thresholds(resolution, |_, _| async {
+                pending.clear();
+                Ok(BatchProgress::completed(false))
+            })
+            .await;
+            assert_eq!(pending, vec![10, 11], "{failure}");
+            if crate::rerank::is_yield(&failure) {
+                assert_eq!(
+                    outcome.unwrap().stopped_because,
+                    Some(FOREGROUND_QUERY_STOP)
+                );
+            } else {
+                assert!(outcome.is_err());
+            }
 
-        let stopped_early = ThresholdResolution {
-            configuration: Vec::new(),
-            usable: vec![legacy_target(1, None)],
-            unverifiable: 0,
-            retry_error: None,
-            interrupted: Some(FOREGROUND_QUERY_STOP),
-        };
-        // Same non-empty `usable`, opposite handling.
-        assert!(stopped_early.interrupted.is_some());
-        assert_eq!(stopped_early.usable.len(), complete.usable.len());
-        // And the reason travels with it, because a forced drain resumes from
-        // this one and ends on the others.
-        assert_eq!(stopped_early.interrupted, Some(FOREGROUND_QUERY_STOP));
+            let complete = resolve_thresholds_with(
+                vec![legacy_target(1, None), legacy_target(2, None)],
+                &scorer,
+                || None,
+                |_| std::future::ready(Ok(Some(0.5))),
+                |_, _| std::future::ready(Ok(())),
+            )
+            .await;
+            with_resolved_thresholds(complete, |targets, _| {
+                assert_eq!(targets.len(), 2);
+                pending.clear();
+                std::future::ready(Ok(BatchProgress::completed(false)))
+            })
+            .await
+            .unwrap();
+            assert!(pending.is_empty(), "a complete retry may consume the batch");
+        }
     }
 }

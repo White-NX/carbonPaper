@@ -161,11 +161,18 @@ pub struct ConversationTurn {
     pub time_context: Option<TurnContext>,
 }
 
+const HISTORY_MAX_TURNS: usize = 12;
+const HISTORY_EVICTION_TURNS: usize = 4;
+
 fn conversation_messages(history: &[ConversationTurn]) -> Vec<Message> {
     let mut messages = vec![Message::System(system_prompt())];
     // Evict four turns at a time, keeping a stable prefix between evictions.
     // Enforce the bound even if a caller bypasses the frontend.
-    let start = history.len().saturating_sub(12).div_ceil(4) * 4;
+    let start = history
+        .len()
+        .saturating_sub(HISTORY_MAX_TURNS)
+        .div_ceil(HISTORY_EVICTION_TURNS)
+        * HISTORY_EVICTION_TURNS;
     for turn in history.iter().skip(start) {
         let question: String = turn.question.chars().take(4_000).collect();
         messages.push(Message::User(match &turn.time_context {
@@ -428,38 +435,60 @@ mod tests {
     }
 
     #[test]
-    fn follow_up_context_is_bounded_and_keeps_citations_in_assistant_turns() {
-        let history: Vec<_> = (0..15)
+    fn bounded_history_keeps_complete_recent_turns_and_citations() {
+        let history: Vec<_> = (0..HISTORY_MAX_TURNS * 3)
             .map(|i| ConversationTurn {
                 question: format!("question {i}"),
-                answer: "Found [#42]".into(),
+                answer: format!("answer {i} [#42]"),
                 time_context: None,
             })
             .collect();
-        let messages = conversation_messages(&history);
-        assert_eq!(messages.len(), 23);
-        assert!(matches!(&messages[1], Message::User(text) if text == "question 4"));
-        assert!(
-            matches!(&messages[2], Message::Assistant { text, tool_calls, reasoning } if text == "Found [#42]" && tool_calls.is_empty() && reasoning.is_null())
-        );
+        for length in 0..=history.len() {
+            let messages = conversation_messages(&history[..length]);
+            assert!(matches!(&messages[0], Message::System(_)));
+            let turns = &messages[1..];
+            assert_eq!(turns.len() % 2, 0);
+            assert!(turns.len() <= HISTORY_MAX_TURNS * 2, "length={length}");
+            if length > 0 {
+                assert!(!turns.is_empty());
+            }
+            let retained = turns.len() / 2;
+            for (pair, expected) in turns
+                .chunks_exact(2)
+                .zip(&history[length - retained..length])
+            {
+                assert!(matches!(&pair[0], Message::User(s) if s == &expected.question));
+                assert!(
+                    matches!(&pair[1], Message::Assistant {text, tool_calls, reasoning}
+                if text == &expected.answer && tool_calls.is_empty() && reasoning.is_null())
+                );
+            }
+        }
     }
 
     #[test]
-    fn bounded_history_keeps_its_prefix_between_chunk_evictions() {
-        let history: Vec<_> = (0..17)
+    fn history_prefix_stays_stable_between_chunk_evictions() {
+        let history: Vec<_> = (0..HISTORY_MAX_TURNS + HISTORY_EVICTION_TURNS * 2)
             .map(|i| ConversationTurn {
                 question: format!("question {i}"),
                 answer: "answer".into(),
                 time_context: None,
             })
             .collect();
-        for length in 13..=16 {
+        let first_question = |length| {
             let messages = conversation_messages(&history[..length]);
-            assert!(matches!(&messages[1], Message::User(text) if text == "question 4"));
-            assert!(messages.len() <= 25);
+            let Message::User(question) = &messages[1] else {
+                panic!("missing retained question")
+            };
+            question.clone()
+        };
+        let first = first_question(HISTORY_MAX_TURNS + 1);
+        for extra in 2..=HISTORY_EVICTION_TURNS {
+            assert_eq!(first_question(HISTORY_MAX_TURNS + extra), first);
         }
-        assert!(
-            matches!(&conversation_messages(&history)[1], Message::User(text) if text == "question 8")
+        assert_ne!(
+            first_question(HISTORY_MAX_TURNS + HISTORY_EVICTION_TURNS + 1),
+            first
         );
     }
 

@@ -214,7 +214,10 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].bigram, "Se");
         // As typed first, then the spellings the index could hold instead.
-        assert_eq!(groups[0].variants, vec!["Se", "SE", "se", "sE"]);
+        assert_eq!(groups[0].variants.first().map(String::as_str), Some("Se"));
+        let variants: std::collections::HashSet<_> =
+            groups[0].variants.iter().map(String::as_str).collect();
+        assert_eq!(variants, ["Se", "SE", "se", "sE"].into_iter().collect());
     }
 
     #[test]

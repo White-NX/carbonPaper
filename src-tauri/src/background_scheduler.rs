@@ -1490,15 +1490,24 @@ mod tests {
     }
 
     #[test]
-    fn only_automatic_single_model_indexers_receive_a_quantum() {
-        assert_eq!(
-            BackgroundTaskKind::ClipIndex.automatic_quantum(),
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(
-            BackgroundTaskKind::SemanticIndex.automatic_quantum(),
-            Some(Duration::from_secs(30))
-        );
+    fn automatic_indexer_quanta_admit_a_batch_then_yield() {
+        for kind in [
+            BackgroundTaskKind::ClipIndex,
+            BackgroundTaskKind::SemanticIndex,
+        ] {
+            let quantum = kind
+                .automatic_quantum()
+                .expect("automatic indexer has a budget");
+            assert!(!quantum.is_zero());
+            let mut context = AutomaticSliceContext::new(quantum, Arc::new(AtomicU64::new(0)), 0);
+            context.deadline = context.started;
+            let semantic = SemanticRuntimeState::new();
+            assert_eq!(context.stop_reason(&semantic, false), None);
+            assert_eq!(
+                context.stop_reason(&semantic, true),
+                Some(AutomaticSliceStopReason::BudgetExpired)
+            );
+        }
         assert_eq!(BackgroundTaskKind::SmartCluster.automatic_quantum(), None);
     }
 
@@ -1576,7 +1585,7 @@ mod tests {
         assert!(exhausted.terminal);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn scheduler_waits_after_the_startup_pass_until_a_real_wake() {
         let wake = Notify::new();
         let mut ticker = tokio::time::interval(TICK_INTERVAL);

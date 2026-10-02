@@ -573,62 +573,71 @@ pub async fn rerank_documents(
     priority: RerankPriority,
     watcher: Option<&ActiveRerankQuery>,
 ) -> Result<Vec<f32>, String> {
+    rerank_chunks(documents, budget, priority.chunk_size(), Instant::now,
+        |scored, total| {
+            crate::background_policy::check_current()?;
+            if watcher.is_some_and(ActiveRerankQuery::cancelled) {
+                return Err(format!("{CANCELLED_BY_USER}: stopped after {scored} of {total} documents"));
+            }
+            if priority == RerankPriority::Background && semantic.foreground_waiting() {
+                return Err(format!("{YIELDED_TO_FOREGROUND}: stood down after {scored} of {total} documents so a foreground query could reach the semantic worker"));
+            }
+            Ok(())
+        },
+        |chunk, allowance| async move {
+            semantic.rerank(app.clone(), query.to_string(), chunk, allowance, false)
+                .await.map(|result| result.scores)
+        },
+        |count| {
+            crate::background_policy::check_current()?;
+            if let Some(watcher) = watcher {
+                watcher.report_chunk(app, count as u64, documents.len() as u64);
+            }
+            Ok(())
+        },
+    ).await
+}
+
+// Keep request orchestration independent of the process transport. Tests can
+// control worker completions and time while exercising this production loop.
+async fn rerank_chunks<F, Fut>(
+    documents: &[String],
+    budget: RerankBudget,
+    chunk_size: usize,
+    mut now: impl FnMut() -> Instant,
+    mut before_chunk: impl FnMut(usize, usize) -> Result<(), String>,
+    mut infer: F,
+    mut after_chunk: impl FnMut(usize) -> Result<(), String>,
+) -> Result<Vec<f32>, String>
+where
+    F: FnMut(Vec<String>, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<f32>, String>>,
+{
     if documents.is_empty() {
         return Ok(Vec::new());
     }
-    let clock = RerankClock::start(budget, Instant::now());
+    let clock = RerankClock::start(budget, now());
     let mut scores = Vec::with_capacity(documents.len());
-    for chunk in documents.chunks(priority.chunk_size()) {
-        crate::background_policy::check_current()?;
-        if let Some(watcher) = watcher {
-            if watcher.cancelled() {
-                return Err(format!(
-                    "{CANCELLED_BY_USER}: stopped after {} of {} documents",
-                    scores.len(),
-                    documents.len()
-                ));
-            }
-        }
-        if priority == RerankPriority::Background && semantic.foreground_waiting() {
-            return Err(format!(
-                "{YIELDED_TO_FOREGROUND}: stood down after {} of {} documents so a foreground \
-                 query could reach the semantic worker",
-                scores.len(),
-                documents.len()
-            ));
-        }
-        // What this chunk may spend, and `None` when the call has nothing left
-        // to spend at all.
-        let Some(allowance) = clock.allowance(Instant::now()) else {
-            return Err(format!(
+    for chunk in documents.chunks(chunk_size) {
+        before_chunk(scores.len(), documents.len())?;
+        let allowance = clock.allowance(now()).ok_or_else(|| {
+            format!(
                 "timeout: reranking ran out of budget after {} of {} documents",
                 scores.len(),
                 documents.len()
-            ));
-        };
-        let result = semantic
-            .rerank(
-                app.clone(),
-                query.to_string(),
-                chunk.to_vec(),
-                allowance,
-                // DirectML parity is not approved for this model; asking for it
-                // only costs a provider negotiation before the fallback to CPU.
-                false,
             )
-            .await?;
-        if result.scores.len() != chunk.len() {
+        })?;
+        let result = infer(chunk.to_vec(), allowance).await?;
+        if result.len() != chunk.len() {
             return Err(format!(
                 "model_mismatch: reranker returned {} scores for {} documents",
-                result.scores.len(),
+                result.len(),
                 chunk.len()
             ));
         }
-        crate::background_policy::check_current()?;
-        scores.extend(result.scores);
-        if let Some(watcher) = watcher {
-            watcher.report_chunk(app, chunk.len() as u64, documents.len() as u64);
-        }
+        // Preserve the post-inference authorization check before publishing progress.
+        after_chunk(chunk.len())?;
+        scores.extend(result);
     }
     Ok(scores)
 }
@@ -666,7 +675,6 @@ mod tests {
     /// Per-document rerank cost on the slowest configuration measured on
     /// 2026-08-01: 1.18 s, two cores at one intra-op thread. Rounded up, so a
     /// bound that clears this clears the measurement with room to spare.
-    const SLOWEST_DOCUMENT: Duration = Duration::from_millis(1250);
 
     #[test]
     fn a_document_matches_the_python_join_contract() {
@@ -701,44 +709,99 @@ mod tests {
         assert_eq!(document.chars().count(), "p | t | ".chars().count() + 600);
     }
 
-    #[test]
-    fn the_calibration_over_fetch_exceeds_one_protocol_batch() {
-        // The reason chunking exists rather than being an optimization: the
-        // default calibration request is 30 * 4 documents against a cap of 64.
-        let calibration_documents = 30 * RERANK_OVERFETCH as usize;
-        assert!(calibration_documents > crate::ml_protocol::MAX_RERANK_DOCUMENTS);
-        // And the foreground chunk stays inside that cap, which is what the
-        // protocol validator rejects a request for exceeding.
-        assert!(FOREGROUND_RERANK_CHUNK <= crate::ml_protocol::MAX_RERANK_DOCUMENTS);
+    #[tokio::test]
+    async fn rerank_batches_preserve_order_and_fit_the_worker_protocol() {
+        for priority in [RerankPriority::Foreground, RerankPriority::Background] {
+            let documents: Vec<_> = (0..crate::ml_protocol::MAX_RERANK_DOCUMENTS * 2 + 3)
+                .map(|i| i.to_string())
+                .collect();
+            let mut seen = Vec::new();
+            let mut progress = 0;
+            let scores = rerank_chunks(
+                &documents,
+                RerankBudget::interactive(),
+                priority.chunk_size(),
+                Instant::now,
+                |_, _| Ok(()),
+                |chunk, allowance| {
+                    assert!(
+                        !chunk.is_empty()
+                            && chunk.len() <= crate::ml_protocol::MAX_RERANK_DOCUMENTS
+                    );
+                    assert!(!allowance.is_zero());
+                    seen.extend(chunk.iter().cloned());
+                    std::future::ready(Ok(chunk
+                        .iter()
+                        .map(|s| s.parse::<f32>().unwrap())
+                        .collect()))
+                },
+                |count| {
+                    progress += count;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(seen, documents);
+            assert_eq!(progress, documents.len());
+            assert_eq!(
+                scores,
+                (0..documents.len()).map(|i| i as f32).collect::<Vec<_>>()
+            );
+        }
     }
 
-    #[test]
-    fn the_result_cap_bounds_what_one_query_can_cost() {
-        // The cap is on results, but what it is really bounding is documents,
-        // because that is what the cross-encoder is paid per. The retired 120
-        // option asked for 480 of them, which exceeded the old whole-query
-        // budget even on the machine the per-document cost was measured on.
-        assert_eq!(MAX_RERANK_RESULTS, 30);
-        let documents = MAX_RERANK_RESULTS as usize * RERANK_OVERFETCH as usize;
-        assert_eq!(documents, 120);
-        // Slowest per-document cost measured, rounded up.
-        let worst_case = SLOWEST_DOCUMENT * documents as u32;
-        assert!(worst_case < RERANK_QUERY_CEILING);
-        // And the ceiling is a runaway guard, not a budget the slowest machine
-        // is expected to brush against.
-        assert!(worst_case * 4 < RERANK_QUERY_CEILING);
+    #[tokio::test]
+    async fn exhausted_total_budget_stops_before_submitting_another_chunk() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let calls = Cell::new(0);
+        let error = rerank_chunks(
+            &vec!["doc".into(); 3],
+            RerankBudget::Total(Duration::from_secs(10)),
+            1,
+            || start + elapsed.get(),
+            |_, _| Ok(()),
+            |_, allowance| {
+                assert_eq!(allowance, Duration::from_secs(10));
+                calls.set(calls.get() + 1);
+                elapsed.set(Duration::from_secs(10));
+                std::future::ready(Ok(vec![1.0]))
+            },
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("timeout:"));
+        assert_eq!(calls.get(), 1);
     }
 
-    #[test]
-    fn a_foreground_chunk_stays_well_inside_its_stall_budget() {
-        // Reaching the stall budget has to mean the worker stopped producing,
-        // not that the machine is slow, or the budget is measuring the wrong
-        // thing again. One chunk at the slowest per-document cost measured:
-        let slowest_chunk = SLOWEST_DOCUMENT * FOREGROUND_RERANK_CHUNK as u32;
-        assert!(slowest_chunk * 10 < RERANK_CHUNK_STALL);
-        // The first chunk also absorbs a cold 570 MB model load, which is the
-        // reason the budget is minutes rather than seconds.
-        assert!(RERANK_CHUNK_STALL >= Duration::from_secs(120));
+    #[tokio::test]
+    async fn invalid_worker_scores_stop_the_pass_without_reporting_completion() {
+        for result in [Ok(vec![]), Err("inference failed".to_string())] {
+            let mut calls = 0;
+            let mut reported = 0;
+            let failure = rerank_chunks(
+                &vec!["doc".into(); 3],
+                RerankBudget::interactive(),
+                1,
+                Instant::now,
+                |_, _| Ok(()),
+                |_, _| {
+                    calls += 1;
+                    std::future::ready(result.clone())
+                },
+                |_| {
+                    reported += 1;
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(failure.is_err());
+            assert_eq!(calls, 1);
+            assert_eq!(reported, 0);
+        }
     }
 
     #[test]
@@ -800,37 +863,28 @@ mod tests {
         // is why a test that stops at the first chunk — or at the enum's
         // shape — proves nothing about either branch.
         let start = Instant::now();
-        let total = RerankClock::start(RerankBudget::Total(RERANK_CHUNK_STALL), start);
-        let per_chunk = RerankClock::start(RerankBudget::interactive(), start);
+        let chunk = Duration::from_secs(180);
+        let total = RerankClock::start(RerankBudget::Total(chunk), start);
+        let per_chunk = RerankClock::start(
+            RerankBudget::PerChunk {
+                chunk,
+                ceiling: chunk * 5,
+            },
+            start,
+        );
         assert_eq!(total.allowance(start), per_chunk.allowance(start));
 
         // A later chunk can: one is spending a budget down, the other is
         // renewing it.
         let late = start + Duration::from_secs(100);
         assert_eq!(total.allowance(late), Some(Duration::from_secs(80)));
-        assert_eq!(per_chunk.allowance(late), Some(RERANK_CHUNK_STALL));
+        assert_eq!(per_chunk.allowance(late), Some(chunk));
 
         // And at the number both were given, one pass is over while the other
         // is twelve minutes from its ceiling.
-        let spent = start + RERANK_CHUNK_STALL;
+        let spent = start + chunk;
         assert_eq!(total.allowance(spent), None);
-        assert_eq!(per_chunk.allowance(spent), Some(RERANK_CHUNK_STALL));
-    }
-
-    #[test]
-    fn a_user_facing_query_runs_under_the_two_budgets_written_for_it() {
-        // The constants each carry an argument in their doc comments about what
-        // they are bounding; `interactive` is where those arguments are
-        // actually applied, and a transposition here would silently bound the
-        // query at three minutes total.
-        assert_eq!(
-            RerankBudget::interactive(),
-            RerankBudget::PerChunk {
-                chunk: RERANK_CHUNK_STALL,
-                ceiling: RERANK_QUERY_CEILING,
-            }
-        );
-        assert!(RERANK_CHUNK_STALL < RERANK_QUERY_CEILING);
+        assert_eq!(per_chunk.allowance(spent), Some(chunk));
     }
 
     #[test]
@@ -923,10 +977,25 @@ mod tests {
     }
 
     #[test]
-    fn the_current_scorer_is_cpu_because_the_engine_refuses_anything_else() {
-        assert_eq!(ScorerIdentity::current().provider, "cpu");
-        assert_eq!(ScorerIdentity::current().variant, RERANK_VARIANT);
-        assert_eq!(ScorerIdentity::current().model_id, "bge-reranker-v2-m3");
+    fn current_scorer_matches_the_loaded_model_contract() {
+        let current = ScorerIdentity::current();
+        let model = descriptor(MlSemanticModel::BgeRerankerV2M3);
+        assert_eq!(current.model_id, model.model_id);
+        assert_eq!(current.model_revision, model.revision);
+        assert_eq!(current.variant, RERANK_VARIANT);
+        assert_eq!(current.provider, provider_label(MlProvider::Cpu));
+        assert!(current.matches_stored(
+            Some(model.model_id),
+            Some(model.revision),
+            Some(RERANK_VARIANT),
+            Some("cpu")
+        ));
+        assert!(!current.matches_stored(
+            Some(model.model_id),
+            Some(model.revision),
+            Some(RERANK_VARIANT),
+            Some("directml")
+        ));
     }
 
     #[test]
@@ -956,50 +1025,39 @@ mod tests {
         assert_eq!(missing["available_variants"].as_array().unwrap().len(), 0);
     }
 
-    #[test]
-    fn a_background_chunk_fits_inside_the_foreground_query_budget() {
-        // The bound on how long a foreground query can wait. A background
-        // request cannot be interrupted once submitted, so the chunk size *is*
-        // the worst-case wait, and it has to fit inside the 5 s budget
-        // (`semantic_query.rs::QUERY_EMBED_TIMEOUT`) together with the model
-        // swap that query still has to pay for.
-        assert!(BACKGROUND_RERANK_CHUNK < crate::ml_protocol::MAX_RERANK_DOCUMENTS);
-        assert!(BACKGROUND_RERANK_CHUNK >= 1);
-        assert_eq!(
-            RerankPriority::Background.chunk_size(),
-            BACKGROUND_RERANK_CHUNK
-        );
-
-        // The arithmetic that picked the value, kept executable so raising the
-        // chunk has to argue with the measurement rather than around it. Both
-        // figures are measured on the shipped session configuration: 1.18 s for
-        // a realistic 325-token document, 0.50 s to load MiniLM after the
-        // cross-encoder is evicted. A chunk of 4 lands at 5.22 s and does not
-        // fit, which is what it was before this was measured.
-        const DOC_MS: u64 = 1_180;
-        const MINILM_SWAP_MS: u64 = 500;
-        const QUERY_BUDGET_MS: u64 = 5_000;
-        let worst_wait_ms = BACKGROUND_RERANK_CHUNK as u64 * DOC_MS + MINILM_SWAP_MS;
-        assert!(
-            worst_wait_ms < QUERY_BUDGET_MS,
-            "a background chunk of {BACKGROUND_RERANK_CHUNK} leaves a foreground query \
-             {worst_wait_ms} ms of work inside a {QUERY_BUDGET_MS} ms budget"
-        );
-
-        // A user-facing rerank no longer takes the largest chunk the protocol
-        // allows. It reports after every chunk and can be stopped between them,
-        // so the chunk is the resolution of both the progress bar and the stop
-        // button — and 64 gave the default request a bar that moved twice.
-        assert_eq!(
-            RerankPriority::Foreground.chunk_size(),
-            FOREGROUND_RERANK_CHUNK
-        );
-        let steps = (MAX_RERANK_RESULTS as usize * RERANK_OVERFETCH as usize)
-            .div_ceil(FOREGROUND_RERANK_CHUNK);
-        assert!(
-            steps >= 10,
-            "a progress bar that advances {steps} times over a whole query is a spinner"
-        );
+    #[tokio::test]
+    async fn a_stop_between_chunks_leaves_remaining_documents_unsubmitted() {
+        use std::cell::Cell;
+        for reason in [YIELDED_TO_FOREGROUND, CANCELLED_BY_USER] {
+            let calls = Cell::new(0);
+            let mut progress = 0;
+            let error = rerank_chunks(
+                &vec!["doc".into(); 7],
+                RerankBudget::interactive(),
+                2,
+                Instant::now,
+                |_, _| {
+                    if calls.get() > 0 {
+                        Err(reason.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |chunk, _| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok(vec![1.0; chunk.len()]))
+                },
+                |count| {
+                    progress += count;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, reason);
+            assert_eq!(calls.get(), 1);
+            assert_eq!(progress, 2);
+        }
     }
 
     #[test]

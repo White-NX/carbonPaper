@@ -96,7 +96,7 @@ overlapped). Tauri events use `useTauriEventListener`. Error text goes through
 
 ## Text
 
-User-facing text follows the UI Text Guidelines in `CLAUDE.md`: say what
+User-facing text follows the [UI Text Guidelines in AGENTS.md](../AGENTS.md#ui-text-guidelines): say what
 something does for the user, not how it is implemented. Model names, library
 names, quantisation formats and SQL keywords (VACUUM, HMAC and similar) do not
 appear in overlay text. Raw logs may contain them, which is why logs live

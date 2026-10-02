@@ -132,31 +132,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_installation_gets_the_full_wizard() {
-        assert_eq!(decide_mode(0, false), OnboardingMode::Full);
-    }
-
-    #[test]
-    fn earlier_users_get_whats_new_once() {
-        assert_eq!(decide_mode(0, true), OnboardingMode::WhatsNew);
-        assert_eq!(
-            decide_mode(ONBOARDING_VERSION - 1, true),
-            OnboardingMode::WhatsNew
-        );
-        assert_eq!(decide_mode(ONBOARDING_VERSION, true), OnboardingMode::None);
-    }
-
-    #[test]
-    fn finishing_an_older_wizard_counts_as_an_existing_user() {
-        // Someone who completed version N and meets version N + 1 has used the
-        // app; they get the short page even without legacy flags.
+    fn onboarding_mode_respects_installation_history_and_completed_versions() {
+        for (version, existing, expected) in [
+            (0, false, OnboardingMode::Full),
+            (0, true, OnboardingMode::WhatsNew),
+            (ONBOARDING_VERSION - 1, true, OnboardingMode::WhatsNew),
+            (ONBOARDING_VERSION, false, OnboardingMode::None),
+            (ONBOARDING_VERSION, true, OnboardingMode::None),
+            (ONBOARDING_VERSION + 3, false, OnboardingMode::None),
+        ] {
+            assert_eq!(
+                decide_mode(version, existing),
+                expected,
+                "version={version}, existing={existing}"
+            );
+        }
         if ONBOARDING_VERSION > 1 {
             assert_eq!(decide_mode(1, false), OnboardingMode::WhatsNew);
         }
-        assert_eq!(
-            decide_mode(ONBOARDING_VERSION + 3, false),
-            OnboardingMode::None
-        );
     }
 
     #[test]

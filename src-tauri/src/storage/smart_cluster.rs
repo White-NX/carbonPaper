@@ -1739,4 +1739,51 @@ mod tests {
             .expect("scoring targets");
         assert!(targets[0].anchor_vector.is_none());
     }
+
+    #[test]
+    fn interrupted_archive_groups_keep_completed_work_and_resume_the_remaining_queue() {
+        let (_temp, storage) = test_storage();
+        let cluster = insert_cluster(&storage, "receipts");
+        for id in [1, 2, 3] {
+            insert_screenshot(&storage, id, "editor", "document");
+            storage.enqueue_smart_cluster_pending(id).unwrap();
+        }
+        let generation = storage.db_generation();
+        let targets = storage.list_smart_cluster_scoring_targets().unwrap();
+        let first = storage
+            .archive_scoring_source_revisions(generation, &[1, 2])
+            .unwrap();
+        storage
+            .commit_archive_scoring_group(
+                generation,
+                &first,
+                &targets,
+                &[(cluster, 1, 0.9), (cluster, 2, 0.8)],
+                None,
+            )
+            .unwrap();
+        let remaining = storage.peek_smart_cluster_pending_batch(10).unwrap();
+        assert_eq!(remaining, vec![3]);
+        // A later pass reads the durable queue rather than replaying the completed group.
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &remaining)
+            .unwrap();
+        storage
+            .commit_archive_scoring_group(
+                generation,
+                &revisions,
+                &targets,
+                &[(cluster, 3, 0.7)],
+                None,
+            )
+            .unwrap();
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 0);
+        assert_eq!(
+            storage
+                .list_smart_cluster_assignments(cluster, 0, 10)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
 }

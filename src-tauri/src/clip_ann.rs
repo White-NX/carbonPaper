@@ -1432,9 +1432,17 @@ mod tests {
     }
 
     #[test]
-    fn expansion_covers_production_page_sizes() {
-        assert_eq!(expansion_search(50_000), 2400);
-        assert!(expansion_search(600_000) >= 2400);
+    fn ann_expansion_covers_the_requested_page_and_remains_bounded() {
+        let mut previous = 0;
+        for rows in [0, 1, 50_000, 600_000, usize::MAX] {
+            let expansion = expansion_search(rows);
+            assert!(expansion > 0 && expansion <= ANN_MAX_CANDIDATES);
+            assert!(expansion >= previous);
+            for page in [1, 20, 200] {
+                assert!(expansion >= ann_candidate_count(rows, page));
+            }
+            previous = expansion;
+        }
     }
 
     #[test]
@@ -1846,13 +1854,26 @@ mod tests {
     }
 
     #[test]
-    fn restored_view_reapplies_expansion_search() {
-        let mut options = usearch::IndexOptions::default();
-        options.dimensions = 2;
-        options.metric = MetricKind::IP;
-        options.quantization = ScalarKind::I8;
+    fn a_restored_ann_index_searches_after_expansion_is_reapplied() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restored.usearch");
+        let options = usearch::IndexOptions {
+            dimensions: 2,
+            metric: MetricKind::IP,
+            quantization: ScalarKind::I8,
+            ..Default::default()
+        };
         let index = Index::new(&options).unwrap();
-        apply_expansion_search(&index, 777).unwrap();
-        assert_eq!(index.expansion_search(), 777);
+        index.reserve(2).unwrap();
+        index.add(1, &[1.0f32, 0.0]).unwrap();
+        index.add(2, &[0.0f32, 1.0]).unwrap();
+        index.save(path.to_str().unwrap()).unwrap();
+        drop(index);
+        let restored = Index::new(&options).unwrap();
+        restored.load(path.to_str().unwrap()).unwrap();
+        let expansion = expansion_search(restored.size());
+        apply_expansion_search(&restored, expansion).unwrap();
+        assert_eq!(restored.expansion_search(), expansion);
+        assert_eq!(restored.search(&[1.0f32, 0.0], 1).unwrap().keys, vec![1]);
     }
 }

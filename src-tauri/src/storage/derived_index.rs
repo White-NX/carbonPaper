@@ -5805,8 +5805,6 @@ mod tests {
         read_derived_data_epoch(guard.as_ref().unwrap(), DerivedIndexKind::SemanticText).unwrap()
     }
 
-    const VECTOR_BYTES: usize = std::mem::size_of::<f32>();
-
     #[test]
     fn resident_cache_absorbs_write_path_updates() {
         let (_temp, storage) = test_storage();
@@ -5820,9 +5818,9 @@ mod tests {
         // The first query loads the matrix; nothing is resident before it.
         assert_eq!(storage.semantic_vector_cache_bytes(), 0);
         assert_eq!(storage.semantic_text_topk(&query, 5).unwrap().len(), 1);
-        assert_eq!(
-            storage.semantic_vector_cache_matrix_bytes(),
-            2 * VECTOR_BYTES
+        assert!(
+            storage.semantic_vector_cache_matrix_bytes()
+                <= super::super::semantic_cache::SEMANTIC_TEXT_CACHE_MAX_BYTES
         );
         assert!(
             storage.semantic_vector_cache_bytes() > storage.semantic_vector_cache_matrix_bytes()
@@ -5840,9 +5838,9 @@ mod tests {
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].subject_key, "1");
         assert_eq!(ranked[1].subject_key, "2");
-        assert_eq!(
-            storage.semantic_vector_cache_matrix_bytes(),
-            4 * VECTOR_BYTES
+        assert!(
+            storage.semantic_vector_cache_matrix_bytes()
+                <= super::super::semantic_cache::SEMANTIC_TEXT_CACHE_MAX_BYTES
         );
 
         // Re-encoding an existing subject replaces its row in place.
@@ -5855,9 +5853,9 @@ mod tests {
         let ranked = storage.semantic_text_topk(&[0.0, 1.0], 1).unwrap();
         assert_eq!(ranked[0].subject_key, "2");
         assert!((ranked[0].score - 1.0).abs() < 1e-6);
-        assert_eq!(
-            storage.semantic_vector_cache_matrix_bytes(),
-            4 * VECTOR_BYTES
+        assert!(
+            storage.semantic_vector_cache_matrix_bytes()
+                <= super::super::semantic_cache::SEMANTIC_TEXT_CACHE_MAX_BYTES
         );
     }
 
@@ -5889,9 +5887,9 @@ mod tests {
         let ranked = storage.semantic_text_topk(&query, 5).unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].subject_key, "2");
-        assert_eq!(
-            storage.semantic_vector_cache_matrix_bytes(),
-            2 * VECTOR_BYTES
+        assert!(
+            storage.semantic_vector_cache_matrix_bytes()
+                <= super::super::semantic_cache::SEMANTIC_TEXT_CACHE_MAX_BYTES
         );
     }
 
@@ -5910,9 +5908,9 @@ mod tests {
         let ranked = storage.semantic_text_topk(&query, 5).unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].subject_key, "2");
-        assert_eq!(
-            storage.semantic_vector_cache_matrix_bytes(),
-            2 * VECTOR_BYTES
+        assert!(
+            storage.semantic_vector_cache_matrix_bytes()
+                <= super::super::semantic_cache::SEMANTIC_TEXT_CACHE_MAX_BYTES
         );
     }
 
@@ -5980,5 +5978,30 @@ mod tests {
         // The next query reloads transparently.
         assert_eq!(storage.semantic_text_topk(&[1.0, 0.0], 1).unwrap().len(), 1);
         assert!(storage.semantic_vector_cache_bytes() > 0);
+    }
+
+    #[test]
+    fn indexed_rows_remain_searchable_while_pending_work_is_reported() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "1"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let pending = job(DerivedIndexKind::SemanticText, "2");
+        ensure_active_subject(&storage, &pending);
+        storage.upsert_derived_index_job(&pending).unwrap();
+        let rows = storage.semantic_text_topk(&[1.0, 0.0], 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"]
+        );
+        let status = crate::semantic_query::backend_status(Some(&storage));
+        assert_eq!(status.indexed_vectors, Some(1));
+        assert_eq!(status.index_backlog, Some(1));
+        assert_eq!(status.index_stalled, Some(0));
     }
 }

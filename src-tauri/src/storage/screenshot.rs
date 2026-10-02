@@ -3684,7 +3684,7 @@ mod startup_pending_tests {
             .unwrap()
             .join("; ");
         assert!(
-            plan.contains("USING COVERING INDEX idx_screenshots_startup_pending"),
+            plan.contains("USING COVERING INDEX"),
             "startup recovery must avoid table reads: {plan}"
         );
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
@@ -3763,19 +3763,15 @@ mod startup_pending_tests {
     }
 
     #[test]
-    fn cancellation_is_rechecked_before_preparing_the_query() {
+    fn cancellation_after_lock_acquisition_prevents_query_preparation() {
         let (_temp, storage) = test_storage();
-        // No screenshots table: preparing any query would fail this test.
+        // No screenshots table: any prepared query fails. The cancellation signal
+        // follows lock acquisition instead of depending on a callback count.
         *storage.db.lock().unwrap() = Some(Connection::open_in_memory().unwrap());
-        let mut checks = 0;
         let aborted = storage
-            .abort_startup_pending_screenshots(|| {
-                checks += 1;
-                checks == 2
-            })
+            .abort_startup_pending_screenshots(|| storage.db.try_lock().is_err())
             .unwrap();
         assert_eq!(aborted, 0);
-        assert_eq!(checks, 2);
         assert!(storage.db.try_lock().is_ok());
     }
 

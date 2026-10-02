@@ -74,38 +74,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seconds_render_with_a_zone_marker() {
-        // Without the trailing `Z` this is the bug from issue #166: JavaScript
-        // would read it as local time.
-        assert_eq!(from_unix_seconds(1_786_428_460), "2026-08-11T06:07:40Z");
+    fn optional_seconds_preserve_missing_values_and_render_utc() {
+        for (seconds, expected) in [
+            (None, ""),
+            (Some(0), "1970-01-01T00:00:00Z"),
+            (Some(1_786_428_460), "2026-08-11T06:07:40Z"),
+        ] {
+            assert_eq!(from_optional_seconds(seconds), expected, "{seconds:?}");
+            if let Some(seconds) = seconds {
+                assert_eq!(from_unix_seconds(seconds), expected);
+            }
+        }
     }
 
     #[test]
-    fn missing_time_renders_empty() {
-        assert_eq!(from_optional_seconds(None), "");
-        assert_eq!(from_optional_seconds(Some(0)), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn sqlite_text_round_trips_through_the_wire_format() {
-        let wire = from_sqlite_utc("2026-08-11 06:07:40");
-        assert_eq!(wire, "2026-08-11T06:07:40Z");
-        assert_eq!(sqlite_utc_to_seconds(&wire), Some(1_786_428_460));
-    }
-
-    #[test]
-    fn unparseable_text_survives() {
-        assert_eq!(from_sqlite_utc("not a time"), "not a time");
-        assert_eq!(sqlite_utc_to_seconds("not a time"), None);
-        assert_eq!(sqlite_utc_to_seconds(""), None);
-    }
-
-    #[test]
-    fn an_offset_is_honoured_rather_than_dropped() {
-        // The same instant as the naive UTC case above, written from UTC+8.
-        assert_eq!(
-            sqlite_utc_to_seconds("2026-08-11T14:07:40+08:00"),
-            Some(1_786_428_460)
-        );
+    fn stored_time_formats_preserve_the_instant_or_unparseable_text() {
+        for (text, seconds, wire) in [
+            (
+                "2026-08-11 06:07:40",
+                Some(1_786_428_460),
+                "2026-08-11T06:07:40Z",
+            ),
+            (
+                "2026-08-11T06:07:40Z",
+                Some(1_786_428_460),
+                "2026-08-11T06:07:40Z",
+            ),
+            (
+                "2026-08-11T14:07:40+08:00",
+                Some(1_786_428_460),
+                "2026-08-11T06:07:40Z",
+            ),
+            ("not a time", None, "not a time"),
+            ("", None, ""),
+        ] {
+            assert_eq!(sqlite_utc_to_seconds(text), seconds, "{text:?}");
+            assert_eq!(from_sqlite_utc(text), wire, "{text:?}");
+            assert_eq!(sqlite_utc_to_seconds(wire), seconds, "wire {text:?}");
+        }
     }
 }

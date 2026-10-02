@@ -451,19 +451,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_admission_is_bounded_and_deduplicated_until_the_job_drops() {
+    fn native_admission_deduplicates_with_free_capacity_and_releases_on_drop() {
         let state = Arc::new(ClassificationState::default());
-        let mut permits = Vec::new();
-        for id in 1..=8 {
-            permits.push(state.permit(0, id).unwrap());
-        }
-        assert!(state.permit(0, 9).is_none());
-        assert!(state.permit(0, 1).is_none());
-        permits.remove(0);
-        let replacement = state.permit(0, 1).unwrap();
+        let capacity = state.capacity.available_permits();
+        assert!(capacity > 1);
+        let first = state.permit(0, 1).unwrap();
+        assert!(state.capacity.available_permits() > 0);
+        assert!(
+            state.permit(0, 1).is_none(),
+            "duplicate must be refused even with free slots"
+        );
+        let others: Vec<_> = (2..=capacity)
+            .map(|id| state.permit(0, id as i64).unwrap())
+            .collect();
+        assert!(state.permit(0, capacity as i64 + 1).is_none());
+        drop(first);
+        let replacement = state
+            .permit(0, 1)
+            .expect("dropping a job permits its successor");
         drop(replacement);
-        drop(permits);
-        assert_eq!(state.capacity.available_permits(), 8);
+        drop(others);
+        assert_eq!(state.capacity.available_permits(), capacity);
         assert!(state.active.lock().unwrap().is_empty());
     }
 
