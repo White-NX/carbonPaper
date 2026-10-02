@@ -12,6 +12,7 @@ export const getRecapRecords = (date, batchStartMs = null, cursor = null) => rea
 export const getRecapProgress = (date, options = {}) => read('recap_get_progress', { date, ...options });
 export const generateRecap = (date, force = false) => write('recap_generate', { date, force });
 export const cancelRecap = () => invoke('recap_cancel');
+export const deleteRecap = (date) => write('recap_delete', { date });
 export const correctRecap = (date, correction) => write('recap_correct', { date, correction });
 
 export function localDate(date = new Date()) {

@@ -1,5 +1,9 @@
 {
   "recap": {
+    "delete": "Delete recap",
+    "deleteTitle": "Delete this day's recap?",
+    "deleteMessage": "The recap and corrections for {{date}} will be permanently deleted. Original records will be kept. You can generate this recap again manually.",
+    "deleting": "Deleting…",
     "overview": "Recap",
     "records": "Records",
     "period": "Period",

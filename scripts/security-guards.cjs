@@ -10,6 +10,7 @@ const COMMAND_TIERS = {
   'commands::recap::recap_get_records': 'session_required',
   'commands::recap::recap_generate': 'session_required',
   'commands::recap::recap_correct': 'session_required',
+  'commands::recap::recap_delete': 'session_required',
   'commands::recap::recap_cancel': 'runtime_public',
   'commands::recap::recap_get_progress': 'session_required',
   'commands::ai::ai_get_settings': 'public',
