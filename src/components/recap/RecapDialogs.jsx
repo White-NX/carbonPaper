@@ -1,10 +1,12 @@
-import React, { useEffect, useId, useState } from 'react';
+import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { OverlayShell } from '../overlay/OverlayShell';
+import { Dialog } from '../Dialog';
 import { Button } from '../ui/Button';
-import { correctRecap, getRecapDay, recapErrorKey } from '../../lib/recap_api';
-import useRecapProgress from '../../hooks/useRecapProgress';
-import RecapProgress from './RecapProgress';
+import { correctRecap, recapErrorKey } from '../../lib/recap_api';
+import { useDialogVisibility } from '../../hooks/useDialogFocus';
+import useRecapDiagnostics from '../../hooks/useRecapDiagnostics';
+import RecapProgress, { DiagnosticError } from './RecapProgress';
 import { RecordList } from './RecapSources';
 
 export function RecapError({ error }) {
@@ -57,22 +59,17 @@ export function SourcesDialog({ sources, action, time, onClose }) {
 }
 
 export function DiagnosticsDialog({ date, onClose }) {
-  const { t } = useTranslation();
-  const [day, setDay] = useState(null);
-  const [error, setError] = useState('');
-  const { progress, error: progressError } = useRecapProgress(date, true, true);
-  useEffect(() => {
-    let live = true;
-    getRecapDay(date, { includeRecords: false, includeAttempts: true }).then((result) => { if (live) setDay(result); }).catch((cause) => { if (live) setError(String(cause)); });
-    return () => { live = false; };
-  }, [date]);
-  return <OverlayShell title={t('recap.generationDetails')} size="xl" onDismiss={onClose} footer={<Button onClick={onClose}>{t('recap.close')}</Button>}>
-    {(error || progressError) && <RecapError error={error || progressError} />}
-    {!day && !error && <p className="text-xs">{t('recap.loading')}</p>}
-    {day?.error && <RecapError error={day.error} />}
-    {day?.batches.filter((batch) => batch.error || batch.summary_error).map((batch) => <div key={batch.start_ms} className="space-y-2 text-xs">
-      <RecapError error={batch.error || batch.summary_error} /><pre className="whitespace-pre-wrap break-words">{batch.error || batch.summary_error}</pre>
-    </div>)}
-    <RecapProgress progress={progress} batches={day?.batches || []} />
-  </OverlayShell>;
+  const { t, i18n } = useTranslation();
+  const active = useDialogVisibility(true);
+  const { day, progress, error } = useRecapDiagnostics(date, active);
+  const displayDate = new Date(`${date}T12:00:00`).toLocaleDateString(i18n.language, { year: 'numeric', month: 'long', day: 'numeric' });
+  return <Dialog isOpen onClose={onClose} maxWidth="max-w-[720px]" className="recap-diagnostics max-h-[85vh] bg-ide-panel" contentClassName="flex flex-col overflow-hidden"
+    title={<><span className="block text-base font-semibold text-ide-text">{t('recap.generationDetails')}</span><span className="mt-1 block text-xs font-normal">{t('recap.title')} · {displayDate}</span></>}>
+    <div className="min-h-0 overflow-y-auto px-4 py-4 sm:px-6" data-recap-diagnostics-scroll>
+      {error && <div className="mb-3"><DiagnosticError error={error} /></div>}
+      {!day && !error && <p role="status" className="text-sm text-ide-muted">{t('recap.loading')}</p>}
+      {(day || progress) && <RecapProgress key={date} progress={progress} batches={day?.batches || []} error={day?.error} />}
+    </div>
+    <div className="flex shrink-0 justify-end border-t border-ide-border px-4 py-3 sm:px-6"><Button onClick={onClose}>{t('recap.close')}</Button></div>
+  </Dialog>;
 }

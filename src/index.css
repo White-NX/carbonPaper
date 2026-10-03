@@ -27,6 +27,13 @@
 .recap-period { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 24px; }
 .recap-period-time { position: relative; padding-top: 6px; }
 .recap-time-dot { position: absolute; top: 11px; right: -13px; width: 5px; height: 5px; border-radius: 50%; background: var(--ide-border); }
+.recap-diagnostics { container: recap-diagnostics / inline-size; }
+.recap-request-fields { grid-template-columns: minmax(0, auto) minmax(0, 1fr); }
+@container recap-diagnostics (max-width: 420px) {
+  .recap-request-fields { grid-template-columns: minmax(0, 1fr); }
+  .recap-request-fields dd { margin-bottom: 4px; }
+  .recap-period-status { max-width: 38%; }
+}
 @container recap (max-width: 720px) {
   .recap-header { grid-template-columns: minmax(0, 1fr) auto; }
   .recap-header-actions { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
