@@ -1,7 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Sparkles, Clock } from 'lucide-react';
-import { focusStyle } from '../ui/Button';
 
 /**
  * 每日回顾顶栏选项卡（回顾 / 原始记录）。
@@ -43,7 +42,7 @@ export function RecapTabs({ tab, onChange }) {
                 document.getElementById(`recap-tab-${next}`)?.focus();
               }
             }}
-            className={`relative flex items-center gap-1.5 rounded-t-md px-3 pb-2.5 pt-1.5 text-[13px] transition-colors ${focusStyle} ${
+            className={`relative flex items-center gap-1.5 rounded-t-md px-3 pb-2.5 pt-1.5 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 ${
               selected
                 ? 'font-semibold text-ide-accent'
                 : 'text-ide-muted hover:bg-ide-hover hover:text-ide-text'

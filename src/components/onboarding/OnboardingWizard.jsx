@@ -26,7 +26,7 @@ import { changeAppLanguage } from '../../i18n';
 import { cn } from '../../lib/utils';
 import { MODEL_DOWNLOAD_MB } from '../../lib/modelSizes';
 import { OverlayShell, ProgressBlock } from '../overlay';
-import { Button, focusStyle } from '../ui/Button';
+import { Button, focusRing } from '../ui/Button';
 import { Banner } from '../ui/Banner';
 import { OptionCardGroup, SwitchRow, ToggleCard } from './OptionCards';
 import { RERANKER_MODEL_ID, WIZARD_STEPS, needsReranker, selectedBrowsers } from './onboardingPlan';
@@ -49,7 +49,7 @@ function StepIndicator({ step, onSelect, locked }) {
           <li key={id} className="flex min-w-0 flex-1 items-center gap-2">
             <button type="button" disabled={locked || index > step} onClick={() => onSelect(index)}
               aria-current={current ? 'step' : undefined}
-              className={cn('flex min-w-0 items-center gap-2 rounded-md text-xs transition-colors disabled:cursor-default', focusStyle,
+              className={cn('flex min-w-0 items-center gap-2 rounded-md text-xs transition-colors disabled:cursor-default', focusRing,
                 current ? 'font-medium text-ide-text' : done ? 'text-ide-muted hover:text-ide-text' : 'text-ide-muted/60')}>
               <span className={cn('flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] tabular-nums transition-colors',
                 current && 'border-ide-accent bg-ide-accent text-white',
@@ -77,7 +77,7 @@ function LanguageSwitch() {
       <Languages className="ml-1.5 h-3.5 w-3.5 text-ide-muted" aria-hidden="true" />
       {languages.map(([value, label]) => (
         <button key={value} type="button" aria-pressed={i18n.language === value} onClick={() => changeAppLanguage(value)}
-          className={cn('rounded-md px-2 py-1 text-xs transition-colors', focusStyle,
+          className={cn('rounded-md px-2 py-1 text-xs transition-colors', focusRing,
             i18n.language === value ? 'bg-ide-panel font-medium text-ide-text shadow-sm' : 'text-ide-muted hover:text-ide-text')}>
           {label}
         </button>
@@ -231,7 +231,7 @@ function SummaryRow({ label, value, onEdit }) {
       <span className="flex min-w-0 items-center gap-2">
         <span className="truncate text-right text-ide-text">{value}</span>
         {onEdit && (
-          <button type="button" onClick={onEdit} className={cn('shrink-0 rounded text-xs text-ide-accent hover:underline', focusStyle)}>
+          <button type="button" onClick={onEdit} className={cn('shrink-0 rounded text-xs text-ide-accent hover:underline', focusRing)}>
             {t('onboarding.review.edit')}
           </button>
         )}
