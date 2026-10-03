@@ -14,24 +14,32 @@ pub fn excerpt(text: &str, previous: Option<&str>, limit: usize) -> String {
     if joined.chars().count() <= limit {
         return joined;
     }
+    if limit < 16 {
+        return limited(&joined, limit);
+    }
+    // Select disjoint source positions, including the separator cost. A new
+    // context has no "changed" range: sample its actual middle, not its head twice.
+    let chars: Vec<char> = joined.chars().collect();
+    let budget = limit - 10; // two "\n[…]\n" separators
+    let edge = budget / 4;
+    let middle_len = budget - edge * 2;
     let prior: HashSet<&str> = previous.unwrap_or("").lines().map(str::trim).collect();
-    let changed = lines
-        .iter()
-        .filter(|s| !prior.contains(**s))
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let head = limited(&joined, limit / 4);
-    let middle = limited(&changed, limit / 2);
-    let tail = joined
-        .chars()
-        .rev()
-        .take(limit / 4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("{head}\n[…]\n{middle}\n[…]\n{tail}")
+    let mut offset = 0;
+    let changed_start = lines.iter().find_map(|line| {
+        let start = offset;
+        offset += line.chars().count() + 1;
+        (previous.is_some() && !prior.contains(line) && offset > edge).then_some(start)
+    });
+    let middle = changed_start
+        .unwrap_or((chars.len() - middle_len) / 2)
+        .clamp(edge, chars.len() - edge - middle_len);
+    let slice = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
+    format!(
+        "{}\n[…]\n{}\n[…]\n{}",
+        slice(0, edge),
+        slice(middle, middle + middle_len),
+        slice(chars.len() - edge, chars.len())
+    )
 }
 
 pub fn prepare(records: &mut [Evidence]) {
@@ -62,9 +70,7 @@ pub fn prepare(records: &mut [Evidence]) {
                     / words.union(&before).count().max(1) as f64
             })
             .unwrap_or(1.0);
-        let compact = excerpt(&e.text, prior.map(String::as_str), 900);
         previous.insert(e.context.clone(), e.text.clone());
-        e.text = compact;
         last_context = e.context.clone();
         last_time = e.timestamp_ms;
     }
@@ -77,7 +83,24 @@ pub fn prepare(records: &mut [Evidence]) {
 /// Deterministic coverage, change/result slots and seeded exploration (70/20/10).
 pub fn selection_order(records: &[Evidence], seed: u64) -> Vec<usize> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut remaining: Vec<usize> = (0..records.len()).collect();
+    let mut seen = HashSet::new();
+    // Compare complete normalized OCR, before excerpting. Keep repeated visits
+    // in different segments and keep every original record in the local index.
+    let mut remaining: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let normalized = e
+                .text
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            seen.insert((e.segment.as_str(), digest(&normalized)))
+                .then_some(i)
+        })
+        .collect();
     let mut contexts = HashMap::<&str, u32>::new();
     let mut apps = HashMap::<&str, u32>::new();
     let mut times = HashMap::<i64, u32>::new();
@@ -327,7 +350,8 @@ mod tests {
         rs.push(e(100, 100_000, "Short", "new result"));
         prepare(&mut rs);
         let order = selection_order(&rs, 7);
-        assert!(order[..5].contains(&99));
+        assert!(order.iter().take(5).any(|i| *i == 99));
+        assert_eq!(order.len(), 2);
         assert_eq!(order, selection_order(&rs, 7));
     }
     #[test]
@@ -337,5 +361,45 @@ mod tests {
         let part = excerpt(&text, Some(&old), 100);
         assert!(part.contains("new result"));
         assert!(part.contains("final confirmation"));
+    }
+
+    #[test]
+    fn long_excerpts_never_repeat_source_positions_and_obey_unicode_limits() {
+        let text: String = (0x4e00..0x5200)
+            .map(|c| char::from_u32(c).unwrap())
+            .collect();
+        for cap in [0, 1, 15, 16, 240, 900] {
+            let part = excerpt(&text, None, cap);
+            assert!(part.chars().count() <= cap);
+            let chars: Vec<char> = part.chars().filter(|c| text.contains(*c)).collect();
+            assert_eq!(chars.len(), chars.iter().collect::<HashSet<_>>().len());
+            if cap >= 16 {
+                assert!(part.starts_with(text.chars().next().unwrap()));
+                assert!(part.ends_with(text.chars().last().unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn dedup_preserves_revisits_full_text_changes_and_local_records() {
+        let mut records = vec![
+            e(1, 0, "A", "same\ntext"),
+            e(2, 1000, "A", " same\n\ntext "),
+            e(3, 2000, "B", "same\ntext"),
+            e(4, 3000, "A", "same\ntext"),
+            e(5, 900_000, "A", "same\ntext"),
+        ];
+        let full = "x".repeat(3000);
+        records.push(e(6, 901_000, "A", &full));
+        let mut changed = full.clone();
+        changed.replace_range(700..701, "y");
+        records.push(e(7, 902_000, "A", &changed));
+        prepare(&mut records);
+        let order = selection_order(&records, 1);
+        assert_eq!(records.len(), 7);
+        assert_eq!(order.len(), 6);
+        assert!(!order.contains(&1));
+        assert!(order.contains(&5) && order.contains(&6));
+        assert_eq!(records[5].text, full);
     }
 }

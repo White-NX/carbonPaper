@@ -168,17 +168,29 @@ impl RunContext {
         {
             return Err("RECAP_SOURCE_CHANGED".into());
         }
-        if self.automatic
-            && !self
-                .app
-                .state::<Arc<crate::idle::IdleState>>()
-                .is_idle
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err("RECAP_WAITING_FOR_IDLE".into());
-        }
         Ok(())
     }
+
+    /// Fullscreen gates new work; never discard an already paid response just
+    /// because the foreground application changed while it was streaming.
+    pub(super) fn check_before_request(&self) -> Result<(), String> {
+        self.check()?;
+        check_background_gate(
+            self.automatic,
+            &self.app.state::<Arc<crate::idle::IdleState>>(),
+        )
+    }
+}
+
+fn check_background_gate(automatic: bool, state: &crate::idle::IdleState) -> Result<(), String> {
+    if automatic
+        && state
+            .fullscreen_exclusive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err("RECAP_WAITING_FOR_IDLE".into());
+    }
+    Ok(())
 }
 
 pub(super) async fn guarded<T>(
@@ -443,7 +455,12 @@ fn request(payload: &Value, max_output: u32) -> ChatRequest {
 }
 
 fn evidence_value(e: &Evidence, cap: usize) -> Value {
-    json!({"id":e.id,"time_ms":e.timestamp_ms,"segment":e.segment,"application":e.process_name,"title":e.window_title,"page":e.page_url,"text":selection::excerpt(&e.text,None,cap),"possibly_related_source":e.screening.related_previous})
+    let text = if e.text.chars().count() <= cap {
+        e.text.clone()
+    } else {
+        selection::excerpt(&e.text, None, cap)
+    };
+    json!({"id":e.id,"time_ms":e.timestamp_ms,"segment":e.segment,"application":e.process_name,"title":e.window_title,"page":e.page_url,"text":text,"possibly_related_source":e.screening.related_previous})
 }
 
 fn initial_request(
@@ -496,11 +513,19 @@ fn initial_request(
     let mut values = Vec::new();
     for i in order {
         let e = &records[i];
-        values.push(evidence_value(e, 900));
+        let previous = records[..i]
+            .iter()
+            .rev()
+            .find(|old| old.context == e.context)
+            .map(|old| old.text.as_str());
+        let mut sample = e.clone();
+        sample.text = selection::excerpt(&e.text, previous, 900);
+        values.push(evidence_value(&sample, 900));
         payload["evidence"] = json!(values);
         if context::estimated_input_tokens(provider.kind, &request(&payload, output)) > allowance {
             values.pop();
-            values.push(evidence_value(e, 240));
+            sample.text = selection::excerpt(&e.text, previous, 240);
+            values.push(evidence_value(&sample, 240));
             payload["evidence"] = json!(values);
             if context::estimated_input_tokens(provider.kind, &request(&payload, output))
                 > allowance
@@ -510,7 +535,7 @@ fn initial_request(
                 break;
             }
         }
-        selected.push(e.clone());
+        selected.push(sample);
     }
     if selected.is_empty() {
         return Err("AI_CONTEXT_LIMIT".into());
@@ -525,7 +550,7 @@ pub(super) async fn complete(
     run: &str,
     stage: &str,
 ) -> Result<ChatResponse, String> {
-    ctx.check()?;
+    ctx.check_before_request()?;
     if context::estimated_input_tokens(provider.kind, req)
         > context::input_allowance(req, provider.context_tokens)
     {
@@ -775,7 +800,18 @@ async fn generate_batch(
     let run = hex::encode(rand::random::<[u8; 16]>());
     if ctx.settings.screening.enabled {
         ctx.stage("screening");
-        if let Err(error) = screening::screen(ctx, &mut records, &run).await {
+        let mut indices = selection::selection_order(&records, start as u64);
+        // Classification's previous-screen relation relies on chronological order.
+        indices.sort_unstable();
+        let mut candidates = indices
+            .iter()
+            .map(|i| records[*i].clone())
+            .collect::<Vec<_>>();
+        let result = screening::screen(ctx, &mut candidates, &run).await;
+        for (i, candidate) in indices.into_iter().zip(candidates) {
+            records[i].screening = candidate.screening;
+        }
+        if let Err(error) = result {
             ctx.check()?; // Classification errors degrade to local selection; auth/cancel does not.
             log_failure(&ctx.day, &run, "screening", &error);
             batch.error = Some(error);
@@ -847,6 +883,9 @@ async fn generate_batch(
                     e.segment = format!("segment-{}", e.id);
                 }
                 e.text = selection::excerpt(&e.text, None, 1800);
+                if !has_new_text(&first, &e) {
+                    continue;
+                }
                 additional_evidence.push(e.clone());
                 if let Some(existing) = selected.iter_mut().find(|old| old.id == e.id) {
                     *existing = e;
@@ -855,55 +894,66 @@ async fn generate_batch(
                 }
             }
         }
-        let payload = json!({"language":ctx.settings.language,"answer_tokens":ctx.settings.answer_tokens,"existing_tasks":model_prior.threads.iter().take(64).map(|t|json!({"id":t.id,"title":t.title})).collect::<Vec<_>>(),"validated_draft":draft,"repair_required":needs_repair,"validation_error":repair_error,"instruction":"Return a complete valid replacement. Use fewer, shorter activities if the previous response exceeded its output limit. Preserve supported draft facts using only the evidence included in this request. No more gaps. Describe only occurrences in the requested batch; earlier evidence may establish task identity only.","batch_start_ms":start,"batch_end_ms":end});
-        let repaired = async {
-            let (second, second_evidence) = followup_request(
-                &first,
-                &response,
-                payload,
-                &selected,
-                &additional_evidence,
-                provider,
-                remaining_input,
-                remaining_output,
-            )?;
-            let response = complete(ctx, provider, &second, &run, "repair").await?;
-            let d = response_draft(&response)?;
-            let a = selection::validate_draft(&d, &second_evidence, &prior_tasks, &scope)?;
-            if a.is_empty() {
-                return Err("RECAP_NO_ACTIVITIES".to_string());
-            }
-            Ok((d, a))
-        }
-        .await;
-        ctx.progress(true, |p| {
-            // A budget/context refusal before a second request must not rewrite
-            // the first attempt's actual result in the activity history.
-            if p.attempts.last().is_some_and(|a| a.kind == "repair") {
-                p.validation(repaired.as_ref().err().map(String::as_str));
-            }
-        });
-        match repaired {
-            Ok((d, a)) => {
-                draft = d;
-                activities = a;
-            }
-            Err(error) => {
-                log_failure(&ctx.day, &run, "repair_validation", &error);
-                if needs_repair {
-                    // If a second request cannot fit, retain the original cause.
-                    return Err(
-                        if matches!(
-                            error.as_str(),
-                            "RECAP_BUDGET_EXHAUSTED" | "AI_CONTEXT_LIMIT"
-                        ) {
-                            repair_error.unwrap_or(error)
-                        } else {
-                            error
-                        },
-                    );
+        if needs_repair || !additional_evidence.is_empty() {
+            let instruction = if needs_repair {
+                "Return a complete valid replacement. Use fewer, shorter activities if the previous response exceeded its output limit. Preserve supported draft facts using only the evidence included in this request."
+            } else {
+                "Return ONLY additional facts or activities supported by the new evidence. The valid first activities will be retained locally: do not repeat or rewrite them. For a fact extending an existing occurrence, reuse its task_id and cite its evidence ID alongside any new supporting IDs; your text will be appended locally. Reuse existing task_id (including new:N) for the same task; use unused new:N identifiers for new tasks. Return an empty activities array if there is nothing useful to add."
+            };
+            let payload = json!({"language":ctx.settings.language,"answer_tokens":ctx.settings.answer_tokens,"existing_tasks":model_prior.threads.iter().take(64).map(|t|json!({"id":t.id,"title":t.title})).collect::<Vec<_>>(),"validated_draft":draft,"repair_required":needs_repair,"validation_error":repair_error,"instruction":format!("{instruction} No more gaps. Describe only occurrences in the requested batch; earlier evidence may establish task identity only."),"batch_start_ms":start,"batch_end_ms":end});
+            let repaired = async {
+                let (second, second_evidence) = followup_request(
+                    &first,
+                    &response,
+                    payload,
+                    &selected,
+                    &additional_evidence,
+                    provider,
+                    remaining_input,
+                    remaining_output,
+                )?;
+                let response = complete(ctx, provider, &second, &run, "repair").await?;
+                let mut d = response_draft(&response)?;
+                selection::validate_draft(&d, &second_evidence, &prior_tasks, &scope)?;
+                if !needs_repair {
+                    d = merge_supplement(&draft, d)?;
                 }
-                batch.error = Some(error);
+                let a = selection::validate_draft(&d, &selected, &prior_tasks, &scope)?;
+                if a.is_empty() {
+                    return Err("RECAP_NO_ACTIVITIES".to_string());
+                }
+                Ok((d, a))
+            }
+            .await;
+            ctx.progress(true, |p| {
+                // A budget/context refusal before a second request must not rewrite
+                // the first attempt's actual result in the activity history.
+                if p.attempts.last().is_some_and(|a| a.kind == "repair") {
+                    p.validation(repaired.as_ref().err().map(String::as_str));
+                }
+            });
+            match repaired {
+                Ok((d, a)) => {
+                    draft = d;
+                    activities = a;
+                }
+                Err(error) => {
+                    log_failure(&ctx.day, &run, "repair_validation", &error);
+                    if needs_repair {
+                        // If a second request cannot fit, retain the original cause.
+                        return Err(
+                            if matches!(
+                                error.as_str(),
+                                "RECAP_BUDGET_EXHAUSTED" | "AI_CONTEXT_LIMIT"
+                            ) {
+                                repair_error.unwrap_or(error)
+                            } else {
+                                error
+                            },
+                        );
+                    }
+                    batch.error = Some(error);
+                }
             }
         }
     }
@@ -944,6 +994,59 @@ async fn generate_batch(
     }
     .into();
     Ok(batch)
+}
+
+/// Compare against the actual excerpt sent, not the full local source.
+fn has_new_text(first: &ChatRequest, extra: &Evidence) -> bool {
+    if extra.text.trim().is_empty() {
+        return false;
+    }
+    let sent = first.messages.iter().find_map(|message| match message {
+        Message::User(text) => serde_json::from_str::<Value>(text).ok(),
+        _ => None,
+    });
+    !sent
+        .as_ref()
+        .and_then(|v| v["evidence"].as_array())
+        .is_some_and(|items| {
+            items.iter().any(|v| {
+                v["id"].as_i64() == Some(extra.id)
+                    && v["text"].as_str() == Some(extra.text.as_str())
+            })
+        })
+}
+
+fn merge_supplement(first: &Draft, supplement: Draft) -> Result<Draft, String> {
+    let mut merged = first.clone();
+    for addition in supplement.activities {
+        // The validator derives activity IDs from task + first source. Appending
+        // another item with that identity would silently lose the new facts.
+        let existing = merged.activities.iter_mut().find(|old| {
+            old.task_id == addition.task_id
+                && (old.task_id.is_some() || old.task_title == addition.task_title)
+                && old
+                    .evidence_ids
+                    .iter()
+                    .any(|id| addition.evidence_ids.contains(id))
+        });
+        if let Some(old) = existing {
+            if old.text.trim() != addition.text.trim() {
+                old.text = format!("{}\n{}", old.text.trim(), addition.text.trim());
+            }
+            for id in addition.evidence_ids {
+                if !old.evidence_ids.contains(&id) {
+                    old.evidence_ids.push(id);
+                }
+            }
+        } else {
+            merged.activities.push(addition);
+        }
+    }
+    merged.gaps = supplement.gaps;
+    if merged.activities.len() > 80 {
+        return Err("RECAP_RESPONSE_TOO_LARGE".into());
+    }
+    Ok(merged)
 }
 
 pub async fn generate(
@@ -1169,10 +1272,7 @@ pub fn start_scheduler(app: tauri::AppHandle) {
                 || !app
                     .state::<Arc<CredentialManagerState>>()
                     .is_session_valid()
-                || !app
-                    .state::<Arc<crate::idle::IdleState>>()
-                    .is_idle
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                || check_background_gate(true, &app.state::<Arc<crate::idle::IdleState>>()).is_err()
             {
                 continue;
             }
@@ -1228,6 +1328,59 @@ mod tests {
     use super::*;
     use crate::ai::config::{ProviderKind, ToolCalling};
     use crate::ai::provider::Usage;
+
+    #[test]
+    fn scheduled_requests_ignore_input_and_power_but_defer_for_fullscreen() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = crate::idle::IdleState::new();
+        for idle in [false, true] {
+            for ac in [false, true] {
+                state.is_idle.store(idle, Relaxed);
+                state.ac_connected.store(ac, Relaxed);
+                state.fullscreen_exclusive.store(false, Relaxed);
+                assert!(check_background_gate(true, &state).is_ok());
+                state.fullscreen_exclusive.store(true, Relaxed);
+                assert_eq!(
+                    check_background_gate(true, &state).unwrap_err(),
+                    "RECAP_WAITING_FOR_IDLE"
+                );
+                assert!(check_background_gate(false, &state).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn supplement_requires_new_visible_text_and_preserves_valid_first_activities() {
+        let mut source = evidence(1);
+        source.text = "Already sent".into();
+        let req = request(&json!({"evidence":[evidence_value(&source, 900)]}), 4000);
+        assert!(!has_new_text(&req, &source));
+        source.text.push_str(" with a new result");
+        assert!(has_new_text(&req, &source));
+        source.text = "  ".into();
+        assert!(!has_new_text(&req, &source));
+        let first = selection::parse_draft(r#"{"activities":[{"task_id":"new:1","task_title":"Task","text":"Read notes","evidence_ids":[1]}],"gaps":[{"question":"Result?","evidence_ids":[2]}]}"#).unwrap();
+        let supplement = selection::parse_draft(r#"{"activities":[{"task_id":"new:1","task_title":"Task","text":"Viewed result","evidence_ids":[2]}]}"#).unwrap();
+        let merged = merge_supplement(&first, supplement).unwrap();
+        assert_eq!(merged.activities.len(), 2);
+        assert_eq!(merged.activities[0].text, first.activities[0].text);
+        assert!(merged.gaps.is_empty());
+        let sources = vec![evidence(1), evidence(2)];
+        let activities =
+            selection::validate_draft(&merged, &sources, &HashSet::new(), "day").unwrap();
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0].task_id, activities[1].task_id);
+        let unchanged = merge_supplement(&first, Draft::default()).unwrap();
+        assert_eq!(unchanged.activities.len(), 1);
+        assert!(unchanged.gaps.is_empty());
+        let addition = selection::parse_draft(r#"{"activities":[{"task_id":"new:1","task_title":"Task","text":"A newly visible result","evidence_ids":[1]}]}"#).unwrap();
+        let extended = merge_supplement(&first, addition).unwrap();
+        let activities =
+            selection::validate_draft(&extended, &sources, &HashSet::new(), "day").unwrap();
+        assert_eq!(activities.len(), 1);
+        assert!(activities[0].text.contains("Read notes"));
+        assert!(activities[0].text.contains("A newly visible result"));
+    }
 
     fn provider() -> ResolvedProvider {
         ResolvedProvider {

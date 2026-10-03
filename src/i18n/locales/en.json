@@ -27,7 +27,7 @@
     "noActivities": "No organized activities in this period yet.",
     "emptyTitle": "No recap for this day yet",
     "emptyDescription": "Organize records from completed periods to revisit your day in order.",
-    "waitingDescription": "Completed periods are organized while you are idle. Come back later to revisit your day.",
+    "waitingDescription": "Completed periods are organized automatically. Come back later to revisit your day.",
     "generateFirst": "Generate recap",
     "generationDetails": "Generation details",
     "eventHistory": "Related activity on this day",
@@ -40,9 +40,9 @@
     "next": "Next day",
     "locked": "Unlock to view your daily recap",
     "welcome": "Put your day in context",
-    "intro": "Review what happened throughout the day, follow related tasks, and return to the original records. Once enabled, new records are organized every four hours while idle.",
+    "intro": "Review what happened throughout the day, follow related tasks, and return to the original records. Once enabled, new records are organized every four hours.",
     "configure": "Open settings",
-    "schedule": "Organized every four hours while idle",
+    "schedule": "Organized automatically every four hours",
     "generating": "Preparing your recap…",
     "generate": "Complete recap",
     "regenerate": "Regenerate",
@@ -90,7 +90,7 @@
         "waiting": "Waiting for model", "thinking": "Model is thinking", "writing": "Writing recap",
         "validating": "Checking recap", "summarizing": "Summarizing period", "saving": "Saving recap", "running": "In progress",
         "ready": "Completed", "partial": "Some content remains incomplete", "failed": "Generation failed",
-        "cancelled": "Stopped", "paused": "Waiting for idle"
+        "cancelled": "Stopped", "paused": "Waiting for fullscreen app to close"
       }
     },
     "correction": {
@@ -105,7 +105,7 @@
     },
     "settings": {
       "saved": "Saved",
-      "enabledHint": "Organize every four hours, when unlocked and idle.",
+      "enabledHint": "Organize every four hours while unlocked, deferring while a fullscreen app blocks background tasks.",
       "missingProvider": "Previous model service removed",
       "manageModels": "Manage model services",
       "title": "Daily recap settings",
@@ -161,7 +161,7 @@
       "RECAP_INVALID_CITATION": "Some content lacked valid sources. You can retry.",
       "RECAP_SCREENING_UNAVAILABLE": "Semantic screening is temporarily unavailable.",
       "RECAP_SCREENING_INVALID_RESPONSE": "The screening service returned unreadable content. This recap used local record selection.",
-      "RECAP_WAITING_FOR_IDLE": "Processing will continue when idle.",
+      "RECAP_WAITING_FOR_IDLE": "Processing will continue after the fullscreen app blocking background tasks closes.",
       "RECAP_INVALID_CORRECTION": "Choose a valid task and name.",
       "RECAP_NOTHING_TO_UNDO": "There is no correction to undo.",
       "AI_NO_PROVIDER": "Configure a model in AI settings first.",

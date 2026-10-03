@@ -11,6 +11,7 @@ pub mod config;
 mod context;
 pub mod provider;
 pub mod recap;
+mod tokenizer;
 pub mod tools;
 pub mod unattended;
 

@@ -100,13 +100,11 @@ impl SearchTimeRange {
     }
 }
 
-/// Endpoints use different tokenizers. Estimate conservatively, counting
-/// non-ASCII bytes individually and ASCII at three bytes per token. Include
-/// protocol overhead, reserve the output allowance and leave 10% headroom.
+/// Size the actual provider payload with the bundled DeepSeek vocabulary and
+/// a fixed safety multiplier. Context allowance separately leaves 10% headroom.
 pub(super) fn estimated_input_tokens(kind: ProviderKind, request: &ChatRequest) -> u64 {
     let body = provider::request_body_for_estimate(kind, request).to_string();
-    let ascii = body.bytes().filter(u8::is_ascii).count() as u64;
-    256 + ascii.div_ceil(3) + (body.len() as u64 - ascii)
+    super::tokenizer::estimate(&body)
 }
 
 pub(super) fn input_allowance(request: &ChatRequest, context_tokens: u32) -> u64 {

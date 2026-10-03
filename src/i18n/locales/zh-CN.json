@@ -27,7 +27,7 @@
     "noActivities": "这个时段暂无已整理的活动。",
     "emptyTitle": "这一天还没有回顾",
     "emptyDescription": "整理已结束时段的记录，按时间回看做过的事情。",
-    "waitingDescription": "已结束的时段会在空闲时自动整理。稍后回来，就能查看一天的经过。",
+    "waitingDescription": "已结束的时段会自动整理。稍后回来，就能查看一天的经过。",
     "generateFirst": "生成回顾",
     "generationDetails": "生成详情",
     "eventHistory": "这一天的相关经过",
@@ -42,7 +42,7 @@
     "welcome": "把一天的经过串起来",
     "intro": "按时间回看做过的事情，串起同一件事的经过，随时打开当时的画面。",
     "configure": "前往设置",
-    "schedule": "每四小时整理一次，空闲时自动更新",
+    "schedule": "每四小时自动整理一次",
     "generating": "正在整理回顾…",
     "generate": "补全回顾",
     "regenerate": "重新生成",
@@ -90,7 +90,7 @@
         "waiting": "等待模型响应", "thinking": "模型正在思考", "writing": "生成回顾正文",
         "validating": "校验回顾", "summarizing": "归纳时段概述", "saving": "保存回顾", "running": "进行中",
         "ready": "已完成", "partial": "部分内容待补全", "failed": "生成失败",
-        "cancelled": "已停止", "paused": "等待空闲后继续"
+        "cancelled": "已停止", "paused": "等待全屏应用退出后继续"
       }
     },
     "correction": {
@@ -105,7 +105,7 @@
     },
     "settings": {
       "saved": "已保存",
-      "enabledHint": "每四小时整理一次，在解锁和空闲时自动更新。",
+      "enabledHint": "解锁后每四小时自动整理一次，全屏应用运行时暂缓。",
       "missingProvider": "原模型服务已移除",
       "manageModels": "管理模型服务",
       "title": "每日回顾设置",
@@ -161,7 +161,7 @@
       "RECAP_INVALID_CITATION": "部分内容缺少有效来源，可以重试。",
       "RECAP_SCREENING_UNAVAILABLE": "语义筛查暂不可用。",
       "RECAP_SCREENING_INVALID_RESPONSE": "语义筛查服务返回的内容无法读取，本次回顾已使用本地筛选结果。",
-      "RECAP_WAITING_FOR_IDLE": "将在空闲时继续整理。",
+      "RECAP_WAITING_FOR_IDLE": "将在阻挡后台任务的全屏应用退出后继续整理。",
       "RECAP_INVALID_CORRECTION": "请选择有效的任务和名称。",
       "RECAP_NOTHING_TO_UNDO": "没有可撤销的纠正。",
       "AI_NO_PROVIDER": "请先在 AI 设置中配置模型。",
