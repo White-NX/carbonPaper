@@ -113,8 +113,8 @@ pub(super) fn input_allowance(request: &ChatRequest, context_tokens: u32) -> u64
     (u64::from(context_tokens) * 9 / 10).saturating_sub(u64::from(request.max_tokens.unwrap_or(0)))
 }
 
-/// Keep system rules and the current question intact. Remove old question /
-/// answer pairs first, then complete older tool exchanges. Never orphan a
+/// Keep system rules and the current question intact. Remove complete old turns
+/// (including their tool exchanges) first, then older current-turn exchanges. Never orphan a
 /// tool result or edit the retained provider-native reasoning blocks.
 pub(super) fn fit_request(
     request: &mut ChatRequest,
@@ -131,8 +131,18 @@ pub(super) fn fit_request(
     let target = allowance * 4 / 5;
     while estimated_input_tokens(kind, request) > target {
         if *current_question > 1 {
-            request.messages.drain(1..3);
-            *current_question -= 2;
+            // A completed turn ends with an assistant answer without tool calls.
+            // Intermediate user messages may contain prefetch results or the
+            // forced-answer instruction, so they are not turn boundaries.
+            let end = request.messages[1..*current_question]
+                .iter()
+                .position(|message| {
+                    matches!(message, Message::Assistant { tool_calls, .. } if tool_calls.is_empty())
+                })
+                .map(|index| index + 2)
+                .unwrap_or(*current_question);
+            request.messages.drain(1..end);
+            *current_question -= end - 1;
             continue;
         }
         let exchanges: Vec<_> = request
@@ -247,6 +257,34 @@ mod tests {
             assert!(matches!(&req.messages[1], Message::User(s) if s == "recent question"));
             assert!(matches!(&req.messages[3], Message::User(s) if s == "current question"));
             assert!(estimated_input_tokens(kind, &req) <= input_allowance(&req, 8192));
+        }
+    }
+
+    #[test]
+    fn historical_tool_turns_are_evicted_whole_including_prefetch_and_forced_answers() {
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            let mut req = request();
+            req.messages[1] = Message::User("old question".into());
+            req.messages.push(Message::User(format!(
+                "{PREFETCH_PREFIX}\n{}",
+                "旧结果".repeat(2000)
+            )));
+            add_exchange(&mut req, "old", "old result", Value::Null);
+            req.messages.push(Message::User("Answer now".into()));
+            req.messages.push(assistant("old answer"));
+            req.messages.push(Message::User("recent question".into()));
+            add_exchange(&mut req, "recent", "evidence [#42]", Value::Null);
+            req.messages.push(assistant("recent answer [#42]"));
+            let recent = req.messages[7..].to_vec();
+            let mut current = req.messages.len();
+            req.messages.push(Message::User("current question".into()));
+            fit_request(&mut req, &mut current, kind, 8192).unwrap();
+            assert_eq!(current, 5);
+            assert_eq!(&req.messages[1..current], recent);
+            assert!(matches!(&req.messages[current], Message::User(s) if s == "current question"));
+            assert!(!provider::request_body_for_estimate(kind, &req)
+                .to_string()
+                .contains("old"));
         }
     }
 

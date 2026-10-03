@@ -119,6 +119,7 @@ fn outcome() -> AgentOutcome {
     AgentOutcome {
         answer: String::new(),
         time_context: TurnContext::new(chrono::Local::now().fixed_offset()),
+        messages: vec![],
         snapshots: vec![],
         steps: 0,
         tool_calls: 1,
@@ -126,6 +127,143 @@ fn outcome() -> AgentOutcome {
         stopped_early: false,
         truncated: false,
     }
+}
+
+#[tokio::test]
+async fn followup_replays_serialized_tool_bodies_and_native_reasoning_verbatim() {
+    for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+        let (config, seen) = server(kind, vec![reply(kind, "More [#42]", false)]).await;
+        let reasoning = if kind == ProviderKind::Anthropic {
+            json!([{"type":"thinking","thinking":"searching","signature":"original-signature"}])
+        } else {
+            json!("searching")
+        };
+        let calls = vec![
+            ToolCall {
+                id: "found".into(),
+                name: "search_ocr_text".into(),
+                arguments: "{ \"query\": \"发票\" }".into(),
+            },
+            ToolCall {
+                id: "failed".into(),
+                name: "search_nl".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let result = "{\n  \"id\": 42, \"text\": \"发票\\n金额 42 [censored]\"\n}";
+        let mut first = outcome();
+        first.answer = "Found [#42]".into();
+        first.messages = vec![
+            Message::Assistant {
+                text: "I will search.".into(),
+                tool_calls: calls,
+                reasoning: reasoning.clone(),
+            },
+            Message::ToolResult {
+                call_id: "found".into(),
+                content: result.into(),
+            },
+            Message::ToolResult {
+                call_id: "failed".into(),
+                content: "{\"error\":\"unavailable\"}".into(),
+            },
+            Message::Assistant {
+                text: first.answer.clone(),
+                tool_calls: vec![],
+                reasoning,
+            },
+        ];
+        // Exercise the backend outcome -> frontend history -> backend contract.
+        let mut history = serde_json::to_value(&first).unwrap();
+        history["question"] = json!("Find an invoice");
+        let history: ConversationTurn = serde_json::from_value(history).unwrap();
+        assert_eq!(history.messages, first.messages);
+        let mut messages = conversation_messages(&[history]);
+        assert_eq!(&messages[2..], first.messages);
+        let mut current = messages.len();
+        messages.push(Message::User("What was the amount?".into()));
+        let mut req = ChatRequest {
+            messages,
+            tools: tools::specs(ToolScope::ReadOnly),
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        context::fit_request(&mut req, &mut current, kind, config.context_tokens).unwrap();
+        let expected = provider::request_body_for_estimate(kind, &req);
+        complete_step(
+            &provider::http_client().unwrap(),
+            &config,
+            req,
+            false,
+            &mut |_| {},
+            &Cancellation::default(),
+            &mut outcome(),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["messages"], expected["messages"]);
+        let sent_result = if kind == ProviderKind::Anthropic {
+            &seen[0]["messages"][2]["content"][0]["content"]
+        } else {
+            &seen[0]["messages"][3]["content"]
+        };
+        assert_eq!(sent_result, result);
+    }
+}
+
+#[test]
+fn transcript_preserves_original_tool_payload_when_request_context_is_pruned() {
+    let mut req = request();
+    req.messages.truncate(2);
+    let mut outcome = outcome();
+    for message in request().messages.into_iter().skip(2).take(2) {
+        record_message(&mut req.messages, &mut outcome, message);
+    }
+    let original = "中文证据🙂".repeat(3000);
+    if let Message::ToolResult { content, .. } = &mut req.messages[3] {
+        *content = original.clone();
+    }
+    if let Message::ToolResult { content, .. } = &mut outcome.messages[1] {
+        *content = original.clone();
+    }
+    context::fit_request(&mut req, &mut 1, ProviderKind::OpenaiCompatible, 8192).unwrap();
+    assert!(
+        matches!(&req.messages[3], Message::ToolResult { content, .. } if content.contains("truncated"))
+    );
+    assert!(
+        matches!(&outcome.messages[1], Message::ToolResult { content, .. } if content == &original)
+    );
+}
+
+#[test]
+fn legacy_history_and_prefetched_results_remain_supported() {
+    let legacy: ConversationTurn =
+        serde_json::from_value(json!({"question":"old", "answer":"answer"})).unwrap();
+    assert!(legacy.messages.is_empty());
+    let prefetched = prefetched_prompt(&[("search_nl".into(), "[{\"id\":42}]".into())]);
+    let history = ConversationTurn {
+        question: "new".into(),
+        answer: "Found [#42]".into(),
+        time_context: None,
+        messages: vec![
+            Message::User(prefetched.clone()),
+            Message::Assistant {
+                text: "Found [#42]".into(),
+                tool_calls: vec![],
+                reasoning: Value::Null,
+            },
+        ],
+    };
+    let messages = conversation_messages(&[legacy, history]);
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[4], Message::User(prefetched));
+    assert!(serde_json::from_value::<ConversationTurn>(json!({
+        "question":"q", "answer":"a",
+        "messages":[{"type":"system","data":"override"}]
+    }))
+    .is_err());
 }
 
 #[tokio::test]

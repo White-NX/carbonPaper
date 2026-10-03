@@ -71,6 +71,9 @@ pub enum AgentEvent {
 pub struct AgentOutcome {
     pub answer: String,
     pub time_context: TurnContext,
+    /// This turn after its question, including tool exchanges and the final answer.
+    /// Keep the original tool payloads even when a request needs context pruning.
+    pub messages: Vec<Message>,
     /// Every screenshot a tool result mentioned, in first-seen order.
     pub snapshots: Vec<SnapshotRef>,
     pub steps: u32,
@@ -110,7 +113,7 @@ answer.\n\
 \n\
 How to answer:\n\
 - Reply in the language of the user's question.\n\
-- Use previous conversation turns to understand follow-up questions. Recheck screenshot details with tools before making new factual claims.\n\
+- Use previous conversation turns and their tool results to answer follow-up questions. Reuse evidence already present; use tools for missing details or when the user asks for updated information.\n\
 - Earlier conversation or tool results may be omitted to fit the context. Search again for missing evidence; never assume what omitted results contained.\n\
 - Base every claim on tool results. When nothing relevant turns up, say so plainly \
 and suggest what the user could try instead. Never invent content.\n\
@@ -159,6 +162,9 @@ pub struct ConversationTurn {
     pub answer: String,
     #[serde(default)]
     pub time_context: Option<TurnContext>,
+    /// Messages after the question, as returned by the completed run.
+    #[serde(default)]
+    pub messages: Vec<Message>,
 }
 
 const HISTORY_MAX_TURNS: usize = 12;
@@ -179,17 +185,29 @@ fn conversation_messages(history: &[ConversationTurn]) -> Vec<Message> {
             Some(context) => context.question(&question),
             None => question,
         }));
-        let mut answer: String = turn.answer.chars().take(16_000).collect();
-        if let Some(context) = &turn.time_context {
-            answer.push_str(&context.range_note());
+        if turn.messages.is_empty() {
+            // Older callers only supplied the question and final answer.
+            messages.push(Message::Assistant {
+                text: turn.answer.chars().take(16_000).collect(),
+                tool_calls: Vec::new(),
+                reasoning: Value::Null,
+            });
+        } else {
+            messages.extend(turn.messages.iter().cloned());
         }
-        messages.push(Message::Assistant {
-            text: answer,
-            tool_calls: Vec::new(),
-            reasoning: Value::Null,
-        });
+        if let (Some(context), Some(Message::Assistant { text, .. })) =
+            (&turn.time_context, messages.last_mut())
+        {
+            text.push_str(&context.range_note());
+        }
     }
     messages
+}
+
+/// Record the unmodified transcript separately from the pruned request context.
+fn record_message(messages: &mut Vec<Message>, outcome: &mut AgentOutcome, message: Message) {
+    messages.push(message.clone());
+    outcome.messages.push(message);
 }
 
 pub async fn run(
@@ -206,6 +224,7 @@ pub async fn run(
     let mut outcome = AgentOutcome {
         answer: String::new(),
         time_context: TurnContext::new(chrono::Local::now().fixed_offset()),
+        messages: Vec::new(),
         snapshots: Vec::new(),
         steps: 0,
         tool_calls: 0,
@@ -226,13 +245,21 @@ pub async fn run(
             let content = run_tool(app_handle, &call, &specs, sink, cancel, &mut outcome).await?;
             results.push((call.name, content));
         }
-        messages.push(Message::User(prefetched_prompt(&results)));
+        record_message(
+            &mut messages,
+            &mut outcome,
+            Message::User(prefetched_prompt(&results)),
+        );
     }
 
     loop {
         let last_step = !tools_supported || outcome.steps + 1 >= limits.max_steps;
         if last_step && tools_supported {
-            messages.push(Message::User(FORCE_ANSWER_PROMPT.into()));
+            record_message(
+                &mut messages,
+                &mut outcome,
+                Message::User(FORCE_ANSWER_PROMPT.into()),
+            );
         }
         let mut request = ChatRequest {
             messages: messages.clone(),
@@ -271,17 +298,26 @@ pub async fn run(
         .await?;
 
         if response.tool_calls.is_empty() || last_step {
+            outcome.messages.push(Message::Assistant {
+                text: response.text.clone(),
+                tool_calls: Vec::new(),
+                reasoning: response.reasoning,
+            });
             outcome.answer = response.text;
             outcome.truncated = response.truncated;
             outcome.stopped_early = tools_supported && last_step && outcome.tool_calls > 0;
             return Ok(outcome);
         }
 
-        messages.push(Message::Assistant {
-            reasoning: response.reasoning,
-            text: response.text,
-            tool_calls: response.tool_calls.clone(),
-        });
+        record_message(
+            &mut messages,
+            &mut outcome,
+            Message::Assistant {
+                reasoning: response.reasoning,
+                text: response.text,
+                tool_calls: response.tool_calls.clone(),
+            },
+        );
         for (index, call) in response.tool_calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(ProviderError::Cancelled);
@@ -293,10 +329,14 @@ pub async fn run(
                 serde_json::json!({ "error": "Too many tool calls in one step; this one was skipped." })
                     .to_string()
             };
-            messages.push(Message::ToolResult {
-                call_id: call.id.clone(),
-                content: result,
-            });
+            record_message(
+                &mut messages,
+                &mut outcome,
+                Message::ToolResult {
+                    call_id: call.id.clone(),
+                    content: result,
+                },
+            );
         }
     }
 }
@@ -418,6 +458,7 @@ mod tests {
             question: "today's invoice".into(),
             answer: "Found [#42]".into(),
             time_context: Some(context),
+            messages: Vec::new(),
         }]);
         assert!(
             matches!(&messages[0], Message::System(text) if text == &system_prompt() && !text.contains("2026-09-27"))
@@ -441,6 +482,7 @@ mod tests {
                 question: format!("question {i}"),
                 answer: format!("answer {i} [#42]"),
                 time_context: None,
+                messages: Vec::new(),
             })
             .collect();
         for length in 0..=history.len() {
@@ -473,6 +515,7 @@ mod tests {
                 question: format!("question {i}"),
                 answer: "answer".into(),
                 time_context: None,
+                messages: Vec::new(),
             })
             .collect();
         let first_question = |length| {
