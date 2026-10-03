@@ -170,6 +170,13 @@ fn main() {
         Path::new("pre-bundle/aria2c.exe"),
     );
 
+    // Ship the vocabulary attribution in both installer and portable resources.
+    copy_file_if_needed(
+        Path::new("src/ai/tokenizer/LICENSE-CODE"),
+        Path::new("pre-bundle/licenses/deepseek-tokenizer.txt"),
+    );
+    println!("cargo:rerun-if-changed=src/ai/tokenizer/LICENSE-CODE");
+
     // --- 2. 复制 compliance_process 到 pre-bundle ---
     let cp_source = Path::new("../compliance_process");
     let cp_dest = Path::new("pre-bundle/compliance_process");

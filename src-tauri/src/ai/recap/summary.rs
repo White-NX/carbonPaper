@@ -214,6 +214,28 @@ fn request(
     }
 }
 
+/// A short, already cited occurrence needs no second paid paraphrase. Longer
+/// text still goes through summarization instead of being silently truncated.
+fn single_activity_summary(batch: &RecapBatch) -> Option<RecapSummary> {
+    let [activity] = batch.activities.as_slice() else {
+        return None;
+    };
+    let text = activity.text.trim();
+    if text.is_empty() || text.chars().count() > 600 || activity.sources.is_empty() {
+        return None;
+    }
+    Some(RecapSummary {
+        overview: text.into(),
+        overview_activity_ids: vec![activity.id.clone()],
+        topics: vec![RecapTopic {
+            task_id: activity.task_id.clone(),
+            title: activity.task_title.clone(),
+            text: text.into(),
+            activity_ids: vec![activity.id.clone()],
+        }],
+    })
+}
+
 pub(super) async fn generate(
     ctx: &RunContext,
     provider: &ResolvedProvider,
@@ -248,6 +270,9 @@ pub(super) async fn generate(
         // Extraction retains its two attempts; summarization gets one attempt.
         let run = format!("summary-{}", hex::encode(rand::random::<[u8; 16]>()));
         let result = async {
+            if let Some(summary) = single_activity_summary(&input) {
+                return validate(summary, &input.activities);
+            }
             let (req, included) = request(&input, &ctx.settings, provider)?;
             let response = complete(ctx, provider, &req, &run, "summary").await?;
             if response.truncated {
@@ -269,6 +294,9 @@ pub(super) async fn generate(
         }
         .await;
         ctx.check()?; // Auth, privacy, source changes and cancellation never become cached errors.
+        if matches!(&result, Err(error) if error == "RECAP_WAITING_FOR_IDLE") {
+            return Err("RECAP_WAITING_FOR_IDLE".into());
+        }
         ctx.progress(true, |p| {
             if p.attempts.last().is_some_and(|a| a.id.starts_with(&run)) {
                 p.validation(result.as_ref().err().map(String::as_str));
@@ -323,6 +351,21 @@ pub(super) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_occurrence_reuses_text_and_citations_without_truncation() {
+        let mut b = batch();
+        assert!(single_activity_summary(&b).is_none());
+        b.activities.truncate(1);
+        let summary = single_activity_summary(&b).unwrap();
+        assert_eq!(summary.overview, b.activities[0].text);
+        assert_eq!(summary.topics[0].title, b.activities[0].task_title);
+        assert!(validate(summary, &b.activities).is_ok());
+        b.activities[0].text = "长".repeat(601);
+        assert!(single_activity_summary(&b).is_none());
+        b.activities[0].text = "Short".into();
+        b.activities[0].sources.clear();
+        assert!(single_activity_summary(&b).is_none());
+    }
     fn batch() -> RecapBatch {
         let activity = |id: &str, task: &str, time| RecapActivity {
             id: id.into(),
