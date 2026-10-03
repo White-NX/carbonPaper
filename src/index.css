@@ -12,8 +12,7 @@
 
 .recap-surface { container: recap / inline-size; }
 .recap-focus:focus-visible, .recap-input:focus-visible {
-  outline: 2px solid var(--ide-accent);
-  outline-offset: 3px;
+  @apply outline-none brightness-90 dark:brightness-125;
 }
 .recap-input {
   width: 100%;
@@ -23,7 +22,6 @@
   color: var(--ide-text);
   padding: 8px 12px;
 }
-.recap-input:focus-visible { outline-offset: 0; }
 .recap-period { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 24px; }
 .recap-period-time { position: relative; padding-top: 6px; }
 .recap-time-dot { position: absolute; top: 11px; right: -13px; width: 5px; height: 5px; border-radius: 50%; background: var(--ide-border); }
@@ -63,8 +61,7 @@
 .settings-disclosure > summary::-webkit-details-marker { display: none; }
 .settings-disclosure[open] > summary .settings-disclosure-chevron { transform: rotate(180deg); }
 .settings-surface :is(button, input, select, textarea, summary, a):focus-visible {
-  outline: 2px solid var(--ide-accent);
-  outline-offset: 3px;
+  @apply outline-none brightness-90 dark:brightness-125;
 }
 @container (max-width: 540px) {
   .settings-choices { grid-template-columns: repeat(2, minmax(0, 1fr)); }
