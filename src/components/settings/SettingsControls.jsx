@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useRef } from 'react';
-import { focusStyle } from '../ui/Button';
 
 export const SettingsControlLabelContext = createContext(undefined);
 const cx = (...classes) => classes.filter(Boolean).join(' ');
+const focus = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent focus-visible:ring-offset-2 focus-visible:ring-offset-ide-bg';
 
 export function SettingsSwitch({ checked, onChange, disabled = false, title, className = '', ...props }) {
   const labelId = useContext(SettingsControlLabelContext);
@@ -11,7 +11,7 @@ export function SettingsSwitch({ checked, onChange, disabled = false, title, cla
       aria-label={!labelId ? title : undefined} title={title} disabled={disabled}
       onClick={() => onChange?.(!checked)} {...props}
       className={cx('relative h-5 w-10 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50',
-        checked ? 'bg-ide-accent' : 'bg-ide-border', focusStyle, className)}>
+        checked ? 'bg-ide-accent' : 'bg-ide-border', focus, className)}>
       <span className={cx('absolute left-0 top-0.5 h-4 w-4 rounded-full bg-white transition-transform', checked ? 'translate-x-5' : 'translate-x-0.5')} />
     </button>
   );
@@ -28,7 +28,7 @@ export function SettingsSelect({ value, onChange, options, label, className = ''
         const option = options.find((item) => String(item.value) === event.target.value);
         if (option) onChange?.(option.value);
       }}
-      className={cx('min-h-9 max-w-full rounded-lg border border-ide-border bg-ide-panel px-3 py-1.5 text-sm text-ide-text disabled:cursor-not-allowed disabled:opacity-50', focusStyle, className)}>
+      className={cx('min-h-9 max-w-full rounded-lg border border-ide-border bg-ide-panel px-3 py-1.5 text-sm text-ide-text disabled:cursor-not-allowed disabled:opacity-50', focus, className)}>
       {options.map((option) => <option key={String(option.value)} value={String(option.value)} disabled={option.disabled}>{option.label}</option>)}
     </select>
   );
@@ -66,7 +66,7 @@ export function SettingsSegmentedControl({ value, options, onChange, columns, de
             disabled={disabled || option.disabled} title={option.title || option.description}
             onKeyDown={(event) => move(event, index)} onClick={() => onChange?.(option.value)}
             className={cx(isCard ? 'rounded-lg border px-3 py-2 text-left' : 'min-h-9 rounded-md border border-transparent px-2 py-1 text-xs font-medium',
-              'transition-colors disabled:cursor-not-allowed disabled:opacity-50', focusStyle,
+              'transition-colors disabled:cursor-not-allowed disabled:opacity-50', focus,
               selected ? option.selectedClassName || (isCard ? 'border-ide-accent bg-ide-accent/10 text-ide-text' : 'bg-ide-accent text-white')
                 : option.idleClassName || 'text-ide-muted hover:bg-ide-hover hover:text-ide-text', option.className)}>
             <span className={cx('block', isCard && 'text-sm font-medium')}>{option.label}</span>

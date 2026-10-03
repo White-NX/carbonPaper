@@ -1,7 +1,7 @@
 import React, { useId, useRef } from 'react';
 import { Check } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { focusStyle } from '../ui/Button';
+import { focusRing } from '../ui/Button';
 import { SettingsControlLabelContext, SettingsSwitch } from '../settings/SettingsControls';
 
 function Badge({ children }) {
@@ -49,7 +49,7 @@ function CardBody({ label, description, badge, note, selected, multiple }) {
 
 const cardClass = (selected) => cn(
   'flex h-full flex-col rounded-xl border px-4 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50',
-  focusStyle,
+  focusRing,
   selected ? 'border-ide-accent bg-ide-accent/5' : 'border-ide-border hover:border-ide-accent/40 hover:bg-ide-hover',
 );
 

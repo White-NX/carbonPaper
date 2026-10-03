@@ -56,7 +56,7 @@ export default function ProcessStorageCard({
               type="button"
               disabled={!hasProcessName}
               onClick={() => onOpenProcessDetail(item.process_name)}
-              className="w-full text-left border border-ide-border rounded-xl p-3 bg-ide-bg/70 transition-colors hover:border-ide-accent/70 disabled:opacity-60 disabled:cursor-not-allowed"
+              className="w-full text-left border border-ide-border rounded-xl p-3 bg-ide-bg/70 transition-colors hover:border-ide-accent/70 focus:outline-none focus:ring-1 focus:ring-ide-accent/40 disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
