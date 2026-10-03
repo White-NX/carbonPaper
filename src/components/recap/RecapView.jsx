@@ -203,15 +203,12 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </>
       ) : undefined}
     >
-      <div className="flex flex-1 flex-wrap items-center justify-between gap-x-5 gap-y-2">
-        {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
-          : <h1 className="flex items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 text-ide-accent" />{t('recap.title')}</h1>}
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
-          <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
-            className="recap-focus h-[30px] min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
-          <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
-          <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
+      <div className="recap-header grid min-w-0 flex-1 items-start gap-x-5 gap-y-2">
+        <div className="flex h-10 min-w-0 items-center">
+          {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
+            : <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 shrink-0 text-ide-accent" /><span className="truncate">{t('recap.title')}</span></h1>}
+        </div>
+        <div className="recap-header-actions flex min-h-10 items-center justify-end gap-1.5">
           {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
           {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
             { label: t('recap.correction.rename'), icon: Pencil, onClick: () => editTask('rename'), disabled: !selected },
@@ -226,6 +223,13 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
               { label: t('recap.delete'), icon: Trash2, danger: true, onClick: () => setConfirmDelete(true), disabled: running || Boolean(operation) || !day || !(hasContent || days.includes(date)) },
             ]} />
           </>}
+        </div>
+        <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-10 shrink-0 items-center gap-1.5">
+          <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
+          <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
+            className="recap-focus h-[30px] w-36 min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
+          <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
+          <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
         </div>
       </div>
     </PageHeader>
