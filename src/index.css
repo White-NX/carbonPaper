@@ -11,6 +11,8 @@
 @tailwind utilities;
 
 .recap-surface { container: recap / inline-size; }
+/* Anchor day navigation to the right edge, independently of changing actions. */
+.recap-header { grid-template-columns: minmax(0, 1fr) auto auto; }
 .recap-focus:focus-visible, .recap-input:focus-visible {
   @apply outline-none brightness-90 dark:brightness-125;
 }
@@ -26,6 +28,9 @@
 .recap-period-time { position: relative; padding-top: 6px; }
 .recap-time-dot { position: absolute; top: 11px; right: -13px; width: 5px; height: 5px; border-radius: 50%; background: var(--ide-border); }
 @container recap (max-width: 720px) {
+  .recap-header { grid-template-columns: minmax(0, 1fr) auto; }
+  .recap-header-actions { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
+  .recap-date-navigation { grid-column: 2; grid-row: 1; }
   .recap-period { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .recap-time-dot { display: none; }
 }
