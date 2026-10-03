@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -23,8 +23,11 @@ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ERROR_BODY_CHARS: usize = 400;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Message {
+    // Replayed frontend history cannot supply system instructions.
+    #[serde(skip_deserializing)]
     System(String),
     User(String),
     Assistant {
@@ -38,7 +41,7 @@ pub enum Message {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

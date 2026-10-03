@@ -88,8 +88,15 @@ describe('AI conversation', () => {
     expect(runAiSearch.mock.lastCall[0].history).toEqual([]);
   });
 
-  it('carries backend time anchors and actual ranges into follow-ups without replaying tools', async () => {
+  it('replays backend messages verbatim with time anchors across follow-ups', async () => {
     const { result } = await setup();
+    const messages = [
+      { type: 'assistant', data: { text: 'Searching.', reasoning: 'working', tool_calls: [
+        { id: 'a', name: 'search_ocr_text', arguments: '{ "query": "invoice" }' },
+      ] } },
+      { type: 'tool_result', data: { call_id: 'a', content: '{\n  "text": "发票\\n金额 42", "id": 42\n}' } },
+      { type: 'assistant', data: { text: 'Found [#42]', reasoning: null, tool_calls: [] } },
+    ];
     const timeContext = {
       started_at: '2026-09-27T23:59:00+08:00',
       searched_ranges: [{ tool: 'search_ocr_text', start_time: 1790467200000, end_time: 1790553600000 }],
@@ -101,12 +108,25 @@ describe('AI conversation', () => {
       emit({ type: 'tool_started', call_id: 'a', name: 'search_ocr_text', arguments: { query: 'invoice' } });
       emit({ type: 'tool_finished', call_id: 'a', ok: true, snapshots: [{ id: 42 }] });
     });
-    await act(async () => finish({ answer: 'Found [#42]', time_context: timeContext }));
+    await act(async () => finish({ answer: 'Found [#42]', time_context: timeContext, messages }));
     act(() => { result.current.start('an hour earlier?'); });
     expect(runAiSearch.mock.lastCall[0].history).toEqual([
-      { question: 'today', answer: 'Found [#42]', time_context: timeContext },
+      { question: 'today', answer: 'Found [#42]', time_context: timeContext, messages },
     ]);
+    expect(runAiSearch.mock.lastCall[0].history[0].messages).toBe(messages);
     expect(result.current.turns[0].steps).toHaveLength(1);
+    const followUpMessages = [
+      { type: 'assistant', data: { text: 'Earlier [#42]', reasoning: null, tool_calls: [] } },
+    ];
+    await act(async () => finish({ answer: 'Earlier [#42]', messages: followUpMessages }));
+    act(() => { result.current.start('compare those'); });
+    expect(runAiSearch.mock.lastCall[0].history.map((turn) => turn.messages)).toEqual([
+      messages, followUpMessages,
+    ]);
+    await act(async () => finish({ answer: 'Comparison', messages: [] }));
+    act(() => result.current.reset());
+    act(() => { result.current.start('new conversation'); });
+    expect(runAiSearch.mock.lastCall[0].history).toEqual([]);
   });
 
   it('keeps a stable bounded history prefix across several follow-ups', async () => {

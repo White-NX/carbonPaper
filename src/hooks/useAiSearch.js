@@ -92,6 +92,7 @@ export function useAiSearch({ active }) {
         history: completed.slice(historyStart).map((turn) => ({
           question: turn.question, answer: turn.answer,
           ...(turn.outcome?.time_context ? { time_context: turn.outcome.time_context } : {}),
+          ...(turn.outcome?.messages ? { messages: turn.outcome.messages } : {}),
         })),
         onEvent: (event) => handleEvent(requestId, event) });
       if (requestRef.current !== requestId) return;
