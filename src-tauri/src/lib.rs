@@ -830,14 +830,13 @@ pub fn run() {
     let data_dir = get_data_dir();
     let _log_guard = logging::init_logging(&data_dir);
 
-    // Resolve the experiment switch once. The resulting policy is carried by
+    // Resolve the journal-mode override once. The resulting policy is carried by
     // StorageState so reopens after restore or directory migration cannot
     // change mode halfway through a process.
     let database_mode_policy = database_mode_policy_from_environment();
     tracing::info!(
-        "Database startup journal mode policy target={} wal_experiment={} debug_build={}",
+        "Database startup journal mode policy target={} debug_build={}",
         database_mode_policy.as_str(),
-        database_mode_policy.is_wal(),
         cfg!(debug_assertions)
     );
 

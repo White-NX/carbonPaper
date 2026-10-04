@@ -204,7 +204,11 @@ impl Drop for NamedConnectionGuard<'_> {
 
 impl StorageState {
     pub fn new(data_dir: PathBuf, credential_state: Arc<CredentialManagerState>) -> Self {
-        Self::new_with_mode_policy(data_dir, credential_state, mode::DatabaseModePolicy::Delete)
+        Self::new_with_mode_policy(
+            data_dir,
+            credential_state,
+            mode::DatabaseModePolicy::default(),
+        )
     }
 
     pub(crate) fn new_with_mode_policy(

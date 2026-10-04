@@ -1395,9 +1395,9 @@ impl StorageState {
     /// r.id` spans both tables, which no index can satisfy, so SQLite sorted
     /// every non-deleted OCR row through a temp B-tree before `LIMIT` applied —
     /// 5.3 s against a 2.5M-row corpus, holding a SHARED lock the whole time.
-    /// This database runs `journal_mode = delete` (see
-    /// `semantic_cache.rs::SCAN_PAGE_ROWS`), where a writer cannot commit until
-    /// every SHARED lock clears, so that scan stalled capture commits until they
+    /// With the former DELETE default (still available as a fallback; see
+    /// `semantic_cache.rs::SCAN_PAGE_ROWS`), a writer could not commit until
+    /// every SHARED lock cleared, so that scan stalled capture commits until they
     /// failed with `database is locked`.
     ///
     /// Reading `screenshots` alone lets `idx_screenshots_deleted_created_at`

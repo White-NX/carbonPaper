@@ -560,12 +560,14 @@ enum CacheQueryMode {
 /// The load is the one scan in this module unbounded by a retention window:
 /// `clip_image` covers the whole history, measured at 51,931 rows / 101 MiB on
 /// the 2026-08-06 development corpus. Read as a single statement it holds a
-/// SQLite SHARED lock for its full duration, and this database runs in rollback
-/// journal mode (`journal_mode = delete`, no WAL), where a writer cannot commit
-/// until every SHARED lock clears — so capture stalls for the whole scan no
-/// matter which connection the scan runs on. Measured on a synthetic 60k-row
-/// corpus, one statement pushed the worst capture commit to 660 ms; 4096-row
-/// pages brought it to 59 ms, at the cost of scan time nothing waits on.
+/// SQLite read transaction for its full duration. In the DELETE fallback mode,
+/// a writer cannot commit until every SHARED lock clears, so capture stalls
+/// for the whole scan no matter which connection the scan runs on. Measured
+/// in DELETE mode on a synthetic 60k-row corpus, one statement pushed the worst
+/// capture commit to 660 ms; 4096-row pages brought it to 59 ms, at the cost of
+/// scan time nothing waits on.
+/// In the default WAL mode, paging also releases read snapshots between pages
+/// so a full-history scan does not pin checkpoint progress for its duration.
 ///
 /// 4096 rather than a smaller page because the cost is not linear: each page
 /// re-seeks the index, and 2048 measured *worse* on the real corpus (17.2 s
@@ -574,7 +576,7 @@ const SCAN_PAGE_ROWS: i64 = 4096;
 
 /// Walk visible vectors a page at a time. The callback owns only the current
 /// decoded row; dropping `rows` at the end of each loop releases SQLite's
-/// SHARED lock before the next page and keeps the callback's memory bounded.
+/// read transaction before the next page and keeps the callback's memory bounded.
 fn scan_visible_embedding_pages<F>(
     conn: &Connection,
     index_kind: DerivedIndexKind,

@@ -18,15 +18,17 @@ const TRANSITION_FAILED: &str = "failed";
 const SAFETY_FREE_BYTES: u64 = 64 * 1024 * 1024;
 const SQLITE_JOURNAL_MODES: [&str; 6] = ["delete", "truncate", "persist", "memory", "wal", "off"];
 
+// Keep the existing environment variable name for compatibility with launch scripts.
 pub(crate) const WAL_EXPERIMENT_ENV: &str = "CARBONPAPER_WAL_EXPERIMENT";
 
 /// The journal mode selected once for the lifetime of a process.
 ///
-/// DELETE remains the default. Both development and release builds can opt
-/// into WAL explicitly through the experiment environment flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// WAL is the default in development and release builds. The environment
+/// override can still request DELETE for compatibility or troubleshooting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DatabaseModePolicy {
     Delete,
+    #[default]
     Wal,
 }
 
@@ -41,25 +43,22 @@ impl DatabaseModePolicy {
     pub(crate) const fn as_str(self) -> &'static str {
         self.target().as_str()
     }
-
-    pub(crate) const fn is_wal(self) -> bool {
-        matches!(self, Self::Wal)
-    }
 }
 
-/// Parse the explicit opt-in without depending on the build profile or
+/// Parse the compatibility override without depending on the build profile or
 /// mutating the process environment in tests. Invalid values warn and use
-/// the default DELETE policy so this optional flag cannot prevent startup.
+/// the default WAL policy so this optional flag cannot prevent startup.
 pub(crate) fn parse_database_mode_policy(raw_value: Option<&str>) -> DatabaseModePolicy {
     let value = raw_value.map(str::trim).filter(|value| !value.is_empty());
     match value {
-        None | Some("0") => DatabaseModePolicy::Delete,
+        None => DatabaseModePolicy::default(),
+        Some("0") => DatabaseModePolicy::Delete,
         Some("1") => DatabaseModePolicy::Wal,
         Some(value) => {
             tracing::warn!(
-                "Invalid {WAL_EXPERIMENT_ENV} value {value:?}; expected 1 or 0; using DELETE startup policy"
+                "Invalid {WAL_EXPERIMENT_ENV} value {value:?}; expected 1 or 0; using WAL startup policy"
             );
-            DatabaseModePolicy::Delete
+            DatabaseModePolicy::default()
         }
     }
 }
@@ -829,27 +828,29 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn database_mode_policy_requires_an_explicit_opt_in_in_all_builds() {
-        for value in [None, Some(""), Some("  "), Some("0"), Some(" 0 ")] {
-            assert_eq!(
-                parse_database_mode_policy(value),
-                DatabaseModePolicy::Delete
-            );
+    fn database_mode_policy_defaults_to_wal_in_all_builds() {
+        assert_eq!(DatabaseModePolicy::default(), DatabaseModePolicy::Wal);
+        for value in [None, Some(""), Some("  "), Some("1"), Some(" 1 ")] {
+            assert_eq!(parse_database_mode_policy(value), DatabaseModePolicy::Wal);
         }
-        for value in ["1", " 1 "] {
+    }
+
+    #[test]
+    fn database_mode_policy_allows_an_explicit_delete_override() {
+        for value in ["0", " 0 "] {
             assert_eq!(
                 parse_database_mode_policy(Some(value)),
-                DatabaseModePolicy::Wal
+                DatabaseModePolicy::Delete
             );
         }
     }
 
     #[test]
-    fn invalid_database_mode_values_use_delete_policy() {
+    fn invalid_database_mode_values_use_default_wal_policy() {
         for value in ["true", "false", "2", "wal", "-1", "invalid", " 2 "] {
             assert_eq!(
                 parse_database_mode_policy(Some(value)),
-                DatabaseModePolicy::Delete,
+                DatabaseModePolicy::Wal,
                 "invalid optional flag {value:?} must retain the default"
             );
         }
@@ -874,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_round_trip_records_actual_mode_and_delete_default() {
+    fn metadata_round_trip_records_actual_delete_mode() {
         let temp = tempdir().unwrap();
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential);
@@ -965,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_initialization_creates_delete_mode_metadata() {
+    fn explicit_delete_policy_creates_delete_mode_metadata() {
         let temp = tempdir().unwrap();
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         crate::credential_manager::save_public_key_to_file(
@@ -973,7 +974,11 @@ mod tests {
             b"mode-metadata-public-key",
         )
         .unwrap();
-        let storage = StorageState::new(temp.path().to_path_buf(), credential);
+        let storage = StorageState::new_with_mode_policy(
+            temp.path().to_path_buf(),
+            credential,
+            parse_database_mode_policy(Some("0")),
+        );
 
         storage.initialize().unwrap();
 
@@ -1001,8 +1006,8 @@ mod tests {
 
         let metadata = storage.database_mode_metadata().unwrap();
         assert!(storage.is_initialized());
-        assert_eq!(metadata.actual_journal_mode, "delete");
-        assert_eq!(metadata.requested_journal_mode, "delete");
+        assert_eq!(metadata.actual_journal_mode, "wal");
+        assert_eq!(metadata.requested_journal_mode, "wal");
         assert_eq!(metadata.transition_state, TRANSITION_STABLE);
     }
 
@@ -1094,16 +1099,12 @@ mod tests {
     }
 
     #[test]
-    fn wal_startup_conversion_records_stable_mode_before_publish() {
+    fn default_startup_records_stable_wal_mode_before_publish() {
         let temp = tempdir().unwrap();
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         crate::credential_manager::save_public_key_to_file(&credential, b"wal-startup-key")
             .unwrap();
-        let storage = StorageState::new_with_mode_policy(
-            temp.path().to_path_buf(),
-            credential,
-            DatabaseModePolicy::Wal,
-        );
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
 
         storage.initialize().unwrap();
 
@@ -1116,6 +1117,7 @@ mod tests {
             .unwrap();
         let status = connection::inspect_connection(&read).unwrap();
         assert_eq!(status.journal_mode, "wal");
+        assert_eq!(status.synchronous, "FULL");
     }
 
     #[test]
@@ -1145,7 +1147,7 @@ mod tests {
         let delete_storage = StorageState::new_with_mode_policy(
             temp.path().to_path_buf(),
             credential,
-            DatabaseModePolicy::Delete,
+            parse_database_mode_policy(Some("0")),
         );
         delete_storage.initialize().unwrap();
         let metadata = delete_storage.database_mode_metadata().unwrap();

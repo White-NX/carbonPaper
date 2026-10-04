@@ -137,7 +137,7 @@ impl StorageState {
         }
 
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, wal_experiment={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
             env!("CARGO_PKG_VERSION"),
             key_derive_dur,
@@ -145,7 +145,6 @@ impl StorageState {
             pragma_dur,
             self.database_mode_policy.as_str(),
             connection_status.journal_mode,
-            self.database_mode_policy.is_wal(),
             connection_status.engine.sqlite_version,
             connection_status.engine.sqlite_source_id,
             connection_status.engine.cipher_version,
@@ -1880,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_wal_database_starts_incremental_without_a_full_vacuum() {
+    fn default_wal_database_starts_incremental_without_a_full_vacuum() {
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         crate::credential_manager::save_public_key_to_file(
@@ -1888,11 +1887,7 @@ mod tests {
             b"fresh-incremental-wal-key",
         )
         .expect("save public key");
-        let storage = StorageState::new_with_mode_policy(
-            temp.path().to_path_buf(),
-            credential,
-            mode::DatabaseModePolicy::Wal,
-        );
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
 
         storage.initialize().expect("initialize WAL database");
 
