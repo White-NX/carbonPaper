@@ -2,7 +2,8 @@ import React from 'react';
 import { Loader2 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
-export const focusRing = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent focus-visible:ring-offset-2 focus-visible:ring-offset-ide-bg';
+// Keep keyboard focus visible within the control so scroll containers cannot clip it.
+export const focusStyle = 'focus-visible:outline-none focus-visible:brightness-90 dark:focus-visible:brightness-125';
 
 const VARIANTS = {
   primary: 'border-transparent bg-ide-accent text-white hover:opacity-90',
@@ -34,7 +35,7 @@ export function Button({
   return (
     <button type="button" disabled={disabled || loading} {...props}
       className={cn('inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
-        VARIANTS[variant], SIZES[size], focusRing, className)}>
+        VARIANTS[variant], SIZES[size], focusStyle, className)}>
       {iconNode}
       {children}
     </button>

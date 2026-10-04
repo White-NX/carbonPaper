@@ -150,6 +150,7 @@ describe('daily recap page', () => {
     expect(await screen.findByText('recap.errors.RECAP_OUTPUT_TRUNCATED')).toBeVisible();
     expect(screen.queryByText('RECAP_OUTPUT_TRUNCATED')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'recap.generationDetails' }));
+    fireEvent.click(await within(screen.getByRole('dialog')).findByRole('button', { name: 'recap.errorDetails' }));
     expect(await within(screen.getByRole('dialog')).findByText('RECAP_OUTPUT_TRUNCATED')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'recap.close' }));
     fireEvent.click(screen.getByRole('button', { name: 'recap.generate' }));
@@ -272,6 +273,10 @@ describe('daily recap page', () => {
     expect(screen.queryByText('Private reasoning')).not.toBeInTheDocument();
     more();
     fireEvent.click(screen.getByRole('menuitem', { name: 'recap.generationDetails' }));
+    const dialog = within(await screen.findByRole('dialog'));
+    fireEvent.click(await dialog.findByRole('button', { name: /recap.progress.attempts.initial/ }));
+    expect(screen.queryByText('Private reasoning')).not.toBeInTheDocument();
+    fireEvent.click(dialog.getByRole('tab', { name: 'recap.diagnostics.tabs.reasoning' }));
     expect(await screen.findByText('Private reasoning')).toBeInTheDocument();
   });
 });

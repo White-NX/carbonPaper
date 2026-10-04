@@ -84,13 +84,46 @@
       "received": "Content received",
       "receivedCounts": "{{reasoning}} thinking characters, {{text}} reply characters",
       "requestId": "Request ID",
-      "attempts": { "initial": "Generate recap", "repair": "Complete and repair", "summary": "Summarize period" },
+      "attempts": { "initial": "Organize activities", "repair": "Complete and repair", "summary": "Summarize period" },
       "stages": {
         "preparing": "Preparing recap", "collecting": "Reading records", "screening": "Selecting content",
         "waiting": "Waiting for model", "thinking": "Model is thinking", "writing": "Writing recap",
         "validating": "Checking recap", "summarizing": "Summarizing period", "saving": "Saving recap", "running": "In progress",
         "ready": "Completed", "partial": "Some content remains incomplete", "failed": "Generation failed",
         "cancelled": "Stopped", "paused": "Waiting for fullscreen app to close"
+      }
+    },
+    "diagnostics": {
+      "ready": "Recap generated",
+      "completedPeriods": "Completed {{count}} / {{total}} periods",
+      "periods": "Generation by period",
+      "periodFrom": "From {{start}}",
+      "finishing": "Finishing the recap",
+      "steps": "Processing steps",
+      "requestContent": "Request content",
+      "tabs": { "reply": "Reply preview", "reasoning": "Thinking", "requestDetails": "Request information" },
+      "model": "Model",
+      "requestDuration": "Request duration",
+      "totalRequestDuration": "Combined request time: {{duration}}",
+      "runDuration": "This run: {{duration}}",
+      "seconds": "{{count}} s",
+      "minutesSeconds": "{{minutes}} min {{seconds}} s",
+      "durationUnavailable": "Duration not recorded",
+      "rawError": "Original error",
+      "savedPreview": "Saved preview",
+      "receivingPreview": "Receiving preview content",
+      "waitingPreview": "Waiting for content…",
+      "noPreview": "This request did not provide this content.",
+      "noRequests": "No saved request history",
+      "preparingRequests": "Preparing content for this period.",
+      "states": {
+        "empty": "Nothing to organize",
+        "pending": "Waiting to organize",
+        "summaryFailed": "Summary update failed",
+        "summaryPending": "Summary pending",
+        "updating": "Updating result",
+        "interrupted": "Request interrupted",
+        "noHistory": "No generation history yet"
       }
     },
     "correction": {

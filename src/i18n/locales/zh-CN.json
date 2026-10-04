@@ -84,13 +84,46 @@
       "received": "已接收内容",
       "receivedCounts": "思考 {{reasoning}} 字符，回复 {{text}} 字符",
       "requestId": "请求编号",
-      "attempts": { "initial": "生成回顾", "repair": "补全与修复", "summary": "归纳时段概述" },
+      "attempts": { "initial": "整理活动", "repair": "补全与修复", "summary": "归纳概述" },
       "stages": {
         "preparing": "准备回顾", "collecting": "读取记录", "screening": "筛选内容",
         "waiting": "等待模型响应", "thinking": "模型正在思考", "writing": "生成回顾正文",
         "validating": "校验回顾", "summarizing": "归纳时段概述", "saving": "保存回顾", "running": "进行中",
         "ready": "已完成", "partial": "部分内容待补全", "failed": "生成失败",
         "cancelled": "已停止", "paused": "等待全屏应用退出后继续"
+      }
+    },
+    "diagnostics": {
+      "ready": "回顾已生成",
+      "completedPeriods": "已完成 {{count}} / {{total}} 个时段",
+      "periods": "各时段生成情况",
+      "periodFrom": "{{start}} 起",
+      "finishing": "正在完成回顾",
+      "steps": "处理步骤",
+      "requestContent": "请求内容",
+      "tabs": { "reply": "回复预览", "reasoning": "思考过程", "requestDetails": "请求信息" },
+      "model": "模型",
+      "requestDuration": "请求耗时",
+      "totalRequestDuration": "请求累计耗时 {{duration}}",
+      "runDuration": "本次运行 {{duration}}",
+      "seconds": "{{count}} 秒",
+      "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
+      "durationUnavailable": "耗时未记录",
+      "rawError": "错误原文",
+      "savedPreview": "已保存的预览",
+      "receivingPreview": "正在接收预览内容",
+      "waitingPreview": "正在等待内容…",
+      "noPreview": "此次请求没有提供这部分内容。",
+      "noRequests": "暂无已保存的请求记录",
+      "preparingRequests": "正在准备这个时段的内容。",
+      "states": {
+        "empty": "无需整理",
+        "pending": "等待整理",
+        "summaryFailed": "概述更新失败",
+        "summaryPending": "概述待补全",
+        "updating": "正在更新结果",
+        "interrupted": "请求已中断",
+        "noHistory": "暂无生成记录"
       }
     },
     "correction": {
