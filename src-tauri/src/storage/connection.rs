@@ -18,8 +18,8 @@ pub(crate) const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 /// transaction.
 pub(crate) const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
-/// Preserve the existing durability policy while DELETE remains the default
-/// journal mode. WAL experiments can choose a different policy explicitly.
+/// Preserve FULL durability in both WAL and DELETE mode, including syncing
+/// the WAL at each commit.
 const SYNCHRONOUS_FULL: &str = "FULL";
 
 /// Minimum SQLite version carried by the SQLCipher bundle for this release.
