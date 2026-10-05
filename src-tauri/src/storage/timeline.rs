@@ -9,6 +9,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -48,9 +49,10 @@ struct RawTimelineRow {
 
 #[derive(Default)]
 struct Timings {
-    db_wait: Duration,
+    read_open: Duration,
     count: Duration,
     sql: Duration,
+    sql_vm_steps: i32,
     hydration: Duration,
     cng: RowKeyDecryptTimings,
     rows: usize,
@@ -64,7 +66,7 @@ impl StorageState {
         start_ts: f64,
         end_ts: f64,
         limit: i64,
-        cancelled: &AtomicBool,
+        cancelled: &Arc<AtomicBool>,
     ) -> Result<Vec<TimelineRecord>, String> {
         let started = Instant::now();
         let mut timings = Timings::default();
@@ -82,18 +84,22 @@ impl StorageState {
         let result = (|| {
             check()?;
             let raw = {
-                let waiting = Instant::now();
-                let guard = self.get_connection_named("get_timeline_records")?;
-                timings.db_wait = waiting.elapsed();
+                let opening = Instant::now();
+                let conn = self.open_read_connection_named("get_timeline_records")?;
+                timings.read_open = opening.elapsed();
                 check()?;
-                read_rows(
-                    guard.as_ref().unwrap(),
-                    start_ts,
-                    end_ts,
-                    limit,
-                    &check,
-                    &mut timings,
-                )?
+                let stop = Arc::clone(cancelled);
+                let credentials = Arc::clone(&self.credential_state);
+                let _cancellation = SqlCancellation::install(&conn, move || {
+                    stop.load(Ordering::Acquire)
+                        || !credentials.is_session_valid()
+                        || credentials.silent_read_auth_required()
+                })?;
+                let result = read_rows(&conn, start_ts, end_ts, limit, &check, &mut timings);
+                // SQLite reports SQLITE_INTERRUPT; preserve the public cancel
+                // or auth error instead of exposing a generic database failure.
+                check()?;
+                result?
             };
             timings.rows = raw.len();
             // No DB guard, native handle or decrypted key is retained by the
@@ -140,7 +146,8 @@ impl StorageState {
             ($level:ident) => {
                 tracing::$level!(status, rows = timings.rows, processed = timings.processed,
                     cng_calls = timings.cng.calls, icon_cache_hits = timings.icon_cache_hits,
-                    db_wait = ?timings.db_wait, count = ?timings.count, sql = ?timings.sql,
+                    read_open = ?timings.read_open, count = ?timings.count, sql = ?timings.sql,
+                    sql_vm_steps = timings.sql_vm_steps,
                     cng_wait = ?timings.cng.lock_wait, cng_decrypt = ?timings.cng.decrypt,
                     ?assembly, ?total, "[DIAG:DB] get_timeline_records timing");
             }
@@ -152,6 +159,55 @@ impl StorageState {
         }
         result
     }
+}
+
+/// The callback also runs inside sqlite3_step, before the first grouped/sorted
+/// row is returned. Removing it on every exit prevents poisoning later reads.
+struct SqlCancellation<'a>(&'a Connection);
+
+impl<'a> SqlCancellation<'a> {
+    fn install(
+        conn: &'a Connection,
+        stop: impl FnMut() -> bool + Send + 'static,
+    ) -> Result<Self, String> {
+        conn.progress_handler(1000, Some(stop))
+            .map_err(|error| error.to_string())?;
+        Ok(Self(conn))
+    }
+}
+
+impl Drop for SqlCancellation<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+fn timeline_rows_sql(bucket: Option<i64>) -> String {
+    let selection = match bucket {
+        Some(bucket) => format!(
+            "SELECT MIN(id) AS picked_id FROM screenshots
+             WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
+             GROUP BY CAST(strftime('%s', created_at) AS INTEGER) / {bucket}"
+        ),
+        None => "SELECT id AS picked_id FROM screenshots
+                 WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
+                 ORDER BY created_at ASC, id ASC LIMIT ?3"
+            .into(),
+    };
+    // Materialize the small ID set exactly once, then force it to drive primary
+    // key hydration. Repeating the time predicate on s lets an unanalyzed DB
+    // reverse the join and restart the GROUP BY coroutine for every screenshot.
+    format!(
+        "WITH picks AS MATERIALIZED ({selection})
+        SELECT s.id, s.image_path, s.created_at,
+        CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
+        s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
+        s.content_key_encrypted, s.page_icon_enc, s.page_icon_id,
+        pi.icon_enc, pi.icon_key_encrypted, s.category
+        FROM picks CROSS JOIN screenshots s ON s.id = picks.picked_id
+        LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
+        ORDER BY s.created_at ASC, s.id ASC LIMIT ?3"
+    )
 }
 
 fn read_rows(
@@ -186,59 +242,49 @@ fn read_rows(
         .map_err(|e| format!("Timeline count failed: {e}"))?;
     timings.count = counting.elapsed();
     check()?;
-    let selection = if total > limit {
-        let bucket = StorageState::snap_bucket_seconds((end_ts - start_ts).max(1.0) / limit as f64);
-        format!(
-            "JOIN (SELECT MIN(id) AS picked_id FROM screenshots
-            WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
-            GROUP BY CAST(strftime('%s', created_at) AS INTEGER) / {bucket}) picks
-            ON picks.picked_id = s.id"
-        )
+    let bucket = if total > limit {
+        Some(StorageState::snap_bucket_seconds(
+            (end_ts - start_ts).max(1.0) / limit as f64,
+        ))
     } else {
-        String::new()
+        None
     };
-    let sql = format!(
-        "SELECT s.id, s.image_path, s.created_at,
-        CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
-        s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
-        s.content_key_encrypted, s.page_icon_enc, s.page_icon_id,
-        pi.icon_enc, pi.icon_key_encrypted, s.category
-        FROM screenshots s {selection}
-        LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
-        WHERE s.is_deleted = 0 AND s.created_at BETWEEN ?1 AND ?2
-        ORDER BY s.created_at ASC, s.id ASC LIMIT ?3"
-    );
+    let sql = timeline_rows_sql(bucket);
     let querying = Instant::now();
     let result = (|| {
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![start, end, limit], |row| {
-                Ok(RawTimelineRow {
-                    id: row.get(0)?,
-                    image_path: row.get(1)?,
-                    created_at: row.get(2)?,
-                    timestamp: row.get(3)?,
-                    window_title: row.get(4)?,
-                    process_name: row.get(5)?,
-                    metadata: row.get(6)?,
-                    title_enc: row.get(7)?,
-                    process_enc: row.get(8)?,
-                    metadata_enc: row.get(9)?,
-                    key_enc: row.get(10)?,
-                    icon_enc: row.get(11)?,
-                    icon_id: row.get(12)?,
-                    shared_icon_enc: row.get(13)?,
-                    shared_icon_key: row.get(14)?,
-                    category: row.get(15)?,
+        let result = (|| {
+            let rows = stmt
+                .query_map(params![start, end, limit], |row| {
+                    Ok(RawTimelineRow {
+                        id: row.get(0)?,
+                        image_path: row.get(1)?,
+                        created_at: row.get(2)?,
+                        timestamp: row.get(3)?,
+                        window_title: row.get(4)?,
+                        process_name: row.get(5)?,
+                        metadata: row.get(6)?,
+                        title_enc: row.get(7)?,
+                        process_enc: row.get(8)?,
+                        metadata_enc: row.get(9)?,
+                        key_enc: row.get(10)?,
+                        icon_enc: row.get(11)?,
+                        icon_id: row.get(12)?,
+                        shared_icon_enc: row.get(13)?,
+                        shared_icon_key: row.get(14)?,
+                        category: row.get(15)?,
+                    })
                 })
-            })
-            .map_err(|e| e.to_string())?;
-        let mut result = Vec::new();
-        for row in rows {
-            check()?;
-            result.push(row.map_err(|e| e.to_string())?);
-        }
-        Ok(result)
+                .map_err(|e| e.to_string())?;
+            let mut result = Vec::new();
+            for row in rows {
+                check()?;
+                result.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(result)
+        })();
+        timings.sql_vm_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        result
     })();
     timings.sql = querying.elapsed();
     result
@@ -333,3 +379,6 @@ fn hydrate(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod query_regression;

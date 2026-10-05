@@ -64,6 +64,7 @@ walkdir = "2.5.0"
 rand = "0.8"
 rusqlite = { version = "=0.40.2", default-features = false, features = [
     "cache",
+    "hooks",
     "bundled-sqlcipher-vendored-openssl",
 ] }
 base64 = "0.22"

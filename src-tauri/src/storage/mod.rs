@@ -714,6 +714,60 @@ mod tests {
     }
 
     #[test]
+    fn timeline_reads_finish_while_primary_writer_is_held() {
+        for policy in [
+            mode::DatabaseModePolicy::Wal,
+            mode::DatabaseModePolicy::Delete,
+        ] {
+            let (_temp, storage) = initialized_read_storage(policy);
+            // Legacy fixture labels need no native private key, but timeline
+            // commands still require a valid UI session throughout the read.
+            storage.credential_state.update_auth_time();
+            let mut primary = storage
+                .get_connection_named("held_timeline_writer")
+                .unwrap();
+            let tx = primary
+                .as_mut()
+                .unwrap()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE screenshots SET process_name = 'Uncommitted' WHERE id = 3",
+                [],
+            )
+            .unwrap();
+            let reader_storage = Arc::clone(&storage);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                let result = reader_storage.get_timeline_records(
+                    READ_TEST_TIMESTAMP as f64,
+                    (READ_TEST_TIMESTAMP + 120) as f64,
+                    500,
+                    &Arc::new(AtomicBool::new(false)),
+                );
+                finished_tx.send(result).unwrap();
+            });
+            let finished = finished_rx.recv_timeout(THREAD_TIMEOUT);
+            // Always release the writer, including on timeout, so a regression
+            // reports a failure instead of leaving the test suite deadlocked.
+            tx.rollback().unwrap();
+            drop(primary);
+            reader.join().unwrap();
+            let records = finished
+                .expect("timeline must not wait for the primary mutex")
+                .unwrap();
+            assert_eq!(
+                records.iter().map(|row| row.id).collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(records[2].process_name.as_deref(), Some("Browser"));
+            assert!(storage
+                .try_database_maintenance("after_timeline_read")
+                .is_some());
+        }
+    }
+
+    #[test]
     fn ui_reads_finish_while_primary_writer_is_held() {
         for policy in [
             mode::DatabaseModePolicy::Wal,
