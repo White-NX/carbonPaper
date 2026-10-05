@@ -30,6 +30,7 @@ mod search_plan;
 mod search_rank;
 mod semantic_cache;
 pub mod smart_cluster;
+mod timeline;
 mod types;
 pub(crate) mod wire_time;
 
@@ -49,6 +50,7 @@ pub(crate) use mode::{
 pub(crate) use policy::disk_totals_for_path;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
+pub use timeline::TimelineRecord;
 pub use types::*;
 
 use crate::credential_manager::{

@@ -1469,7 +1469,7 @@ impl StorageState {
     }
 
     /// Rounds a raw bucket width in seconds up to the next standardized step.
-    fn snap_bucket_seconds(raw_seconds: f64) -> i64 {
+    pub(super) fn snap_bucket_seconds(raw_seconds: f64) -> i64 {
         const NICE_SECONDS: [i64; 21] = [
             1, 2, 5, 10, 15, 30, // seconds
             60, 120, 300, 600, 900, 1800, // minutes

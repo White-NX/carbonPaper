@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod timeline_requests;
+static TIMELINE_REQUESTS: Lazy<timeline_requests::TimelineRequests> =
+    Lazy::new(timeline_requests::TimelineRequests::default);
+
 #[derive(Default, Clone)]
 struct ThumbnailWarmupProgress {
     running: bool,
@@ -212,16 +216,24 @@ mod tests {
 /// Returns timeline records between millisecond timestamps `start_time` and `end_time`.
 ///
 /// Authentication: required. `max_records` caps the result (sampling evenly across range).
-/// Returns an array of `ScreenshotRecord` objects. Frontend: `lib/monitor_api.js`.
+/// Returns lightweight `TimelineRecord` objects. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_timeline(
+    window: tauri::Window,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     start_time: f64,
     end_time: f64,
     max_records: Option<i64>,
-) -> Result<Vec<storage::ScreenshotRecord>, String> {
+    request_id: Option<String>,
+) -> Result<Vec<storage::TimelineRecord>, String> {
     check_auth_required(&credential_state)?;
+    let request_id = request_id.unwrap_or_else(|| format!("legacy-{}", rand::random::<u64>()));
+    if request_id.len() > 128 {
+        return Err("Invalid timeline request id".into());
+    }
+    let ticket = TIMELINE_REQUESTS.begin(window.label(), &request_id)?;
+    let cancelled = ticket.cancelled.clone();
 
     let start_ts = if start_time > 10_000_000_000.0 {
         start_time / 1000.0
@@ -236,10 +248,25 @@ pub async fn storage_get_timeline(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        state.get_screenshots_by_time_range_sampled(start_ts, end_ts, max_records.or(Some(500)))
+        state.get_timeline_records(start_ts, end_ts, max_records.unwrap_or(500), &cancelled)
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+/// Stops a timeline read for the calling window. Authentication: required.
+#[tauri::command]
+pub fn storage_cancel_timeline(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    request_id: String,
+) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+    if request_id.len() > 128 {
+        return Err("Invalid timeline request id".into());
+    }
+    TIMELINE_REQUESTS.cancel(window.label(), &request_id);
+    Ok(())
 }
 
 /// Aggregates screenshot counts into `bucket_ms` timeline buckets.

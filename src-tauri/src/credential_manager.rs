@@ -1587,15 +1587,47 @@ pub fn decrypt_row_key_with_cng_silent(
     state: &CredentialManagerState,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CredentialError> {
+    decrypt_row_key_with_cng_measured(
+        state,
+        ciphertext,
+        &mut RowKeyDecryptTimings::default(),
+        &|| false,
+    )
+    .map(|value| value.expect("a non-cancellable unwrap always returns a key"))
+}
+
+#[derive(Default)]
+pub(crate) struct RowKeyDecryptTimings {
+    pub calls: usize,
+    pub lock_wait: std::time::Duration,
+    pub decrypt: std::time::Duration,
+}
+
+/// Measures private-key contention separately from CNG execution. Cancellation
+/// is checked again after acquiring the handle, before spending work on a row.
+pub(crate) fn decrypt_row_key_with_cng_measured(
+    state: &CredentialManagerState,
+    ciphertext: &[u8],
+    timings: &mut RowKeyDecryptTimings,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<u8>>, CredentialError> {
+    if cancelled() {
+        return Ok(None);
+    }
     if !state.protected_read_authorized() {
         return Err(CredentialError::AuthRequired);
     }
     #[cfg(windows)]
     {
+        let wait_started = std::time::Instant::now();
         let retained = state
             .cached_private_key
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        timings.lock_wait += wait_started.elapsed();
+        if cancelled() {
+            return Ok(None);
+        }
         // A reader may have waited for another unwrap or an explicit
         // verification; revocation must take effect before its own call.
         if !state.protected_read_authorized() {
@@ -1603,18 +1635,20 @@ pub fn decrypt_row_key_with_cng_silent(
         }
         let key = retained.as_ref().ok_or(CredentialError::AuthRequired)?;
         let attempted_at = std::time::Instant::now();
+        timings.calls += 1;
         let result = key.unwrap_row_key(ciphertext);
+        timings.decrypt += attempted_at.elapsed();
         if matches!(result, Err(CredentialError::AuthRequired)) {
             tracing::warn!("Retained CNG key requires user verification for silent reads");
             // Keep the handle mutex until the failure is recorded. A newer
             // verification cannot be overwritten by a late reader failure.
             state.require_silent_read_authentication(attempted_at);
         }
-        result
+        result.map(Some)
     }
     #[cfg(not(windows))]
     {
-        let _ = ciphertext;
+        let _ = (ciphertext, timings);
         Err(CredentialError::SystemError(
             "CNG is only available on Windows".to_string(),
         ))

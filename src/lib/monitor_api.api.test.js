@@ -20,6 +20,7 @@ import {
   getScreenshotDetails,
   resumeOfficeDocument,
   updateMonitorFilters,
+  getTimeline,
 } from './monitor_api';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -47,6 +48,32 @@ describe('monitor_api command wrappers', () => {
       expect(call?.[1]).toEqual(options);
     }
   };
+
+  it('cancels the exact timeline request and waits for backend acknowledgement', async () => {
+    let finish;
+    invoke.mockImplementation((command) => command === 'storage_get_timeline'
+      ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
+    const controller = new AbortController();
+    const request = getTimeline(100, 200, 500, { signal: controller.signal });
+    const settled = vi.fn();
+    const handled = request.catch(settled);
+    const params = invoke.mock.calls[0][1];
+    expect(params).toMatchObject({ startTime: 100, endTime: 200, maxRecords: 500, requestId: expect.any(String) });
+    controller.abort();
+    await Promise.resolve();
+    expect(invoke).toHaveBeenCalledWith('storage_cancel_timeline', { requestId: params.requestId });
+    expect(settled).not.toHaveBeenCalled();
+    finish([{ id: 1 }]);
+    await handled;
+    expect(settled.mock.calls[0][0].name).toBe('AbortError');
+  });
+
+  it('does not send a timeline read that was cancelled before admission', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(getTimeline(100, 200, 500, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(invoke).not.toHaveBeenCalled();
+  });
 
   it('calls Rust visual search with the stable command payload', async () => {
     invoke.mockResolvedValue({ results: [{ id: 1 }] });

@@ -25,6 +25,7 @@ import SessionBand from './timeline/SessionBand';
 import DetailTrack from './timeline/DetailTrack';
 import SearchMarkerLayer from './timeline/SearchMarkerLayer';
 import { getSearchMarkerFitRange } from '../lib/timeline_search';
+import { createTimelineRequestQueue } from '../lib/timeline_requests';
 
 const MINUTE = 60000;
 const HOUR = 3600000;
@@ -176,7 +177,6 @@ const Timeline = ({
   const lastMouseXRef = useRef(0);
   const isDraggingRef = useRef(false);
   const dragMovedRef = useRef(0);
-  const fetchEpochRef = useRef(0);
   const densityEpochRef = useRef(0);
   const overviewEpochRef = useRef(0);
   const wheelIdleTimerRef = useRef(null);
@@ -311,24 +311,12 @@ const Timeline = ({
 
   // ── Data Fetching ──────────────────────────────────────────
 
-  const fetchEventsRange = useCallback(async (start, end, sampleMs) => {
-    const epoch = ++fetchEpochRef.current;
-
-    try {
-      const records = await getTimeline(start, end, TIMELINE_SAMPLE_LIMIT);
-      if (fetchEpochRef.current !== epoch) return;
-
+  const eventRequests = useMemo(() => createTimelineRequestQueue(
+    ({ start, end }, signal) => getTimeline(start, end, TIMELINE_SAMPLE_LIMIT, { signal }),
+    { onResult: (records, { start, end, sampleMs }) => {
       const mapped = (records || [])
         .filter((record) => record.timestamp != null)
         .map((record) => {
-          let meta = null;
-          if (record?.metadata) {
-            try {
-              meta = typeof record.metadata === 'string' ? JSON.parse(record.metadata) : record.metadata;
-            } catch {
-              meta = null;
-            }
-          }
           return {
             id: record.id,
             timestamp: record.timestamp
@@ -337,8 +325,8 @@ const Timeline = ({
             imagePath: record.image_path,
             appName: record.process_name,
             windowTitle: record.window_title,
-            processIcon: record.process_icon || meta?.process_icon || record.page_icon || null,
-            processPath: record.process_path || meta?.process_path || null,
+            processIcon: record.process_icon || null,
+            processPath: record.process_path || null,
             category: record.category || null,
           };
         })
@@ -355,13 +343,19 @@ const Timeline = ({
       setEvents((prev) => (sameFidelity
         ? pruneEvents(mergeSortedEvents(prev, mapped), start, end)
         : mapped));
-    } catch (error) {
+    }, onError: (error, range) => {
       console.error('[Timeline] Fetch error:', error);
       // Forget the request so the range guard tries again rather than believing
       // this range is covered. A newer request has already replaced it.
-      if (fetchEpochRef.current === epoch) requestedEventsRef.current = null;
-    }
-  }, []);
+      const requested = requestedEventsRef.current;
+      if (requested?.start === range.start && requested?.end === range.end
+          && requested?.sampleMs === range.sampleMs) requestedEventsRef.current = null;
+    } },
+  ), []);
+
+  const fetchEventsRange = useCallback((start, end, sampleMs, refresh) => {
+    eventRequests.request({ start, end, sampleMs }, { refresh });
+  }, [eventRequests]);
 
   const fetchDensityRange = useCallback(async (start, end, bucketMs) => {
     const epoch = ++densityEpochRef.current;
@@ -418,7 +412,7 @@ const Timeline = ({
    * loading while still costing a few requests rather than one per frame, because
    * each fetch reaches well past both edges of the screen.
    */
-  const ensureEvents = useCallback((center, span, force = false) => {
+  const ensureEvents = useCallback((center, span, force = false, refresh = false) => {
     if (!span) return;
 
     const requestSpan = span * EVENT_PREFETCH_FACTOR;
@@ -437,7 +431,7 @@ const Timeline = ({
     const start = center - requestSpan / 2;
     const end = center + requestSpan / 2;
     requestedEventsRef.current = { start, end, sampleMs };
-    requestEvents(start, end, sampleMs);
+    requestEvents(start, end, sampleMs, refresh);
   }, [requestEvents]);
 
   const ensureDensity = useCallback((center, span, force = false) => {
@@ -514,7 +508,10 @@ const Timeline = ({
     requestedDensityRef.current = null;
     requestedOverviewRef.current = null;
     loadedSampleMsRef.current = null;
+    requestEvents.cancel();
+    eventRequests.cancel();
     setImageEpoch((prev) => prev + 1);
+    if (sqlPaused) return;
     ensureEvents(centerTime, visibleSpan, true);
     ensureDensity(centerTime, visibleSpan, true);
     // Refresh only when refreshKey changes
@@ -532,7 +529,7 @@ const Timeline = ({
     const interval = setInterval(() => {
       const view = liveViewRef.current;
       const overview = overviewViewRef.current;
-      ensureEvents(view.center, view.span, true);
+      ensureEvents(view.center, view.span, true, true);
       ensureDensity(view.center, view.span, true);
       ensureOverview(overview.anchor, overview.span, true);
     }, period);
@@ -542,9 +539,20 @@ const Timeline = ({
 
   useEffect(() => () => {
     requestEvents.cancel();
+    eventRequests.cancel();
+    // Effect replay must request this range again after cancelling its read.
+    requestedEventsRef.current = null;
     requestDensity.cancel();
     requestOverview.cancel();
-  }, [requestEvents, requestDensity, requestOverview]);
+  }, [requestEvents, requestDensity, requestOverview, eventRequests]);
+
+  useEffect(() => {
+    if (sqlPaused) {
+      requestEvents.cancel();
+      eventRequests.cancel();
+      requestedEventsRef.current = null;
+    }
+  }, [sqlPaused, requestEvents, eventRequests]);
 
   // ── Thumbnail Loading ──────────────────────────────────────
 
