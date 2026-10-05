@@ -7,6 +7,7 @@
 
 mod ann_build;
 mod background_scheduler;
+mod blind_index;
 mod classification;
 mod connection;
 pub(crate) mod database_snapshot;

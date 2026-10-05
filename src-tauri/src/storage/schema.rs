@@ -187,6 +187,7 @@ impl StorageState {
 
     /// Initialize database tables.
     pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+        super::blind_index::check_supported_format(conn)?;
         // Must run before the CREATE batch below, or `IF NOT EXISTS` would
         // create the new empty tables first and leave the legacy rows stranded
         // under the old names.
@@ -817,6 +818,7 @@ impl StorageState {
         }
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
+        super::blind_index::ensure_schema(conn)?;
 
         Ok(())
     }
