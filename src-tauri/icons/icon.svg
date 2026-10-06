@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 168 168" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">CarbonPaper</title>
+  <desc id="desc">Curved charcoal, ivory and sage paper sheets floating above a warm rounded square.</desc>
+  <defs>
+    <linearGradient id="tile" x1="34" y1="7" x2="134" y2="153" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F0EDE6"/>
+      <stop offset=".5" stop-color="#EDEAE2"/>
+      <stop offset="1" stop-color="#E3DED3"/>
+    </linearGradient>
+    <radialGradient id="tileLight" cx="0" cy="0" r="1" gradientTransform="translate(117 44) rotate(126) scale(121 104)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity=".38"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sage" x1="44" y1="98" x2="130" y2="93" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#52645D"/>
+      <stop offset=".46" stop-color="#667F75"/>
+      <stop offset="1" stop-color="#88A69A"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="74" y1="74" x2="97" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D2CDBD"/>
+      <stop offset=".45" stop-color="#E2DDCF"/>
+      <stop offset=".8" stop-color="#F4F0E4"/>
+      <stop offset="1" stop-color="#FFFBEF"/>
+    </linearGradient>
+    <linearGradient id="curl" x1="77" y1="69" x2="88" y2="90" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9F9C8C"/>
+      <stop offset=".45" stop-color="#D6D0BF"/>
+      <stop offset=".82" stop-color="#F1EAD9"/>
+      <stop offset="1" stop-color="#FFF7E5"/>
+    </linearGradient>
+    <linearGradient id="charcoal" x1="61" y1="44" x2="108" y2="83" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#414946"/>
+      <stop offset=".5" stop-color="#353E3B"/>
+      <stop offset="1" stop-color="#5A625C"/>
+    </linearGradient>
+    <linearGradient id="topLight" x1="78" y1="58" x2="135" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity=".12"/>
+    </linearGradient>
+    <filter id="tileShadow" x="0" y="0" width="168" height="168" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="5" stdDeviation="3.5" flood-color="#6C6554" flood-opacity=".14"/>
+    </filter>
+    <filter id="groundShadow" x="19" y="87" width="130" height="57" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="3.7"/>
+    </filter>
+    <filter id="sheetShadow" x="17" y="22" width="137" height="116" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="3.5" stdDeviation="2.6" flood-color="#343D31" flood-opacity=".27"/>
+    </filter>
+    <filter id="curlShadow" x="20" y="22" width="132" height="91" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.6" flood-color="#4B493A" flood-opacity=".25"/>
+    </filter>
+  </defs>
+
+  <!-- The canvas outside the rounded tile stays transparent. -->
+  <g id="background" filter="url(#tileShadow)">
+    <rect x="8" y="6" width="152" height="148" rx="29" fill="url(#tile)"/>
+    <rect x="8" y="6" width="152" height="148" rx="29" fill="url(#tileLight)"/>
+  </g>
+
+  <path id="floatingShadow" d="M34 107 89 94 135 106 89 130Z" fill="#696B54" opacity=".25" filter="url(#groundShadow)"/>
+
+  <!-- Bottom sheet: sage green, with a very fine lit edge. -->
+  <g id="bottomSheet">
+    <path d="M30 98 88 56Q90 54 93 56L135 86Q139 88 135 91L91 124Q87 127 82 124Z" fill="url(#sage)"/>
+    <path d="m31 98 51 25q5 3 9 0l44-33" stroke="#D8E1D5" stroke-opacity=".45" stroke-width=".55"/>
+    <path d="m91 124 44-33q3-2 2-3" stroke="#47695D" stroke-opacity=".42" stroke-width=".6"/>
+  </g>
+
+  <!-- Middle sheet: the front edge lifts gently toward the right. -->
+  <g id="middleSheet" filter="url(#sheetShadow)">
+    <path d="M30 84 88 43Q90 42 93 43L137 72C129 81 109 98 91 109Q87 112 82 110C63 103 43 91 30 84Z" fill="url(#paper)"/>
+    <path d="M30 84C43 91 63 103 82 110Q87 112 91 109C109 98 129 81 137 72" stroke="#FFFBEF" stroke-width=".7" stroke-linejoin="round"/>
+    <path d="m32 84 23-16" stroke="#F7F3E8" stroke-opacity=".65" stroke-width=".5"/>
+  </g>
+
+  <!-- The ivory underside is visible beneath the curled charcoal face. -->
+  <g id="topSheet" filter="url(#curlShadow)">
+    <path d="M30 72 91 28 137 50C134 60 125 69 112 79C103 87 94 94 85 93C67 91 45 80 30 72Z" fill="url(#curl)"/>
+    <path d="M30 72 91 28C108 36 122 44 137 50C132 59 112 74 91 81C78 88 55 82 30 72Z" fill="url(#charcoal)"/>
+    <path d="M30 72 91 28C108 36 122 44 137 50C132 59 112 74 91 81C78 88 55 82 30 72Z" fill="url(#topLight)"/>
+    <path d="M30 72C55 82 78 88 91 81C112 74 132 59 137 50" stroke="#FFF8E8" stroke-width=".85" stroke-linecap="round"/>
+    <path d="M31 73C46 81 67 91 85 93C94 94 103 87 112 79" stroke="#FFF7E4" stroke-opacity=".85" stroke-width=".55"/>
+  </g>
+</svg>
