@@ -202,18 +202,34 @@ export const verifyUser = async () => {
  * 获取时间线数据 - 直接从 Rust 存储层获取
  * 需要认证才能访问
  */
-export const getTimeline = async (startTime, endTime, maxRecords = null) => {
+export const getTimeline = async (startTime, endTime, maxRecords = null, { signal } = {}) => {
     return withAuth(async () => {
-        // 使用新的 Rust 存储命令
+        const aborted = () => new DOMException('Timeline request cancelled', 'AbortError');
+        if (signal?.aborted) throw aborted();
+        const requestId = crypto.randomUUID();
         const params = {
             startTime: startTime,
-            endTime: endTime
+            endTime: endTime,
+            requestId,
         };
         if (maxRecords !== null) {
             params.maxRecords = maxRecords;
         }
-        const records = await invoke('storage_get_timeline', params);
-        return records || [];
+        const cancel = () => {
+            void withAuth(() => invoke('storage_cancel_timeline', { requestId }))
+                .catch((error) => console.warn('[Timeline] Cancellation failed:', error));
+        };
+        signal?.addEventListener('abort', cancel, { once: true });
+        try {
+            const records = await invoke('storage_get_timeline', params);
+            if (signal?.aborted) throw aborted();
+            return records || [];
+        } catch (error) {
+            if (signal?.aborted || String(error).includes('TIMELINE_CANCELLED')) throw aborted();
+            throw error;
+        } finally {
+            signal?.removeEventListener('abort', cancel);
+        }
     });
 };
 

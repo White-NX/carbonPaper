@@ -1,8 +1,43 @@
 //! Bitmap index lazy indexing and maintenance.
 
+use super::super::blind_index::{BlindIndex, MutationStats};
 use super::super::{BlindIndexRepairProgress, StorageState};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+mod bench;
+mod postings_io;
+
+#[derive(Default)]
+struct LazyIndexWriteDiagnostics {
+    cache_setup: Duration,
+    tx_begin: Duration,
+    active_check: Duration,
+    hash_update: Duration,
+    bitmap_prepare: Duration,
+    bitmap_filter: Duration,
+    bitmap_read: Duration,
+    bitmap_merge: Duration,
+    bitmap_serialize: Duration,
+    bitmap_write: Duration,
+    commit: Duration,
+    active_rows: u64,
+    existing_postings: usize,
+    postings_written: usize,
+    postings_bytes_read: usize,
+    postings_bytes_written: usize,
+}
+
+// Accumulate before the caller propagates an error, so failed slow batches
+// retain the time spent in the failing operation as well.
+fn measure_lazy_index_step<T>(elapsed: &mut Duration, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = operation();
+    *elapsed += started.elapsed();
+    result
+}
 
 impl StorageState {
     /// Number of OCR rows to process per batch for lazy indexing.
@@ -126,39 +161,21 @@ impl StorageState {
             removed_ocr_ids: metadata_u64(Self::BLIND_INDEX_REPAIR_REMOVED_IDS_KEY),
             ..BlindIndexRepairProgress::default()
         };
-        let remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM blind_bitmap_index WHERE token_hash > ?1",
-                [&cursor],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Failed to count remaining blind postings: {error}"))?;
+        let index = BlindIndex::open(conn)?;
+        let remaining = index.count_after(&cursor)?;
         status.total_postings = status
             .processed_postings
             .saturating_add(remaining.max(0) as u64);
         progress_callback(status.clone());
 
         loop {
-            let batch: Vec<(String, Vec<u8>)> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT token_hash, postings_blob
-                         FROM blind_bitmap_index
-                         WHERE token_hash > ?1
-                         ORDER BY token_hash ASC
-                         LIMIT ?2",
-                    )
-                    .map_err(|error| {
-                        format!("Failed to prepare blind-index repair batch: {error}")
-                    })?;
-                let rows = stmt
-                    .query_map(params![&cursor, Self::BLIND_INDEX_REPAIR_BATCH], |row| {
-                        Ok((row.get(0)?, row.get(1)?))
-                    })
-                    .map_err(|error| format!("Failed to read blind-index repair batch: {error}"))?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| format!("Failed to decode blind-index posting: {error}"))?
-            };
+            let mut batch = Vec::new();
+            for hash in index.tokens_after(&cursor, Self::BLIND_INDEX_REPAIR_BATCH)? {
+                let posting = index
+                    .read(&hash, false)?
+                    .ok_or("Blind posting vanished during exclusive repair")?;
+                batch.push((hash, posting.bitmap));
+            }
 
             if batch.is_empty() {
                 break;
@@ -169,15 +186,11 @@ impl StorageState {
                 .last()
                 .map(|(hash, _)| hash.clone())
                 .unwrap_or_default();
-            let mut replacements: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut replacements: Vec<(String, roaring::RoaringBitmap)> = Vec::new();
             let mut deletions: Vec<String> = Vec::new();
             let mut removed_in_batch = 0u64;
 
-            for (token_hash, blob) in batch {
-                let mut bitmap =
-                    roaring::RoaringBitmap::deserialize_from(&blob[..]).map_err(|error| {
-                        format!("Failed to deserialize blind posting {token_hash}: {error}")
-                    })?;
+            for (token_hash, mut bitmap) in batch {
                 let before = bitmap.len();
                 bitmap &= &valid_ocr_ids;
                 let removed = before.saturating_sub(bitmap.len());
@@ -188,11 +201,7 @@ impl StorageState {
                 if bitmap.is_empty() {
                     deletions.push(token_hash);
                 } else {
-                    let mut repaired = Vec::new();
-                    bitmap.serialize_into(&mut repaired).map_err(|error| {
-                        format!("Failed to serialize repaired posting {token_hash}: {error}")
-                    })?;
-                    replacements.push((token_hash, repaired));
+                    replacements.push((token_hash, bitmap));
                 }
             }
 
@@ -202,25 +211,13 @@ impl StorageState {
                 format!("Failed to start blind-index repair transaction: {error}")
             })?;
             {
-                let mut update = tx
-                    .prepare_cached(
-                        "UPDATE blind_bitmap_index SET postings_blob = ?2 WHERE token_hash = ?1",
-                    )
-                    .map_err(|error| format!("Failed to prepare posting update: {error}"))?;
-                for (token_hash, blob) in &replacements {
-                    update.execute(params![token_hash, blob]).map_err(|error| {
-                        format!("Failed to update posting {token_hash}: {error}")
-                    })?;
+                let index = BlindIndex::open(&tx)?;
+                let mut stats = MutationStats::default();
+                for (hash, bitmap) in &replacements {
+                    index.replace(hash, bitmap, &mut stats)?;
                 }
-            }
-            {
-                let mut delete = tx
-                    .prepare_cached("DELETE FROM blind_bitmap_index WHERE token_hash = ?1")
-                    .map_err(|error| format!("Failed to prepare posting delete: {error}"))?;
-                for token_hash in &deletions {
-                    delete.execute([token_hash]).map_err(|error| {
-                        format!("Failed to delete posting {token_hash}: {error}")
-                    })?;
+                for hash in &deletions {
+                    index.replace(hash, &roaring::RoaringBitmap::new(), &mut stats)?;
                 }
             }
 
@@ -382,6 +379,22 @@ impl StorageState {
         self.index_batch_internal(rows, &hmac_key)
     }
 
+    fn visible_ocr_bitmap_sql(id_count: usize) -> String {
+        let placeholders = (0..id_count).map(|_| "?").collect::<Vec<_>>().join(",");
+        // Without statistics SQLite can scan every live entry in
+        // idx_ocr_deleted_screenshot, then filter the batch's ids. NOT INDEXED
+        // excludes that secondary index but preserves INTEGER PRIMARY KEY
+        // lookups, keeping the work proportional to the batch size.
+        format!(
+            "SELECT o.id
+             FROM ocr_results o NOT INDEXED
+             JOIN screenshots s ON s.id = o.screenshot_id
+             WHERE o.id IN ({placeholders})
+               AND o.is_deleted = 0
+               AND s.is_deleted = 0"
+        )
+    }
+
     fn query_visible_ocr_bitmap(
         conn: &Connection,
         ids: &[i64],
@@ -392,15 +405,7 @@ impl StorageState {
             return Ok(active);
         }
 
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT o.id
-             FROM ocr_results o
-             JOIN screenshots s ON s.id = o.screenshot_id
-             WHERE o.id IN ({placeholders})
-               AND o.is_deleted = 0
-               AND s.is_deleted = 0"
-        );
+        let sql = Self::visible_ocr_bitmap_sql(ids.len());
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|error| format!("{context} active-row prepare: {error}"))?;
@@ -451,16 +456,37 @@ impl StorageState {
         }
 
         // 3. Update DB
-        {
-            let mut guard = self.get_connection_named("lazy_indexer_write")?;
+        // Traverse the token index in key order instead of HashMap order. Keep
+        // only one posting blob resident in Rust while SQLite reuses its pages.
+        let ordered_hashes = postings_io::ordered_token_hashes(batch_tokens.keys());
+        let mut diagnostics = LazyIndexWriteDiagnostics::default();
+        let mut posting_stats = MutationStats::default();
+        let wait_started = Instant::now();
+        let mut guard = self.get_connection_named("lazy_indexer_write")?;
+        let mutex_wait = wait_started.elapsed();
+        // Use the same start as the generic mutex-hold warning.
+        let hold_started = guard.acquired_at;
+        let write_result = (|| -> Result<(), String> {
             let conn = guard.as_mut().unwrap();
-            let tx = conn.transaction().map_err(|e| format!("lazy tx: {}", e))?;
+            let cache_budget = measure_lazy_index_step(&mut diagnostics.cache_setup, || {
+                postings_io::PostingsCacheBudget::new(conn)
+            })
+            .map_err(|e| format!("lazy cache: {}", e))?;
+            // The cache guard borrows the connection through commit/rollback.
+            // This mutex-owned connection has no concurrent transaction users;
+            // unchecked_transaction still rejects a nested BEGIN at runtime.
+            let tx =
+                measure_lazy_index_step(&mut diagnostics.tx_begin, || conn.unchecked_transaction())
+                    .map_err(|e| format!("lazy tx: {}", e))?;
 
-            let ids: Vec<i64> = row_hashes.iter().map(|(id, _)| *id).collect();
-            let active_ids = Self::query_visible_ocr_bitmap(&tx, &ids, "lazy index")?;
+            let active_ids = measure_lazy_index_step(&mut diagnostics.active_check, || {
+                let ids: Vec<i64> = row_hashes.iter().map(|(id, _)| *id).collect();
+                Self::query_visible_ocr_bitmap(&tx, &ids, "lazy index")
+            })?;
+            diagnostics.active_rows = active_ids.len();
 
             // Update text_hash
-            {
+            measure_lazy_index_step(&mut diagnostics.hash_update, || -> Result<(), String> {
                 let mut upd_stmt = tx
                     .prepare_cached(
                         "UPDATE ocr_results SET text_hash = ?1
@@ -468,54 +494,71 @@ impl StorageState {
                     )
                     .map_err(|e| format!("lazy upd prep: {}", e))?;
                 for (id, hash) in &row_hashes {
-                    upd_stmt.execute(params![hash, id]).ok();
+                    upd_stmt
+                        .execute(params![hash, id])
+                        .map_err(|e| format!("lazy text hash update: {e}"))?;
+                }
+                Ok(())
+            })?;
+
+            let index =
+                measure_lazy_index_step(&mut diagnostics.bitmap_prepare, || BlindIndex::open(&tx))?;
+            for hash in &ordered_hashes {
+                let candidate_bitmap = &batch_tokens[*hash];
+                let new_bitmap = measure_lazy_index_step(&mut diagnostics.bitmap_filter, || {
+                    candidate_bitmap & &active_ids
+                });
+                if !new_bitmap.is_empty() {
+                    index.add(hash, &new_bitmap, &mut posting_stats)?;
                 }
             }
 
-            // Update blind_bitmap_index
-            {
-                let mut get_stmt = tx
-                    .prepare_cached(
-                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                    )
-                    .map_err(|e| format!("lazy get prep: {}", e))?;
-                let mut put_stmt = tx
-                    .prepare_cached(
-                        "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
-                    )
-                    .map_err(|e| format!("lazy put prep: {}", e))?;
+            measure_lazy_index_step(&mut diagnostics.commit, || tx.commit())
+                .map_err(|e| format!("lazy commit: {}", e))?;
+            drop(cache_budget);
+            Ok(())
+        })();
+        diagnostics.bitmap_read = posting_stats.read;
+        diagnostics.bitmap_merge = posting_stats.merge;
+        diagnostics.bitmap_serialize = posting_stats.serialize;
+        diagnostics.bitmap_write = posting_stats.write;
+        diagnostics.existing_postings = posting_stats.existing_tokens;
+        diagnostics.postings_written = posting_stats.fragments_written;
+        diagnostics.postings_bytes_read = posting_stats.bytes_read;
+        diagnostics.postings_bytes_written = posting_stats.bytes_written;
+        let hold = hold_started.elapsed();
+        drop(guard);
 
-                for (hash, candidate_bitmap) in &batch_tokens {
-                    let new_bitmap = candidate_bitmap & &active_ids;
-                    if new_bitmap.is_empty() {
-                        continue;
-                    }
-                    let existing_blob: Option<Vec<u8>> = get_stmt
-                        .query_row(params![hash], |row| row.get(0))
-                        .optional()
-                        .map_err(|e| format!("lazy get: {}", e))?;
-
-                    let merged = if let Some(blob) = existing_blob {
-                        let mut existing = roaring::RoaringBitmap::deserialize_from(&blob[..])
-                            .map_err(|e| format!("lazy deser: {}", e))?;
-                        existing |= &new_bitmap;
-                        existing
-                    } else {
-                        new_bitmap
-                    };
-
-                    let mut buf = Vec::new();
-                    merged
-                        .serialize_into(&mut buf)
-                        .map_err(|e| format!("lazy ser: {}", e))?;
-                    put_stmt
-                        .execute(params![hash, buf])
-                        .map_err(|e| format!("lazy put: {}", e))?;
-                }
-            }
-
-            tx.commit().map_err(|e| format!("lazy commit: {}", e))?;
+        // Emit after releasing the connection, including on transaction failure.
+        // Only aggregate timings and sizes are logged, never OCR text or hashes.
+        if hold >= Duration::from_secs(1) || mutex_wait >= Duration::from_secs(1) {
+            tracing::warn!(
+                rows = rows.len(),
+                prepared_rows = row_hashes.len(),
+                active_rows = diagnostics.active_rows,
+                tokens = batch_tokens.len(),
+                existing_postings = diagnostics.existing_postings,
+                postings_written = diagnostics.postings_written,
+                postings_bytes_read = diagnostics.postings_bytes_read,
+                postings_bytes_written = diagnostics.postings_bytes_written,
+                committed = write_result.is_ok(),
+                ?mutex_wait,
+                ?hold,
+                cache_setup = ?diagnostics.cache_setup,
+                tx_begin = ?diagnostics.tx_begin,
+                active_check = ?diagnostics.active_check,
+                hash_update = ?diagnostics.hash_update,
+                bitmap_prepare = ?diagnostics.bitmap_prepare,
+                bitmap_filter = ?diagnostics.bitmap_filter,
+                bitmap_read = ?diagnostics.bitmap_read,
+                bitmap_merge = ?diagnostics.bitmap_merge,
+                bitmap_serialize = ?diagnostics.bitmap_serialize,
+                bitmap_write = ?diagnostics.bitmap_write,
+                commit = ?diagnostics.commit,
+                "[DIAG:DB] lazy_indexer_write timing"
+            );
         }
+        write_result?;
 
         Ok(rows.len())
     }
@@ -554,6 +597,8 @@ impl StorageState {
         }
 
         // Atomic update for the batch
+        let _cache_budget = postings_io::PostingsCacheBudget::new(conn)
+            .map_err(|e| format!("HMAC index cache: {e}"))?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         {
             let ids: Vec<i64> = row_hashes.iter().map(|(id, _)| *id).collect();
@@ -566,43 +611,17 @@ impl StorageState {
                 )
                 .map_err(|e| e.to_string())?;
             for (id, hash) in &row_hashes {
-                let _ = upd_stmt.execute(params![hash, id]);
+                upd_stmt
+                    .execute(params![hash, id])
+                    .map_err(|e| format!("HMAC text hash update: {e}"))?;
             }
 
-            let mut get_stmt = tx
-                .prepare_cached(
-                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                )
-                .map_err(|e| e.to_string())?;
-            let mut put_stmt = tx
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
-                )
-                .map_err(|e| e.to_string())?;
-
-            for (hash, candidate_bitmap) in &batch_tokens {
-                let new_bitmap = candidate_bitmap & &active_ids;
-                if new_bitmap.is_empty() {
-                    continue;
-                }
-                let existing_blob: Option<Vec<u8>> = get_stmt
-                    .query_row(params![hash], |row| row.get(0))
-                    .optional()
-                    .unwrap_or(None);
-                let merged = if let Some(blob) = existing_blob {
-                    if let Ok(mut existing) = roaring::RoaringBitmap::deserialize_from(&blob[..]) {
-                        existing |= &new_bitmap;
-                        existing
-                    } else {
-                        new_bitmap
-                    }
-                } else {
-                    new_bitmap
-                };
-
-                let mut buf = Vec::new();
-                if merged.serialize_into(&mut buf).is_ok() {
-                    let _ = put_stmt.execute(params![hash, buf]);
+            let index = BlindIndex::open(&tx)?;
+            let mut stats = MutationStats::default();
+            for hash in postings_io::ordered_token_hashes(batch_tokens.keys()) {
+                let new_bitmap = &batch_tokens[hash] & &active_ids;
+                if !new_bitmap.is_empty() {
+                    index.add(hash, &new_bitmap, &mut stats)?;
                 }
             }
         }
@@ -657,19 +676,19 @@ mod tests {
                 .expect("insert OCR fixture");
             connection
                 .execute(
-                    "INSERT INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
+                    "INSERT INTO blind_bitmap_inline (token_hash, postings_blob) VALUES (?1, ?2)",
                     params!["active-and-stale", serialize(&[1, 2, 4, 99])],
                 )
                 .expect("insert mixed posting");
             connection
                 .execute(
-                    "INSERT INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
+                    "INSERT INTO blind_bitmap_inline (token_hash, postings_blob) VALUES (?1, ?2)",
                     params!["active-only", serialize(&[3])],
                 )
                 .expect("insert active posting");
             connection
                 .execute(
-                    "INSERT INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
+                    "INSERT INTO blind_bitmap_inline (token_hash, postings_blob) VALUES (?1, ?2)",
                     params!["stale-only", serialize(&[2, 99])],
                 )
                 .expect("insert stale posting");
@@ -693,7 +712,7 @@ mod tests {
         let connection = guard.as_ref().expect("database");
         let mixed: Vec<u8> = connection
             .query_row(
-                "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = 'active-and-stale'",
+                "SELECT postings_blob FROM blind_bitmap_inline WHERE token_hash = 'active-and-stale'",
                 [],
                 |row| row.get(0),
             )
@@ -703,7 +722,7 @@ mod tests {
 
         let active: Vec<u8> = connection
             .query_row(
-                "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = 'active-only'",
+                "SELECT postings_blob FROM blind_bitmap_inline WHERE token_hash = 'active-only'",
                 [],
                 |row| row.get(0),
             )
@@ -713,7 +732,7 @@ mod tests {
 
         let stale_exists: bool = connection
             .query_row(
-                "SELECT 1 FROM blind_bitmap_index WHERE token_hash = 'stale-only'",
+                "SELECT 1 FROM blind_bitmap_inline WHERE token_hash = 'stale-only'",
                 [],
                 |_| Ok(true),
             )
@@ -743,5 +762,114 @@ mod tests {
             StorageState::query_visible_ocr_bitmap(connection, &[100, 101, 102, 999], "test")
                 .expect("query visible OCR ids");
         assert_eq!(active.iter().collect::<Vec<_>>(), vec![100]);
+    }
+
+    #[test]
+    fn blind_index_repair_cleans_chunked_postings_and_preserves_logical_counts() {
+        let (_temp, storage) = test_storage();
+        let original: RoaringBitmap = (0..70_000).map(|n| n * 37).collect();
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute_batch("INSERT INTO screenshots(id,image_path,image_hash,is_deleted) VALUES(1,'1.enc','h1',0),(2,'2.enc','h2',1);
+                INSERT INTO ocr_results(id,screenshot_id,text_hash,is_deleted) VALUES(37,1,'a',0),(74,2,'b',0),(111,1,'c',1);").unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let index = BlindIndex::open(&tx).unwrap();
+            let mut stats = MutationStats::default();
+            index.replace("mixed", &original, &mut stats).unwrap();
+            let mut stale = original.clone();
+            stale.remove(37);
+            index.replace("stale", &stale, &mut stats).unwrap();
+            tx.commit().unwrap();
+        }
+        let summary = storage.run_blind_index_repair(|_| {}).unwrap();
+        assert_eq!(summary.total_postings, 2);
+        assert_eq!(summary.processed_postings, 2);
+        assert_eq!(summary.changed_postings, 2);
+        assert_eq!(summary.deleted_postings, 1);
+        assert_eq!(summary.removed_ocr_ids, (original.len() - 1) * 2);
+        assert!(!storage.is_blind_index_repair_needed().unwrap());
+        let guard = storage.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        let index = BlindIndex::open(conn).unwrap();
+        assert_eq!(index.count_after("").unwrap(), 1);
+        assert!(index.read("stale", true).unwrap().is_none());
+        assert_eq!(
+            index.read("mixed", true).unwrap().unwrap().bitmap,
+            [37].into_iter().collect()
+        );
+        let probe = index.probe(&["mixed".into()]).unwrap().postings.remove(0);
+        assert!(probe.chunked);
+        assert_eq!(probe.cardinality, Some(1));
+        assert_eq!(probe.bytes, serialize(&[37]).len());
+    }
+
+    #[test]
+    fn visible_ocr_lookup_uses_primary_keys_with_bounded_work() {
+        let (_temp, storage) = test_storage();
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = guard.as_ref().expect("database");
+        conn.execute_batch(
+            "WITH RECURSIVE ids(id) AS (
+                SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < 10000
+             )
+             INSERT INTO screenshots (id, image_path, image_hash)
+             SELECT id, 'history.enc', CAST(id AS TEXT) FROM ids;
+             INSERT INTO ocr_results (id, screenshot_id, text_hash)
+             SELECT id, id, '' FROM screenshots;",
+        )
+        .expect("insert active OCR history");
+
+        // Use the production schema and bundled SQLite engine. Without
+        // statistics, the old query scans idx_ocr_deleted_screenshot for
+        // is_deleted=0 even though only this batch's primary keys are needed.
+        for analyzed in [false, true] {
+            if analyzed {
+                conn.execute_batch("ANALYZE").expect("analyze fixture");
+            }
+            for first_id in [9901, 10001] {
+                let ids: Vec<i64> = (first_id..first_id + 100).collect();
+                let sql = StorageState::visible_ocr_bitmap_sql(ids.len());
+                let plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .expect("prepare visibility query plan")
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .expect("explain visibility query")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("read visibility query plan")
+                    .join("; ");
+
+                let mut stmt = conn.prepare(&sql).expect("prepare visibility query");
+                let mut actual = stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("query visible OCR ids")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("read visible OCR ids");
+                actual.sort_unstable();
+                let expected = if first_id == 9901 {
+                    ids.clone()
+                } else {
+                    vec![]
+                };
+                assert_eq!(actual, expected);
+
+                // VM steps catch an index-range scan too, which SQLite's
+                // FullscanStep counter alone does not report as a table scan.
+                let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                assert!(
+                    plan.contains("SEARCH o USING INTEGER PRIMARY KEY")
+                        && plan.contains("SEARCH s USING INTEGER PRIMARY KEY"),
+                    "analyzed={analyzed}, first_id={first_id}, steps={steps}: {plan}"
+                );
+                assert!(
+                    steps < 50 * ids.len() as i32 + 100,
+                    "batch lookup must not scan OCR history: analyzed={analyzed}, first_id={first_id}, steps={steps}"
+                );
+            }
+        }
     }
 }

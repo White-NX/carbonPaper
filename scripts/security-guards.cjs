@@ -54,6 +54,7 @@ const COMMAND_TIERS = {
   'monitor::monitor_classify_debug': 'session_required',
   'monitor::monitor_remove_local_anchors_by_process': 'session_required',
   'commands::storage::storage_get_timeline': 'session_required',
+  'commands::storage::storage_cancel_timeline': 'session_required',
   'commands::storage::storage_list_recent_screenshots': 'session_required',
   'commands::storage::storage_get_timeline_density': 'session_required',
   'commands::storage::storage_search': 'session_required',

@@ -43,7 +43,7 @@ impl StorageState {
     /// Compute IDF-weighted scores for a list of visible links.
     ///
     /// For each link, tokenizes the anchor text into bigrams, looks up document
-    /// frequencies from the blind_bitmap_index, and produces a score:
+    /// frequencies from the blind index, and produces a score:
     ///   score = Σ idf(token) × ln(1 + text_len) × entropy_penalty(text) / ln(e + text_len)
     /// where idf(token) = ln(1 + N / (1 + df)).
     /// The entropy penalty dampens links whose anchor text has abnormally low
@@ -81,28 +81,9 @@ impl StorageState {
         let all_hashes_vec: Vec<String> = all_hashes.into_iter().collect();
         let mut df_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
-        for chunk in all_hashes_vec.chunks(500) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-            let sql = format!(
-                "SELECT token_hash, postings_blob FROM blind_bitmap_index WHERE token_hash IN ({})",
-                placeholders
-            );
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| format!("Failed to prepare bitmap query: {}", e))?;
-            let rows = stmt
-                .query_map(params.as_slice(), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })
-                .map_err(|e| format!("Failed to query bitmaps: {}", e))?;
-            for row in rows.filter_map(|r| r.ok()) {
-                let (hash, blob) = row;
-                if let Ok(rb) = roaring::RoaringBitmap::deserialize_from(&blob[..]) {
-                    df_map.insert(hash, rb.len() as f64);
-                }
-            }
+        let index = super::blind_index::BlindIndex::open(conn)?;
+        for (hash, cardinality) in index.cardinalities(&all_hashes_vec)? {
+            df_map.insert(hash, cardinality as f64);
         }
 
         // Score each link
@@ -151,6 +132,70 @@ impl StorageState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_scores_preserve_idf_when_large_postings_are_promoted() {
+        use crate::credential_manager::CredentialManagerState;
+        use crate::storage::blind_index::{BlindIndex, MutationStats};
+        use roaring::RoaringBitmap;
+        use rusqlite::Connection;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(CredentialManagerState::new(temp.path().into()));
+        credentials.cache_master_key_for_tests(vec![9; 32]);
+        credentials.set_foreground_state(true);
+        credentials.update_auth_time();
+        let key = credentials.get_hmac_key().unwrap();
+        let storage = StorageState::new(temp.path().into(), credentials);
+        storage.ocr_row_count.store(100_000, Ordering::Relaxed);
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        let common: RoaringBitmap = (0..70_000).map(|n| n * 37).collect();
+        let rare: RoaringBitmap = [7, 9].into_iter().collect();
+        let mut common_bytes = Vec::new();
+        common.serialize_into(&mut common_bytes).unwrap();
+        let mut rare_bytes = Vec::new();
+        rare.serialize_into(&mut rare_bytes).unwrap();
+        let common_hash = StorageState::compute_hmac_hash("ab", &key);
+        let rare_hash = StorageState::compute_hmac_hash("cd", &key);
+        for (hash, bytes) in [(&common_hash, &common_bytes), (&rare_hash, &rare_bytes)] {
+            conn.execute(
+                "INSERT INTO blind_bitmap_inline VALUES(?1,?2)",
+                rusqlite::params![hash, bytes],
+            )
+            .unwrap();
+        }
+        *storage.db.lock().unwrap() = Some(conn);
+        let links = ["ab", "cd", "missing", "https://example.test"].map(|text| VisibleLink {
+            text: text.into(),
+            url: "https://example.test".into(),
+        });
+        let before = storage.compute_link_scores(&links).unwrap();
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            BlindIndex::open(&tx)
+                .unwrap()
+                .replace(&common_hash, &common, &mut MutationStats::default())
+                .unwrap();
+            tx.commit().unwrap();
+            assert!(
+                BlindIndex::open(conn)
+                    .unwrap()
+                    .probe(&[common_hash])
+                    .unwrap()
+                    .postings[0]
+                    .chunked
+            );
+        }
+        let after = storage.compute_link_scores(&links).unwrap();
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(before.text, after.text);
+            assert!((before.score - after.score).abs() < 1e-12);
+        }
+    }
 
     #[test]
     fn character_entropy_matches_known_distributions() {

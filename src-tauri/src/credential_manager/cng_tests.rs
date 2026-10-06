@@ -112,6 +112,42 @@ fn native_retained_handle_serves_single_and_batch_reads_across_threads() {
 }
 
 #[test]
+fn native_measured_unwrap_reports_calls_and_honors_cancellation_after_lock_wait() {
+    let (state, ciphertext) = native_fixture();
+    let mut timings = RowKeyDecryptTimings::default();
+    let key = decrypt_row_key_with_cng_measured(&state, &ciphertext, &mut timings, &|| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(key, vec![7; MASTER_KEY_LEN]);
+    assert_eq!(timings.calls, 1);
+    assert!(!timings.decrypt.is_zero());
+    let cancelled = AtomicBool::new(false);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let held = state.cached_private_key.lock().unwrap();
+        let reader = scope.spawn(|| {
+            let first = std::cell::Cell::new(true);
+            let mut timings = RowKeyDecryptTimings::default();
+            let result =
+                decrypt_row_key_with_cng_measured(&state, &ciphertext, &mut timings, &|| {
+                    if first.replace(false) {
+                        entered.send(()).unwrap();
+                        false
+                    } else {
+                        cancelled.load(Ordering::Acquire)
+                    }
+                });
+            assert!(result.unwrap().is_none());
+            assert_eq!(timings.calls, 0);
+        });
+        waiting.recv().unwrap();
+        cancelled.store(true, Ordering::Release);
+        drop(held);
+        reader.join().unwrap();
+    });
+}
+
+#[test]
 fn native_batch_reader_rechecks_authorization_after_admission() {
     let (state, ciphertext) = native_fixture();
     let reader = CngKeySession::open_silent(&state).unwrap();

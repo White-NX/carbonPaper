@@ -1469,7 +1469,7 @@ impl StorageState {
     }
 
     /// Rounds a raw bucket width in seconds up to the next standardized step.
-    fn snap_bucket_seconds(raw_seconds: f64) -> i64 {
+    pub(super) fn snap_bucket_seconds(raw_seconds: f64) -> i64 {
         const NICE_SECONDS: [i64; 21] = [
             1, 2, 5, 10, 15, 30, // seconds
             60, 120, 300, 600, 900, 1800, // minutes
@@ -3212,50 +3212,10 @@ impl StorageState {
             .map_err(|e| format!("Failed to start OCR cleanup transaction: {}", e))?;
 
         if !removals.is_empty() {
-            let mut get_stmt = tx
-                .prepare_cached(
-                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                )
-                .map_err(|e| format!("Failed to prepare bitmap read: {}", e))?;
-            let mut put_stmt = tx
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
-                )
-                .map_err(|e| format!("Failed to prepare bitmap write: {}", e))?;
-            let mut del_stmt = tx
-                .prepare_cached("DELETE FROM blind_bitmap_index WHERE token_hash = ?1")
-                .map_err(|e| format!("Failed to prepare bitmap delete: {}", e))?;
-
+            let index = super::blind_index::BlindIndex::open(&tx)?;
+            let mut stats = super::blind_index::MutationStats::default();
             for (token_hash, remove_set) in removals {
-                let existing_blob: Option<Vec<u8>> = get_stmt
-                    .query_row(params![&token_hash], |row| row.get(0))
-                    .optional()
-                    .map_err(|e| format!("Failed to load bitmap row: {}", e))?;
-
-                let Some(blob) = existing_blob else {
-                    continue;
-                };
-
-                let mut bitmap = RoaringBitmap::deserialize_from(&blob[..])
-                    .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
-
-                for id in remove_set.iter() {
-                    bitmap.remove(id);
-                }
-
-                if bitmap.is_empty() {
-                    del_stmt
-                        .execute(params![&token_hash])
-                        .map_err(|e| format!("Failed to delete empty bitmap row: {}", e))?;
-                } else {
-                    let mut buf = Vec::new();
-                    bitmap
-                        .serialize_into(&mut buf)
-                        .map_err(|e| format!("Failed to serialize bitmap: {}", e))?;
-                    put_stmt
-                        .execute(params![&token_hash, &buf])
-                        .map_err(|e| format!("Failed to write bitmap row: {}", e))?;
-                }
+                index.remove(&token_hash, &remove_set, &mut stats)?;
             }
         }
 
@@ -4136,6 +4096,16 @@ mod ocr_lifecycle_tests {
 
     #[test]
     fn ocr_delete_queue_drains_readable_rows_and_unblocks_screenshots() {
+        assert_readable_ocr_delete_queue_drains(false);
+    }
+
+    #[test]
+    fn ocr_delete_queue_preserves_other_ids_in_chunked_postings() {
+        assert_readable_ocr_delete_queue_drains(true);
+    }
+
+    fn assert_readable_ocr_delete_queue_drains(chunked: bool) {
+        use super::super::blind_index::{BlindIndex, MutationStats};
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         credential_state.cache_master_key_for_tests(vec![9u8; 32]);
@@ -4166,23 +4136,21 @@ mod ocr_lifecycle_tests {
             .map(|token| StorageState::compute_hmac_hash(&token, &hmac_key))
             .collect();
         assert!(!tokens.is_empty(), "fixture text must produce bigrams");
+        let mut expected: RoaringBitmap = if chunked {
+            (0..70_000).map(|n| n * 37).collect()
+        } else {
+            RoaringBitmap::new()
+        };
+        expected.extend([10, 11]);
+        let tx = connection.unchecked_transaction().unwrap();
         for token_hash in &tokens {
-            // Two postings per token so the row survives as a non-empty bitmap
-            // and the assertion below distinguishes "unlinked" from "dropped".
-            let mut bitmap = RoaringBitmap::new();
-            bitmap.insert(10);
-            bitmap.insert(11);
-            let mut blob = Vec::new();
-            bitmap
-                .serialize_into(&mut blob)
-                .expect("serialize postings");
-            connection
-                .execute(
-                    "INSERT INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
-                    params![token_hash, &blob],
-                )
-                .expect("seed postings");
+            BlindIndex::open(&tx)
+                .unwrap()
+                .replace(token_hash, &expected, &mut MutationStats::default())
+                .unwrap();
         }
+        tx.commit().unwrap();
+        expected.remove(10);
         *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
 
         // The screenshot stays blocked while its OCR row is still present.
@@ -4219,18 +4187,20 @@ mod ocr_lifecycle_tests {
                 0,
                 "the queue row must be cleared so the batch cannot repeat forever"
             );
+            let index = BlindIndex::open(conn).unwrap();
             for token_hash in &tokens {
-                let blob: Vec<u8> = conn
-                    .query_row(
-                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                        params![token_hash],
-                        |row| row.get(0),
-                    )
-                    .expect("postings row survives with its other id");
-                let bitmap =
-                    RoaringBitmap::deserialize_from(&blob[..]).expect("deserialize postings");
-                assert!(!bitmap.contains(10), "deleted row must be unlinked");
-                assert!(bitmap.contains(11), "unrelated posting must survive");
+                let posting = index.read(token_hash, chunked).unwrap().unwrap();
+                assert_eq!(posting.bitmap, expected, "only the deleted row is unlinked");
+                let probe = index
+                    .probe(&[token_hash.clone()])
+                    .unwrap()
+                    .postings
+                    .remove(0);
+                assert_eq!(probe.chunked, chunked);
+                assert_eq!(probe.bytes, expected.serialized_size());
+                if chunked {
+                    assert_eq!(probe.cardinality, Some(expected.len()));
+                }
             }
         }
 

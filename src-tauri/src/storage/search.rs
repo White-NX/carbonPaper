@@ -20,7 +20,9 @@ use crate::credential_manager::decrypt_with_master_key;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use roaring::RoaringBitmap;
-use rusqlite::{params, Connection, OptionalExtension, ToSql};
+#[cfg(test)]
+use rusqlite::OptionalExtension;
+use rusqlite::{params, Connection, ToSql};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -353,9 +355,9 @@ struct HashedGroup {
 }
 
 impl HashedGroup {
-    /// Upper bound on what deserializing this group costs, and the key the
-    /// intersection orders by. Bytes rather than cardinality because SQLite
-    /// can report a blob's length without reading it.
+    /// Canonical full-bitmap bytes, used to order intersections and budget
+    /// recall consistently across storage formats. Chunk headers may add a
+    /// little physical I/O, which is reported separately in SearchCounts.
     fn bytes(&self) -> usize {
         self.present.iter().map(|(_, size)| *size).sum()
     }
@@ -388,49 +390,35 @@ fn plan_groups<'a>(
 /// pass and possibly a third time by the typo-tolerant pass. Reading it once
 /// is the difference between three deserializations and one.
 struct PostingStore<'a> {
-    conn: &'a Connection,
+    index: super::blind_index::BlindIndex<'a>,
+    layouts: HashMap<String, bool>,
     sizes: HashMap<String, usize>,
     cache: HashMap<String, Rc<RoaringBitmap>>,
 }
 
 impl<'a> PostingStore<'a> {
-    fn new(conn: &'a Connection) -> Self {
-        Self {
-            conn,
+    fn new(conn: &'a Connection) -> Result<Self, String> {
+        Ok(Self {
+            index: super::blind_index::BlindIndex::open(conn)?,
+            layouts: HashMap::new(),
             sizes: HashMap::new(),
             cache: HashMap::new(),
-        }
+        })
     }
 
     /// Asks the index which of these hashes exist and how large they are, in
     /// one statement per [`SQL_CHUNK`].
     ///
-    /// `length(postings_blob)` is the point of this: SQLite answers it from
-    /// the record header, so the planner can order its work by posting-list
-    /// size without deserializing — or even transferring — a single bitmap.
+    /// Inline BLOB lengths and chunk directory metrics let the planner order
+    /// work without deserializing or transferring any bitmap payload.
     fn probe(&mut self, hashes: &[String], counts: &mut SearchCounts) -> Result<(), String> {
-        for chunk in hashes.chunks(SQL_CHUNK) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT token_hash, length(postings_blob)
-                   FROM blind_bitmap_index WHERE token_hash IN ({placeholders})"
-            );
-            let params: Vec<&dyn ToSql> = chunk.iter().map(|hash| hash as &dyn ToSql).collect();
-            let mut stmt = self
-                .conn
-                .prepare(&sql)
-                .map_err(|e| format!("Failed to prepare posting probe: {}", e))?;
-            let rows = stmt
-                .query_map(params.as_slice(), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })
-                .map_err(|e| format!("Failed to probe postings: {}", e))?;
-            for (hash, size) in rows.filter_map(Result::ok) {
-                self.sizes.insert(hash, size.max(0) as usize);
-            }
-            counts.probed += chunk.len();
-            counts.statements += 1;
+        let batch = self.index.probe(hashes)?;
+        for posting in batch.postings {
+            self.layouts.insert(posting.hash.clone(), posting.chunked);
+            self.sizes.insert(posting.hash, posting.bytes);
         }
+        counts.probed += hashes.len();
+        counts.statements += batch.statements;
         counts.present = self.sizes.len();
         Ok(())
     }
@@ -467,21 +455,13 @@ impl<'a> PostingStore<'a> {
 
         let mut union = RoaringBitmap::new();
         for (hash, _) in &group.present {
-            let blob: Option<Vec<u8>> = self
-                .conn
-                .query_row(
-                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
-                    params![hash],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| format!("Failed to query bitmap: {}", e))?;
-            let Some(blob) = blob else { continue };
-            counts.loaded += 1;
-            counts.loaded_bytes += blob.len() as u64;
-            let bitmap = RoaringBitmap::deserialize_from(&blob[..])
-                .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
-            union |= bitmap;
+            let hint = self.layouts.get(hash).copied().unwrap_or(false);
+            let Some(posting) = self.index.read(hash, hint)? else {
+                continue;
+            };
+            counts.loaded += posting.fragments;
+            counts.loaded_bytes += posting.bytes as u64;
+            union |= posting.bitmap;
         }
 
         let shared = Rc::new(union);
@@ -1756,7 +1736,7 @@ impl StorageState {
         telemetry: &mut SearchTelemetry,
         watch: &mut Stopwatch,
     ) -> Result<(Vec<Candidate>, Tier), String> {
-        let mut store = PostingStore::new(conn);
+        let mut store = PostingStore::new(conn)?;
         let phrase_planned = plan_groups(&plan.phrase_groups, hmac_key);
         // The flat list is what makes the rarest bigram of *any* keyword
         // narrow the candidates first, instead of each keyword being resolved
@@ -2160,7 +2140,7 @@ mod tests {
 
     fn hashed(conn: &Connection, text: &str, hmac_key: &[u8]) -> Vec<HashedGroup> {
         let planned = plan_groups(&super::super::search_plan::bigram_groups(text), hmac_key);
-        let mut store = PostingStore::new(conn);
+        let mut store = PostingStore::new(conn).unwrap();
         let hashes: Vec<String> = planned
             .iter()
             .flat_map(|group| group.hashes.iter().cloned())
@@ -2169,6 +2149,99 @@ mod tests {
             .probe(&hashes, &mut SearchCounts::default())
             .expect("probe");
         store.resolve(&planned)
+    }
+
+    fn promote_search_fixture(conn: &Connection) {
+        use crate::storage::blind_index::{ensure_schema, BlindIndex, MutationStats};
+        let rows: Vec<(String, Vec<u8>)> = conn
+            .prepare("SELECT token_hash, postings_blob FROM blind_bitmap_index")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        conn.execute_batch("CREATE TABLE app_metadata(key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        ensure_schema(conn).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let index = BlindIndex::open(&tx).unwrap();
+        for (hash, bytes) in rows {
+            let bitmap = RoaringBitmap::deserialize_from(bytes.as_slice()).unwrap();
+            index
+                .replace(&hash, &bitmap, &mut MutationStats::default())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn chunked_postings_preserve_variant_union_strict_and_fuzzy_recall() {
+        let conn = search_fixture();
+        let mut common: Vec<u32> = (0..70_000).map(|n| n * 37).collect();
+        common.extend([7, 9]);
+        let mut planned = Vec::new();
+        for (i, ids) in [
+            common.as_slice(),
+            common.as_slice(),
+            common.as_slice(),
+            common.as_slice(),
+            &[7, 9],
+            &[7],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hash = format!("token-{i}");
+            conn.execute(
+                "INSERT INTO blind_bitmap_index VALUES(?1,?2)",
+                params![&hash, serialize(ids)],
+            )
+            .unwrap();
+            planned.push(PlannedGroup {
+                bigram: hash.clone(),
+                hashes: vec![hash],
+            });
+        }
+        conn.execute(
+            "INSERT INTO blind_bitmap_index VALUES('case-variant',?1)",
+            [serialize(&[11, u32::MAX])],
+        )
+        .unwrap();
+        planned[0].hashes.push("case-variant".into());
+        let hashes: Vec<String> = planned
+            .iter()
+            .flat_map(|g| g.hashes.iter().cloned())
+            .collect();
+        let mut previous = None;
+        for chunked in [false, true] {
+            if chunked {
+                promote_search_fixture(&conn);
+            }
+            let mut counts = SearchCounts::default();
+            let mut store = PostingStore::new(&conn).unwrap();
+            store.probe(&hashes, &mut counts).unwrap();
+            assert_eq!(store.layouts.values().any(|v| *v), chunked);
+            let groups = store.resolve(&planned);
+            let refs: Vec<_> = groups.iter().collect();
+            let strict = intersect_groups(&mut store, &refs, false, &mut counts)
+                .unwrap()
+                .unwrap();
+            assert_eq!(strict.iter().collect::<Vec<_>>(), vec![7]);
+            let (mut hits, checked) = fuzzy_candidates(&mut store, &refs, 1, None, &mut counts)
+                .unwrap()
+                .unwrap();
+            hits.sort_unstable();
+            assert_eq!(hits, vec![(7, 6), (9, 5)]);
+            assert_eq!(checked, 6);
+            let union = store.load(&groups[0], &mut counts).unwrap();
+            assert!(union.contains(11) && union.contains(u32::MAX));
+            let canonical_sizes: Vec<_> = groups.iter().map(HashedGroup::bytes).collect();
+            let result = (canonical_sizes, strict, hits, (*union).clone());
+            if let Some(before) = previous {
+                assert_eq!(result, before);
+            }
+            previous = Some(result);
+        }
     }
 
     #[test]
@@ -2330,7 +2403,7 @@ mod tests {
             "every bigram of the lowercase query should resolve to a posting list"
         );
 
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let refs: Vec<&HashedGroup> = groups.iter().collect();
         let hits = intersect_groups(&mut store, &refs, false, &mut SearchCounts::default())
             .expect("intersect")
@@ -2353,7 +2426,7 @@ mod tests {
             "Degrees of freedom, six of them, before separation",
         );
 
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let phrase = hashed(&conn, "Six Degrees of Separation", hmac_key);
         let refs: Vec<&HashedGroup> = phrase.iter().collect();
         let hits = intersect_groups(&mut store, &refs, false, &mut SearchCounts::default())
@@ -2374,7 +2447,7 @@ mod tests {
             )
             .unwrap();
         }
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let mut counts = SearchCounts::default();
         store
             .probe(&["common".into(), "empty".into()], &mut counts)
@@ -2408,7 +2481,7 @@ mod tests {
     #[test]
     fn a_missing_bigram_is_fatal_only_in_strict_mode() {
         let conn = search_fixture();
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let groups = store.resolve(&[PlannedGroup {
             bigram: "zz".to_string(),
             hashes: vec!["absent".to_string()],
@@ -2459,7 +2532,7 @@ mod tests {
             });
         }
 
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let mut counts = SearchCounts::default();
         let hashes: Vec<String> = planned
             .iter()
@@ -2481,7 +2554,7 @@ mod tests {
     #[test]
     fn the_fuzzy_pass_declines_queries_too_short_to_tolerate_a_typo() {
         let conn = search_fixture();
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let groups = store.resolve(&[PlannedGroup {
             bigram: "ab".to_string(),
             hashes: vec!["absent".to_string()],
@@ -2497,7 +2570,7 @@ mod tests {
     #[test]
     fn the_fuzzy_seed_never_loads_a_posting_list_over_its_byte_budget() {
         let conn = search_fixture();
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let groups: Vec<HashedGroup> = (0..8)
             .map(|index| HashedGroup {
                 bigram: format!("b{index}"),
@@ -2533,28 +2606,44 @@ mod tests {
             )
             .unwrap();
         }
-        let mut store = PostingStore::new(&conn);
-        let mut counts = SearchCounts::default();
-        store
-            .probe(&["a".into(), "b".into(), "c".into()], &mut counts)
+        for chunked in [false, true] {
+            if chunked {
+                promote_search_fixture(&conn);
+            }
+            let mut store = PostingStore::new(&conn).unwrap();
+            let mut counts = SearchCounts::default();
+            store
+                .probe(&["a".into(), "b".into(), "c".into()], &mut counts)
+                .unwrap();
+            let groups = store.resolve(&["a", "b", "c"].map(|key| PlannedGroup {
+                bigram: key.into(),
+                hashes: vec![key.into()],
+            }));
+            assert_eq!(
+                groups.iter().map(HashedGroup::bytes).collect::<Vec<_>>(),
+                vec![small.len(), small.len(), large.len()]
+            );
+            let allowed: RoaringBitmap = [0u32].into_iter().collect();
+            let (hits, _) = fuzzy_candidates(
+                &mut store,
+                &groups.iter().collect::<Vec<_>>(),
+                1,
+                Some(&allowed),
+                &mut counts,
+            )
+            .unwrap()
             .unwrap();
-        let groups = store.resolve(&["a", "b", "c"].map(|key| PlannedGroup {
-            bigram: key.into(),
-            hashes: vec![key.into()],
-        }));
-        let allowed: RoaringBitmap = [0u32].into_iter().collect();
-        let (hits, _) = fuzzy_candidates(
-            &mut store,
-            &groups.iter().collect::<Vec<_>>(),
-            1,
-            Some(&allowed),
-            &mut counts,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(hits.iter().any(|(id, _)| *id == 0));
-        assert_eq!(counts.loaded_bytes, (small.len() * 2) as u64);
-        assert!(counts.loaded_bytes <= FUZZY_LOAD_BYTES);
+            assert!(hits.iter().any(|(id, _)| *id == 0));
+            assert!(store.cache.contains_key("a") && store.cache.contains_key("b"));
+            assert!(
+                !store.cache.contains_key("c"),
+                "both formats must skip the unaffordable third group"
+            );
+            if !chunked {
+                assert_eq!(counts.loaded_bytes, (small.len() * 2) as u64);
+            }
+            assert!(counts.loaded_bytes <= FUZZY_LOAD_BYTES);
+        }
     }
 
     #[test]
@@ -2580,7 +2669,7 @@ mod tests {
         );
 
         let refs: Vec<&HashedGroup> = groups.iter().collect();
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let strict = intersect_groups(&mut store, &refs, true, &mut SearchCounts::default())
             .expect("intersect")
             .expect("every group resolves");
@@ -2618,7 +2707,7 @@ mod tests {
         );
 
         let refs: Vec<&HashedGroup> = groups.iter().collect();
-        let mut store = PostingStore::new(&conn);
+        let mut store = PostingStore::new(&conn).unwrap();
         let (kept, checked) =
             fuzzy_candidates(&mut store, &refs, 2, None, &mut SearchCounts::default())
                 .expect("fuzzy pass")
