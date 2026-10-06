@@ -995,11 +995,11 @@
         "levels": {
           "standard": {
             "title": "Standard Protection",
-            "description": "Filter content that may trigger AI provider review, preventing your account from being flagged or data from being manually reviewed."
+            "description": "Filter the selected categories of explicit content and personal information before sharing screenshot text with AI tools."
           },
           "minimal": {
             "title": "Minimal Filtering",
-            "description": "Only filter content likely to cause API request rejection."
+            "description": "Filter illicit transactions, violent threats and related content while keeping more ordinary discussion."
           },
           "off": {
             "title": "Off",
@@ -1027,11 +1027,11 @@
           }
         },
         "categories": {
-          "cat_01": "Spam / Promotion",
-          "cat_02": "Legal Compliance",
-          "cat_03": "Regional Compliance",
-          "cat_04": "NSFW",
-          "cat_05": "Content That May Trigger Safety Review"
+          "cat_01": "Spam and Promotional Solicitation",
+          "cat_02": "Illicit Transactions and Activities",
+          "cat_03": "Regionally Sensitive Expressions",
+          "cat_04": "Sexually Explicit Content",
+          "cat_05": "Violence, Hate and Harm"
         },
         "pii": {
           "title": "Personal Information Detection",

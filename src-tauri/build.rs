@@ -177,24 +177,51 @@ fn main() {
     );
     println!("cargo:rerun-if-changed=src/ai/tokenizer/LICENSE-CODE");
 
-    // --- 2. 复制 compliance_process 到 pre-bundle ---
-    let cp_source = Path::new("../compliance_process");
+    // --- 2. Bundle only the five reviewed, encrypted dictionaries. ---
+    // Local plaintext and curation artifacts must never enter a release, even
+    // when they are ignored by Git. Also remove leftovers from older builds.
+    let cp_source = Path::new("../compliance_process/dicts");
     let cp_dest = Path::new("pre-bundle/compliance_process");
-    if cp_source.exists() && cp_source.is_dir() {
-        fs::create_dir_all(cp_dest).expect("Failed to create compliance_process dir in pre-bundle");
-        for entry in WalkDir::new(cp_source).into_iter().filter_map(|e| e.ok()) {
-            let src_path = entry.path();
-            let relative = src_path
-                .strip_prefix(cp_source)
+    let dict_names: Vec<String> = (1..=5).map(|i| format!("dict_{i:02}.dict.enc")).collect();
+    for name in &dict_names {
+        assert!(
+            cp_source.join(name).is_file(),
+            "Missing encrypted dictionary: {name}"
+        );
+    }
+    if cp_dest.exists() {
+        let expected =
+            fs::canonicalize(std::env::current_dir().expect("Cannot resolve build directory"))
+                .expect("Cannot canonicalize build directory")
+                .join(cp_dest);
+        assert_eq!(
+            fs::canonicalize(cp_dest).expect("Cannot resolve compliance staging directory"),
+            expected,
+            "Refusing to clean a redirected compliance staging directory"
+        );
+        for entry in WalkDir::new(cp_dest).min_depth(1).contents_first(true) {
+            let entry = entry.expect("Cannot inspect bundled compliance resources");
+            let relative = entry
+                .path()
+                .strip_prefix(cp_dest)
                 .expect("strip_prefix failed");
-            let dest_path = cp_dest.join(relative);
-            if src_path.is_dir() {
-                fs::create_dir_all(&dest_path).expect("Failed to create dir");
-            } else if src_path.is_file() {
-                copy_file_if_needed(src_path, &dest_path);
+            let allowed = dict_names
+                .iter()
+                .any(|name| relative == Path::new("dicts").join(name));
+            if entry.file_type().is_dir() {
+                if relative != Path::new("dicts") {
+                    fs::remove_dir(entry.path()).expect("Cannot remove stale compliance directory");
+                }
+            } else if !allowed || entry.file_type().is_symlink() {
+                fs::remove_file(entry.path())
+                    .expect("Cannot remove unapproved compliance resource");
             }
         }
-        eprintln!("Included compliance_process directory");
+    }
+    let dict_dest = cp_dest.join("dicts");
+    fs::create_dir_all(&dict_dest).expect("Failed to create bundled dictionary directory");
+    for name in &dict_names {
+        copy_file_if_needed(&cp_source.join(name), &dict_dest.join(name));
     }
 
     // --- 3. 复制 browser-extension 目录到 pre-bundle ---
