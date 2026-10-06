@@ -32,6 +32,8 @@ function describeStep(step, t) {
     case 'get_smart_clusters': return t('aiSearch.steps.clusters');
     case 'get_smart_cluster_ocr_corpus':
     case 'get_smart_cluster_summary': return t('aiSearch.steps.cluster_content');
+    case 'get_recap_days': return t('aiSearch.steps.recap_days');
+    case 'get_recap_day': return t('aiSearch.steps.recap_day', { date: args.date ?? '' });
     default: return step.name;
   }
 }
@@ -104,6 +106,7 @@ function stepKind(step) {
   if (['search_ocr_text', 'search_nl'].includes(step.name)) return 'searches';
   if (step.name === 'get_snapshot_details') return 'screenshots';
   if (step.name === 'get_snapshots_by_time_range') return 'records';
+  if (['get_recap_days', 'get_recap_day'].includes(step.name)) return 'recaps';
   return 'archives';
 }
 

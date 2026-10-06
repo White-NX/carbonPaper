@@ -25,6 +25,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_smart_clusters",
     "get_smart_cluster_ocr_corpus",
     "get_smart_cluster_summary",
+    "get_recap_days",
+    "get_recap_day",
     "upsert_smart_cluster_summary",
     "delete_smart_cluster_summary",
 ];
@@ -147,6 +149,33 @@ pub fn tool_definitions() -> Value {
                     "cluster_id": { "type": "integer", "description": "Smart cluster ID" }
                 },
                 "required": ["cluster_id"]
+            }
+        },
+        {
+            "name": "get_recap_days",
+            "description": "List recorded daily recap dates, newest first, from the most recent 730 non-deleted dates. Dates use the user's local calendar (YYYY-MM-DD). A listed date may have pending or stale periods; use get_recap_day to read available content. Does not generate recaps.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "start_date": { "type": "string", "description": "Inclusive local date YYYY-MM-DD" },
+                    "end_date": { "type": "string", "description": "Inclusive local date YYYY-MM-DD" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Pagination offset (default 0)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Max dates (default 30)" }
+                }
+            }
+        },
+        {
+            "name": "get_recap_day",
+            "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is local YYYY-MM-DD; timestamps are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "date": { "type": "string", "description": "Local date YYYY-MM-DD" },
+                    "batch_start_ms": { "type": "integer", "description": "Optional period start from a previous response, in Unix milliseconds" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Activity offset (default 0)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max activities (default 10)" }
+                },
+                "required": ["date"]
             }
         },
         {

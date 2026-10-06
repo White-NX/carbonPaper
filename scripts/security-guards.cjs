@@ -408,6 +408,24 @@ function checkBrowserDialogs() {
   }
 }
 
+function checkRecapToolGuards() {
+  const source = read('src-tauri/src/mcp_server/recap.rs');
+  for (const name of ['tool_get_recap_days', 'tool_get_recap_day']) {
+    const start = source.indexOf(`async fn ${name}(`);
+    const end = source.indexOf('\n}', start);
+    const body = source.slice(start, end);
+    const auth = body.indexOf('require_authenticated_session(app_handle)?');
+    const args = body.indexOf('serde_json::from_value');
+    if (start < 0 || auth < 0 || args < 0 || auth > args) {
+      throw new Error(`${name} must authenticate before processing tool arguments`);
+    }
+  }
+  if (!source.includes('recap::with_current_day(')) {
+    throw new Error('Daily recap tool must retain the session, privacy and revision fence');
+  }
+}
+
+checkRecapToolGuards();
 checkCommandPolicies();
 checkCommandGuardImplementations();
 checkRuntimeControlInvariants();
