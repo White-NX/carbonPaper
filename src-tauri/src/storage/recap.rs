@@ -943,7 +943,10 @@ mod tests {
     #[test]
     fn legacy_privacy_upgrade_preserves_current_payloads_without_reviving_stale_ones() {
         let (_temp, s) = storage();
-        let config = SensitiveFilterConfig::default();
+        let config = SensitiveFilterConfig {
+            version: 2,
+            ..SensitiveFilterConfig::default()
+        };
         let legacy = crate::ai::recap::digest(&serde_json::to_string(&config).unwrap());
         let saved = serde_json::to_value(config).unwrap();
         let reloaded = PrivacyFingerprint::new(serde_json::from_value(saved).unwrap()).unwrap();

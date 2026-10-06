@@ -42,6 +42,17 @@ function controller(overrides = {}) {
 }
 
 describe('AiSearchPanel', () => {
+  it('describes daily recap lookups and groups them separately from archives', () => {
+    const t = (key, options) => `${key}:${options?.date ?? options?.count ?? ''}`;
+    render(<Steps steps={[
+      { id: 'dates', name: 'get_recap_days', status: 'done', itemCount: 2 },
+      { id: 'day', name: 'get_recap_day', arguments: { date: '2026-10-01' }, status: 'done' },
+    ]} running={false} t={t} />);
+    fireEvent.click(screen.getByRole('button', { name: 'aiSearch.steps.recaps:2' }));
+    expect(screen.getByText('aiSearch.steps.recap_days:')).toBeInTheDocument();
+    expect(screen.getByText('aiSearch.steps.recap_day:2026-10-01')).toBeInTheDocument();
+  });
+
   it('renders answer tables with interactive citations and aligned cells', () => {
     const onSelectResult = vi.fn();
     const snapshots = [{ id: 42, window_title: 'Paper' }];

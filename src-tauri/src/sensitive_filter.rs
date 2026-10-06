@@ -34,9 +34,10 @@ const DICT_FILES: &[(&str, &str)] = &[
     ("cat_05", "dict_05.dict.enc"),
 ];
 
-/// Layout version of [`SensitiveFilterConfig`]. Version 2 replaced Presidio
-/// with [`crate::pii`] and made removing the affected OCR segment the default.
-pub const CONFIG_VERSION: u32 = 2;
+/// Policy version of [`SensitiveFilterConfig`]. Version 2 replaced Presidio
+/// with [`crate::pii`]. Version 3 uses curated dictionaries and narrower domains;
+/// advancing the version invalidates recap caches filtered under the old policy.
+pub const CONFIG_VERSION: u32 = 3;
 
 /// What happens to content with a sensitive word or personal information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +507,174 @@ fn decrypt_dict(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<String>, String>
 mod tests {
     use super::*;
 
+    /// Explicit local curation check. Inputs and reports stay outside tracked
+    /// sources, and assertion messages never contain dictionary text.
+    #[test]
+    #[ignore = "requires local dictionary curation artifacts"]
+    fn curated_dictionary_replay() {
+        let private =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.dictionary-cleaning.local");
+        let key: [u8; 32] = Sha256::digest(DICT_KEY_MATERIAL).into();
+        let load = |name: &str| {
+            let state = SensitiveFilterState::default();
+            {
+                let mut lists = state.word_lists.write().unwrap();
+                for (category, file) in DICT_FILES {
+                    let data = std::fs::read(private.join(name).join(file))
+                        .expect("Cannot read local encrypted replay dictionary");
+                    lists.insert(
+                        category.to_string(),
+                        decrypt_dict(&key, &data).expect("Cannot decode local replay dictionary"),
+                    );
+                }
+            }
+            let mut config = state.get_config();
+            config.pii_enabled = false;
+            state.update_config(config);
+            state
+        };
+        let old = load("backup");
+        let new = load("candidate");
+        let case_data =
+            std::fs::read(private.join("replay-cases.json")).expect("Missing local replay cases");
+        let cases: serde_json::Value =
+            serde_json::from_slice(&case_data).expect("Invalid local replay cases");
+        let mut candidate_hash = Sha256::new();
+        for (_, file) in DICT_FILES {
+            candidate_hash.update(file.as_bytes());
+            candidate_hash.update(std::fs::read(private.join("candidate").join(file)).unwrap());
+        }
+        let cases = cases.as_array().expect("Invalid replay case shape");
+        let mut kept_misses = 0;
+        let mut mode_failures = 0;
+        let mut category_failures = 0;
+        let mut by_action: HashMap<String, [usize; 3]> = HashMap::new();
+        for case in cases {
+            let text = case["text"].as_str().expect("Missing replay text");
+            let action = case["action"].as_str().expect("Missing replay action");
+            let hit = new.contains_sensitive(text);
+            let counts = by_action.entry(action.to_string()).or_default();
+            counts[0] += 1;
+            counts[1] += usize::from(old.contains_sensitive(text));
+            counts[2] += usize::from(hit);
+            if case["expected"].as_bool() == Some(true) && !hit {
+                kept_misses += 1;
+            }
+            for mode in [
+                FilterMode::Reject,
+                FilterMode::RemoveParagraph,
+                FilterMode::Mask,
+            ] {
+                let result = crate::mcp_server::filter_identity(&new, mode, text);
+                let valid = match (hit, mode, result) {
+                    (true, FilterMode::Reject, Err(_)) => true,
+                    (true, FilterMode::RemoveParagraph, Ok(value)) => value == "[censored]",
+                    (true, FilterMode::Mask, Ok(value)) => value != text,
+                    (false, _, Ok(value)) => value == text,
+                    _ => false,
+                };
+                mode_failures += usize::from(!valid);
+            }
+        }
+        for category in CATEGORY_IDS {
+            let mut config = new.get_config();
+            for (id, enabled) in &mut config.categories {
+                *enabled = id == category;
+            }
+            new.update_config(config);
+            for case in cases.iter().filter(|case| {
+                case["expected"].as_bool() == Some(true)
+                    && case["category"].as_str() == Some(category)
+            }) {
+                category_failures +=
+                    usize::from(!new.contains_sensitive(case["text"].as_str().unwrap()));
+            }
+        }
+        let mut config = new.get_config();
+        for enabled in config.categories.values_mut() {
+            *enabled = false;
+        }
+        new.update_config(config);
+        for case in cases {
+            category_failures +=
+                usize::from(new.contains_sensitive(case["text"].as_str().unwrap()));
+        }
+        let mut config = new.get_config();
+        for enabled in config.categories.values_mut() {
+            *enabled = true;
+        }
+        new.update_config(config);
+        // Handwritten ordinary text, independent of the model classifications.
+        let benign = [
+            "请在周五之前提交项目报告。",
+            "今天更新了浏览器和操作系统。",
+            "我们讨论了数据库索引和查询性能。",
+            "请打开设置页面调整字体大小。",
+            "这份历史教材介绍了不同地区的文化。",
+            "医生建议保持充足睡眠并定期体检。",
+            "医院正在开展公共卫生知识讲座。",
+            "法律课程讨论合同纠纷的处理流程。",
+            "这篇论文分析了社会调查的数据。",
+            "新闻报道应当核实信息来源。",
+            "儿童健康教育需要家长和学校共同参与。",
+            "图书馆举办了文学作品阅读活动。",
+            "研究人员介绍了人体结构与生理功能。",
+            "我们正在准备国际会议的材料。",
+            "我想了解这本小说的人物关系。",
+            "这个游戏支持多人合作模式。",
+            "请检查网络连接和代理设置。",
+            "照片保存在本地加密数据库中。",
+            "用户可以随时关闭消息通知。",
+            "今年的旅行计划包括参观博物馆。",
+            "天气预报说明天可能下雨。",
+            "我们需要改善搜索结果的相关性。",
+            "应用支持深色模式和快捷键。",
+            "这场讲座介绍了语言学习方法。",
+            "学生正在学习世界地理和历史。",
+            "表格记录了本月的采购数量。",
+            "安全培训介绍了火灾逃生路线。",
+            "请不要将密码写入日志文件。",
+            "系统会在下载完成后显示通知。",
+            "这份指南说明如何恢复备份。",
+            "The className property controls the component style.",
+            "Please review the assessment and update the documentation.",
+            "The password field is empty in this example.",
+            "Use an encrypted database for local screenshot history.",
+            "The medical textbook explains anatomy and public health.",
+            "The newspaper reports on the regional election results.",
+            "A legal researcher is studying historical court decisions.",
+            "The library has a collection of classical literature.",
+            "The user can disable this category in settings.",
+            "The release package contains five encrypted dictionaries.",
+        ];
+        let benign_old_hits = benign
+            .iter()
+            .filter(|text| old.contains_sensitive(text))
+            .count();
+        let benign_new_hits = benign
+            .iter()
+            .filter(|text| new.contains_sensitive(text))
+            .count();
+        let report = serde_json::json!({
+            "candidate_sha256": format!("{:x}", candidate_hash.finalize()),
+            "cases_sha256": format!("{:x}", Sha256::digest(&case_data)),
+            "cases": cases.len(), "by_action_total_old_new": by_action,
+            "kept_misses": kept_misses, "mode_failures": mode_failures,
+            "category_failures": category_failures, "benign_cases": benign.len(),
+            "benign_old_hits": benign_old_hits, "benign_new_hits": benign_new_hits,
+            "limits": "Term replay is a consistency check, not ground truth; the 40 handwritten benign sentences are a small smoke corpus, not a production accuracy estimate. PII is disabled to isolate dictionary behavior."
+        });
+        std::fs::write(
+            private.join("replay-report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .expect("Cannot write local replay report");
+        assert!(
+            kept_misses == 0 && mode_failures == 0 && category_failures == 0,
+            "Local curation replay invariant failed; inspect aggregate report"
+        );
+    }
+
     /// Helper: create a SensitiveFilterState with given words in a single category.
     fn make_state_with_words(words: Vec<&str>) -> SensitiveFilterState {
         let state = SensitiveFilterState::default();
@@ -679,6 +848,26 @@ mod tests {
         assert_eq!(config.mode, "reject");
         assert!(config.pii_entities.is_empty());
         assert_eq!(config.pii_settings(), PiiSettings::new([], false));
+    }
+
+    #[test]
+    fn curated_policy_upgrade_preserves_user_choices() {
+        let config = stored(serde_json::json!({
+            "enabled": false,
+            "categories": { "cat_01": false, "cat_02": true, "cat_03": false },
+            "mode": "reject",
+            "pii_enabled": false,
+            "pii_entities": [],
+            "version": 2,
+        }));
+        assert_eq!(config.version, 3);
+        assert!(!config.enabled);
+        assert!(!config.pii_enabled);
+        assert!(config.pii_entities.is_empty());
+        assert_eq!(config.mode, "reject");
+        assert_eq!(config.categories.get("cat_01"), Some(&false));
+        assert_eq!(config.categories.get("cat_02"), Some(&true));
+        assert_eq!(config.categories.get("cat_03"), Some(&false));
     }
 
     #[test]

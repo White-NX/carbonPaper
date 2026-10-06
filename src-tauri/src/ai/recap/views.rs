@@ -77,6 +77,21 @@ pub fn read_day_view(
     records: bool,
     attempts: bool,
 ) -> Result<serde_json::Value, String> {
+    with_current_day(app, date, |day| {
+        let storage = app.state::<Arc<StorageState>>();
+        day_view(day, records, attempts, |ids| {
+            storage.recap_process_icon(ids)
+        })
+    })
+}
+
+/// Project a corrected day while fencing session, privacy and source changes.
+/// Tool callers use this without loading UI icons or exporting diagnostics.
+pub(crate) fn with_current_day<T>(
+    app: &tauri::AppHandle,
+    date: &str,
+    project: impl FnOnce(RecapDay) -> Result<T, String>,
+) -> Result<T, String> {
     let credentials = app.state::<Arc<CredentialManagerState>>();
     if !credentials.is_session_valid() {
         return Err("AUTH_REQUIRED".into());
@@ -89,9 +104,7 @@ pub fn read_day_view(
     let privacy = privacy_fingerprint(app)?;
     let (start, end) = day_bounds(date)?;
     let (revision, _, _) = storage.recap_day_revision(date, start, end, &privacy)?;
-    let result = day_view(super::read_day(app, date)?, records, attempts, |ids| {
-        storage.recap_process_icon(ids)
-    })?;
+    let result = project(super::read_day(app, date)?)?;
     if !credentials.is_session_valid() {
         return Err("AUTH_REQUIRED".into());
     }

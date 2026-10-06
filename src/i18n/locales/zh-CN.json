@@ -995,11 +995,11 @@
         "levels": {
           "standard": {
             "title": "标准保护",
-            "description": "过滤可能触发 AI 提供商审核的内容，防止账户被标记或数据被人工审查。"
+            "description": "向 AI 工具分享截屏文字前，过滤所选类别中的露骨、敏感表达和个人信息。"
           },
           "minimal": {
             "title": "最小过滤",
-            "description": "仅过滤可能导致 API 请求被拒绝的内容。"
+            "description": "过滤违法交易、暴力威胁等内容，并保留更多普通讨论。"
           },
           "off": {
             "title": "关闭",
@@ -1027,11 +1027,11 @@
           }
         },
         "categories": {
-          "cat_01": "垃圾信息 / 推广",
-          "cat_02": "法律合规",
-          "cat_03": "地区合规",
-          "cat_04": "NSFW 内容",
-          "cat_05": "可能触发安全审查的内容"
+          "cat_01": "垃圾信息与推广招揽",
+          "cat_02": "违法交易与行为",
+          "cat_03": "地区敏感表达",
+          "cat_04": "露骨成人内容",
+          "cat_05": "暴力、仇恨与伤害"
         },
         "pii": {
           "title": "个人信息检测",
@@ -2058,6 +2058,9 @@
       "details": "阅读截图 #{{id}}",
       "clusters": "查看智能归档",
       "cluster_content": "阅读归档内容",
+      "recap_days": "查看每日回顾日期",
+      "recap_day": "阅读 {{date}} 的每日回顾",
+      "recaps": "查看了 {{count}} 次每日回顾",
       "searches": "搜索了 {{count}} 次",
       "screenshots": "阅读了 {{count}} 张截图",
       "records": "浏览了 {{count}} 次记录",

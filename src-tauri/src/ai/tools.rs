@@ -249,6 +249,13 @@ fn fit_to_budget(mut value: Value) -> String {
         let keep = list.len() / 2;
         omitted += list.len() - keep;
         list.truncate(keep);
+        // Paginated tools must resume after the items actually shown to the
+        // model, not after the larger page returned by storage.
+        if value.get("total").and_then(Value::as_u64).is_some() {
+            if let Some(offset) = value.get("offset").and_then(Value::as_u64) {
+                value["next_offset"] = offset.saturating_add(keep as u64).into();
+            }
+        }
         text = value.to_string();
         if text.chars().count() <= MAX_RESULT_CHARS {
             break;
@@ -260,7 +267,7 @@ fn fit_to_budget(mut value: Value) -> String {
     }
     if omitted > 0 {
         return serde_json::json!({
-            "note": format!("{omitted} more items omitted to fit; narrow the query or use offset/limit"),
+            "note": format!("{omitted} more items omitted to fit; use next_offset when present, otherwise narrow the query or use offset/limit"),
             "result": value,
         })
         .to_string();
@@ -289,6 +296,8 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert!(names.contains(&"search_ocr_text".to_string()));
+        assert!(names.contains(&"get_recap_days".to_string()));
+        assert!(names.contains(&"get_recap_day".to_string()));
         assert!(!names.iter().any(|n| mcp_contract::is_write_tool(n)));
     }
 
@@ -344,6 +353,48 @@ mod tests {
         assert!(outcome.content.contains("more items omitted"));
         assert_eq!(outcome.snapshots.len(), 400);
         serde_json::from_str::<Value>(&outcome.content).unwrap();
+    }
+
+    #[test]
+    fn recap_evidence_becomes_clickable_sources_without_confusing_activity_ids() {
+        let outcome = summarize(
+            "get_recap_day",
+            json!({
+                "date": "2026-10-01", "items": [{
+                    "activity_id": "activity-1", "task_id": "task-1",
+                    "sources": [{ "screenshot_id": 42, "timestamp": 1_790_784_000_000_i64,
+                        "process_name": "editor.exe", "window_title": "Release notes" }]
+                }]
+            }),
+        );
+        assert_eq!(ids(&outcome), vec![42]);
+        assert_eq!(
+            outcome.snapshots[0].timestamp,
+            Some(json!(1_790_784_000_000_i64))
+        );
+        assert_eq!(outcome.item_count, Some(1));
+    }
+
+    #[test]
+    fn compacted_recap_pages_resume_after_visible_activities() {
+        let items = (0..50)
+            .map(|i| {
+                json!({
+                    "activity_id": format!("activity-{i}"), "text": "x".repeat(1400)
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcome = summarize(
+            "get_recap_day",
+            json!({
+                "date": "2026-10-01", "offset": 10, "next_offset": null, "total": 60,
+                "items": items,
+            }),
+        );
+        let content: Value = serde_json::from_str(&outcome.content).unwrap();
+        let visible = content["result"]["items"].as_array().unwrap().len();
+        assert!(visible < 50);
+        assert_eq!(content["result"]["next_offset"], 10 + visible);
     }
 
     #[test]

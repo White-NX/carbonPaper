@@ -30,6 +30,9 @@ use crate::storage::{OcrResult, StorageState};
 use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
+mod recap;
+use recap::{tool_get_recap_day, tool_get_recap_days};
+
 // ==================== Default config ====================
 
 const DEFAULT_MCP_PORT: u16 = 23816;
@@ -360,6 +363,8 @@ define_mcp_tool_dispatch!(
     "get_smart_clusters" => tool_get_smart_clusters,
     "get_smart_cluster_ocr_corpus" => tool_get_smart_cluster_ocr_corpus,
     "get_smart_cluster_summary" => tool_get_smart_cluster_summary,
+    "get_recap_days" => tool_get_recap_days,
+    "get_recap_day" => tool_get_recap_day,
     "upsert_smart_cluster_summary" => tool_upsert_smart_cluster_summary,
     "delete_smart_cluster_summary" => tool_delete_smart_cluster_summary,
 );

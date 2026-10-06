@@ -193,6 +193,65 @@
       "name": "get_smart_cluster_summary"
     },
     {
+      "description": "List recorded daily recap dates, newest first, from the most recent 730 non-deleted dates. Dates use the user's local calendar (YYYY-MM-DD). A listed date may have pending or stale periods; use get_recap_day to read available content. Does not generate recaps.",
+      "inputSchema": {
+        "properties": {
+          "end_date": {
+            "description": "Inclusive local date YYYY-MM-DD",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max dates (default 30)",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "description": "Pagination offset (default 0)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_date": {
+            "description": "Inclusive local date YYYY-MM-DD",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_recap_days"
+    },
+    {
+      "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is local YYYY-MM-DD; timestamps are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details.",
+      "inputSchema": {
+        "properties": {
+          "batch_start_ms": {
+            "description": "Optional period start from a previous response, in Unix milliseconds",
+            "type": "integer"
+          },
+          "date": {
+            "description": "Local date YYYY-MM-DD",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max activities (default 10)",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "description": "Activity offset (default 0)",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "date"
+        ],
+        "type": "object"
+      },
+      "name": "get_recap_day"
+    },
+    {
       "description": "Create or replace the stored AI-generated title, cluster overview, OCR summary, key points, evidence, and model metadata for a smart cluster.",
       "inputSchema": {
         "properties": {

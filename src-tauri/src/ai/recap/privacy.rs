@@ -107,7 +107,10 @@ mod tests {
 
     #[test]
     fn equivalent_policy_reloads_have_one_fingerprint_and_match_old_hashes() {
-        let config = SensitiveFilterConfig::default();
+        let config = SensitiveFilterConfig {
+            version: 2,
+            ..SensitiveFilterConfig::default()
+        };
         let saved = serde_json::to_value(&config).unwrap();
         let expected = PrivacyFingerprint::new(config).unwrap();
         for _ in 0..64 {
@@ -117,6 +120,19 @@ mod tests {
             assert_eq!(expected.as_str(), actual.as_str());
             assert!(expected.matches_legacy(&old_hash).unwrap());
         }
+    }
+
+    #[test]
+    fn curated_dictionary_policy_does_not_reuse_previous_summaries() {
+        let previous = SensitiveFilterConfig {
+            version: 2,
+            ..SensitiveFilterConfig::default()
+        };
+        let old_hash = digest(&serde_json::to_string(&previous).unwrap());
+        let old = PrivacyFingerprint::new(previous).unwrap();
+        let current = PrivacyFingerprint::new(SensitiveFilterConfig::default()).unwrap();
+        assert_ne!(old.as_str(), current.as_str());
+        assert!(!current.matches_legacy(&old_hash).unwrap());
     }
 
     #[test]
