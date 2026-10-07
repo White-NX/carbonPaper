@@ -1,4 +1,7 @@
 {
+  "mainPreview": {
+    "emptyHint": "选择上方时间轴中的截图，或搜索历史内容"
+  },
   "recap": {
     "delete": "删除回顾",
     "deleteTitle": "删除当天的回顾？",
@@ -1384,7 +1387,7 @@
   },
   "snapshotPreview": {
     "windowTitle": "快照预览",
-    "nativeWindowTitle": "Carbonpaper 快照预览",
+    "nativeWindowTitle": "CarbonPaper 快照预览",
     "snapshotWithId": "快照 {{id}}",
     "openWindow": "打开独立预览窗口",
     "clearTabs": "清空预览标签",

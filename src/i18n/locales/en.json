@@ -1,4 +1,7 @@
 {
+  "mainPreview": {
+    "emptyHint": "Select a screenshot from the timeline above, or search your history."
+  },
   "recap": {
     "delete": "Delete recap",
     "deleteTitle": "Delete this day's recap?",
@@ -1384,7 +1387,7 @@
   },
   "snapshotPreview": {
     "windowTitle": "Snapshot Preview",
-    "nativeWindowTitle": "Carbonpaper Snapshot Preview",
+    "nativeWindowTitle": "CarbonPaper Snapshot Preview",
     "snapshotWithId": "Snapshot {{id}}",
     "openWindow": "Open snapshot preview window",
     "clearTabs": "Clear preview tabs",

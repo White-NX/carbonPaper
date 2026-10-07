@@ -11,6 +11,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
 import PreviewActionBar from './PreviewActionBar';
+import EmptyPreview from './EmptyPreview';
 import {
   getSnapshotPreviewKey,
   normalizeSnapshotPreviewItem,
@@ -318,8 +319,6 @@ export default function MainArea({
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={`${activeTab === 'preview' ? 'flex' : 'hidden'} main-preview-surface flex-1 items-center justify-center overflow-hidden relative min-w-0 min-h-0`}>
           <div className="pointer-events-none absolute inset-0" aria-hidden="true">
-            <div className="main-preview-orb main-preview-orb--a" />
-            <div className="main-preview-orb main-preview-orb--b" />
             <div className="main-preview-grid" />
           </div>
 
@@ -349,12 +348,7 @@ export default function MainArea({
           )}
 
           {!selectedEvent && !selectedImageSrc && !isLoadingDetails && (
-            <div className="pointer-events-none absolute left-8 bottom-10 text-left select-none">
-              <div className="text-ide-text opacity-85 text-[clamp(4.2rem,7vw,5.8rem)] leading-none font-black tracking-tight">Carbonpaper</div>
-              <div className="mt-1.5 text-base md:text-lg font-medium text-ide-muted mx-3">
-                Under <span className="font-semibold text-ide-text opacity-90">GPL-3</span> Licence
-              </div>
-            </div>
+            <EmptyPreview />
           )}
 
           {/* Preview Action Bar */}
