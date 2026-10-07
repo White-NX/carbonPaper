@@ -3,7 +3,7 @@ import { Moon, Sun, Settings, Bell, Minus, Square, X, Copy, Loader2 } from 'luci
 import { useTranslation } from 'react-i18next';
 import { SearchBox } from './SearchBox';
 import { APP_VERSION } from '../lib/version';
-import appMark from '../assets/carbonpaper-mark.svg';
+import BrandMark from './BrandMark';
 
 function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, handlePauseMonitor, handleResumeMonitor, locked }) {
   const { t } = useTranslation();
@@ -75,16 +75,9 @@ export default function TopBar({
   return (
     <header data-tauri-drag-region className="h-11 flex items-center justify-between px-4 shrink-0 select-none">
       <div className="flex items-center gap-4 pointer-events-none">
-        <div className="flex items-center gap-2 text-ide-accent">
-          <span
-            aria-hidden="true"
-            className="w-5 h-5 shrink-0 bg-current text-ide-muted"
-            style={{
-              mask: `url("${appMark}") center / contain no-repeat`,
-              WebkitMask: `url("${appMark}") center / contain no-repeat`,
-            }}
-          />
-          <span className="font-bold tracking-tight">Carbonpaper</span>
+        <div className="flex items-center gap-2 text-ide-text">
+          <BrandMark className="w-5 h-5 text-ide-muted" />
+          <span className="font-semibold tracking-tight">CarbonPaper</span>
         </div>
         <span className="px-3 py-1 rounded-full border border-ide-border text-xs font-mono text-ide-muted">
           {APP_VERSION}
