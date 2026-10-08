@@ -1,3 +1,8 @@
+; beforeBundleCommand creates the manifest files before Tauri discovers resources.
+; Tauri then patches carbonpaper.exe with the NSIS bundle type. Re-sign at
+; compile time, before any File instruction captures the final runtime bytes.
+!system 'node "${__FILEDIR__}\..\scripts\sign-protected-runtime.mjs"' = 0
+
 !macro NSIS_HOOK_POSTINSTALL
   ; Files that releases with the Python monitor installed. An upgrade only
   ; overwrites what the new bundle carries, so these would otherwise stay.

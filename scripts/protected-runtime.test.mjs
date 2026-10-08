@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -23,7 +24,7 @@ function testPe(importedDll = 'kernel32.dll') {
 
 async function fixture(t) {
   const parent = realpathSync(os.tmpdir());
-  const root = mkdtempSync(path.join(parent, 'carbonpaper-runtime-test-'));
+  const root = mkdtempSync(path.join(parent, 'carbonpaper-runtime-test-with spaces-'));
   t.after(() => {
     const resolved = realpathSync(root);
     assert.equal(path.dirname(resolved), parent);
@@ -56,8 +57,88 @@ async function fixture(t) {
     writeFileSync(path.join(packaged, manifestName), bytes);
     writeFileSync(path.join(packaged, signatureName), sign(null, Buffer.concat([context, bytes]), privateKey).toString('base64'));
   };
-  return { root, prebundle, packaged, signingKey, trustedKey, manifest, resign };
+  return { root, prebundle, release, packaged, signingKey, trustedKey, manifest, resign };
 }
+
+function stageSigningScripts(root) {
+  const scripts = path.join(root, 'scripts');
+  mkdirSync(scripts);
+  for (const name of ['sign-protected-runtime.mjs', 'protected-runtime.mjs', 'privileged-imports.mjs']) {
+    cpSync(new URL(name, import.meta.url), path.join(scripts, name));
+  }
+  cpSync(new URL('../src-tauri/nsis_hooks.nsh', import.meta.url), path.join(root, 'src-tauri', 'nsis_hooks.nsh'));
+  return path.join(scripts, 'sign-protected-runtime.mjs');
+}
+
+test('the signing entry point works from the NSIS compiler directory', async (t) => {
+  const f = await fixture(t);
+  const script = stageSigningScripts(f.root);
+  const compilerDirectory = path.join(f.release, 'nsis', 'x64');
+  mkdirSync(compilerDirectory, { recursive: true });
+  const result = spawnSync(process.execPath, [script], {
+    cwd: compilerDirectory,
+    env: { ...process.env, CARBONPAPER_UPDATE_SIGNING_KEY: f.signingKey },
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  cpSync(f.prebundle, f.packaged, { recursive: true });
+  assert.deepEqual(await verifyProtectedRuntime(f.packaged, f.trustedKey), f.manifest);
+});
+
+const nsisCompiler = process.platform === 'win32' && [
+  process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'tauri', 'NSIS', 'makensis.exe'),
+  process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'NSIS', 'makensis.exe'),
+  process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'NSIS', 'makensis.exe'),
+].find(candidate => candidate && existsSync(candidate));
+const canExtractNsis = nsisCompiler && spawnSync('7z', ['i'], { stdio: 'ignore', windowsHide: true }).status === 0;
+
+test('NSIS packages a fresh signature after Tauri patches the executable and aborts if signing fails', {
+  skip: canExtractNsis ? false : 'Requires Windows with NSIS and 7-Zip',
+}, async (t) => {
+  const f = await fixture(t);
+  stageSigningScripts(f.root);
+  const main = path.join(f.release, 'carbonpaper.exe');
+  writeFileSync(main, 'synthetic executable after the Tauri NSIS bundle-type patch');
+  cpSync(main, path.join(f.packaged, 'carbonpaper.exe'));
+  await assert.rejects(verifyProtectedRuntime(f.packaged, f.trustedKey), /checksum mismatch: carbonpaper\.exe/);
+
+  const compilerDirectory = path.join(f.release, 'nsis', 'x64');
+  mkdirSync(compilerDirectory, { recursive: true });
+  const installer = path.join(compilerDirectory, 'runtime.exe');
+  const script = path.join(compilerDirectory, 'installer.nsi');
+  writeFileSync(script, [
+    'Unicode true',
+    `!include "${path.join(f.root, 'src-tauri', 'nsis_hooks.nsh')}"`,
+    'Name "Protected runtime regression"',
+    `OutFile "${installer}"`,
+    'RequestExecutionLevel user',
+    'SetCompressor /SOLID lzma',
+    'Section',
+    'SetOutPath $INSTDIR',
+    ...binaries.map(name => `File "${path.join(f.release, name)}"`),
+    `File /r "${f.prebundle}\\*"`,
+    'SectionEnd',
+    '',
+  ].join('\n'));
+  const compile = signingKey => spawnSync(nsisCompiler, ['/V2', script], {
+    cwd: compilerDirectory,
+    env: { ...process.env, CARBONPAPER_UPDATE_SIGNING_KEY: signingKey },
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  const built = compile(f.signingKey);
+  assert.equal(built.status, 0, built.stdout + built.stderr);
+  const extracted = path.join(f.root, 'extracted installer');
+  const extraction = spawnSync('7z', ['x', installer, `-o${extracted}`, '-y'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(extraction.status, 0, extraction.stdout + extraction.stderr);
+  const verified = await verifyProtectedRuntime(extracted, f.trustedKey);
+  assert.notEqual(verified.files['carbonpaper.exe'], f.manifest.files['carbonpaper.exe']);
+
+  const missingKey = compile('');
+  assert.notEqual(missingKey.status, 0);
+  assert.match(missingKey.stdout + missingKey.stderr, /CARBONPAPER_UPDATE_SIGNING_KEY is required/);
+});
 
 test('final packaged binaries and nested resources verify with the release key', async (t) => {
   const f = await fixture(t);

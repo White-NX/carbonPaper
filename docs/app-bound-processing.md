@@ -441,8 +441,13 @@ in-process broker with temporary storage. Neither adds a developer-path or
 environment-key override to production authorization. Signature tests generate
 ephemeral keys inside their fixtures and do not replace the release public key.
 
-The release pipeline builds both helpers before Tauri bundling. `beforeBundleCommand` signs the final binary/resource manifest;
-the portable packer signs its final files as well. Signing requires the existing
+The release pipeline builds both helpers before Tauri bundling. `beforeBundleCommand`
+creates the signed manifest files before Tauri discovers bundle resources. Tauri then
+patches the main executable with its bundle type, so [the NSIS hook](../src-tauri/nsis_hooks.nsh)
+re-signs the final binary/resource manifest at installer compile time, before NSIS
+packs the files. The signing entry point resolves the repository from its own location
+because the NSIS compiler runs from its output directory. The portable packer signs
+its final files as well. Signing requires the existing
 base64 PEM `CARBONPAPER_UPDATE_SIGNING_KEY` and checks that its public key matches
 the application. Missing or mismatched keys fail packaging.
 
