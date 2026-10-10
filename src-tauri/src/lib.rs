@@ -49,6 +49,7 @@ mod ml_runtime;
 mod model_management;
 mod monitor;
 mod native_messaging;
+mod nmh_protocol;
 mod office_protocol;
 mod office_runtime;
 mod office_window;
@@ -56,6 +57,7 @@ mod onboarding;
 mod pii;
 mod power;
 mod processing_stage;
+mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
 mod registry_config;
 mod rerank;
@@ -596,7 +598,8 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let _ = monitor::control(&app_handle, monitor::MonitorAction::TogglePause).await;
+                    let _ =
+                        monitor::control(&app_handle, monitor::MonitorAction::TogglePause).await;
                 });
             }
             MENU_ID_RESTART => {

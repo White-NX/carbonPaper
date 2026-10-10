@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
-pub const IPC_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-
 pub async fn read_ipc_frame(server: &mut NamedPipeServer) -> Result<Vec<u8>, String> {
     let mut first = [0u8; 4];
     match tokio::time::timeout(
@@ -21,36 +18,23 @@ pub async fn read_ipc_frame(server: &mut NamedPipeServer) -> Result<Vec<u8>, Str
         Err(_) => return Err("overall_timeout".to_string()),
     }
 
-    let len = u32::from_le_bytes(first) as usize;
-    if len > 0 && len <= IPC_MAX_MESSAGE_BYTES {
-        let mut body = vec![0u8; len];
-        tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            server.read_exact(&mut body),
-        )
-        .await
-        .map_err(|_| "overall_timeout".to_string())?
-        .map_err(|e| format!("read_body_error:{}", e))?;
-        return Ok(body);
-    }
-
-    Err(format!(
-        "Invalid IPC v{} frame length: {} (max {})",
-        IPC_PROTOCOL_VERSION, len, IPC_MAX_MESSAGE_BYTES
-    ))
+    let len = crate::nmh_protocol::frame_length(first).map_err(|error| error.to_string())?;
+    let mut body = vec![0u8; len];
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        server.read_exact(&mut body),
+    )
+    .await
+    .map_err(|_| "overall_timeout".to_string())?
+    .map_err(|e| format!("read_body_error:{}", e))?;
+    Ok(body)
 }
 
 pub async fn write_ipc_frame(server: &mut NamedPipeServer, body: &[u8]) -> Result<(), String> {
-    if body.len() > IPC_MAX_MESSAGE_BYTES {
-        return Err(format!(
-            "Response too large: {} bytes (max {})",
-            body.len(),
-            IPC_MAX_MESSAGE_BYTES
-        ));
-    }
-    let len = body.len() as u32;
+    let prefix =
+        crate::nmh_protocol::frame_prefix(body.len()).map_err(|error| error.to_string())?;
     server
-        .write_all(&len.to_le_bytes())
+        .write_all(&prefix)
         .await
         .map_err(|e| format!("write_prefix_error:{}", e))?;
     server

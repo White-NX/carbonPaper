@@ -74,6 +74,8 @@ function rootInputFiles() {
     path.join(tauriDir, 'src', 'office_protocol.rs'),
     path.join(tauriDir, 'src', 'office_window.rs'),
     path.join(tauriDir, 'src', 'bin', 'nmh.rs'),
+    path.join(tauriDir, 'src', 'nmh_protocol.rs'),
+    path.join(tauriDir, 'src', 'windows_platform.rs'),
     ...walkRustFiles(path.join(tauriDir, 'app-bound', 'src')),
     path.join(tauriDir, 'app-bound', 'Cargo.toml'),
     path.join(tauriDir, 'app-bound', 'build.rs'),
