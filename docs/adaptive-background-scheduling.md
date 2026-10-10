@@ -134,11 +134,12 @@ The performance probe uses the packaged ONNX runtime and installed model files,
 synthetic inputs, a 5% native Job Object quota, 20 warm samples and three cold
 loads per model. It tests cancellation followed by a different request ID,
 compares native text-input/scroll dispatch with and without B, and records a
-separate 1% CPU experiment. It writes only a local JSON report:
+separate 1% CPU experiment. This optional development tool uses a standalone
+Python 3 installation to drive the Rust worker and writes a local JSON report:
 
 ```powershell
 npm run build:semantic-ml:release
-C:\Users\24540\AppData\Local\carbonpaper\.venv\Scripts\python.exe tools/measure-adaptive-background.py
+py -3 tools/measure-adaptive-background.py
 ```
 
 The UI probe covers a hidden Windows RichTextBox's input, layout, scrolling and
