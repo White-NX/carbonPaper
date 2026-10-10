@@ -248,34 +248,23 @@ pub async fn monitor_search_nl(
     _fuzzy: Option<bool>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
-    let limit = limit.unwrap_or(20).min(crate::clip_query::MAX_CLIP_RESULTS);
-    let offset = offset.unwrap_or(0).min(crate::clip_query::MAX_CLIP_OFFSET);
     let process_names = process_names.unwrap_or_default();
 
     // `fuzzy` is retained in the command contract but does not apply to
     // text-to-image similarity.
-    match crate::clip_query::try_rust_clip_query(
+    let results = crate::clip_query::search(
         &app,
-        crate::clip_query::ClipQueryRequest {
-            query: &query,
-            limit,
-            offset,
-            process_names: &process_names,
+        crate::clip_query::ClipQueryRequest::new(
+            &query,
+            limit.map(u64::from),
+            offset.map(u64::from),
+            &process_names,
             start_time,
             end_time,
-        },
+        ),
     )
-    .await
-    {
-        crate::clip_query::ClipQueryOutcome::Served(results) => Ok(serde_json::json!({
-            "status": "success",
-            "results": results,
-            "backend": "rust",
-        })),
-        crate::clip_query::ClipQueryOutcome::Unavailable(reason) => {
-            Err(format!("CLIP search unavailable: {reason}"))
-        }
-    }
+    .await?;
+    Ok(serde_json::json!({ "status": "success", "results": results, "backend": "rust" }))
 }
 
 #[tauri::command]

@@ -152,11 +152,9 @@ struct McpServerInner {
 
 fn require_authenticated_session(app_handle: &tauri::AppHandle) -> Result<(), String> {
     let credential_state = app_handle.state::<Arc<CredentialManagerState>>();
-    if credential_state.is_session_valid() {
-        Ok(())
-    } else {
-        Err("AUTH_REQUIRED: CarbonPaper is locked. User needs to complete CNG authentication in the app before you retrying this MCP request.".to_string())
-    }
+    crate::commands::check_auth_required(&credential_state).map_err(|_| {
+        "AUTH_REQUIRED: CarbonPaper is locked. User needs to complete CNG authentication in the app before retrying this MCP request.".to_string()
+    })
 }
 
 // ==================== JSON-RPC types ====================
@@ -1172,16 +1170,8 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
         .and_then(Value::as_str)
         .ok_or("Missing required parameter: query")?
         .to_string();
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(20)
-        .min(u64::from(crate::clip_query::MAX_CLIP_RESULTS)) as u32;
-    let offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(u64::from(crate::clip_query::MAX_CLIP_OFFSET)) as u32;
+    let limit = args.get("limit").and_then(Value::as_u64);
+    let offset = args.get("offset").and_then(Value::as_u64);
     let process_names: Vec<String> = args
         .get("process_names")
         .and_then(Value::as_array)
@@ -1202,25 +1192,18 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
         .map(crate::mcp_contract::timestamp_seconds);
 
     // Use the same Rust CLIP path as the application search surface.
-    let rust = crate::clip_query::try_rust_clip_query(
+    let items = crate::clip_query::search(
         app_handle,
-        crate::clip_query::ClipQueryRequest {
-            query: &query,
+        crate::clip_query::ClipQueryRequest::new(
+            &query,
             limit,
             offset,
-            process_names: &process_names,
+            &process_names,
             start_time,
             end_time,
-        },
+        ),
     )
-    .await;
-
-    let items = match rust {
-        crate::clip_query::ClipQueryOutcome::Served(results) => results,
-        crate::clip_query::ClipQueryOutcome::Unavailable(reason) => {
-            return Err(format!("CLIP search unavailable: {reason}"));
-        }
-    };
+    .await?;
 
     let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let mode = filter.mode();

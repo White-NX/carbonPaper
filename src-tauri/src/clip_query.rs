@@ -227,23 +227,51 @@ pub enum ClipQueryOutcome {
 /// One `search_nl` request, in the shape the Tauri command and the MCP tool
 /// both already speak.
 pub struct ClipQueryRequest<'a> {
-    pub query: &'a str,
-    pub limit: u32,
-    pub offset: u32,
-    pub process_names: &'a [String],
+    query: &'a str,
+    limit: u32,
+    offset: u32,
+    process_names: &'a [String],
     /// Unix seconds, inclusive.
-    pub start_time: Option<f64>,
-    pub end_time: Option<f64>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+}
+
+impl<'a> ClipQueryRequest<'a> {
+    pub fn new(
+        query: &'a str,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        process_names: &'a [String],
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+    ) -> Self {
+        Self {
+            query,
+            limit: limit.unwrap_or(20).clamp(1, u64::from(MAX_CLIP_RESULTS)) as u32,
+            offset: offset.unwrap_or(0).min(u64::from(MAX_CLIP_OFFSET)) as u32,
+            process_names,
+            start_time,
+            end_time,
+        }
+    }
+}
+
+/// Shared search behavior; adapters own transport formats and privacy filtering.
+pub async fn search(
+    app: &AppHandle,
+    request: ClipQueryRequest<'_>,
+) -> Result<Vec<serde_json::Value>, String> {
+    match try_rust_clip_query(app, request).await {
+        ClipQueryOutcome::Served(results) => Ok(results),
+        ClipQueryOutcome::Unavailable(reason) => Err(format!("CLIP search unavailable: {reason}")),
+    }
 }
 
 /// Offer one natural-language image query to the Rust CLIP index.
 ///
 /// Anything that stops Rust answering becomes `Unavailable` with a specific
 /// model, migration, or index reason.
-pub async fn try_rust_clip_query(
-    app: &AppHandle,
-    request: ClipQueryRequest<'_>,
-) -> ClipQueryOutcome {
+async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> ClipQueryOutcome {
     let trimmed = request.query.trim();
     if trimmed.is_empty() {
         observe_served();
@@ -934,5 +962,13 @@ mod tests {
         assert_eq!(bounded_clip_offset(9_999), 9_999);
         assert_eq!(bounded_clip_offset(10_000), 10_000);
         assert_eq!(bounded_clip_offset(10_001), 10_000);
+        let defaults = ClipQueryRequest::new("query", None, None, &[], None, None);
+        assert_eq!((defaults.limit, defaults.offset), (20, 0));
+        let bounded =
+            ClipQueryRequest::new("query", Some(u64::MAX), Some(u64::MAX), &[], None, None);
+        assert_eq!(
+            (bounded.limit, bounded.offset),
+            (MAX_CLIP_RESULTS, MAX_CLIP_OFFSET)
+        );
     }
 }
