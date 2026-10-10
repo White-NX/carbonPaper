@@ -16,13 +16,13 @@ export default function ModelInventoryTable({
       <div className="flex items-center justify-between px-1">
         <label className="text-sm font-semibold text-ide-accent flex items-center gap-2">
           <Database className="w-4 h-4" />
-          {t('settings.features.models.title', '模型管理')}
+          {t('settings.features.models.title')}
         </label>
         <button
           onClick={onRefresh}
           disabled={modelsLoading}
           className="p-1 text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          title={t('settings.features.models.refresh', '刷新')}
+          title={t('settings.features.models.refresh')}
         >
           <RefreshCw className={`w-4 h-4 ${modelsLoading ? 'animate-spin' : ''}`} />
         </button>
@@ -32,10 +32,10 @@ export default function ModelInventoryTable({
         <table className="w-full text-xs">
           <thead className="bg-ide-panel">
             <tr>
-              <th className="px-3 py-2 text-left font-medium text-ide-text whitespace-nowrap">{t('settings.features.models.name', '模型')}</th>
-              <th className="px-3 py-2 text-left font-medium text-ide-text whitespace-nowrap">{t('settings.features.models.purpose', '用途')}</th>
-              <th className="px-3 py-2 text-left font-medium text-ide-text whitespace-nowrap">{t('settings.features.models.size', '大小')}</th>
-              <th className="px-3 py-2 text-left font-medium text-ide-text">{t('settings.features.models.location', '位置')}</th>
+              <th className="px-3 py-2 text-left font-medium text-ide-text whitespace-nowrap">{t('settings.features.models.name')}</th>
+              <th className="px-3 py-2 text-left font-medium text-ide-text whitespace-nowrap">{t('settings.features.models.purpose')}</th>
+              <th className="px-3 py-2 text-left font-medium text-ide-text whitespace-nowrap">{t('settings.features.models.size')}</th>
+              <th className="px-3 py-2 text-left font-medium text-ide-text">{t('settings.features.models.location')}</th>
             </tr>
           </thead>
           <tbody>
@@ -68,7 +68,7 @@ export default function ModelInventoryTable({
             ) : (
               <tr>
                 <td colSpan="4" className="px-4 py-6 text-center text-ide-muted text-sm">
-                  {t('settings.features.models.empty', '暂无模型数据')}
+                  {t('settings.features.models.empty')}
                 </td>
               </tr>
             )}

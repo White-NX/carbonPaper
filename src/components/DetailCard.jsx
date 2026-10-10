@@ -226,7 +226,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
           {/* Category */}
           <div>
-            <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category', '分类')}</label>
+            <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category')}</label>
             <div className="mt-1">
               {editingCategory ? (
                 <div className="space-y-1 max-h-32 overflow-y-auto">
@@ -257,7 +257,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
                       {currentCategory}
                     </span>
                   ) : (
-                    <span className="text-ide-muted">{t('sidebar.labels.uncategorized', '未分类')}</span>
+                    <span className="text-ide-muted">{t('sidebar.labels.uncategorized')}</span>
                   )}
                 </button>
               )}

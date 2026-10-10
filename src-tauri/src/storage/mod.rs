@@ -44,9 +44,7 @@ pub use derived_migration::*;
 pub use document_ref::STALE_DOCUMENT_REF_GENERATION;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
-pub(crate) use mode::{
-    database_mode_policy_from_environment, DatabaseModeEligibility, DatabaseModeMetadata,
-};
+pub(crate) use mode::database_mode_policy_from_environment;
 pub(crate) use policy::disk_totals_for_path;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
@@ -98,7 +96,6 @@ pub struct StorageState {
     initialized: Mutex<bool>,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
-    hmac_migration_cancel_requested: AtomicBool,
     hmac_migration_in_progress: AtomicBool,
     lazy_indexer_shutdown: AtomicBool,
     /// Diagnostic: tracks which operation currently holds the DB mutex
@@ -231,7 +228,6 @@ impl StorageState {
             initialized: Mutex::new(false),
             migration_cancel_requested: AtomicBool::new(false),
             migration_in_progress: AtomicBool::new(false),
-            hmac_migration_cancel_requested: AtomicBool::new(false),
             hmac_migration_in_progress: AtomicBool::new(false),
             lazy_indexer_shutdown: AtomicBool::new(false),
             lock_holder: Mutex::new(""),
@@ -291,13 +287,6 @@ impl StorageState {
         self.migration_in_progress.load(Ordering::SeqCst)
     }
 
-    /// Request cancellation of an ongoing HMAC migration.
-    pub fn request_hmac_migration_cancel(&self) -> bool {
-        self.hmac_migration_cancel_requested
-            .store(true, Ordering::SeqCst);
-        self.hmac_migration_in_progress.load(Ordering::SeqCst)
-    }
-
     pub fn is_migration_in_progress(&self) -> bool {
         self.migration_in_progress.load(Ordering::SeqCst)
     }
@@ -308,10 +297,6 @@ impl StorageState {
 
     pub fn is_hmac_migration_in_progress(&self) -> bool {
         self.hmac_migration_in_progress.load(Ordering::SeqCst)
-    }
-
-    pub fn is_hmac_migration_cancel_requested(&self) -> bool {
-        self.hmac_migration_cancel_requested.load(Ordering::SeqCst)
     }
 
     pub fn is_startup_vacuum_in_progress(&self) -> bool {
@@ -623,16 +608,13 @@ mod tests {
             policy,
         ));
         storage.initialize().expect("initialize encrypted storage");
-        assert_eq!(
-            storage
-                .database_mode_metadata()
-                .unwrap()
-                .actual_journal_mode,
-            policy.as_str()
-        );
         {
             let guard = storage.get_connection_named("seed_read_fixture").unwrap();
             let conn = guard.as_ref().unwrap();
+            assert_eq!(
+                connection::inspect_connection(conn).unwrap().journal_mode,
+                policy.as_str()
+            );
             conn.execute_batch(
                 "INSERT INTO screenshots
                     (id, image_path, image_hash, process_name, created_at, is_deleted)

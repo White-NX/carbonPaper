@@ -43,7 +43,6 @@ mod mcp_token;
 mod minilm_contract;
 mod minilm_index;
 #[allow(dead_code)]
-mod ml_contracts;
 #[allow(dead_code)]
 mod ml_protocol;
 mod ml_runtime;
@@ -1222,7 +1221,6 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::utility::close_process,
             commands::utility::set_app_language,
             monitor::start_monitor,
             monitor::get_monitor_autostart,
@@ -1249,7 +1247,6 @@ pub fn run() {
             office_runtime::office_resume_document,
             semantic_runtime::get_ml_semantic_status,
             semantic_runtime::get_background_index_progress,
-            semantic_runtime::restart_ml_semantic_worker,
             minilm_index::semantic_index_run_now,
             minilm_index::semantic_index_stop_now,
             clip_index::clip_index_run_now,
@@ -1286,13 +1283,9 @@ pub fn run() {
             commands::storage::storage_soft_delete_screenshots,
             commands::storage::storage_get_delete_queue_status,
             commands::storage::storage_get_index_health,
-            commands::storage::storage_save_screenshot,
             commands::storage::storage_set_policy,
             commands::storage::storage_get_policy,
-            commands::storage::storage_get_public_key,
             commands::storage::storage_compute_link_scores,
-            commands::storage::storage_encrypt_for_chromadb,
-            commands::storage::storage_decrypt_from_chromadb,
             commands::storage::storage_update_category,
             commands::storage::storage_get_categories_from_db,
             commands::storage::storage_batch_get_categories,
@@ -1302,12 +1295,8 @@ pub fn run() {
             commands::migration::storage_run_manual_vacuum,
             commands::migration::storage_check_hmac_migration_status,
             commands::migration::storage_run_hmac_migration,
-            commands::migration::storage_hmac_migration_cancel,
             commands::migration::storage_export_backup,
             commands::migration::storage_import_backup,
-            commands::database_mode::storage_get_database_mode_metadata,
-            commands::database_mode::storage_check_database_mode_eligibility,
-            commands::database_mode::storage_transition_wal_to_delete,
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::ai::ai_get_settings,
@@ -1334,8 +1323,6 @@ pub fn run() {
             commands::mcp::mcp_ack_privacy_warning,
             commands::mcp::mcp_reset_token,
             commands::mcp::mcp_copy_token_to_clipboard,
-            commands::mcp::mcp_get_port,
-            commands::mcp::mcp_set_port,
             commands::mcp::mcp_get_sensitive_filter_config,
             commands::mcp::mcp_set_sensitive_filter_config,
             // 高级配置命令
@@ -1384,10 +1371,7 @@ pub fn run() {
             updater::updater_install,
             // Native messaging commands
             native_messaging::get_nm_host_status,
-            native_messaging::register_nm_host_chrome,
-            native_messaging::register_nm_host_edge,
             native_messaging::install_browser_extension,
-            native_messaging::sync_extension_if_needed,
             onboarding::get_onboarding_state,
             onboarding::complete_onboarding,
             native_messaging::detect_installed_browsers,
@@ -1413,7 +1397,6 @@ pub fn run() {
             commands::smart_cluster::smart_cluster_clear_assignments,
             commands::smart_cluster::smart_cluster_status,
             // Idle / power
-            idle::get_idle_state,
             // Error window commands
             commands::utility::get_log_dir,
             commands::utility::get_critical_errors,
@@ -1421,7 +1404,6 @@ pub fn run() {
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
             commands::utility::hide_to_tray,
-            commands::utility::frontend_log,
             // 轻量模式命令
             commands::utility::switch_to_lightweight_mode,
             commands::utility::switch_to_standard_mode,

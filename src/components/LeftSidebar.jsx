@@ -113,7 +113,7 @@ export default function LeftSidebar({ selectedEvent, selectedDetails, onCategory
               </div>
             </div>
             <div>
-              <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category', '分类')}</label>
+              <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category')}</label>
               <div className="mt-1">
                 {editingCategory ? (
                   <div className="space-y-1">
@@ -144,7 +144,7 @@ export default function LeftSidebar({ selectedEvent, selectedDetails, onCategory
                         {currentCategory}
                       </span>
                     ) : (
-                      <span className="text-ide-muted">{t('sidebar.labels.uncategorized', '未分类')}</span>
+                      <span className="text-ide-muted">{t('sidebar.labels.uncategorized')}</span>
                     )}
                   </button>
                 )}

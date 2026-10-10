@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use super::policy::disk_totals_for_path;
-use super::{connection, database_snapshot, mode, StorageState};
+use super::{connection, database_snapshot, StorageState};
 
 const WORKER_BUDGET_RECOVERY_KEY: &str = "worker_budget_invalid_argument_recovery_v1";
 
@@ -82,17 +82,12 @@ impl StorageState {
         // VACUUM just to materialize the pointer-map pages.
         Self::set_auto_vacuum_incremental(&conn)?;
 
-        // The mode ledger must exist before a startup conversion can record a
-        // transitioning or failed result. A supported conversion may be
-        // deferred, but no primary or read-only connection is published until
-        // the effective journal mode has been verified.
-        mode::ensure_mode_table(&conn)?;
+        // Verify the effective journal mode before publishing any connection.
         let connection_status = self.apply_startup_database_mode(&conn, &connection_status)?;
 
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
-        self.initialize_database_mode_metadata(&conn, &connection_status.journal_mode)?;
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         if let Err(error) = self.trim_oversized_wal_under_maintenance(&conn) {
             tracing::warn!("[DB] Deferring oversized WAL cleanup at startup: {error}");
@@ -192,7 +187,6 @@ impl StorageState {
         // create the new empty tables first and leave the legacy rows stranded
         // under the old names.
         Self::upgrade_migration_tables_to_derived(conn)?;
-        mode::ensure_mode_table(conn)?;
 
         conn.execute_batch(
             r#"

@@ -155,10 +155,10 @@ export default function PreviewActionBar({
           <button
             onClick={onOpenFloatingPreview}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-colors hover:bg-ide-hover text-ide-text"
-            title={t('previewAction.openFloatingPreview', '在独立窗口中查看')}
+            title={t('previewAction.openFloatingPreview')}
           >
             <Maximize2 className="w-3.5 h-3.5" />
-            <span>{t('previewAction.float', '独立预览')}</span>
+            <span>{t('previewAction.float')}</span>
           </button>
 
           <div className="w-px h-5 bg-ide-border/50" />

@@ -46,24 +46,24 @@ export default function AppBoundUpgradePrompt({ visible }) {
   return (
     <OverlayShell
       icon={ShieldCheck}
-      title={t('appBound.title', '重启后继续后台整理')}
-      subtitle={t('appBound.subtitle', '重启后无需解锁，整理继续进行')}
+      title={t('appBound.title')}
+      subtitle={t('appBound.subtitle')}
       footer={(
         <>
           <Button size="md" disabled={busy} onClick={later}>
-            {t('appBound.later', '稍后')}
+            {t('appBound.later')}
           </Button>
           <Button size="md" variant="primary" icon={ShieldCheck} loading={busy} onClick={enable}>
-            {busy ? t('appBound.working', '正在处理…') : repair ? t('appBound.repair', '修复组件') : t('appBound.enable', '启用')}
+            {busy ? t('appBound.working') : repair ? t('appBound.repair') : t('appBound.enable')}
           </Button>
         </>
       )}
     >
       <p className="text-sm leading-relaxed text-ide-text/90">
-        {t('appBound.description', '空闲时继续整理新记录，即使重启后尚未解锁。解锁后会自动补全关键词搜索。')}
+        {t('appBound.description')}
       </p>
       <Banner tone="info">
-        {t('appBound.installHint', '启用时 Windows 会请求管理员授权，完成后应用会重新启动。')}
+        {t('appBound.installHint')}
       </Banner>
       {error && <Banner tone="error">{error}</Banner>}
     </OverlayShell>

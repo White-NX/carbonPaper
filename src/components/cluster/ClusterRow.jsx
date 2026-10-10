@@ -137,7 +137,7 @@ export default function ClusterRow({
           <button
             type="button"
             onClick={commitEdit}
-            title={t('common.confirm', '确定')}
+            title={t('common.confirm')}
             className="grid h-6 w-6 shrink-0 place-items-center rounded hover:bg-ide-hover"
           >
             <Check className="h-3.5 w-3.5 text-emerald-400" />
@@ -145,7 +145,7 @@ export default function ClusterRow({
           <button
             type="button"
             onClick={() => { setRenameError(null); setEditing(false); }}
-            title={t('common.cancel', '取消')}
+            title={t('common.cancel')}
             className="grid h-6 w-6 shrink-0 place-items-center rounded hover:bg-ide-hover"
           >
             <X className="h-3.5 w-3.5 text-ide-muted" />
@@ -191,7 +191,7 @@ export default function ClusterRow({
             </span>
           </div>
           <p className="mt-1 truncate text-[11.5px] text-ide-muted" title={subtitle || undefined}>
-            {subtitle || t('smartClusters.rowNoSource', '暂无归档快照')}
+            {subtitle || t('smartClusters.rowNoSource')}
           </p>
         </div>
 
@@ -199,7 +199,7 @@ export default function ClusterRow({
           <div className="font-mono text-[13px] tabular-nums text-ide-text">{count}</div>
           {recentCount > 0 && (
             <div className="mt-0.5 font-mono text-[10.5px] tabular-nums text-ide-muted">
-              {t('smartClusters.rowRecent', '+{{count}} 本周', { count: recentCount })}
+              {t('smartClusters.rowRecent', { count: recentCount })}
             </div>
           )}
         </div>
@@ -214,8 +214,8 @@ export default function ClusterRow({
         >
           <button
             type="button"
-            aria-label={t('smartClusters.rowMenu', '更多操作')}
-            title={t('smartClusters.rowMenu', '更多操作')}
+            aria-label={t('smartClusters.rowMenu')}
+            title={t('smartClusters.rowMenu')}
             aria-expanded={menuOpen}
             aria-haspopup="true"
             onClick={() => setMenuOpen((prev) => !prev)}
@@ -233,12 +233,12 @@ export default function ClusterRow({
                   icon={paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
                   onClick={() => { setMenuOpen(false); onTogglePause(id); }}
                 >
-                  {paused ? t('clusterCard.actionResume', '继续') : t('clusterCard.actionPause', '暂停')}
+                  {paused ? t('clusterCard.actionResume') : t('clusterCard.actionPause')}
                 </MenuItem>
               )}
               {onRename && (
                 <MenuItem icon={<Pencil className="h-3.5 w-3.5" />} onClick={startEdit}>
-                  {t('clusterCard.actionRename', '重命名')}
+                  {t('clusterCard.actionRename')}
                 </MenuItem>
               )}
               {onDelete && (
@@ -247,7 +247,7 @@ export default function ClusterRow({
                   danger
                   onClick={() => { setMenuOpen(false); onDelete(id); }}
                 >
-                  {t('clusterCard.actionDelete', '删除')}
+                  {t('clusterCard.actionDelete')}
                 </MenuItem>
               )}
             </MenuPanel>

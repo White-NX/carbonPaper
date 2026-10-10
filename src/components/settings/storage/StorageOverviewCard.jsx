@@ -76,7 +76,7 @@ export default function StorageOverviewCard({
               className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-bg hover:border-ide-accent hover:text-ide-accent transition-colors"
             >
               <FileDown className="w-3.5 h-3.5" />
-              {t('settings.storageManagement.backup.export', 'Export Backup')}
+              {t('settings.storageManagement.backup.export')}
             </button>
             <button
               type="button"
@@ -84,7 +84,7 @@ export default function StorageOverviewCard({
               className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-bg hover:border-ide-accent hover:text-ide-accent transition-colors"
             >
               <FileUp className="w-3.5 h-3.5" />
-              {t('settings.storageManagement.backup.import', 'Import Backup')}
+              {t('settings.storageManagement.backup.import')}
             </button>
           </div>
         </div>

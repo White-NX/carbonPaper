@@ -108,7 +108,7 @@ export function useFeaturesController({
     description: t(`settings.features.management.featureMode.options.${option.value}.description`),
     disabled: option.value === 'smart' && !scModelAvailable,
     title: option.value === 'smart' && !scModelAvailable
-      ? t('settings.features.management.smartCluster.modelMissing', '请先下载模型')
+      ? t('settings.features.management.smartCluster.modelMissing')
       : t(`settings.features.management.featureMode.options.${option.value}.description`),
   }));
   const selectedFeatureMode = featureModeOptions.find((option) => option.value === featureMode) || featureModeOptions[0];

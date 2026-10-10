@@ -42,7 +42,7 @@ export default function FeaturesSection() {
   if (loading || !config) {
     return (
       <div className="flex items-center justify-center py-12 text-ide-muted text-sm">
-        {t('settings.features.loading', '加载中...')}
+        {t('settings.features.loading')}
       </div>
     );
   }
@@ -53,7 +53,7 @@ export default function FeaturesSection() {
       <section className="space-y-3">
         <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
           <Layers className="w-4 h-4" />
-          {t('settings.features.management.title', '功能管理')}
+          {t('settings.features.management.title')}
         </label>
 
         <div className="space-y-3">

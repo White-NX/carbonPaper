@@ -1,20 +1,16 @@
-//! Database journal-mode metadata, eligibility checks, and controlled WAL
-//! transition support.
+//! Startup journal-mode policy and safe WAL/DELETE conversion.
+//!
+//! SQLite owns the effective mode. Failed conversions are logged and retried at
+//! the next initialization, without a separate transition ledger.
 
 use super::connection::{self, JournalMode};
 use super::policy::disk_totals_for_path;
 use super::StorageState;
-use rusqlite::{params, Connection};
-use serde::Serialize;
+use rusqlite::Connection;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-const MODE_TABLE: &str = "database_mode_metadata";
-const TRANSITION_STABLE: &str = "stable";
-const TRANSITIONING: &str = "transitioning";
-const TRANSITION_FAILED: &str = "failed";
 const SAFETY_FREE_BYTES: u64 = 64 * 1024 * 1024;
 const SQLITE_JOURNAL_MODES: [&str; 6] = ["delete", "truncate", "persist", "memory", "wal", "off"];
 
@@ -67,73 +63,6 @@ pub(crate) fn parse_database_mode_policy(raw_value: Option<&str>) -> DatabaseMod
 pub(crate) fn database_mode_policy_from_environment() -> DatabaseModePolicy {
     let raw_value = std::env::var(WAL_EXPERIMENT_ENV).ok();
     parse_database_mode_policy(raw_value.as_deref())
-}
-
-const MODE_TABLE_SCHEMA: &str = r#"
-    CREATE TABLE IF NOT EXISTS database_mode_metadata (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        actual_journal_mode TEXT NOT NULL CHECK (
-            actual_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-        ),
-        requested_journal_mode TEXT NOT NULL CHECK (
-            requested_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-        ),
-        transition_state TEXT NOT NULL CHECK (
-            transition_state IN ('stable', 'transitioning', 'failed')
-        ),
-        transition_id TEXT,
-        previous_journal_mode TEXT CHECK (
-            previous_journal_mode IS NULL OR
-            previous_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-        ),
-        last_error TEXT,
-        started_at TEXT,
-        completed_at TEXT,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-"#;
-
-/// Create the small mode ledger before any startup conversion can run.
-pub(crate) fn ensure_mode_table(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(MODE_TABLE_SCHEMA)
-        .map_err(|error| format!("Failed to initialize database mode metadata table: {error}"))
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct DatabaseModeMetadata {
-    pub actual_journal_mode: String,
-    pub requested_journal_mode: String,
-    pub transition_state: String,
-    pub transition_id: Option<String>,
-    pub previous_journal_mode: Option<String>,
-    pub last_error: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct DatabaseModeEligibility {
-    pub current_journal_mode: String,
-    pub target_journal_mode: String,
-    pub writable_filesystem: bool,
-    pub local_filesystem: bool,
-    pub available_free_bytes: Option<u64>,
-    pub required_free_bytes: u64,
-    pub can_transition: bool,
-    pub reasons: Vec<String>,
-}
-
-fn now_text() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
-fn transition_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{}-{nanos:x}", std::process::id())
 }
 
 fn normalize_mode(mode: &str) -> Result<String, String> {
@@ -198,7 +127,7 @@ fn writable_probe(directory: &Path) -> Result<(), String> {
     let name = format!(
         ".carbonpaper-write-probe-{}-{}",
         std::process::id(),
-        transition_id()
+        rand::random::<u64>()
     );
     let path = probe_parent.join(name);
     let result = (|| {
@@ -231,250 +160,51 @@ fn evaluate_eligibility(
     local_filesystem: bool,
     available_free_bytes: Option<u64>,
     required_free_bytes: u64,
-    skip_startup_noop_checks: bool,
-) -> DatabaseModeEligibility {
-    let writable = writable_result.is_ok();
-    let current = current_mode.trim().to_ascii_lowercase();
-    let target = target_mode.trim().to_ascii_lowercase();
-    let same_mode = current == target;
-    let free_ok = available_free_bytes
-        .map(|free| free >= required_free_bytes)
-        .unwrap_or(false);
-    let requires_filesystem_checks = !(skip_startup_noop_checks && same_mode);
-    let mut reasons = Vec::new();
-    if requires_filesystem_checks {
-        if let Err(error) = writable_result {
-            reasons.push(error);
-        }
-        if !local_filesystem {
-            reasons.push("Database directory is on a non-local filesystem".to_string());
-        }
-        if available_free_bytes.is_none() {
-            reasons.push("Unable to determine free space on the database volume".to_string());
-        } else if !free_ok {
-            reasons.push(format!(
-                "Insufficient free space: required {required_free_bytes} bytes"
-            ));
-        }
-    }
-
-    let checks_ok = !requires_filesystem_checks || (writable && local_filesystem && free_ok);
-    let can_transition = match (current.as_str(), target.as_str()) {
-        ("delete", "delete") | ("wal", "wal") => true,
-        ("delete", "wal") | ("wal", "delete") => checks_ok,
-        _ => false,
-    };
-
-    if current == target && current == "delete" {
-        reasons.push("Database already uses DELETE journal mode".to_string());
-    } else if !matches!(
-        (current.as_str(), target.as_str()),
-        ("delete", "delete") | ("delete", "wal") | ("wal", "delete") | ("wal", "wal")
-    ) {
-        reasons.push(format!(
-            "Controlled startup transition only supports DELETE and WAL, got {current} -> {target}"
-        ));
-    }
-    DatabaseModeEligibility {
-        current_journal_mode: current,
-        target_journal_mode: target,
-        writable_filesystem: writable,
-        local_filesystem,
-        available_free_bytes,
-        required_free_bytes,
-        can_transition,
-        reasons,
-    }
-}
-
-fn read_metadata(conn: &Connection) -> Result<DatabaseModeMetadata, String> {
-    conn.query_row(
-        &format!(
-            "SELECT actual_journal_mode, requested_journal_mode, transition_state,
-                    transition_id, previous_journal_mode, last_error, started_at,
-                    completed_at, updated_at FROM {MODE_TABLE} WHERE id = 1"
-        ),
-        [],
-        |row| {
-            Ok(DatabaseModeMetadata {
-                actual_journal_mode: row.get(0)?,
-                requested_journal_mode: row.get(1)?,
-                transition_state: row.get(2)?,
-                transition_id: row.get(3)?,
-                previous_journal_mode: row.get(4)?,
-                last_error: row.get(5)?,
-                started_at: row.get(6)?,
-                completed_at: row.get(7)?,
-                updated_at: row.get(8)?,
-            })
-        },
-    )
-    .map_err(|error| format!("Failed to read database mode metadata: {error}"))
-}
-
-fn write_metadata(
-    conn: &Connection,
-    actual: &str,
-    requested: &str,
-    state: &str,
-    id: Option<&str>,
-    previous: Option<&str>,
-    last_error: Option<&str>,
-    started: Option<&str>,
-    completed: Option<&str>,
 ) -> Result<(), String> {
-    let actual = normalize_mode(actual)?;
-    let requested = normalize_mode(requested)?;
-    conn.execute(
-        &format!(
-            "INSERT INTO {MODE_TABLE}
-             (id, actual_journal_mode, requested_journal_mode, transition_state,
-              transition_id, previous_journal_mode, last_error, started_at,
-              completed_at, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
-             ON CONFLICT(id) DO UPDATE SET
-               actual_journal_mode = excluded.actual_journal_mode,
-               requested_journal_mode = excluded.requested_journal_mode,
-               transition_state = excluded.transition_state,
-               transition_id = excluded.transition_id,
-               previous_journal_mode = excluded.previous_journal_mode,
-               last_error = excluded.last_error,
-               started_at = excluded.started_at,
-               completed_at = excluded.completed_at,
-               updated_at = CURRENT_TIMESTAMP"
-        ),
-        params![actual, requested, state, id, previous, last_error, started, completed],
-    )
-    .map_err(|error| format!("Failed to write database mode metadata: {error}"))?;
-    Ok(())
+    if current_mode == target_mode {
+        return Ok(());
+    }
+    if !is_supported_mode_conversion(current_mode, target_mode) {
+        return Err(format!("Controlled startup transition only supports DELETE and WAL, got {current_mode} -> {target_mode}"));
+    }
+    let mut reasons = Vec::new();
+    if let Err(error) = writable_result {
+        reasons.push(error);
+    }
+    if !local_filesystem {
+        reasons.push("Database directory is on a non-local filesystem".to_string());
+    }
+    match available_free_bytes {
+        None => reasons.push("Unable to determine free space on the database volume".to_string()),
+        Some(free) if free < required_free_bytes => reasons.push(format!(
+            "Insufficient free space: required {required_free_bytes} bytes"
+        )),
+        Some(_) => {}
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join("; "))
+    }
 }
 
 impl StorageState {
-    pub(crate) fn initialize_database_mode_metadata(
-        &self,
-        conn: &Connection,
-        actual_mode: &str,
-    ) -> Result<(), String> {
-        let actual_mode = normalize_mode(actual_mode)?;
-        let existing = conn
-            .query_row(
-                &format!("SELECT 1 FROM {MODE_TABLE} WHERE id = 1"),
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if existing {
-            let metadata = read_metadata(conn)?;
-            // Startup records what SQLite actually opened. An interrupted
-            // request whose target mode is already active is complete; one
-            // that did not reach its target remains diagnosable as failed.
-            let interrupted = metadata.transition_state == TRANSITIONING;
-            let reached_interrupted_target =
-                interrupted && metadata.requested_journal_mode == actual_mode;
-            let stable_drift = metadata.transition_state == TRANSITION_STABLE
-                && metadata.requested_journal_mode != actual_mode;
-            let state = if reached_interrupted_target {
-                TRANSITION_STABLE
-            } else if interrupted || stable_drift {
-                TRANSITION_FAILED
-            } else {
-                metadata.transition_state.as_str()
-            };
-            let last_error = if reached_interrupted_target {
-                None
-            } else if interrupted && metadata.last_error.is_none() {
-                Some("Database mode transition was interrupted before startup".to_string())
-            } else if stable_drift && metadata.last_error.is_none() {
-                Some(format!(
-                    "Database journal mode changed outside the controlled transition: requested {}, actual {}",
-                    metadata.requested_journal_mode, actual_mode
-                ))
-            } else {
-                metadata.last_error.clone()
-            };
-            let completed_at = if reached_interrupted_target {
-                Some(now_text())
-            } else {
-                metadata.completed_at.clone()
-            };
-            let requested_mode = normalize_mode(&metadata.requested_journal_mode)
-                .unwrap_or_else(|_| actual_mode.clone());
-            return write_metadata(
-                conn,
-                &actual_mode,
-                &requested_mode,
-                state,
-                if reached_interrupted_target {
-                    None
-                } else {
-                    metadata.transition_id.as_deref()
-                },
-                metadata.previous_journal_mode.as_deref(),
-                last_error.as_deref(),
-                metadata.started_at.as_deref(),
-                completed_at.as_deref(),
-            );
-        }
-        write_metadata(
-            conn,
-            &actual_mode,
-            &actual_mode,
-            TRANSITION_STABLE,
-            None,
-            None,
-            None,
-            None,
-            Some(&now_text()),
-        )
-    }
-
-    pub(crate) fn database_mode_metadata(&self) -> Result<DatabaseModeMetadata, String> {
-        let guard = self.get_connection_named("database_mode_metadata")?;
-        read_metadata(
-            guard
-                .as_ref()
-                .ok_or_else(|| "Database not initialized".to_string())?,
-        )
-    }
-
-    fn database_mode_eligibility_under_maintenance(
-        &self,
-        current_mode: &str,
-        target_mode: &str,
-        skip_startup_noop_checks: bool,
-    ) -> DatabaseModeEligibility {
+    fn check_startup_mode_conversion(&self, current: &str, target: &str) -> Result<(), String> {
         let data_dir = self
             .data_dir
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let current = current_mode.trim().to_ascii_lowercase();
-        let target = target_mode.trim().to_ascii_lowercase();
-        // A startup no-op does not rewrite the database file group. Actual
-        // DELETE/WAL conversions still need the full filesystem preflight.
-        let requires_checks = !(skip_startup_noop_checks && current == target);
-        let writable_result = if requires_checks {
-            writable_probe(&data_dir)
-        } else {
-            Ok(())
-        };
-        let local = !requires_checks || is_local_filesystem(&data_dir);
         let required = database_group_size(&data_dir)
             .saturating_mul(2)
             .saturating_add(SAFETY_FREE_BYTES);
-        let available = if requires_checks {
-            disk_totals_for_path(&data_dir).map(|(_, free)| free)
-        } else {
-            None
-        };
         evaluate_eligibility(
-            current_mode,
-            target_mode,
-            writable_result,
-            local,
-            available,
+            current,
+            target,
+            writable_probe(&data_dir),
+            is_local_filesystem(&data_dir),
+            disk_totals_for_path(&data_dir).map(|(_, free)| free),
             required,
-            skip_startup_noop_checks,
         )
     }
 
@@ -542,75 +272,28 @@ impl StorageState {
         }
     }
 
-    fn persist_transition_failure(
-        &self,
-        connection: &Connection,
-        current_mode: &str,
-        target_mode: &str,
-        id: &str,
-        started: &str,
-        error: &str,
-    ) -> Result<(), String> {
-        let actual_after = connection::inspect_connection(connection)
-            .map(|status| status.journal_mode)
-            .unwrap_or_else(|_| current_mode.to_string());
-        write_metadata(
-            connection,
-            &actual_after,
-            target_mode,
-            TRANSITION_FAILED,
-            Some(id),
-            Some(current_mode),
-            Some(error),
-            Some(started),
-            Some(&now_text()),
-        )
-    }
-
-    /// Keep startup available when an optional journal-mode conversion cannot
-    /// be completed. The effective mode is re-read because a conversion may
-    /// have changed SQLite's mode before a later cleanup step failed.
     fn defer_startup_transition(
         &self,
         connection: &Connection,
         current_status: &connection::ConnectionStatus,
-        current_mode: &str,
-        target_mode: &str,
-        id: &str,
-        started: &str,
+        target: &str,
         error: &str,
-    ) -> Result<connection::ConnectionStatus, String> {
-        let effective_status =
+    ) -> connection::ConnectionStatus {
+        // A conversion can reach its target before sidecar cleanup fails.
+        let effective =
             connection::inspect_connection(connection).unwrap_or_else(|_| current_status.clone());
-        if let Err(metadata_error) = self.persist_transition_failure(
-            connection,
-            current_mode,
-            target_mode,
-            id,
-            started,
-            error,
-        ) {
-            tracing::warn!(
-                "Failed to persist deferred startup journal mode transition {} -> {}: {}",
-                current_mode,
-                target_mode,
-                metadata_error
-            );
-        }
         tracing::warn!(
             "Deferring startup journal mode transition {} -> {}; continuing with {}: {}",
-            current_mode,
-            target_mode,
-            effective_status.journal_mode,
+            current_status.journal_mode,
+            target,
+            effective.journal_mode,
             error
         );
-        Ok(effective_status)
+        effective
     }
 
-    /// Apply the fixed process startup policy while the caller owns the
-    /// maintenance gate and before the primary connection is published. A
-    /// supported conversion is best-effort so low disk space cannot make an
-    /// already-open database permanently unavailable at startup.
+    /// Apply the process policy before primary or independent connections are
+    /// published. A failed supported conversion keeps the database available.
     pub(crate) fn apply_startup_database_mode(
         &self,
         connection: &Connection,
@@ -618,203 +301,24 @@ impl StorageState {
     ) -> Result<connection::ConnectionStatus, String> {
         let current = normalize_mode(&current_status.journal_mode)?;
         let target = self.database_mode_policy.as_str();
-        let eligibility = self.database_mode_eligibility_under_maintenance(&current, target, true);
-        if !eligibility.can_transition {
-            let id = transition_id();
-            let started = now_text();
-            let error = format!(
-                "Database is not eligible for startup journal mode {target}: {}",
-                eligibility.reasons.join("; ")
-            );
-            if is_supported_mode_conversion(&current, target) {
-                return self.defer_startup_transition(
-                    connection,
-                    current_status,
-                    &current,
-                    target,
-                    &id,
-                    &started,
-                    &error,
-                );
-            }
-            if let Err(metadata_error) =
-                self.persist_transition_failure(connection, &current, target, &id, &started, &error)
-            {
-                return Err(format!(
-                    "{error}; failed to persist transition failure: {metadata_error}"
-                ));
-            }
-            return Err(error);
-        }
-
         if current == target {
             if target == JournalMode::Delete.as_str() {
-                // A prior conversion may have reached DELETE just before its
-                // sidecar cleanup was interrupted. DELETE-mode startup owns
-                // that cleanup boundary, so stale WAL files cannot survive
-                // merely because SQLite already reports the target mode.
                 self.remove_wal_sidecars()?;
             }
-            write_metadata(
-                connection,
-                &current,
-                target,
-                TRANSITION_STABLE,
-                None,
-                None,
-                None,
-                None,
-                Some(&now_text()),
-            )?;
             return connection::inspect_connection(connection).map_err(|error| {
                 format!("Failed to verify startup journal mode {target}: {error}")
             });
         }
-
-        let id = transition_id();
-        let started = now_text();
-        write_metadata(
-            connection,
-            &current,
-            target,
-            TRANSITIONING,
-            Some(&id),
-            Some(&current),
-            None,
-            Some(&started),
-            None,
-        )?;
-
-        let transition_result = self.transition_connection_to_target(connection, &current, target);
-        match transition_result {
-            Ok(status) => {
-                write_metadata(
-                    connection,
-                    &status.journal_mode,
-                    target,
-                    TRANSITION_STABLE,
-                    None,
-                    Some(&current),
-                    None,
-                    Some(&started),
-                    Some(&now_text()),
-                )?;
-                Ok(status)
-            }
+        if !is_supported_mode_conversion(&current, target) {
+            return Err(format!("Controlled startup transition only supports DELETE and WAL, got {current} -> {target}"));
+        }
+        match self
+            .check_startup_mode_conversion(&current, target)
+            .and_then(|()| self.transition_connection_to_target(connection, &current, target))
+        {
+            Ok(status) => Ok(status),
             Err(error) => {
-                if is_supported_mode_conversion(&current, target) {
-                    return self.defer_startup_transition(
-                        connection,
-                        current_status,
-                        &current,
-                        target,
-                        &id,
-                        &started,
-                        &error,
-                    );
-                }
-                if let Err(metadata_error) = self
-                    .persist_transition_failure(connection, &current, target, &id, &started, &error)
-                {
-                    return Err(format!(
-                        "{error}; failed to persist transition failure: {metadata_error}"
-                    ));
-                }
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) fn check_database_mode_eligibility(
-        &self,
-    ) -> Result<DatabaseModeEligibility, String> {
-        let _maintenance = self.database_maintenance("database_mode_eligibility");
-        let guard = self.get_connection_named("database_mode_eligibility")?;
-        let connection = guard
-            .as_ref()
-            .ok_or_else(|| "Database not initialized".to_string())?;
-        let status = connection::inspect_connection(connection)
-            .map_err(|error| format!("Failed to inspect database journal mode: {error}"))?;
-        Ok(self.database_mode_eligibility_under_maintenance(&status.journal_mode, "delete", false))
-    }
-
-    pub(crate) fn transition_wal_to_delete(&self) -> Result<DatabaseModeMetadata, String> {
-        let _maintenance = self.database_maintenance("database_mode_wal_to_delete");
-        let mut guard = self.get_connection_named("database_mode_wal_to_delete")?;
-        let connection = guard
-            .as_mut()
-            .ok_or_else(|| "Database not initialized".to_string())?;
-        let status = connection::inspect_connection(connection)
-            .map_err(|error| format!("Failed to inspect database journal mode: {error}"))?;
-        let current = normalize_mode(&status.journal_mode)?;
-        if current == "delete" {
-            write_metadata(
-                connection,
-                "delete",
-                "delete",
-                TRANSITION_STABLE,
-                None,
-                None,
-                None,
-                None,
-                Some(&now_text()),
-            )?;
-            return read_metadata(connection);
-        }
-        if current != "wal" {
-            return Err(format!(
-                "Controlled transition only supports WAL, got {current}"
-            ));
-        }
-        let eligibility =
-            self.database_mode_eligibility_under_maintenance(&current, "delete", false);
-        if !eligibility.can_transition {
-            return Err(format!(
-                "Database is not eligible for WAL to DELETE transition: {}",
-                eligibility.reasons.join("; ")
-            ));
-        }
-
-        let id = transition_id();
-        let started = now_text();
-        write_metadata(
-            connection,
-            "wal",
-            "delete",
-            TRANSITIONING,
-            Some(&id),
-            Some("wal"),
-            None,
-            Some(&started),
-            None,
-        )?;
-        let transition_result = (|| {
-            self.transition_connection_to_target(connection, "wal", "delete")?;
-            write_metadata(
-                connection,
-                "delete",
-                "delete",
-                TRANSITION_STABLE,
-                None,
-                Some("wal"),
-                None,
-                Some(&started),
-                Some(&now_text()),
-            )?;
-            read_metadata(connection)
-        })();
-        match transition_result {
-            Ok(metadata) => Ok(metadata),
-            Err(error) => {
-                if let Err(metadata_error) = self.persist_transition_failure(
-                    connection, &current, "delete", &id, &started, &error,
-                ) {
-                    Err(format!(
-                        "{error}; failed to persist transition failure: {metadata_error}"
-                    ))
-                } else {
-                    Err(error)
-                }
+                Ok(self.defer_startup_transition(connection, current_status, target, &error))
             }
         }
     }
@@ -856,117 +360,8 @@ mod tests {
         }
     }
 
-    fn create_mode_table(conn: &Connection) {
-        conn.execute_batch(
-            "CREATE TABLE database_mode_metadata (
-                id INTEGER PRIMARY KEY CHECK(id = 1),
-                actual_journal_mode TEXT NOT NULL,
-                requested_journal_mode TEXT NOT NULL,
-                transition_state TEXT NOT NULL,
-                transition_id TEXT,
-                previous_journal_mode TEXT,
-                last_error TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .unwrap();
-    }
-
     #[test]
-    fn metadata_round_trip_records_actual_delete_mode() {
-        let temp = tempdir().unwrap();
-        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
-        let storage = StorageState::new(temp.path().to_path_buf(), credential);
-        let conn = Connection::open_in_memory().unwrap();
-        create_mode_table(&conn);
-        storage
-            .initialize_database_mode_metadata(&conn, "delete")
-            .unwrap();
-        let metadata = read_metadata(&conn).unwrap();
-        assert_eq!(metadata.actual_journal_mode, "delete");
-        assert_eq!(metadata.requested_journal_mode, "delete");
-        assert_eq!(metadata.transition_state, TRANSITION_STABLE);
-    }
-
-    #[test]
-    fn metadata_preserves_non_delete_sqlite_mode() {
-        let temp = tempdir().unwrap();
-        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
-        let storage = StorageState::new(temp.path().to_path_buf(), credential);
-        let conn = Connection::open_in_memory().unwrap();
-        create_mode_table(&conn);
-
-        storage
-            .initialize_database_mode_metadata(&conn, "truncate")
-            .unwrap();
-        let metadata = read_metadata(&conn).unwrap();
-        assert_eq!(metadata.actual_journal_mode, "truncate");
-        assert_eq!(metadata.requested_journal_mode, "truncate");
-    }
-
-    #[test]
-    fn startup_completes_interrupted_transition_when_target_is_active() {
-        let temp = tempdir().unwrap();
-        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
-        let storage = StorageState::new(temp.path().to_path_buf(), credential);
-        let conn = Connection::open_in_memory().unwrap();
-        create_mode_table(&conn);
-        write_metadata(
-            &conn,
-            "wal",
-            "delete",
-            TRANSITIONING,
-            Some("transition-1"),
-            Some("wal"),
-            None,
-            Some("started"),
-            None,
-        )
-        .unwrap();
-
-        storage
-            .initialize_database_mode_metadata(&conn, "delete")
-            .unwrap();
-
-        let metadata = read_metadata(&conn).unwrap();
-        assert_eq!(metadata.actual_journal_mode, "delete");
-        assert_eq!(metadata.requested_journal_mode, "delete");
-        assert_eq!(metadata.transition_state, TRANSITION_STABLE);
-        assert!(metadata.transition_id.is_none());
-        assert!(metadata.last_error.is_none());
-        assert!(metadata.completed_at.is_some());
-    }
-
-    #[test]
-    fn startup_marks_uncontrolled_mode_drift_failed() {
-        let temp = tempdir().unwrap();
-        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
-        let storage = StorageState::new(temp.path().to_path_buf(), credential);
-        let conn = Connection::open_in_memory().unwrap();
-        create_mode_table(&conn);
-        storage
-            .initialize_database_mode_metadata(&conn, "delete")
-            .unwrap();
-
-        storage
-            .initialize_database_mode_metadata(&conn, "wal")
-            .unwrap();
-
-        let metadata = read_metadata(&conn).unwrap();
-        assert_eq!(metadata.actual_journal_mode, "wal");
-        assert_eq!(metadata.requested_journal_mode, "delete");
-        assert_eq!(metadata.transition_state, TRANSITION_FAILED);
-        assert!(metadata
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("outside the controlled transition"));
-    }
-
-    #[test]
-    fn explicit_delete_policy_creates_delete_mode_metadata() {
+    fn explicit_delete_policy_creates_delete_mode() {
         let temp = tempdir().unwrap();
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         crate::credential_manager::save_public_key_to_file(
@@ -982,10 +377,13 @@ mod tests {
 
         storage.initialize().unwrap();
 
-        let metadata = storage.database_mode_metadata().unwrap();
-        assert_eq!(metadata.actual_journal_mode, "delete");
-        assert_eq!(metadata.requested_journal_mode, "delete");
-        assert_eq!(metadata.transition_state, TRANSITION_STABLE);
+        let status = connection::inspect_connection(
+            &storage
+                .open_read_connection_named("mode_test_status")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status.journal_mode, "delete");
     }
 
     #[test]
@@ -1004,11 +402,14 @@ mod tests {
             .initialize()
             .expect("invalid optional flag must not block storage startup");
 
-        let metadata = storage.database_mode_metadata().unwrap();
+        let status = connection::inspect_connection(
+            &storage
+                .open_read_connection_named("mode_test_status")
+                .unwrap(),
+        )
+        .unwrap();
         assert!(storage.is_initialized());
-        assert_eq!(metadata.actual_journal_mode, "wal");
-        assert_eq!(metadata.requested_journal_mode, "wal");
-        assert_eq!(metadata.transition_state, TRANSITION_STABLE);
+        assert_eq!(status.journal_mode, "wal");
     }
 
     #[test]
@@ -1020,19 +421,13 @@ mod tests {
             true,
             Some(128 * 1024 * 1024),
             64 * 1024 * 1024,
-            false,
         );
-        assert!(eligibility.can_transition);
-        assert!(eligibility.writable_filesystem);
-        assert!(eligibility.local_filesystem);
-        assert!(eligibility.reasons.is_empty());
+        assert!(eligibility.is_ok());
 
-        let insufficient = evaluate_eligibility("wal", "delete", Ok(()), true, Some(1), 64, false);
-        assert!(!insufficient.can_transition);
+        let insufficient = evaluate_eligibility("wal", "delete", Ok(()), true, Some(1), 64);
         assert!(insufficient
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("Insufficient free space")));
+            .unwrap_err()
+            .contains("Insufficient free space"));
 
         let unavailable = evaluate_eligibility(
             "wal",
@@ -1041,12 +436,11 @@ mod tests {
             false,
             None,
             64,
-            false,
         );
-        assert!(!unavailable.can_transition);
-        assert!(!unavailable.writable_filesystem);
-        assert!(!unavailable.local_filesystem);
-        assert!(unavailable.reasons.len() >= 3);
+        let error = unavailable.unwrap_err();
+        assert!(error.contains("not writable"));
+        assert!(error.contains("non-local filesystem"));
+        assert!(error.contains("Unable to determine free space"));
     }
 
     #[test]
@@ -1058,48 +452,29 @@ mod tests {
             false,
             Some(1),
             64,
-            true,
         );
 
-        assert!(eligibility.can_transition);
-        assert!(eligibility.reasons.is_empty());
+        assert!(eligibility.is_ok());
     }
 
     #[test]
-    fn deferred_startup_transition_keeps_effective_mode_and_records_failure() {
+    fn deferred_startup_transition_keeps_effective_mode() {
         let temp = tempdir().unwrap();
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential);
         let connection = Connection::open(temp.path().join("deferred-transition.db")).unwrap();
         let current_status = connection::set_journal_mode(&connection, JournalMode::Wal).unwrap();
-        ensure_mode_table(&connection).unwrap();
-
-        let status = storage
-            .defer_startup_transition(
-                &connection,
-                &current_status,
-                "wal",
-                "delete",
-                "deferred-test",
-                "started",
-                "Insufficient free space: test",
-            )
-            .unwrap();
-
+        let status = storage.defer_startup_transition(
+            &connection,
+            &current_status,
+            "delete",
+            "Insufficient free space: test",
+        );
         assert_eq!(status.journal_mode, "wal");
-        let metadata = read_metadata(&connection).unwrap();
-        assert_eq!(metadata.actual_journal_mode, "wal");
-        assert_eq!(metadata.requested_journal_mode, "delete");
-        assert_eq!(metadata.transition_state, TRANSITION_FAILED);
-        assert!(metadata
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Insufficient free space"));
     }
 
     #[test]
-    fn default_startup_records_stable_wal_mode_before_publish() {
+    fn default_startup_verifies_wal_mode_before_publish() {
         let temp = tempdir().unwrap();
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         crate::credential_manager::save_public_key_to_file(&credential, b"wal-startup-key")
@@ -1108,10 +483,13 @@ mod tests {
 
         storage.initialize().unwrap();
 
-        let metadata = storage.database_mode_metadata().unwrap();
-        assert_eq!(metadata.actual_journal_mode, "wal");
-        assert_eq!(metadata.requested_journal_mode, "wal");
-        assert_eq!(metadata.transition_state, TRANSITION_STABLE);
+        let status = connection::inspect_connection(
+            &storage
+                .open_read_connection_named("mode_test_status")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status.journal_mode, "wal");
         let read = storage
             .open_read_connection_named("wal_startup_mode_read")
             .unwrap();
@@ -1150,9 +528,13 @@ mod tests {
             parse_database_mode_policy(Some("0")),
         );
         delete_storage.initialize().unwrap();
-        let metadata = delete_storage.database_mode_metadata().unwrap();
-        assert_eq!(metadata.actual_journal_mode, "delete");
-        assert_eq!(metadata.requested_journal_mode, "delete");
+        let status = connection::inspect_connection(
+            &delete_storage
+                .open_read_connection_named("mode_test_status")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status.journal_mode, "delete");
         let guard = delete_storage
             .get_connection_named("wal_revert_verify")
             .unwrap();
@@ -1198,10 +580,15 @@ mod tests {
         assert!(temp.path().join("screenshots.db-wal").exists());
         assert!(temp.path().join("screenshots.db-shm").exists());
 
-        let metadata = storage.transition_wal_to_delete().unwrap();
-        assert_eq!(metadata.actual_journal_mode, "delete");
-        assert_eq!(metadata.requested_journal_mode, "delete");
-        assert_eq!(metadata.transition_state, TRANSITION_STABLE);
+        let status = {
+            let guard = storage
+                .get_connection_named("mode_test_transition")
+                .unwrap();
+            storage
+                .transition_connection_to_target(guard.as_ref().unwrap(), "wal", "delete")
+                .unwrap()
+        };
+        assert_eq!(status.journal_mode, "delete");
 
         let guard = storage.get_connection_named("mode_test_verify").unwrap();
         let connection = guard.as_ref().unwrap();

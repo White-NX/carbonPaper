@@ -7,23 +7,17 @@
 use super::StorageState;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rand::RngCore;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SIDECAR_MAGIC: &[u8; 8] = b"CPDVEC01";
-const SIDECAR_FORMAT_VERSION: u32 = 3;
 const MAX_SUBJECT_KEY_BYTES: usize = 1024;
 pub(super) const MAX_METADATA_BYTES: usize = 4096;
 const MAX_VECTOR_DIMENSIONS: usize = 65_536;
-const SIDECAR_PAGE_SIZE: u32 = 512;
 const LEASE_TOKEN_BYTES: usize = 16;
-pub const DERIVED_GENERATION_CANCELLED: &str = "DERIVED_GENERATION_CANCELLED";
 
 #[derive(Default)]
 struct EmbeddingCommitContext<'a> {
@@ -35,11 +29,6 @@ struct EmbeddingCommitContext<'a> {
 
 fn sqlite_i64(value: u64, field: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{field} exceeds SQLite INTEGER range: {value}"))
-}
-
-fn sqlite_u64_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
-    let value: i64 = row.get(index)?;
-    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -186,20 +175,6 @@ pub struct DerivedIndexBacklog {
 pub struct ClipBackfillWork {
     pub images: u64,
     pub megapixels: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DerivedIndexGeneration {
-    pub index_kind: DerivedIndexKind,
-    pub generation: u64,
-    pub data_epoch: u64,
-    pub file_name: String,
-    pub checksum_sha256: String,
-    pub row_count: u64,
-    pub dimensions: Option<u32>,
-    pub model_id: Option<String>,
-    pub model_revision: Option<String>,
-    pub embedding_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1068,9 +1043,8 @@ impl StorageState {
     /// embeddings. Stored and query vectors are both L2-normalized, so cosine
     /// similarity equals the dot product. This is the production semantic read
     /// path (`semantic_query.rs`): SQLite remains authoritative and the
-    /// `.cpdvec` ANN sidecar is not consulted until a performance gate requires
-    /// it. The scan is bounded by the ~30-day MiniLM hot layer that M2.4
-    /// migrated.
+    /// resident matrix serves the ~30-day MiniLM hot layer. CLIP image search
+    /// has its own persistent ANN path in `clip_ann.rs`.
     ///
     /// Scoring runs against the resident matrix rather than re-reading the
     /// store per query — see `semantic_cache` for the freshness and lifetime
@@ -1769,128 +1743,6 @@ impl StorageState {
         u64::try_from(changed).map_err(|_| "Invalid derived invalidation count".to_string())
     }
 
-    /// Writes a checksummed, immutable flat-vector generation through a temp
-    /// file and atomic rename. A later ANN implementation can replace the
-    /// payload format without changing SQLite ownership or generation safety.
-    pub fn publish_derived_index_generation(
-        &self,
-        index_kind: DerivedIndexKind,
-    ) -> Result<DerivedIndexGeneration, String> {
-        self.publish_derived_index_generation_with_progress(
-            index_kind,
-            |_phase, _current, _total| {},
-            || false,
-        )
-    }
-
-    /// Publish a generation on a blocking worker with cooperative cancellation
-    /// and bounded progress callbacks. `sync_all` itself cannot be interrupted;
-    /// callers should present that phase as a short safe-write interval.
-    pub fn publish_derived_index_generation_with_progress<P, C>(
-        &self,
-        index_kind: DerivedIndexKind,
-        mut progress: P,
-        cancelled: C,
-    ) -> Result<DerivedIndexGeneration, String>
-    where
-        P: FnMut(&str, u64, u64),
-        C: Fn() -> bool,
-    {
-        if self.is_migration_in_progress() {
-            return Err("Cannot publish a derived index during data migration".to_string());
-        }
-        let _publish_guard = self.derived_generation_publish_guard();
-        // Recheck after acquiring the shared publication/migration boundary so
-        // a migration that won the race cannot overlap filesystem publication.
-        if self.is_migration_in_progress() {
-            return Err("Cannot publish a derived index during data migration".to_string());
-        }
-        // Copy the path without holding data_dir while acquiring the database
-        // mutex. Existing image reads acquire those locks in the opposite order.
-        let data_dir = self
-            .data_dir
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        let snapshot = self.get_derived_index_snapshot_metadata(index_kind)?;
-        let generation = next_generation_id()?;
-        let sidecar_dir = data_dir.join("derived-indexes");
-        fs::create_dir_all(&sidecar_dir)
-            .map_err(|error| format!("Failed to create derived index directory: {error}"))?;
-        let file_name = format!("{}-{generation}.cpdvec", index_kind.as_str());
-        let final_path = sidecar_dir.join(&file_name);
-        let temp_path = sidecar_dir.join(format!(".{file_name}.tmp"));
-        if cancelled() {
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-        let checksum_sha256 = match self.write_sidecar_streaming(
-            &temp_path,
-            index_kind,
-            generation,
-            &snapshot,
-            &mut progress,
-            &cancelled,
-        ) {
-            Ok(checksum) => checksum,
-            Err(error) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(error);
-            }
-        };
-        if cancelled() {
-            let _ = fs::remove_file(&temp_path);
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-        if let Err(error) =
-            verify_sidecar_with_progress(&temp_path, &checksum_sha256, &mut progress, &cancelled)
-        {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
-        if cancelled() {
-            let _ = fs::remove_file(&temp_path);
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-        progress("publishing_commit", 0, 1);
-        fs::rename(&temp_path, &final_path).map_err(|error| {
-            let _ = fs::remove_file(&temp_path);
-            format!("Failed to publish derived index generation: {error}")
-        })?;
-
-        if cancelled() {
-            let _ = fs::remove_file(&final_path);
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-
-        let record = DerivedIndexGeneration {
-            index_kind,
-            generation,
-            data_epoch: snapshot.data_epoch,
-            file_name,
-            checksum_sha256,
-            row_count: snapshot.row_count,
-            dimensions: snapshot.dimensions,
-            model_id: snapshot
-                .model_contract
-                .as_ref()
-                .map(|value| value.model_id.clone()),
-            model_revision: snapshot
-                .model_contract
-                .as_ref()
-                .map(|value| value.model_revision.clone()),
-            embedding_version: snapshot
-                .model_contract
-                .as_ref()
-                .map(|value| value.embedding_version),
-        };
-        if let Err(error) = self.record_derived_index_generation(&record) {
-            let _ = fs::remove_file(&final_path);
-            return Err(error);
-        }
-        progress("publishing_commit", 1, 1);
-        Ok(record)
-    }
-
     /// Startup runs before derived-index readers are exposed, so it is the safe
     /// point to remove immutable generations that are no longer referenced by
     /// SQLite. Runtime publication never deletes finalized sidecars.
@@ -1958,42 +1810,6 @@ impl StorageState {
             }
         }
         Ok(())
-    }
-
-    pub fn get_derived_index_generation(
-        &self,
-        index_kind: DerivedIndexKind,
-    ) -> Result<Option<DerivedIndexGeneration>, String> {
-        let guard = self.get_connection_named("get_derived_index_generation")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        conn.query_row(
-            r#"
-            SELECT g.generation, g.data_epoch, g.file_name, g.checksum_sha256,
-                   g.row_count, g.dimensions, g.model_id, g.model_revision,
-                   g.embedding_version
-            FROM derived_index_generations g
-            LEFT JOIN derived_index_state s ON s.index_kind = g.index_kind
-            WHERE g.index_kind = ?1
-              AND g.data_epoch = COALESCE(s.data_epoch, 0)
-            "#,
-            [index_kind.as_str()],
-            |row| {
-                Ok(DerivedIndexGeneration {
-                    index_kind,
-                    generation: sqlite_u64_from_row(row, 0)?,
-                    data_epoch: sqlite_u64_from_row(row, 1)?,
-                    file_name: row.get(2)?,
-                    checksum_sha256: row.get(3)?,
-                    row_count: sqlite_u64_from_row(row, 4)?,
-                    dimensions: row.get(5)?,
-                    model_id: row.get(6)?,
-                    model_revision: row.get(7)?,
-                    embedding_version: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|error| format!("Failed to read derived index generation: {error}"))
     }
 
     pub fn get_derived_ann_generation(
@@ -2538,153 +2354,6 @@ impl StorageState {
             Ok(())
         })
     }
-
-    fn record_derived_index_generation(
-        &self,
-        generation: &DerivedIndexGeneration,
-    ) -> Result<(), String> {
-        let mut guard = self.get_connection_named("record_derived_index_generation")?;
-        let conn = guard.as_mut().ok_or("Database not initialized")?;
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("Failed to start derived generation transaction: {error}"))?;
-        let current_epoch: i64 = tx
-            .query_row(
-                "SELECT COALESCE((SELECT data_epoch FROM derived_index_state WHERE index_kind = ?1), 0)",
-                [generation.index_kind.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Failed to read derived index epoch: {error}"))?;
-        let current_epoch = u64::try_from(current_epoch)
-            .map_err(|_| format!("Invalid derived index epoch: {current_epoch}"))?;
-        if current_epoch != generation.data_epoch {
-            return Err("Derived index changed while generation was being published".to_string());
-        }
-        let generation_id = sqlite_i64(generation.generation, "derived generation")?;
-        let data_epoch = sqlite_i64(generation.data_epoch, "derived data epoch")?;
-        let row_count = sqlite_i64(generation.row_count, "derived row count")?;
-        tx.execute(
-            r#"
-            INSERT INTO derived_index_generations (
-                index_kind, generation, data_epoch, file_name, checksum_sha256,
-                row_count, dimensions, model_id, model_revision, embedding_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(index_kind) DO UPDATE SET
-                generation = excluded.generation,
-                data_epoch = excluded.data_epoch,
-                file_name = excluded.file_name,
-                checksum_sha256 = excluded.checksum_sha256,
-                row_count = excluded.row_count,
-                dimensions = excluded.dimensions,
-                model_id = excluded.model_id,
-                model_revision = excluded.model_revision,
-                embedding_version = excluded.embedding_version,
-                created_at = CURRENT_TIMESTAMP
-            "#,
-            params![
-                generation.index_kind.as_str(),
-                generation_id,
-                data_epoch,
-                generation.file_name,
-                generation.checksum_sha256,
-                row_count,
-                generation.dimensions,
-                generation.model_id,
-                generation.model_revision,
-                generation.embedding_version,
-            ],
-        )
-        .map_err(|error| format!("Failed to record derived index generation: {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("Failed to commit derived index generation: {error}"))?;
-        Ok(())
-    }
-
-    fn get_derived_index_snapshot_metadata(
-        &self,
-        index_kind: DerivedIndexKind,
-    ) -> Result<DerivedIndexSnapshotMetadata, String> {
-        let guard = self.get_connection_named("get_derived_index_snapshot_metadata")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        derived_index_snapshot_metadata_from_conn(conn, index_kind)
-    }
-
-    fn list_query_visible_embedding_page(
-        &self,
-        index_kind: DerivedIndexKind,
-        after_subject_key: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<DerivedEmbeddingRecord>, String> {
-        let guard = self.get_connection_named("list_query_visible_embedding_page")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        list_query_visible_embedding_page_from_conn(conn, index_kind, after_subject_key, limit)
-    }
-
-    fn write_sidecar_streaming(
-        &self,
-        path: &Path,
-        index_kind: DerivedIndexKind,
-        generation: u64,
-        snapshot: &DerivedIndexSnapshotMetadata,
-        progress: &mut impl FnMut(&str, u64, u64),
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<String, String> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| format!("Failed to create derived index temp file: {error}"))?;
-        let mut writer = BufWriter::new(file);
-        let mut hasher = Sha256::new();
-        write_sidecar_header(&mut writer, &mut hasher, index_kind, generation, snapshot)?;
-        progress("publishing_write", 0, snapshot.row_count);
-
-        let mut after_subject_key: Option<String> = None;
-        let mut written_rows = 0u64;
-        loop {
-            if cancelled() {
-                return Err(DERIVED_GENERATION_CANCELLED.to_string());
-            }
-            let page = self.list_query_visible_embedding_page(
-                index_kind,
-                after_subject_key.as_deref(),
-                SIDECAR_PAGE_SIZE,
-            )?;
-            if page.is_empty() {
-                break;
-            }
-            for row in &page {
-                write_sidecar_row(&mut writer, &mut hasher, row)?;
-            }
-            written_rows = written_rows
-                .checked_add(page.len() as u64)
-                .ok_or_else(|| "Derived generation row count overflow".to_string())?;
-            after_subject_key = page.last().map(|row| row.job.subject_key.clone());
-            progress("publishing_write", written_rows, snapshot.row_count);
-        }
-        if written_rows != snapshot.row_count {
-            return Err(format!(
-                "Derived index changed while generation was being streamed: expected {} rows, wrote {written_rows}",
-                snapshot.row_count
-            ));
-        }
-
-        if cancelled() {
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-        writer
-            .flush()
-            .map_err(|error| format!("Failed to flush derived index temp file: {error}"))?;
-        progress("publishing_sync", 0, 0);
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| format!("Failed to sync derived index temp file: {error}"))?;
-        if cancelled() {
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-        Ok(hex::encode(hasher.finalize()))
-    }
 }
 
 type RawEmbeddingRow = (String, i64, Vec<u8>, String, String, i64, String, String);
@@ -2753,32 +2422,6 @@ fn derived_index_snapshot_metadata_from_conn(
         })
         .map_err(|error| format!("Failed to inspect derived generation rows: {error}"))?;
     decode_snapshot_metadata(data_epoch, raw)
-}
-
-fn list_query_visible_embedding_page_from_conn(
-    conn: &rusqlite::Connection,
-    index_kind: DerivedIndexKind,
-    after_subject_key: Option<&str>,
-    limit: u32,
-) -> Result<Vec<DerivedEmbeddingRecord>, String> {
-    let sql = visible_embedding_sql(
-        "AND (?2 IS NULL OR e.subject_key > ?2)",
-        "ORDER BY e.subject_key LIMIT ?3",
-    );
-    let mut statement = conn
-        .prepare(&sql)
-        .map_err(|error| format!("Failed to prepare derived generation page: {error}"))?;
-    let rows = statement
-        .query_map(
-            params![index_kind.as_str(), after_subject_key, limit],
-            map_embedding_row(index_kind),
-        )
-        .map_err(|error| format!("Failed to query derived generation page: {error}"))?;
-    rows.map(|row| {
-        row.map_err(|error| format!("Failed to read derived generation row: {error}"))
-            .and_then(|row| decode_embedding_row(index_kind, row))
-    })
-    .collect()
 }
 
 #[cfg(test)]
@@ -3347,127 +2990,6 @@ fn new_lease_token() -> String {
     let mut bytes = [0u8; LEASE_TOKEN_BYTES];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
-}
-
-fn write_sidecar_header(
-    writer: &mut impl Write,
-    hasher: &mut Sha256,
-    index_kind: DerivedIndexKind,
-    generation: u64,
-    snapshot: &DerivedIndexSnapshotMetadata,
-) -> Result<(), String> {
-    write_hashed(writer, hasher, SIDECAR_MAGIC)?;
-    write_hashed(writer, hasher, &SIDECAR_FORMAT_VERSION.to_le_bytes())?;
-    write_hashed(writer, hasher, &generation.to_le_bytes())?;
-    write_hashed(writer, hasher, &snapshot.data_epoch.to_le_bytes())?;
-    let kind = index_kind.as_str().as_bytes();
-    let kind_len = u16::try_from(kind.len()).map_err(|_| "Index kind is too long".to_string())?;
-    write_hashed(writer, hasher, &kind_len.to_le_bytes())?;
-    write_hashed(writer, hasher, kind)?;
-    let (model_id, model_revision, embedding_version) = snapshot
-        .model_contract
-        .as_ref()
-        .map(|contract| {
-            (
-                contract.model_id.as_bytes(),
-                contract.model_revision.as_bytes(),
-                contract.embedding_version,
-            )
-        })
-        .unwrap_or((&[], &[], 0));
-    let model_id_len =
-        u16::try_from(model_id.len()).map_err(|_| "Model id is too long".to_string())?;
-    let model_revision_len = u16::try_from(model_revision.len())
-        .map_err(|_| "Model revision is too long".to_string())?;
-    write_hashed(writer, hasher, &model_id_len.to_le_bytes())?;
-    write_hashed(writer, hasher, model_id)?;
-    write_hashed(writer, hasher, &model_revision_len.to_le_bytes())?;
-    write_hashed(writer, hasher, model_revision)?;
-    write_hashed(writer, hasher, &embedding_version.to_le_bytes())?;
-    write_hashed(writer, hasher, &snapshot.row_count.to_le_bytes())?;
-    write_hashed(
-        writer,
-        hasher,
-        &snapshot.dimensions.unwrap_or(0).to_le_bytes(),
-    )
-}
-
-fn write_sidecar_row(
-    writer: &mut impl Write,
-    hasher: &mut Sha256,
-    row: &DerivedEmbeddingRecord,
-) -> Result<(), String> {
-    let key = row.job.subject_key.as_bytes();
-    let key_len = u32::try_from(key.len()).map_err(|_| "Subject key is too long".to_string())?;
-    write_hashed(writer, hasher, &key_len.to_le_bytes())?;
-    write_hashed(writer, hasher, key)?;
-    let vector = encode_vector(&row.vector)?;
-    write_hashed(writer, hasher, &vector)
-}
-
-fn write_hashed(writer: &mut impl Write, hasher: &mut Sha256, bytes: &[u8]) -> Result<(), String> {
-    writer
-        .write_all(bytes)
-        .map_err(|error| format!("Failed to write derived index temp file: {error}"))?;
-    hasher.update(bytes);
-    Ok(())
-}
-
-#[cfg(test)]
-fn verify_sidecar(path: &Path, expected_checksum: &str) -> Result<(), String> {
-    verify_sidecar_with_progress(
-        path,
-        expected_checksum,
-        &mut |_phase, _current, _total| {},
-        &|| false,
-    )
-}
-
-fn verify_sidecar_with_progress(
-    path: &Path,
-    expected_checksum: &str,
-    progress: &mut impl FnMut(&str, u64, u64),
-    cancelled: &impl Fn() -> bool,
-) -> Result<(), String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("Failed to open derived index sidecar: {error}"))?;
-    let total = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let mut reader = BufReader::new(file);
-    let mut header = [0u8; SIDECAR_MAGIC.len()];
-    reader
-        .read_exact(&mut header)
-        .map_err(|error| format!("Failed to read derived index sidecar header: {error}"))?;
-    if &header != SIDECAR_MAGIC {
-        return Err("Derived index sidecar has an invalid header".to_string());
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(header);
-    let mut verified = header.len() as u64;
-    let mut last_reported = 0_u64;
-    progress("publishing_verify", verified, total);
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
-        if cancelled() {
-            return Err(DERIVED_GENERATION_CANCELLED.to_string());
-        }
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("Failed to read derived index sidecar: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        verified = verified.saturating_add(read as u64);
-        if verified.saturating_sub(last_reported) >= 8 * 1024 * 1024 || verified >= total {
-            progress("publishing_verify", verified, total);
-            last_reported = verified;
-        }
-    }
-    let checksum = hex::encode(hasher.finalize());
-    if checksum != expected_checksum {
-        return Err("Derived index sidecar checksum mismatch".to_string());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -4371,12 +3893,6 @@ mod tests {
         ] {
             commit_vector(&storage, spec, vector).unwrap();
         }
-        storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap();
-        storage
-            .publish_derived_index_generation(DerivedIndexKind::ClipImage)
-            .unwrap();
 
         {
             let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
@@ -4400,14 +3916,6 @@ mod tests {
             .is_none());
         assert!(storage
             .get_derived_index_job(DerivedIndexKind::ClipImage, "hash-42")
-            .unwrap()
-            .is_none());
-        assert!(storage
-            .get_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap()
-            .is_none());
-        assert!(storage
-            .get_derived_index_generation(DerivedIndexKind::ClipImage)
             .unwrap()
             .is_none());
     }
@@ -5007,67 +4515,26 @@ mod tests {
     }
 
     #[test]
-    fn generation_is_checksummed_and_published_after_completed_rows_only() {
+    fn startup_cleanup_retains_referenced_legacy_sidecars() {
         let (temp, storage) = test_storage();
-        commit_vector(
-            &storage,
-            job(DerivedIndexKind::SemanticText, "1"),
-            vec![1.0, 0.0],
-        )
-        .unwrap();
-        let pending = job(DerivedIndexKind::SemanticText, "2");
-        ensure_active_subject(&storage, &pending);
-        storage.upsert_derived_index_job(&pending).unwrap();
-
-        let generation = storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
-            .expect("publish generation");
-        assert_eq!(generation.row_count, 1);
-        assert_eq!(generation.dimensions, Some(2));
-        assert_eq!(generation.model_id.as_deref(), Some("model-a"));
-        assert_eq!(generation.model_revision.as_deref(), Some("revision-1"));
-        assert_eq!(generation.embedding_version, Some(1));
-        let path = temp
-            .path()
-            .join("derived-indexes")
-            .join(&generation.file_name);
-        verify_sidecar(&path, &generation.checksum_sha256).unwrap();
-        assert_eq!(
-            storage
-                .get_derived_index_generation(DerivedIndexKind::SemanticText)
-                .unwrap()
-                .unwrap(),
-            generation
-        );
-    }
-
-    #[test]
-    fn publishing_retains_replaced_sidecar_until_safe_startup_cleanup() {
-        let (temp, storage) = test_storage();
-        commit_vector(
-            &storage,
-            job(DerivedIndexKind::SemanticText, "1"),
-            vec![1.0, 0.0],
-        )
-        .unwrap();
-        let first = storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap();
-        let first_path = temp.path().join("derived-indexes").join(&first.file_name);
-        assert!(first_path.exists());
-
-        let second = storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap();
-        let second_path = temp.path().join("derived-indexes").join(&second.file_name);
-        assert_ne!(first.file_name, second.file_name);
-        assert!(first_path.exists());
-        assert!(second_path.exists());
-
+        let directory = temp.path().join("derived-indexes");
+        std::fs::create_dir_all(&directory).unwrap();
+        let first_path = directory.join("semantic_text-1.cpdvec");
+        let second_path = directory.join("semantic_text-2.cpdvec");
+        std::fs::write(&first_path, b"replaced legacy generation").unwrap();
+        std::fs::write(&second_path, b"referenced legacy generation").unwrap();
         {
             let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().unwrap();
+            conn.execute(
+                "INSERT INTO derived_index_generations
+                    (index_kind, generation, data_epoch, file_name, checksum_sha256, row_count)
+                 VALUES ('semantic_text', 2, 0, 'semantic_text-2.cpdvec', ?1, 0)",
+                ["00".repeat(32)],
+            )
+            .unwrap();
             storage
-                .cleanup_derived_index_sidecars_at_startup(guard.as_ref().unwrap(), temp.path())
+                .cleanup_derived_index_sidecars_at_startup(conn, temp.path())
                 .unwrap();
         }
         assert!(!first_path.exists());
@@ -5088,33 +4555,6 @@ mod tests {
         }
 
         assert!(sidecar_path.is_file());
-    }
-
-    #[test]
-    fn derived_mutation_invalidates_published_generation() {
-        let (_temp, storage) = test_storage();
-        let write = claimed_write(
-            &storage,
-            job(DerivedIndexKind::SemanticText, "1"),
-            vec![1.0, 0.0],
-        );
-        storage.commit_derived_embedding(&write).unwrap();
-        storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap();
-        assert!(storage
-            .get_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap()
-            .is_some());
-
-        let mut changed = write.job.clone();
-        changed.source_fingerprint = "changed-source".to_string();
-        storage.upsert_derived_index_job(&changed).unwrap();
-
-        assert!(storage
-            .get_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap()
-            .is_none());
     }
 
     fn ann_manifest(covered_epoch: u64) -> DerivedAnnGeneration {
@@ -5464,7 +4904,7 @@ mod tests {
     }
 
     #[test]
-    fn non_visible_job_churn_and_unindexed_deletion_preserve_generation() {
+    fn non_visible_job_churn_and_unindexed_deletion_preserve_snapshot() {
         let (_temp, storage) = test_storage();
         commit_vector(
             &storage,
@@ -5476,7 +4916,7 @@ mod tests {
         ensure_active_subject(&storage, &pending);
         storage.upsert_derived_index_job(&pending).unwrap();
         let generation = storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
+            .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
             .unwrap();
 
         let lease_token = storage.mark_derived_index_job_processing(&pending).unwrap();
@@ -5491,9 +4931,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             storage
-                .get_derived_index_generation(DerivedIndexKind::SemanticText)
+                .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
                 .unwrap(),
-            Some(generation.clone())
+            generation.clone()
         );
 
         {
@@ -5509,82 +4949,14 @@ mod tests {
         }
         assert_eq!(
             storage
-                .get_derived_index_generation(DerivedIndexKind::SemanticText)
+                .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
                 .unwrap(),
-            Some(generation)
+            generation
         );
     }
 
     #[test]
-    fn stale_snapshot_cannot_be_recorded_as_current_generation() {
-        let (_temp, storage) = test_storage();
-        commit_vector(
-            &storage,
-            job(DerivedIndexKind::SemanticText, "1"),
-            vec![1.0, 0.0],
-        )
-        .unwrap();
-        let snapshot = storage
-            .get_derived_index_snapshot_metadata(DerivedIndexKind::SemanticText)
-            .unwrap();
-
-        commit_vector(
-            &storage,
-            job(DerivedIndexKind::SemanticText, "2"),
-            vec![0.0, 1.0],
-        )
-        .unwrap();
-
-        let stale = DerivedIndexGeneration {
-            index_kind: DerivedIndexKind::SemanticText,
-            generation: 1,
-            data_epoch: snapshot.data_epoch,
-            file_name: "stale.cpdvec".to_string(),
-            checksum_sha256: "00".repeat(32),
-            row_count: snapshot.row_count,
-            dimensions: snapshot.dimensions,
-            model_id: snapshot
-                .model_contract
-                .as_ref()
-                .map(|contract| contract.model_id.clone()),
-            model_revision: snapshot
-                .model_contract
-                .as_ref()
-                .map(|contract| contract.model_revision.clone()),
-            embedding_version: snapshot
-                .model_contract
-                .as_ref()
-                .map(|contract| contract.embedding_version),
-        };
-        assert!(storage.record_derived_index_generation(&stale).is_err());
-    }
-
-    #[test]
-    fn generation_streams_across_multiple_database_pages() {
-        let (_temp, storage) = test_storage();
-        let row_count = SIDECAR_PAGE_SIZE + 17;
-        for id in 0..row_count {
-            commit_vector(
-                &storage,
-                job(DerivedIndexKind::SemanticText, &(id + 1).to_string()),
-                vec![id as f32, 1.0],
-            )
-            .unwrap();
-        }
-
-        let generation = storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap();
-        assert_eq!(generation.row_count, u64::from(row_count));
-        assert_eq!(generation.dimensions, Some(2));
-        assert!(storage
-            .get_derived_index_generation(DerivedIndexKind::SemanticText)
-            .unwrap()
-            .is_some());
-    }
-
-    #[test]
-    fn rejects_non_finite_and_mixed_dimension_generations() {
+    fn rejects_non_finite_and_mixed_dimension_snapshots() {
         let (_temp, storage) = test_storage();
         let invalid = storage.commit_derived_embedding(&claimed_write(
             &storage,
@@ -5597,12 +4969,12 @@ mod tests {
             commit_vector(&storage, job(DerivedIndexKind::SemanticText, key), vector).unwrap();
         }
         assert!(storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
+            .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
             .is_err());
     }
 
     #[test]
-    fn rejects_mixed_model_contract_generations() {
+    fn rejects_mixed_model_contract_snapshots() {
         let (_temp, storage) = test_storage();
         let first = job(DerivedIndexKind::SemanticText, "1");
         let mut second = job(DerivedIndexKind::SemanticText, "2");
@@ -5611,7 +4983,7 @@ mod tests {
             commit_vector(&storage, spec, vec![1.0, 0.0]).unwrap();
         }
         assert!(storage
-            .publish_derived_index_generation(DerivedIndexKind::SemanticText)
+            .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
             .is_err());
     }
 

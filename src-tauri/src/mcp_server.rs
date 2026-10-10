@@ -1754,14 +1754,6 @@ pub(crate) fn port_from_policy(policy: &Value) -> u16 {
         .unwrap_or(DEFAULT_MCP_PORT)
 }
 
-pub fn get_port(storage_state: &StorageState) -> u16 {
-    storage_state
-        .load_policy()
-        .ok()
-        .map(|policy| port_from_policy(&policy))
-        .unwrap_or(DEFAULT_MCP_PORT)
-}
-
 #[cfg(test)]
 mod runtime_state_tests {
     use super::*;

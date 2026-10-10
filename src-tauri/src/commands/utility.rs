@@ -11,22 +11,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
 
-/// Forwards a frontend log message into the Rust tracing pipeline.
-///
-/// Authentication: not required. `level` selects the tracing level and `message` is
-/// logged with a `Frontend:` prefix; returns JSON `null`.
-#[tauri::command]
-pub fn frontend_log(level: String, message: String) {
-    match level.as_str() {
-        "info" => tracing::info!("Frontend: {}", message),
-        "warn" => tracing::warn!("Frontend: {}", message),
-        "error" => tracing::error!("Frontend: {}", message),
-        "debug" => tracing::debug!("Frontend: {}", message),
-        "trace" => tracing::trace!("Frontend: {}", message),
-        _ => tracing::info!("Frontend: {}", message),
-    }
-}
-
 /// Returns the absolute CarbonPaper log-directory path as a JSON string.
 ///
 /// Authentication: not required. Frontend: `hooks/useCriticalErrors.js`.
@@ -136,19 +120,6 @@ pub fn hide_to_tray(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 pub fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), String> {
     crate::set_app_language(&app, &language)
-}
-
-/// Terminates the process from an authorized security/recovery screen.
-///
-/// Authentication: main-window origin required. Returns only if termination fails.
-#[tauri::command]
-pub fn close_process(
-    window: tauri::Window,
-    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
-    credential_state.clear_all_cached_keys();
-    std::process::exit(0);
 }
 
 /// Returns advanced runtime configuration as a JSON object.

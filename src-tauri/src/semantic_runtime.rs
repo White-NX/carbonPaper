@@ -1886,19 +1886,6 @@ pub async fn get_background_index_progress(
     })
 }
 
-#[tauri::command]
-pub fn restart_ml_semantic_worker(
-    window: tauri::Window,
-    state: tauri::State<'_, Arc<SemanticRuntimeState>>,
-    _monitor: tauri::State<'_, crate::monitor::MonitorState>,
-) -> Result<SemanticRuntimeStatus, String> {
-    crate::commands::check_main_window(&window)?;
-    state.stop();
-    let mut status = state.status();
-    status.classification_backend = crate::classification_runtime::backend_status();
-    Ok(status)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

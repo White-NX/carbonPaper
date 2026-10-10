@@ -5,6 +5,16 @@ import { withAuth, requestAuth, checkAuthSession } from './auth_api';
 export { requestAuth, checkAuthSession };
 export { initAuthListeners, lockSession } from './auth_api';
 
+export const getThumbnailWarmupStatus = () => withAuth(
+    () => invoke('storage_get_thumbnail_warmup_status'),
+);
+export const warmupThumbnails = (options = {}) => withAuth(
+    () => invoke('storage_warmup_thumbnails'), options,
+);
+export const cancelThumbnailWarmup = () => withAuth(
+    () => invoke('storage_cancel_thumbnail_warmup'), { autoPrompt: true },
+);
+
 export const REQUEST_DEADLINES = Object.freeze({
     imageMs: 15_000,
     thumbnailMs: 15_000,

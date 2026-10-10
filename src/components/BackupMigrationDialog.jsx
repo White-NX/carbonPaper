@@ -34,11 +34,11 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
 
   const handleAction = async () => {
     if (mode === 'export' && password !== confirmPassword) {
-      setError(t('settings.backup.error_password_mismatch', 'Passwords do not match'));
+      setError(t('settings.backup.error_password_mismatch'));
       return;
     }
     if (!password) {
-      setError(t('settings.backup.error_password_empty', 'Password cannot be empty'));
+      setError(t('settings.backup.error_password_empty'));
       return;
     }
 
@@ -96,8 +96,8 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
   };
 
   const title = mode === 'export' 
-    ? t('settings.backup.export_title', 'Export Data Backup') 
-    : t('settings.backup.import_title', 'Import Data Backup');
+    ? t('settings.backup.export_title')
+    : t('settings.backup.import_title');
 
   return (
     <Dialog isOpen={isOpen} onClose={handleClose} title={title} disableClose={status === 'processing'}>
@@ -108,14 +108,14 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
               <ShieldAlert className="w-5 h-5 text-ide-accent shrink-0 mt-0.5" />
               <div className="text-xs text-ide-muted leading-relaxed">
                 {mode === 'export' 
-                  ? t('settings.backup.export_hint', 'This will pack your database and screenshots into an encrypted ZIP. The password is required to decrypt the backup on another computer. PLEASE KEEP IT SAFE.')
-                  : t('settings.backup.import_hint', 'Importing will replace your current data with the contents of the backup. This action cannot be undone.')}
+                  ? t('settings.backup.export_hint')
+                  : t('settings.backup.import_hint')}
               </div>
             </div>
 
             <div className="space-y-4">
               <div className="space-y-1.5">
-                <label className="text-xs font-medium text-ide-muted ml-1">{t('settings.backup.password_label', 'Backup Password')}</label>
+                <label className="text-xs font-medium text-ide-muted ml-1">{t('settings.backup.password_label')}</label>
                 <div className="relative">
                   <input
                     type="password"
@@ -130,7 +130,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
 
               {mode === 'export' && (
                 <div className="space-y-1.5">
-                  <label className="text-xs font-medium text-ide-muted ml-1">{t('settings.backup.confirm_password_label', 'Confirm Password')}</label>
+                  <label className="text-xs font-medium text-ide-muted ml-1">{t('settings.backup.confirm_password_label')}</label>
                   <div className="relative">
                     <input
                       type="password"
@@ -156,14 +156,14 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                 onClick={handleClose}
                 className="px-4 py-2 border border-ide-border rounded-lg text-sm hover:bg-ide-panel transition-colors"
               >
-                {t('common.cancel', 'Cancel')}
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleAction}
                 className="px-4 py-2 bg-ide-accent text-white rounded-lg text-sm font-medium hover:bg-ide-accent/90 transition-colors flex items-center gap-2"
               >
                 {mode === 'export' ? <FileDown className="w-4 h-4" /> : <FileUp className="w-4 h-4" />}
-                {mode === 'export' ? t('settings.backup.export_btn', 'Start Export') : t('settings.backup.import_btn', 'Start Import')}
+                {mode === 'export' ? t('settings.backup.export_btn') : t('settings.backup.import_btn')}
               </button>
             </div>
           </>
@@ -173,7 +173,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
           <div className="py-8 flex flex-col items-center justify-center space-y-4">
             <RefreshCw className="w-10 h-10 text-ide-accent animate-spin" />
             <div className="text-center w-full max-w-sm">
-              <div className="text-sm font-medium">{t('settings.backup.processing', 'Processing...')}</div>
+              <div className="text-sm font-medium">{t('settings.backup.processing')}</div>
               {progress && progress.total_files > 0 ? (
                 <div className="mt-4 space-y-2">
                   <div className="flex items-center justify-between text-xs text-ide-muted">
@@ -188,7 +188,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                   </div>
                 </div>
               ) : (
-                <div className="text-xs text-ide-muted mt-1">{t('settings.backup.processing_hint', 'Please do not close the application.')}</div>
+                <div className="text-xs text-ide-muted mt-1">{t('settings.backup.processing_hint')}</div>
               )}
             </div>
           </div>
@@ -198,18 +198,18 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
           <div className="py-6 flex flex-col items-center justify-center space-y-4">
             <CheckCircle2 className="w-12 h-12 text-green-500" />
             <div className="text-center">
-              <div className="text-sm font-medium">{t('settings.backup.success_title', 'Operation Successful')}</div>
+              <div className="text-sm font-medium">{t('settings.backup.success_title')}</div>
               <p className="text-xs text-ide-muted mt-2 max-w-[280px]">
                 {mode === 'export' 
-                  ? t('settings.backup.export_success_hint', 'Backup file has been saved.')
-                  : t('settings.backup.import_success_hint', 'Data has been imported. Please restart the application to apply changes.')}
+                  ? t('settings.backup.export_success_hint')
+                  : t('settings.backup.import_success_hint')}
               </p>
             </div>
             <button
               onClick={handleClose}
               className="mt-4 px-6 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm font-medium hover:bg-ide-hover transition-colors"
             >
-              {t('common.close', 'Close')}
+              {t('common.close')}
             </button>
           </div>
         )}
@@ -220,7 +220,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
               <ShieldAlert className="w-7 h-7 text-red-500" />
             </div>
             <div className="text-center">
-              <div className="text-sm font-medium text-red-500">{t('settings.backup.error_title', 'Operation Failed')}</div>
+              <div className="text-sm font-medium text-red-500">{t('settings.backup.error_title')}</div>
               <p className="text-xs text-ide-muted mt-2 break-all max-w-[300px]">
                 {error}
               </p>
@@ -230,13 +230,13 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                 onClick={() => setStatus('idle')}
                 className="px-4 py-2 border border-ide-border rounded-lg text-sm hover:bg-ide-panel transition-colors"
               >
-                {t('common.retry', 'Retry')}
+                {t('common.retry')}
               </button>
               <button
                 onClick={handleClose}
                 className="px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm hover:bg-ide-hover transition-colors"
               >
-                {t('common.close', 'Close')}
+                {t('common.close')}
               </button>
             </div>
           </div>

@@ -27,10 +27,10 @@ export default function SmartClusterCard({
         <div className="flex-1 min-w-0">
           <p className="text-sm text-ide-text font-medium flex items-center gap-1.5">
             <Sparkles className="w-3.5 h-3.5 text-ide-accent" />
-            {t('settings.features.management.smartCluster.label', '智能聚类（按描述自动归档）')}
+            {t('settings.features.management.smartCluster.label')}
           </p>
           <p className="text-xs text-ide-muted mt-1">
-            {t('settings.features.management.smartCluster.description', '输入一句话描述（如 "对加利福尼亚山脉的研究"），自动归档相关快照。仅在系统空闲时计算。')}
+            {t('settings.features.management.smartCluster.description')}
           </p>
         </div>
       </div>
@@ -38,14 +38,14 @@ export default function SmartClusterCard({
       {!scModelAvailable && !scDownloading && !scDownloadError && (
         <div className="mt-4 pt-4 border-t border-ide-border/50 flex items-center justify-between gap-3">
           <p className="text-xs text-ide-muted">
-            {t('settings.features.management.smartCluster.modelNotDownloaded', 'bge-reranker-v2-m3 (uint8, ~570MB) 尚未下载')}
+            {t('settings.features.management.smartCluster.modelNotDownloaded')}
           </p>
           <SettingsButton
             onClick={onDownloadReranker}
             variant="primary"
             icon={Download}
           >
-            {t('settings.features.management.smartCluster.downloadModel', '下载模型')}
+            {t('settings.features.management.smartCluster.downloadModel')}
           </SettingsButton>
         </div>
       )}
@@ -54,7 +54,7 @@ export default function SmartClusterCard({
         <div className="mt-4 pt-4 border-t border-ide-border/50">
           <div className="flex items-center gap-2 text-xs text-ide-muted mb-2">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            {t('settings.features.management.smartCluster.downloading', '正在下载…')}
+            {t('settings.features.management.smartCluster.downloading')}
           </div>
           <progress aria-label={t('settings.features.management.smartCluster.downloading')} className="h-1.5 w-full accent-ide-accent" />
           <SettingsDisclosure title={t('settings.details.download')}>
@@ -77,7 +77,7 @@ export default function SmartClusterCard({
             size="xs"
             icon={RotateCcw}
           >
-            {t('settings.features.management.smartCluster.retry', '重试')}
+            {t('settings.features.management.smartCluster.retry')}
           </SettingsButton>
         </div>
       )}
@@ -86,12 +86,12 @@ export default function SmartClusterCard({
         <div className="mt-4 pt-4 border-t border-ide-border/50 space-y-3">
           <div className="flex items-center justify-between gap-2 text-xs">
             <span className="text-ide-muted">
-              {t('settings.features.management.smartCluster.status', '状态')}:
+              {t('settings.features.management.smartCluster.status')}:
             </span>
             <span className="text-ide-text flex items-center gap-3">
-              <span>{t('settings.features.management.smartCluster.pending', '待处理')}: <span className="font-mono">{scStatus?.pending_count ?? '--'}</span></span>
+              <span>{t('settings.features.management.smartCluster.pending')}: <span className="font-mono">{scStatus?.pending_count ?? '--'}</span></span>
               <span className="opacity-50">·</span>
-              <span>{t('settings.features.management.smartCluster.activeClusters', '启用的聚类')}: <span className="font-mono">{scStatus?.enabled_cluster_count ?? 0}/{scStatus?.total_cluster_count ?? 0}</span></span>
+              <span>{t('settings.features.management.smartCluster.activeClusters')}: <span className="font-mono">{scStatus?.enabled_cluster_count ?? 0}/{scStatus?.total_cluster_count ?? 0}</span></span>
             </span>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
@@ -99,13 +99,13 @@ export default function SmartClusterCard({
               onClick={onDrainNow}
               icon={Zap}
             >
-              {t('settings.features.management.smartCluster.drainNow', '立即处理待处理队列')}
+              {t('settings.features.management.smartCluster.drainNow')}
             </SettingsButton>
             <SettingsButton
               onClick={onRescanAll}
               icon={RefreshCw}
             >
-              {t('settings.features.management.smartCluster.rescanAll', '全部重新匹配 hot 层')}
+              {t('settings.features.management.smartCluster.rescanAll')}
             </SettingsButton>
           </div>
         </div>

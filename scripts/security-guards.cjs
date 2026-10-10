@@ -34,7 +34,6 @@ const COMMAND_TIERS = {
   'app_bound::app_bound_set_policy': 'session_required',
   'app_bound::app_bound_install': 'session_required',
   'app_bound::app_bound_uninstall': 'session_required',
-  'commands::utility::close_process': 'lifecycle_public',
   'commands::utility::set_app_language': 'public',
   'monitor::start_monitor': 'runtime_public',
   'monitor::get_monitor_autostart': 'public',
@@ -75,13 +74,9 @@ const COMMAND_TIERS = {
   'commands::storage::storage_soft_delete_screenshots': 'session_required',
   'commands::storage::storage_get_delete_queue_status': 'session_required',
   'commands::storage::storage_get_index_health': 'session_required',
-  'commands::storage::storage_save_screenshot': 'session_required',
   'commands::storage::storage_set_policy': 'session_required',
   'commands::storage::storage_get_policy': 'session_required',
-  'commands::storage::storage_get_public_key': 'public',
   'commands::storage::storage_compute_link_scores': 'public',
-  'commands::storage::storage_encrypt_for_chromadb': 'public',
-  'commands::storage::storage_decrypt_from_chromadb': 'session_required',
   'commands::storage::storage_update_category': 'session_required',
   'commands::storage::storage_get_categories_from_db': 'session_required',
   'commands::storage::storage_batch_get_categories': 'session_required',
@@ -91,12 +86,8 @@ const COMMAND_TIERS = {
   'commands::migration::storage_run_manual_vacuum': 'session_required',
   'commands::migration::storage_check_hmac_migration_status': 'public',
   'commands::migration::storage_run_hmac_migration': 'session_required',
-  'commands::migration::storage_hmac_migration_cancel': 'session_required',
   'commands::migration::storage_export_backup': 'session_required',
   'commands::migration::storage_import_backup': 'session_required',
-  'commands::database_mode::storage_get_database_mode_metadata': 'session_required',
-  'commands::database_mode::storage_check_database_mode_eligibility': 'session_required',
-  'commands::database_mode::storage_transition_wal_to_delete': 'session_required',
   'analysis::get_analysis_overview': 'session_required',
   'commands::mcp::mcp_set_enabled': 'session_required',
   'commands::mcp::mcp_get_status': 'public',
@@ -104,8 +95,6 @@ const COMMAND_TIERS = {
   'commands::mcp::mcp_ack_privacy_warning': 'public',
   'commands::mcp::mcp_reset_token': 'session_required',
   'commands::mcp::mcp_copy_token_to_clipboard': 'session_required',
-  'commands::mcp::mcp_get_port': 'public',
-  'commands::mcp::mcp_set_port': 'session_required',
   'commands::mcp::mcp_get_sensitive_filter_config': 'session_required',
   'commands::mcp::mcp_set_sensitive_filter_config': 'session_required',
   'commands::utility::get_advanced_config': 'public',
@@ -139,10 +128,7 @@ const COMMAND_TIERS = {
   'native_messaging::detect_installed_browsers': 'public',
   'onboarding::get_onboarding_state': 'public',
   'onboarding::complete_onboarding': 'public',
-  'native_messaging::register_nm_host_chrome': 'session_required',
-  'native_messaging::register_nm_host_edge': 'session_required',
   'native_messaging::install_browser_extension': 'session_required',
-  'native_messaging::sync_extension_if_needed': 'background_policy',
   'commands::utility::get_extension_enhancement_config': 'public',
   'commands::utility::set_extension_enhancement': 'session_required',
   'commands::utility::get_nmh_sessions': 'public',
@@ -163,14 +149,12 @@ const COMMAND_TIERS = {
   'commands::smart_cluster::smart_cluster_rescan_all': 'session_required',
   'commands::smart_cluster::smart_cluster_clear_assignments': 'session_required',
   'commands::smart_cluster::smart_cluster_status': 'session_required',
-  'idle::get_idle_state': 'public',
   'commands::utility::get_log_dir': 'public',
   'commands::utility::get_critical_errors': 'public',
   'commands::utility::restart_app': 'lifecycle_public',
   'commands::utility::trigger_test_error': 'session_required',
   'commands::utility::exit_app': 'lifecycle_public',
   'commands::utility::hide_to_tray': 'lifecycle_public',
-  'commands::utility::frontend_log': 'public',
   'commands::utility::switch_to_lightweight_mode': 'public',
   'commands::utility::switch_to_standard_mode': 'public',
   'commands::utility::get_lightweight_status': 'public',
@@ -187,7 +171,6 @@ const COMMAND_TIERS = {
   'ml_runtime::debug_trigger_ocr_model_repair_notification': 'session_required',
   'semantic_runtime::get_ml_semantic_status': 'public',
   'semantic_runtime::get_background_index_progress': 'public',
-  'semantic_runtime::restart_ml_semantic_worker': 'runtime_public',
   'minilm_index::semantic_index_run_now': 'session_required',
   'minilm_index::semantic_index_stop_now': 'runtime_public',
   'clip_index::clip_index_run_now': 'session_required',
@@ -290,7 +273,6 @@ function checkCommandGuardImplementations() {
     'monitor::stop_monitor',
     'monitor::pause_monitor',
     'monitor::resume_monitor',
-    'commands::utility::close_process',
     'commands::utility::restart_app',
     'commands::utility::exit_app',
     'commands::utility::hide_to_tray',
@@ -311,8 +293,6 @@ function checkCommandGuardImplementations() {
   "set_autostart",
   "model_management::download_model",
   "updater::updater_install",
-  "native_messaging::register_nm_host_chrome",
-  "native_messaging::register_nm_host_edge",
   "native_messaging::install_browser_extension",
   "commands::utility::set_lightweight_config",
   "commands::utility::open_path",
@@ -339,7 +319,6 @@ function checkRuntimeControlInvariants() {
     'monitor::stop_monitor',
     'monitor::pause_monitor',
     'monitor::resume_monitor',
-    'semantic_runtime::restart_ml_semantic_worker',
   ];
   for (const command of runtimeCommands) {
     const body = commandFunctionBody(command);
@@ -353,7 +332,7 @@ function checkRuntimeControlInvariants() {
 
   const interactiveAuthRuntimeCalls = walk(path.join(ROOT, 'src'))
     .filter((file) => /\.(js|jsx|ts|tsx)$/.test(file))
-    .filter((file) => /withAuth\s*\(\s*\(\)\s*=>\s*invoke\(['"](?:start_monitor|stop_monitor|pause_monitor|resume_monitor|restart_ml_semantic_worker)['"]/.test(fs.readFileSync(file, 'utf8')))
+    .filter((file) => /withAuth\s*\(\s*\(\)\s*=>\s*invoke\(['"](?:start_monitor|stop_monitor|pause_monitor|resume_monitor)['"]/.test(fs.readFileSync(file, 'utf8')))
     .map((file) => path.relative(ROOT, file));
   if (interactiveAuthRuntimeCalls.length) {
     throw new Error(`Runtime controls must not request interactive authentication:\n${interactiveAuthRuntimeCalls.join('\n')}`);

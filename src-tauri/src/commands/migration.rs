@@ -188,24 +188,6 @@ pub async fn storage_run_hmac_migration(
     .map_err(|e| format!("Migration task panicked: {}", e))?
 }
 
-/// Requests cancellation of the active HMAC migration.
-///
-/// Authentication: required. Returns `{ "status": "cancel_requested" | "idle",
-/// "is_running": boolean }`.
-#[tauri::command]
-pub async fn storage_hmac_migration_cancel(
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    state: tauri::State<'_, Arc<StorageState>>,
-) -> Result<serde_json::Value, String> {
-    super::check_auth_required(&credential_state)?;
-
-    let in_progress = state.request_hmac_migration_cancel();
-    Ok(serde_json::json!({
-        "status": if in_progress { "cancel_requested" } else { "idle" },
-        "is_running": in_progress
-    }))
-}
-
 /// Lists screenshot files that still exist as plaintext paths.
 ///
 /// Authentication: required. Returns a JSON array of path strings.

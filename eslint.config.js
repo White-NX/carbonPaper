@@ -46,6 +46,10 @@ export default [
       'react/jsx-no-duplicate-props': 'error',
       'react/jsx-no-undef': 'error',
       'react/no-unknown-property': 'error',
+      'no-restricted-syntax': ['error', {
+        selector: 'CallExpression:matches([callee.name="t"], [callee.property.name="t"])[arguments.1.type="Literal"][arguments.1.value=type(string)]',
+        message: 'Keep translation defaults in src/i18n/locales instead of inline strings.',
+      }],
 
       // Existing components intentionally accept flexible data-shaped props.
       'react/prop-types': 'off',

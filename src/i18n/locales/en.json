@@ -45,7 +45,6 @@
     "welcome": "Put your day in context",
     "intro": "Review what happened throughout the day, follow related tasks, and return to the original records. Once enabled, new records are organized every four hours.",
     "configure": "Open settings",
-    "schedule": "Organized automatically every four hours",
     "generating": "Preparing your recap…",
     "generate": "Complete recap",
     "regenerate": "Regenerate",
@@ -56,28 +55,14 @@
     "correct": "Correct association",
     "summaryPending": "The period summary is pending. Activity details are available below.",
     "summaryUnavailable": "The period summary could not be updated. Activity details are still available.",
-    "taskInDetails": "Details of this activity are available below.",
-    "details": "View activity and sources",
-    "source": "Source record",
-    "locate": "Locate on timeline",
-    "relatedTask": "Related task: {{title}}",
-    "allActivities": "Show all activities",
-    "empty": "Organized activities will appear here. You can generate a recap of completed periods.",
-    "partial": "Your recap is available. Some details remain incomplete.",
-    "failed": "Recap generation failed for this period",
     "errorDetails": "View error details",
-    "errorLogHint": "Search the app logs for [RECAP] to see the failed stage and request records.",
-    "allRecords": "Records from {{start}}–{{end}} ({{count}})",
     "remoteConsent": "Recaps and semantic screening send selected screen text to the model services you configure.",
     "allowRemote": "Allow and continue",
     "progress": {
       "title": "Generation activity",
       "completed": "Processed {{count}} / {{total}} periods",
       "completedLabel": "Period progress",
-      "period": "Preparing the period starting at {{start}}",
-      "reply": "View reply preview",
       "previewLimited": "Only the beginning of longer content is kept in this preview.",
-      "requestDetails": "Request details",
       "outputLimit": "Request output limit (including thinking)",
       "inputUsage": "Input tokens",
       "outputUsage": "Output tokens (including thinking)",
@@ -87,13 +72,27 @@
       "received": "Content received",
       "receivedCounts": "{{reasoning}} thinking characters, {{text}} reply characters",
       "requestId": "Request ID",
-      "attempts": { "initial": "Organize activities", "repair": "Complete and repair", "summary": "Summarize period" },
+      "attempts": {
+        "initial": "Organize activities",
+        "repair": "Complete and repair",
+        "summary": "Summarize period"
+      },
       "stages": {
-        "preparing": "Preparing recap", "collecting": "Reading records", "screening": "Selecting content",
-        "waiting": "Waiting for model", "thinking": "Model is thinking", "writing": "Writing recap",
-        "validating": "Checking recap", "summarizing": "Summarizing period", "saving": "Saving recap", "running": "In progress",
-        "ready": "Completed", "partial": "Some content remains incomplete", "failed": "Generation failed",
-        "cancelled": "Stopped", "paused": "Waiting for fullscreen app to close"
+        "preparing": "Preparing recap",
+        "collecting": "Reading records",
+        "screening": "Selecting content",
+        "waiting": "Waiting for model",
+        "thinking": "Model is thinking",
+        "writing": "Writing recap",
+        "validating": "Checking recap",
+        "summarizing": "Summarizing period",
+        "saving": "Saving recap",
+        "running": "In progress",
+        "ready": "Completed",
+        "partial": "Some content remains incomplete",
+        "failed": "Generation failed",
+        "cancelled": "Stopped",
+        "paused": "Waiting for fullscreen app to close"
       }
     },
     "diagnostics": {
@@ -104,7 +103,11 @@
       "finishing": "Finishing the recap",
       "steps": "Processing steps",
       "requestContent": "Request content",
-      "tabs": { "reply": "Reply preview", "reasoning": "Thinking", "requestDetails": "Request information" },
+      "tabs": {
+        "reply": "Reply preview",
+        "reasoning": "Thinking",
+        "requestDetails": "Request information"
+      },
       "model": "Model",
       "requestDuration": "Request duration",
       "totalRequestDuration": "Combined request time: {{duration}}",
@@ -253,14 +256,6 @@
   "settings": {
     "general": {
       "title": "General Options",
-      "language": {
-        "label": "Language",
-        "description": "Select display language for the interface."
-      },
-      "telemetry": {
-        "label": "Allow sending telemetry diagnostic data",
-        "description": "Allow program to upload error logs that do not contain privacy data to the telemetry server."
-      },
       "powerSaving": {
         "label": "Power Saving Mode",
         "description": "Automatically pause monitor service when on battery power, and resume when plugged in."
@@ -268,7 +263,6 @@
       "gameMode": {
         "label": "Game Mode",
         "description": "When enabled will disable DML and screenshots on game launch for better game performance.",
-        "requires_dml": "Requires DirectML acceleration to be enabled first",
         "active": "Active: DirectML temporarily disabled",
         "inactive": "GPU load normal",
         "permanent": "DirectML disabled (too many switches, will restore on restart)",
@@ -294,23 +288,6 @@
             "label": "Custom",
             "description": "Tune battery saving and game protection separately."
           }
-        }
-      },
-      "lightweightMode": {
-        "startHidden": {
-          "label": "Start with Hidden Window (Lightweight Mode)",
-          "description": "Start without showing the UI, run background services only, accessible via tray menu"
-        },
-        "autoSwitch": {
-          "label": "Auto-switch to Lightweight Mode",
-          "description": "Automatically switch to lightweight mode after window closes to save memory",
-          "delayLabel": "Delay:",
-          "delayUnit": "minutes"
-        },
-        "switchNow": {
-          "label": "Switch to Lightweight Mode Now",
-          "description": "Close UI and free memory, can reopen via tray menu",
-          "button": "Switch"
         }
       },
       "windowBehavior": {
@@ -359,7 +336,6 @@
       "monitor": {
         "title": "Monitor Service",
         "tooltip": "Runs task organization and privacy detection.",
-        "status": "Status: {{status}}",
         "status_label": "Status:",
         "description": "Control the background screenshot & OCR service.",
         "starting": "Starting...",
@@ -436,74 +412,40 @@
           },
           "until_close": {
             "label": "Until app exits",
-            "description": "Stay unlocked until the app fully exits.",
-            "warning": true
+            "description": "Stay unlocked until the app fully exits."
           }
         },
         "current": {
           "unlocked": "Unlocked",
-          "locked": "Locked",
-          "label": "Current session:"
+          "locked": "Locked"
         },
-        "lock_now": "Lock now",
-        "locking": "Locking..."
+        "lock_now": "Lock now"
       }
     },
     "advanced": {
-      "loading": "Loading...",
-      "warning": "These settings may affect monitor service performance and system stability. Adjust carefully.",
       "quick_restart": "Quick Restart",
-      "terms": {
-        "directml": "DirectML is Microsoft's GPU inference interface. It can accelerate OCR on compatible GPUs, but may compete with games or graphics-heavy apps."
-      },
       "cpu": {
         "title": "CPU usage limit",
         "label": "Limit CPU usage",
         "description": "Limit background CPU usage to reduce its effect on other apps.",
-        "percent_label": "CPU limit percent",
-        "changed_notice": "CPU limit changes take effect when the monitor service restarts"
+        "percent_label": "CPU limit percent"
       },
       "ocr": {
         "title": "OCR processing",
-        "single_flight": "Fixed single-task mode",
-        "single_flight_desc": "OCR processes RGB capture frames before JPEG encoding. To cap memory use, full RGB frames are not queued while OCR is running.",
-        "pause_label": "Pause captures when OCR queue has work",
-        "pause_desc": "When enabled, pauses captures while there are unprocessed OCR tasks to reduce resource usage",
-        "queue_limit_label": "Limit OCR task queue size",
-        "queue_limit_desc": "Pause captures until queue is drained when above this size",
-        "max_queue_label": "Max queue size",
         "timeout_label": "OCR timeout",
         "timeout_desc": "The maximum time allowed for a single recognition task.",
         "seconds": "seconds",
-        "info": "OCR queue settings take effect immediately without restarting the monitor service",
         "invalidTimeout": "Enter a whole number between 30 and 600."
       },
       "rust_ocr": {
         "title": "OCR engine",
-        "raw_rgb": "Rust Raw RGB OCR",
-        "raw_rgb_desc": "The isolated Rust ML process reads RGB capture frames directly.",
-        "use_rust": "Use Rust OCR",
-        "rust_desc": "Runs OCR directly on RGB capture frames in an isolated Rust ML process.",
-        "model_ready": "PP-OCRv5 Mobile is installed",
-        "model_missing": "PP-OCRv5 Mobile must be installed",
-        "model_bundled": "PP-OCRv5 Mobile is bundled with CarbonPaper",
-        "model_repaired": "PP-OCRv5 Mobile was installed by online repair",
-        "model_damaged": "PP-OCRv5 Mobile installation resources are missing or corrupt",
-        "model_checking": "Checking model…",
         "model_downloading": "Downloading…",
-        "model_download": "Download model",
-        "model_repair": "Repair online",
-        "status_loading": "Reading status…",
-        "status_counts": "Success {{success}} · Failed {{failure}} · Last {{elapsed}} ms",
-        "restart": "Restart Rust ML process",
-        "retry_failed": "Retry failed screenshots ({{count}})"
+        "model_repair": "Repair online"
       },
       "dml": {
         "title": "DirectML inference acceleration",
         "label": "Use graphics acceleration",
         "description": "Use a DirectX 12 compatible graphics device to accelerate recognition and vector processing.",
-        "notice": "Note: Running DirectML on the primary GPU may impact gaming performance.",
-        "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "gpu_select": "Select GPU device",
         "gpu_loading": "Detecting GPUs...",
         "gpu_none": "No compatible GPU detected",
@@ -513,7 +455,6 @@
         "title": "Background organization",
         "label": "Continue organizing while locked",
         "description": "After one successful unlock, CarbonPaper can keep organizing records for this app session. Unlock again after restarting.",
-        "status": "Current status",
         "refresh": "Refresh status",
         "states": {
           "waiting_for_idle": "Waiting for idle",
@@ -529,12 +470,7 @@
         "profile": "Execution profile",
         "waitReason": "Waiting reason",
         "pauses": "Pauses",
-        "yieldLatency": "Last yield latency",
-        "task": "Task",
-        "eligible": "Run during use",
-        "backlogAge": "Backlog age",
-        "verified": "Verified",
-        "pendingEvaluation": "Awaiting evaluation"
+        "yieldLatency": "Last yield latency"
       },
       "network": {
         "title": "Network access",
@@ -625,12 +561,9 @@
       },
       "classification_backend": {
         "title": "Automatic screenshot classification",
-        "label": "Rust BGE classification inference",
-        "description": "Classifies activity using window titles, text, and your corrections.",
         "successes": "Rust successes",
         "failures": "Rust failures",
-        "last_elapsed": "Last inference",
-        "last_error": "Last error"
+        "last_elapsed": "Last inference"
       },
       "vacuum": {
         "title": "Database maintenance",
@@ -722,11 +655,8 @@
         "copying": "Copying files: {{copied}}/{{total}}",
         "current_file": "Current: {{file}}",
         "completed": "Completed",
-        "cancel": "Cancel",
         "upgrading": "Upgrading the search index…",
         "background_tip": "You can safely close this window. The upgrade will continue in the background, and search results will gradually populate.",
-        "preparing": "Initializing migration...",
-        "indexing_detailed": "Upgrading secure index: {{processed}} / {{total}}",
         "search_unavailable_title": "Search Limited",
         "search_unavailable_desc": "The database is undergoing a security upgrade and the search index is being rebuilt. During this time, search results may be incomplete or temporarily unavailable. Normal service will resume automatically once the upgrade completes."
       },
@@ -802,9 +732,7 @@
           "1hour": "1 hour",
           "today": "Today"
         },
-        "button": "{{label}} within",
         "confirmTitle": "Confirm?",
-        "confirmMessage": "This deletes snapshots and OCR records in the selected range and cannot be undone. Continue?",
         "yes": "YES",
         "no": "NO",
         "chooseRange": "Choose a time range",
@@ -820,7 +748,6 @@
     "save_filters": {
       "synced": "Filter rules saved and applied.",
       "saved_local_not_running": "Rules saved. They will apply when recording next starts.",
-      "saved_local_unsupported": "",
       "saved_local_sync_failed": "Rules saved but could not be applied yet. Retry or restart recording."
     },
     "autolaunch": {
@@ -834,22 +761,13 @@
     },
     "extension": {
       "title": "Browser Extension",
-      "description": "Manage browser extension",
       "chrome": {
-        "name": "Chrome / Chromium browsers",
-        "label": "Install",
-        "registered": "Registered",
-        "registering": "Registering..."
+        "name": "Chrome / Chromium browsers"
       },
       "edge": {
-        "name": "Microsoft Edge",
-        "label": "Install",
-        "registered": "Registered",
-        "registering": "Registering..."
+        "name": "Microsoft Edge"
       },
       "status": {
-        "registered": "Registered",
-        "not_registered": "Not registered",
         "checking": "Checking…",
         "connected": "Connected",
         "configured": "Configured, not connected",
@@ -857,7 +775,6 @@
         "unavailable": "Connection status unavailable"
       },
       "enhance": {
-        "label": "Extension Enhancement",
         "description": "Save page addresses, titles, and links with browser records so you can return to the original page.",
         "global": "Enable extension enhancement"
       },
@@ -866,9 +783,7 @@
         "empty": "No browser is currently connected.",
         "pid": "PID {{pid}}"
       },
-      "success": "Extension installed successfully. Please enable the unpacked extension in your browser.",
       "error": "Installation failed: {{error}}",
-      "help": "After clicking the button, load the unpacked extension from the path shown in your browser's extension settings page.",
       "tutorial": {
         "title": "View installation steps",
         "step1": "Choose “Set up browser” or “Set up again” to prepare the files and open the browser extension manager.",
@@ -890,7 +805,6 @@
     "ai_embedding": {
       "title": "AI assistant access",
       "description": "Expose a local MCP (Model Context Protocol) HTTP server so that AI assistants can query your snapshot data, OCR text, and smart clusters.",
-      "mcp_service": "MCP Service",
       "mcp_description": "When enabled, starts a local MCP service that lets AI tools query snapshot data, including screenshot metadata, OCR text, and smart cluster information. Be mindful of privacy and only authorize AI tools you trust.",
       "enable_label": "Enable MCP Server",
       "start_button": "Start",
@@ -906,7 +820,6 @@
       "token": {
         "title": "Access Token",
         "description": "The token is used for API authentication. It is only shown once when generated.",
-        "show_once_warning": "This token will only be shown once. Please copy and save it now. You will not be able to view it again.",
         "copy": "Copy",
         "copied": "Copied",
         "reset": "Reset Token",
@@ -914,13 +827,11 @@
         "reset_confirm_message": "The current token will be permanently invalidated. All clients using the old token will lose access. A new token will be generated."
       },
       "status": {
-        "running": "MCP server is running",
         "stopped": "MCP server is stopped",
         "starting": "Starting MCP server",
         "pending_auth": "Enabled. The MCP server will start automatically after Windows Hello authentication.",
         "error": "MCP server failed to start",
-        "port_label": "Port",
-        "auth_required": "Authentication required"
+        "port_label": "Port"
       },
       "connection_info": {
         "title": "Connection Information",
@@ -993,7 +904,6 @@
       },
       "content_filter": {
         "title": "Content Filter",
-        "description": "Filter flagged content from MCP server responses based on compliance rules.",
         "level_label": "Privacy Protection Level",
         "levels": {
           "standard": {
@@ -1039,7 +949,6 @@
         "pii": {
           "title": "Personal Information Detection",
           "description": "Find phone numbers, ID numbers, bank card numbers, passwords and other personal information in content returned to AI tools, and handle it with the selected filter behavior.",
-          "toggle_label": "Enable Personal Information Detection",
           "entity_types_label": "Entity Types to Detect",
           "entity_types": {
             "PHONE_NUMBER": "Phone Numbers",
@@ -1121,8 +1030,7 @@
           "activeClusters": "Active",
           "drainNow": "Process pending records",
           "rescanAll": "Match records again",
-          "retry": "Retry Download",
-          "openManagement": "Open Smart Cluster Management"
+          "retry": "Retry Download"
         },
         "indexHealth": {
           "label": "Search and maintenance",
@@ -1134,8 +1042,7 @@
           "vectorRows": "Vectors",
           "deleteQueue": "Delete queue",
           "smartPending": "Smart cluster pending"
-        },
-        "disabled_notice": "This feature is disabled"
+        }
       },
       "models": {
         "title": "Model Management",
@@ -1188,8 +1095,7 @@
       "saveFailed": "Could not save: {{error}}",
       "operationFailed": "Operation failed: {{error}}",
       "retryApply": "Retry applying",
-      "savedPendingRestart": "Changes saved. Restart recording to apply them.",
-      "saved": "Saved."
+      "savedPendingRestart": "Changes saved. Restart recording to apply them."
     },
     "details": {
       "options": "More options",
@@ -1205,7 +1111,16 @@
       "unknown": "Status unavailable"
     },
     "maintenance": {
-      "manageIndexes": "Manage search indexes"
+      "manageIndexes": "Manage search indexes",
+      "thumbnails": {
+        "title": "Screenshot previews",
+        "description": "Prepare thumbnails to make browsing your screenshot history smoother.",
+        "running": "Preparing previews",
+        "stopping": "Stopping…",
+        "stop": "Stop",
+        "resume": "Continue preparing",
+        "stopped": "Preparation stopped. You can continue at any time."
+      }
     },
     "about": {
       "updates": "App updates",
@@ -1219,7 +1134,6 @@
       "repository": "Project home",
       "repositoryDescription": "Browse the source, report an issue, or contribute.",
       "developers": "Developer previews",
-      "preview": "Preview",
       "previews": {
         "error": "Error window",
         "ocr": "Recognition repair notice",
@@ -1300,15 +1214,10 @@
     "clear": "Clear",
     "refresh": "Refresh"
   },
-  "delete": {
-    "failure": "Delete failed: {{error}}",
-    "success": "Successfully deleted {{count}} records"
-  },
   "updateModal": {
     "title": "New Version Released",
     "titleCritical": "Critical Update Required",
     "version": "Version {{version}}",
-    "releaseNotes": "Release Notes",
     "downloadInstall": "Download & Install",
     "later": "Later",
     "background": "Download in Background",
@@ -1319,21 +1228,6 @@
     "applying": "Applying update...",
     "downloadFailed": "Download failed: {{error}}",
     "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
-  },
-  "save_filters": {
-    "synced": "Saved and synced to monitor service",
-    "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",
-    "saved_local_unsupported": "Saved locally, but current monitor process does not support filter commands. Please restart monitor service",
-    "saved_local_sync_failed": "Saved locally; sync failed: {{error}}"
-  },
-  "autolaunch": {
-    "read_error": "Failed to read autostart status",
-    "enabled": "Added to startup",
-    "disabled": "Removed from startup",
-    "action_failed": "Operation failed: {{error}}"
-  },
-  "analysis": {
-    "load_failed": "Failed to load analysis data: {{error}}"
   },
   "topbar": {
     "settings": "Settings",
@@ -1355,8 +1249,7 @@
     "showOcr": "Show OCR content",
     "openFloatingPreview": "View in separate window",
     "openMainPreview": "View in main window/preview",
-    "float": "Separate Preview",
-    "alpha": "alpha"
+    "float": "Separate Preview"
   },
   "snapshotSource": {
     "open": "Open related content",
@@ -1577,11 +1470,7 @@
       "placeholder_nl": "Describe the screen you are looking for",
       "go": "Search",
       "searching": "Searching...",
-      "enter_keyword": "Enter a keyword or choose filters to begin.",
-      "press_enter": "Press Enter in the top search bar to jump here quickly.",
       "did_you_know": "Did you know: {{msg}}",
-      "no_results": "No matching results",
-      "adjust": "Adjust filters or try different keywords.",
       "no_results_for": "No screenshots contain \"{{query}}\"",
       "no_results_filtered": "No screenshots match the current filters.",
       "no_results_hint": "Widening the time range or dropping a filter often helps.",
@@ -1600,7 +1489,6 @@
     },
     "processes": {
       "all": "All Processes",
-      "label": "Processes",
       "select": "Select Processes",
       "clear": "Clear",
       "no_data": "No process data",
@@ -1675,13 +1563,6 @@
       "run_in_background": "Run in background"
     }
   },
-  "aboutSection": {
-    "debug": {
-      "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification",
-      "preview_app_bound_offer": "Preview App Bound Upgrade Prompt",
-      "preview_app_bound_repair": "Preview App Bound Repair Prompt"
-    }
-  },
   "clipBackfill": {
     "title": "Image index backfill",
     "lead": "{{count}} screenshots have no image index yet. They will not appear in the search box's natural-language results until they are indexed.",
@@ -1743,8 +1624,7 @@
     "restart": "Restart CarbonPaper",
     "exit": "Exit",
     "switchToNormal": "Switch to Normal Mode",
-    "switchToXibao": "Switch to Celebration Mode",
-    "triggerTest": "Trigger Test Error Window"
+    "switchToXibao": "Switch to Celebration Mode"
   },
   "ocrModelRepair": {
     "title": "OCR Model Repair",
