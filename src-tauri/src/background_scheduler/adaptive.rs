@@ -332,7 +332,7 @@ impl BackgroundSchedulerState {
         model: &str,
         size: u64,
         parameters: &str,
-    ) -> Result<Option<UnitMeasurement>, String> {
+    ) -> crate::task_error::TaskResult<Option<UnitMeasurement>> {
         let Some(lease) = policy::current_execution() else {
             return Ok(None);
         };
@@ -377,7 +377,7 @@ impl BackgroundSchedulerState {
         key: &CostKey,
         cold: bool,
         disk: bool,
-    ) -> Result<(), String> {
+    ) -> crate::task_error::TaskResult<()> {
         let Some(lease) = policy::current_execution() else {
             return Ok(());
         };

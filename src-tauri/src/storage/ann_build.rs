@@ -1,6 +1,7 @@
 //! Durable frozen ANN input and complete-checkpoint cursors. No file operation
 //! is performed while an archive transaction or publication lock is held.
 use super::{DerivedAnnSnapshotRow, StorageState};
+use crate::task_error::TaskError;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -53,11 +54,11 @@ impl AnnBuildCheckpoint {
     }
 }
 
-fn sql_integer(value: u64) -> Result<i64, String> {
+fn sql_integer(value: u64) -> Result<i64, TaskError> {
     i64::try_from(value).map_err(|_| "ANN cursor exceeds SQLite range".into())
 }
 
-fn current_dataset(conn: &rusqlite::Connection, dataset: &str) -> Result<(), String> {
+fn current_dataset(conn: &rusqlite::Connection, dataset: &str) -> Result<(), TaskError> {
     let actual: String = conn
         .query_row(
             "SELECT value FROM app_metadata WHERE key='app_bound_dataset_id'",
@@ -66,32 +67,32 @@ fn current_dataset(conn: &rusqlite::Connection, dataset: &str) -> Result<(), Str
         )
         .map_err(|e| e.to_string())?;
     if actual != dataset {
-        return Err("background_paused: ANN database changed".into());
+        return Err(TaskError::Paused("ANN_database_changed"));
     }
     Ok(())
 }
 
-fn update_state(conn: &rusqlite::Connection, state: &AnnBuildCheckpoint) -> Result<(), String> {
+fn update_state(conn: &rusqlite::Connection, state: &AnnBuildCheckpoint) -> Result<(), TaskError> {
     current_dataset(conn, &state.dataset_id)?;
     let changes = conn.execute("UPDATE ann_build_checkpoints SET state_json=?2 WHERE index_kind='clip_image' AND generation=?1 AND dataset_id=?3",
         params![sql_integer(state.generation)?, serde_json::to_string(state).map_err(|e| e.to_string())?, state.dataset_id]).map_err(|e| e.to_string())?;
     if changes != 1 {
-        return Err("background_paused: ANN build was replaced".into());
+        return Err(TaskError::Paused("ANN_build_was_replaced"));
     }
     Ok(())
 }
 
 impl StorageState {
-    pub(crate) fn check_ann_runtime(&self, state: &AnnBuildCheckpoint) -> Result<(), String> {
+    pub(crate) fn check_ann_runtime(&self, state: &AnnBuildCheckpoint) -> Result<(), TaskError> {
         if state
             .runtime_generation
             .is_some_and(|generation| generation != self.db_generation())
         {
-            return Err("background_paused: ANN database generation changed".into());
+            return Err(TaskError::Paused("ANN_database_generation_changed"));
         }
         Ok(())
     }
-    pub(crate) fn cleanup_ann_inputs(&self, state: &AnnBuildCheckpoint) -> Result<bool, String> {
+    pub(crate) fn cleanup_ann_inputs(&self, state: &AnnBuildCheckpoint) -> Result<bool, TaskError> {
         let guard = self.get_connection_named("cleanup_ann_inputs")?;
         self.check_ann_runtime(state)?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
@@ -99,7 +100,7 @@ impl StorageState {
         let deleted = conn.execute("DELETE FROM ann_build_inputs WHERE rowid IN (SELECT rowid FROM ann_build_inputs LIMIT 256)", []).map_err(|e| e.to_string())?;
         Ok(deleted > 0)
     }
-    pub(crate) fn ann_build_checkpoint(&self) -> Result<Option<AnnBuildCheckpoint>, String> {
+    pub(crate) fn ann_build_checkpoint(&self) -> Result<Option<AnnBuildCheckpoint>, TaskError> {
         let guard = self.get_connection_named("ann_build_checkpoint")?;
         let json: Option<String> = guard
             .as_ref()
@@ -112,12 +113,14 @@ impl StorageState {
             .optional()
             .map_err(|e| e.to_string())?;
         json.map(|s| {
-            serde_json::from_str(&s).map_err(|e| format!("invalid ANN checkpoint metadata: {e}"))
+            serde_json::from_str(&s).map_err(|e| {
+                TaskError::InvalidCheckpoint(format!("invalid ANN checkpoint metadata: {e}"))
+            })
         })
         .transpose()
     }
 
-    pub(crate) fn begin_ann_build(&self, state: &mut AnnBuildCheckpoint) -> Result<(), String> {
+    pub(crate) fn begin_ann_build(&self, state: &mut AnnBuildCheckpoint) -> Result<(), TaskError> {
         let guard = self.get_connection_named("begin_ann_build")?;
         self.check_ann_runtime(state)?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
@@ -128,13 +131,13 @@ impl StorageState {
         tx.execute("INSERT INTO ann_build_checkpoints(index_kind,generation,dataset_id,state_json) VALUES('clip_image',?1,?2,?3)
             ON CONFLICT(index_kind) DO UPDATE SET generation=excluded.generation,dataset_id=excluded.dataset_id,state_json=excluded.state_json",
             params![sql_integer(state.generation)?, state.dataset_id, serde_json::to_string(state).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| TaskError::from(e.to_string()))
     }
 
     pub(crate) fn save_ann_build_checkpoint(
         &self,
         state: &AnnBuildCheckpoint,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         let guard = self.get_connection_named("save_ann_build_checkpoint")?;
         self.check_ann_runtime(state)?;
         update_state(guard.as_ref().ok_or("Database not initialized")?, state)
@@ -144,7 +147,7 @@ impl StorageState {
         &self,
         state: &mut AnnBuildCheckpoint,
         limit: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         let guard = self.get_connection_named("freeze_ann_page")?;
         self.check_ann_runtime(state)?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
@@ -196,7 +199,7 @@ impl StorageState {
         state: &AnnBuildCheckpoint,
         after: u64,
         limit: u32,
-    ) -> Result<Vec<DerivedAnnSnapshotRow>, String> {
+    ) -> Result<Vec<DerivedAnnSnapshotRow>, TaskError> {
         let guard = self.get_connection_named("frozen_ann_page")?;
         self.check_ann_runtime(state)?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
@@ -215,6 +218,6 @@ impl StorageState {
             )
             .map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| e.to_string())
+            .map_err(|e| TaskError::from(e.to_string()))
     }
 }

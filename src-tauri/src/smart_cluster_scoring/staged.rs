@@ -13,7 +13,7 @@ pub(crate) struct StagedCommit {
 
 /// A scheduler deferral, rather than a successful zero-work slice which would
 /// immediately wake itself while a dependency or retry timer is outstanding.
-pub(crate) fn waiting_reason(storage: &StorageState) -> Result<Option<&'static str>, String> {
+pub(crate) fn waiting_reason(storage: &StorageState) -> Result<Option<&'static str>, TaskError> {
     if !storage.staged_smart_cluster_pending_ids(1)?.is_empty() {
         return Ok(None);
     }
@@ -71,15 +71,15 @@ pub(crate) async fn score_and_commit<F, Fut, S>(
     anchors: &HashMap<i64, Vec<f32>>,
     mut rerank: F,
     mut stop: S,
-) -> Result<StagedCommit, String>
+) -> Result<StagedCommit, TaskError>
 where
     F: FnMut(String, Vec<String>) -> Fut,
-    Fut: Future<Output = Result<Vec<f32>, String>>,
+    Fut: Future<Output = Result<Vec<f32>, TaskError>>,
     S: FnMut() -> Option<&'static str>,
 {
-    let check_stop = |reason: Option<&str>| -> Result<(), String> {
+    let check_stop = |reason: Option<&'static str>| -> Result<(), TaskError> {
         match reason {
-            Some(reason) => Err(format!("deferred: {reason}")),
+            Some(reason) => Err(TaskError::Paused(reason)),
             None => Ok(()),
         }
     };
@@ -88,7 +88,7 @@ where
     if work.receipt.consumer != Consumer::SmartCluster
         || !storage.staged_source_is_current(&work.receipt)?
     {
-        return Err("deferred: staged source changed".into());
+        return Err(TaskError::Paused("staged_source_changed"));
     }
     let id = work.receipt.screenshot_id;
     let input = &work.input;
@@ -101,7 +101,7 @@ where
     let record = storage
         .get_query_visible_embedding(DerivedIndexKind::SemanticText, &id.to_string())?
         .filter(|record| record.job == expected)
-        .ok_or("deferred: waiting_for_index")?;
+        .ok_or(TaskError::Paused("waiting_for_index"))?;
     crate::minilm_contract::validate_minilm_vector(&record.vector)?;
     let document = build_rerank_document(&input.process_name, &input.window_title, &input.ocr_text);
     let documents = HashMap::from([(id, document)]);
@@ -110,9 +110,9 @@ where
     let mut assignments = Vec::new();
     for target in &usable {
         check_stop(stop())?;
-        let anchor = anchors
-            .get(&target.id)
-            .ok_or("model_mismatch: missing anchor vector")?;
+        let anchor = anchors.get(&target.id).ok_or_else(|| {
+            TaskError::worker(MlErrorKind::ModelMismatch, "missing anchor vector")
+        })?;
         let candidates = prefilter(anchor, &vectors, &documents);
         if candidates.is_empty() {
             continue;
@@ -142,7 +142,7 @@ pub(super) async fn run_batch(
     state: &Arc<SmartClusterWorkerState>,
     storage: Arc<StorageState>,
     forced: bool,
-) -> Result<Option<BatchProgress>, String> {
+) -> Result<Option<BatchProgress>, TaskError> {
     if !forced
         && !crate::background_scheduler::prefer_staged(
             app,
@@ -154,7 +154,7 @@ pub(super) async fn run_batch(
     }
     let (ids, targets) = tokio::task::spawn_blocking({
         let storage = storage.clone();
-        move || -> Result<_, String> {
+        move || -> Result<_, TaskError> {
             let targets = storage.list_smart_cluster_scoring_targets()?;
             let ids = storage.staged_smart_cluster_pending_ids(if forced {
                 batch_size_for(true, targets.len()) as usize
@@ -252,9 +252,7 @@ pub(super) async fn run_batch(
             }
             Err(error) => {
                 let yielded = crate::rerank::is_yield(&error);
-                let failed = !yielded
-                    && !error.starts_with("deferred:")
-                    && !crate::background_policy::is_pause(&error);
+                let failed = !error.is_pause();
                 let receipt = work.receipt.clone();
                 let release = tokio::task::spawn_blocking({
                     let storage = storage.clone();
@@ -269,6 +267,7 @@ pub(super) async fn run_batch(
                     tracing::warn!(
                         "[SMART_CLUSTER] staged task failed screenshot_id={id}: {error}"
                     );
+                    return Err(error);
                 }
                 if let Some(reason) = stand_down_reason(app, state, forced)
                     .or(yielded.then_some(FOREGROUND_QUERY_STOP))

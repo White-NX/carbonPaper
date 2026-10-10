@@ -3,6 +3,7 @@
 //! Clock values are supplied by the caller so hysteresis, missing telemetry and
 //! changes of execution budget can be tested without a desktop or a model.
 
+use crate::task_error::{TaskError, TaskResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -558,7 +559,7 @@ impl ExecutionLease {
     pub fn reason(&self) -> Option<&'static str> {
         *self.reason.lock().unwrap_or_else(|e| e.into_inner())
     }
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> TaskResult<()> {
         if self
             .unit_deadline
             .lock()
@@ -568,7 +569,7 @@ impl ExecutionLease {
             self.revoke("cost_overrun");
         }
         self.reason()
-            .map_or(Ok(()), |reason| Err(format!("background_paused: {reason}")))
+            .map_or(Ok(()), |reason| Err(TaskError::Paused(reason)))
     }
     pub fn limit_unit(&self, budget: Option<Duration>) {
         *self.unit_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -584,7 +585,7 @@ impl ExecutionLease {
             *deadline += Duration::from_secs(1);
         }
     }
-    pub async fn rest(&self, execution: Duration) -> Result<(), String> {
+    pub async fn rest(&self, execution: Duration) -> TaskResult<()> {
         if self.profile == ExecutionProfile::Background {
             let duty_rest =
                 execution.mul_f64((100 - self.duty_percent) as f64 / self.duty_percent as f64);
@@ -625,28 +626,12 @@ tokio::task_local! { pub static EXECUTION: Arc<ExecutionLease>; }
 pub fn current_execution() -> Option<Arc<ExecutionLease>> {
     EXECUTION.try_with(Arc::clone).ok()
 }
-pub fn check_current() -> Result<(), String> {
+pub fn check_current() -> TaskResult<()> {
     current_execution().map_or(Ok(()), |lease| lease.check())
 }
 pub fn is_background() -> bool {
     current_execution().is_some_and(|lease| lease.profile == ExecutionProfile::Background)
 }
-pub fn is_pause(error: &str) -> bool {
-    error.contains("background_paused:")
-        || error.starts_with("cancelled:")
-        || error.contains("embed failed: cancelled:")
-        || matches!(
-            error,
-            "app_bound_disabled"
-                | "app_bound_lease_expired"
-                | "app_bound_task_retired"
-                | "app_bound_dataset_mismatch"
-                | "staging generation changed"
-                | "staged source changed"
-                | "Staged input changed before embedding commit"
-        )
-}
-
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PauseStatistics {
     pub total: u64,
@@ -708,18 +693,25 @@ mod tests {
     fn revoked_staged_leases_are_pauses_while_integrity_and_model_errors_are_failures() {
         use carbonpaper_app_bound::protocol::BrokerError;
         for error in [
-            BrokerError::Disabled.code(),
-            BrokerError::LeaseExpired.code(),
-            BrokerError::Retired.code(),
-            BrokerError::DatasetMismatch.code(),
-            "staging generation changed",
-            "Staged input changed before embedding commit",
+            BrokerError::Disabled,
+            BrokerError::LeaseExpired,
+            BrokerError::Retired,
+            BrokerError::DatasetMismatch,
         ] {
-            assert!(is_pause(error), "{error}");
+            assert!(TaskError::from(error).is_pause());
         }
-        assert!(!is_pause("app_bound_access_denied"));
-        assert!(!is_pause(BrokerError::Integrity.code()));
-        assert!(!is_pause("model_mismatch: invalid tensor"));
+        assert!(TaskError::Paused("staging_generation_changed").is_pause());
+        for error in [
+            TaskError::from(BrokerError::AccessDenied),
+            TaskError::from(BrokerError::Integrity),
+            TaskError::worker(
+                crate::ml_protocol::MlErrorKind::ModelMismatch,
+                "background_paused: the model is invalid",
+            ),
+            TaskError::from("cancelled: ordinary diagnostic text"),
+        ] {
+            assert!(!error.is_pause(), "{error}");
+        }
     }
 
     #[test]

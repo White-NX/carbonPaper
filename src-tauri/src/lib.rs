@@ -73,6 +73,7 @@ mod sensitive_filter;
 mod settings_window;
 mod smart_cluster_scoring;
 mod storage;
+mod task_error;
 mod updater;
 
 use analysis::AnalysisState;

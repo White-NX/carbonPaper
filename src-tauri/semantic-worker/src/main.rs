@@ -17,8 +17,8 @@ mod semantic_metrics;
 mod semantic_models;
 
 use ml_protocol::{
-    read_request, write_response, MlProvider, MlRequest, MlResponse, MlSemanticTimings,
-    ML_PROTOCOL_VERSION,
+    read_request, write_response, MlError, MlErrorKind, MlProvider, MlRequest, MlResponse,
+    MlSemanticTimings, ML_PROTOCOL_VERSION,
 };
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -258,7 +258,10 @@ fn run() -> Result<(), String> {
             MlRequest::Ocr { .. } => write_semantic_error(
                 &mut writer,
                 request_id,
-                "invalid_request: OCR request was sent to the semantic worker".to_string(),
+                MlError::new(
+                    MlErrorKind::InvalidRequest,
+                    "OCR request was sent to the semantic worker",
+                ),
             )?,
         }
         registry.finish(request_id);
@@ -286,12 +289,10 @@ fn timings<T>(
 fn write_semantic_error<W: Write>(
     writer: &mut W,
     request_id: u64,
-    error: String,
+    error: MlError,
 ) -> Result<(), String> {
-    let (kind, message) = error
-        .split_once(": ")
-        .map(|(kind, message)| (kind.to_string(), message.to_string()))
-        .unwrap_or_else(|| ("inference".to_string(), error));
+    let kind = error.kind.as_str().to_string();
+    let message = error.message;
     eprintln!("[ML:SEMANTIC] request failed request_id={request_id} kind={kind} error={message}");
     write_response(
         writer,
@@ -301,6 +302,7 @@ fn write_semantic_error<W: Write>(
             message,
         },
     )
+    .map_err(Into::into)
 }
 
 struct Args {

@@ -13,11 +13,13 @@ use crate::credential_manager::CredentialManagerState;
 use crate::minilm_contract::{
     build_minilm_task_text, minilm_job_spec, validate_minilm_vector, MINILM_OCR_SNIPPET_CHARS,
 };
+use crate::ml_protocol::MlErrorKind;
 use crate::ml_protocol::MlSemanticModel;
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{
     BackgroundReadError, DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind, StorageState,
 };
+use crate::task_error::TaskError;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -242,7 +244,7 @@ pub async fn run_scheduled_slice(
     app: &AppHandle,
     manual: bool,
     quantum: Option<&AutomaticSliceContext>,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     if !manual
         && crate::background_scheduler::prefer_staged(
             app,
@@ -266,7 +268,7 @@ pub async fn run_scheduled_slice(
 async fn run_automatic_quantum(
     app: &AppHandle,
     quantum: &AutomaticSliceContext,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut batches = 0u32;
     let mut has_more = true;
@@ -337,7 +339,7 @@ async fn run_scheduled_request(
     manual: bool,
     run_maintenance: bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
     if manual && run.stopped_by_user() {
@@ -476,7 +478,7 @@ async fn run_pass(
     mode: PassMode,
     run_maintenance: bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
-) -> Result<PassOutcome, String> {
+) -> Result<PassOutcome, TaskError> {
     if !may_run(app, mode) {
         return Ok(PassOutcome::refused(if mode.is_manual() {
             "maintenance_in_progress"
@@ -661,7 +663,7 @@ async fn drain_until_done(
     deadline: Instant,
     mut waited: Duration,
     mode: PassMode,
-) -> Result<PassOutcome, String> {
+) -> Result<PassOutcome, TaskError> {
     debug_assert!(mode.is_manual());
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut total = PassOutcome::default();
@@ -747,8 +749,8 @@ impl PassOutcome {
 /// Rust by mirroring its own deletions across. The query also sweeps subjects
 /// with no live screenshot at all, which after the triggers is a safety net for
 /// a row that predates them rather than the normal path.
-async fn reap_expired(storage: Arc<StorageState>) -> Result<(), String> {
-    let removed = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+async fn reap_expired(storage: Arc<StorageState>) -> Result<(), TaskError> {
+    let removed = tokio::task::spawn_blocking(move || -> Result<usize, TaskError> {
         let subjects = storage
             .list_expired_semantic_text_subjects(SEMANTIC_TEXT_RETENTION, MAINTENANCE_BATCH)?;
         let mut removed = 0usize;
@@ -781,15 +783,15 @@ async fn reap_expired(storage: Arc<StorageState>) -> Result<(), String> {
 /// would hand the same screenshot back on the next pass, forever, and once
 /// enough of them accumulated they would fill the query's `LIMIT` and starve the
 /// repair of screenshots that really are missing a vector.
-async fn reconcile_missing(storage: Arc<StorageState>) -> Result<(), String> {
+async fn reconcile_missing(storage: Arc<StorageState>) -> Result<(), TaskError> {
     let (queued, excluded) =
-        tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+        tokio::task::spawn_blocking(move || -> Result<(usize, usize), TaskError> {
             let ids = storage
                 .list_semantic_text_index_candidates(SEMANTIC_TEXT_RETENTION, MAINTENANCE_BATCH)?;
             if ids.is_empty() {
                 return Ok((0, 0));
             }
-            let sources = minilm_sources(&storage, &ids).map_err(|error| error.to_string())?;
+            let sources = minilm_sources(&storage, &ids)?;
             let mut queued = 0usize;
             for source in sources.indexable.values() {
                 match storage.ensure_derived_index_job(&source.spec) {
@@ -843,7 +845,7 @@ struct ClaimedJob {
 }
 
 struct EncodeChunkFailure {
-    error: String,
+    error: TaskError,
     claimed: Vec<ClaimedJob>,
     deferred_reason: Option<&'static str>,
 }
@@ -858,7 +860,7 @@ async fn drain_queue(
     mode: PassMode,
     fast_retry_used: &mut bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
-) -> Result<PassOutcome, String> {
+) -> Result<PassOutcome, TaskError> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     if let Some((quantum, made_progress)) = automatic_context {
         if let Some(reason) = quantum.stop_reason(&semantic, made_progress) {
@@ -875,7 +877,7 @@ async fn drain_queue(
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
     let mut outcome = PassOutcome::default();
-    let mut failure: Option<String> = None;
+    let mut failure: Option<TaskError> = None;
     while !pending.is_empty() {
         // The user may have come back since the claim, or since the previous
         // chunk. Release the rest of the leases without charging the retry
@@ -1039,7 +1041,7 @@ async fn encode_chunk(
     if let Some((quantum, made_progress)) = automatic_context {
         if let Some(reason) = quantum.stop_reason(semantic, made_progress) {
             return Err(EncodeChunkFailure {
-                error: reason.as_str().to_string(),
+                error: reason.as_str().into(),
                 claimed,
                 deferred_reason: Some(reason.as_str()),
             });
@@ -1050,7 +1052,7 @@ async fn encode_chunk(
             crate::semantic_runtime::BACKGROUND_PASS_GUARD
                 .try_lock()
                 .map_err(|_| EncodeChunkFailure {
-                    error: "semantic_worker_busy".to_string(),
+                    error: "semantic_worker_busy".into(),
                     claimed: claimed.clone(),
                     deferred_reason: Some("semantic_worker_busy"),
                 })?,
@@ -1062,7 +1064,7 @@ async fn encode_chunk(
         if let Some(reason) = quantum.stop_reason(semantic, made_progress) {
             drop(worker_guard);
             return Err(EncodeChunkFailure {
-                error: reason.as_str().to_string(),
+                error: reason.as_str().into(),
                 claimed,
                 deferred_reason: Some(reason.as_str()),
             });
@@ -1084,10 +1086,13 @@ async fn encode_chunk(
     let vectors = match embedded {
         Ok(result) if result.vectors.len() == claimed.len() => result.vectors,
         Ok(result) => {
-            let error = format!(
-                "protocol: semantic worker returned {} vectors for {} inputs",
-                result.vectors.len(),
-                claimed.len()
+            let error = TaskError::worker(
+                MlErrorKind::Protocol,
+                format!(
+                    "semantic worker returned {} vectors for {} inputs",
+                    result.vectors.len(),
+                    claimed.len()
+                ),
             );
             return Err(EncodeChunkFailure {
                 error,
@@ -1097,9 +1102,8 @@ async fn encode_chunk(
         }
         Err(error) => {
             return Err(EncodeChunkFailure {
-                deferred_reason: crate::background_policy::is_pause(&error)
-                    .then_some("background_paused"),
-                error: format!("embed failed: {error}"),
+                deferred_reason: error.is_pause().then_some("background_paused"),
+                error,
                 claimed,
             });
         }
@@ -1131,14 +1135,14 @@ async fn encode_chunk(
 /// at capture time may have been overtaken by a re-OCR: its stored fingerprint
 /// would then describe text that no longer exists. Such a job is re-queued
 /// against the current source instead of being encoded against a stale one.
-async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, String> {
+async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, TaskError> {
     let execution = crate::background_policy::current_execution();
     let limit = if execution.is_some() {
         1
     } else {
         DRAIN_BATCH as u32
     };
-    tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, TaskError> {
         let generation = storage.db_generation();
         if let Some(lease) = &execution {
             lease.check()?;
@@ -1165,7 +1169,7 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
             .archive_scoring_source_revisions(generation, &ids)?
             .into_iter()
             .collect();
-        let sources = minilm_sources(&storage, &ids).map_err(|error| error.to_string())?;
+        let sources = minilm_sources(&storage, &ids)?;
 
         let mut claimed = Vec::with_capacity(jobs.len());
         for job in jobs {
@@ -1210,10 +1214,21 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
                     lease_token,
                 }),
                 // Lost the race to another claimant, or the row moved on.
-                Err(error) => tracing::debug!(
+                Err(error) if error.is_pause() => tracing::debug!(
                     "[SEMANTIC:INDEX] could not claim {}: {error}",
                     job.spec.subject_key
                 ),
+                Err(error) => {
+                    for job in &claimed {
+                        let _ = storage.requeue_derived_index_job(
+                            &job.spec,
+                            &job.lease_token,
+                            "claim_failed",
+                            "claim batch could not finish",
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(claimed)
@@ -1227,7 +1242,7 @@ async fn commit_batch(
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
     vectors: Vec<Vec<f32>>,
-) -> Result<u64, String> {
+) -> Result<u64, TaskError> {
     let execution = crate::background_policy::current_execution();
     tokio::task::spawn_blocking(move || {
         let mut indexed = 0;
@@ -1277,9 +1292,9 @@ async fn commit_batch(
                         &job.spec,
                         &job.lease_token,
                         "commit_deferred",
-                        &error,
+                        &error.to_string(),
                     );
-                    if !crate::background_policy::is_pause(&error) {
+                    if !error.is_pause() {
                         tracing::warn!(
                             "[SEMANTIC:INDEX] commit failed for {}: {error}",
                             job.spec.subject_key
@@ -1339,9 +1354,13 @@ async fn fail_claims(
 /// Worker-wide failures belong to the scheduler, not to each screenshot. A
 /// deterministic contract/model failure remains on the per-subject ledger so
 /// it can be diagnosed and rebuilt explicitly.
-async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJob>, error: &str) {
+async fn settle_failed_claims(
+    storage: Arc<StorageState>,
+    claimed: Vec<ClaimedJob>,
+    error: &TaskError,
+) {
     if crate::semantic_runtime::is_deterministic_worker_failure(error) {
-        fail_claims(storage, claimed, "embed_failed", error).await;
+        fail_claims(storage, claimed, "embed_failed", &error.to_string()).await;
     } else {
         release_claims(
             storage,

@@ -12,8 +12,10 @@ use crate::ml_protocol::{
     read_response, write_request, MlImageInput, MlProvider, MlRequest, MlResponse, MlSemanticModel,
     MlSemanticTimings, ML_PROTOCOL_VERSION,
 };
+use crate::ml_protocol::{MlError, MlErrorKind};
 use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources};
 use crate::semantic_models::{descriptor, expected_model_fingerprint};
+use crate::task_error::TaskError;
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufReader, BufWriter};
@@ -168,7 +170,7 @@ impl SemanticMlChild {
         let _ = child.wait();
     }
 
-    fn request(&self, request: &MlRequest, body: &[u8]) -> Result<MlResponse, String> {
+    fn request(&self, request: &MlRequest, body: &[u8]) -> Result<MlResponse, TaskError> {
         let _guard = self
             .request_lock
             .lock()
@@ -181,10 +183,10 @@ impl SemanticMlChild {
             .stdout
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        read_response(&mut *stdout)
+        read_response(&mut *stdout).map_err(Into::into)
     }
 
-    fn cancel(&self, request_id: u64) -> Result<(), String> {
+    fn cancel(&self, request_id: u64) -> Result<(), TaskError> {
         // Control writes deliberately bypass request_lock and stdout. The
         // worker's reader consumes them while the execution thread is in ORT.
         write_request(
@@ -192,6 +194,7 @@ impl SemanticMlChild {
             &MlRequest::Cancel { request_id },
             &[],
         )
+        .map_err(Into::into)
     }
 
     fn usage(&self) -> Option<crate::background_resources::ProcessUsage> {
@@ -204,13 +207,13 @@ impl SemanticMlChild {
 /// Foreground and capture-classification requests always see the restored cap.
 struct RequestCpuBudget(Arc<SemanticMlChild>);
 impl RequestCpuBudget {
-    fn apply(process: Arc<SemanticMlChild>, percent: Option<u32>) -> Result<Self, String> {
+    fn apply(process: Arc<SemanticMlChild>, percent: Option<u32>) -> Result<Self, TaskError> {
         if let Err(error) = set_cpu_rate(process._job.0, percent) {
             process.kill();
             return Err(if percent.is_some() {
-                format!("background_paused: CPU budget unavailable: {error}")
+                TaskError::Paused("cpu_budget_unavailable")
             } else {
-                error
+                error.into()
             });
         }
         Ok(Self(process))
@@ -247,7 +250,7 @@ struct RequestWatch {
     lease: Option<Arc<ExecutionLease>>,
 }
 impl RequestWatch {
-    fn check(&self, runtime: &SemanticRuntimeState) -> Result<(), String> {
+    fn check(&self, runtime: &SemanticRuntimeState) -> Result<(), TaskError> {
         if let Some(lease) = &self.lease {
             if runtime.foreground_waiting() {
                 lease.revoke("foreground_request");
@@ -258,7 +261,10 @@ impl RequestWatch {
             lease.check()?;
         }
         if Instant::now() >= self.deadline {
-            return Err("timeout: semantic request deadline reached".into());
+            return Err(TaskError::worker(
+                MlErrorKind::Timeout,
+                "semantic request deadline reached",
+            ));
         }
         Ok(())
     }
@@ -381,7 +387,7 @@ impl SemanticRuntimeState {
         texts: Vec<String>,
         timeout: Duration,
         prefer_directml: bool,
-    ) -> Result<SemanticEmbeddingResult, String> {
+    ) -> Result<SemanticEmbeddingResult, TaskError> {
         let request = MlRequest::EmbedText {
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
             timeout_ms: duration_ms(timeout),
@@ -404,8 +410,9 @@ impl SemanticRuntimeState {
                 vectors,
                 timings,
             }),
-            other => Err(format!(
-                "protocol: unexpected semantic embedding response: {other:?}"
+            other => Err(TaskError::worker(
+                MlErrorKind::Protocol,
+                format!("unexpected semantic embedding response: {other:?}"),
             )),
         }
     }
@@ -418,7 +425,7 @@ impl SemanticRuntimeState {
         body: Vec<u8>,
         timeout: Duration,
         prefer_directml: bool,
-    ) -> Result<SemanticEmbeddingResult, String> {
+    ) -> Result<SemanticEmbeddingResult, TaskError> {
         let request = MlRequest::EmbedImage {
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
             timeout_ms: duration_ms(timeout),
@@ -442,8 +449,9 @@ impl SemanticRuntimeState {
                 vectors,
                 timings,
             }),
-            other => Err(format!(
-                "protocol: unexpected semantic image response: {other:?}"
+            other => Err(TaskError::worker(
+                MlErrorKind::Protocol,
+                format!("unexpected semantic image response: {other:?}"),
             )),
         }
     }
@@ -455,7 +463,7 @@ impl SemanticRuntimeState {
         documents: Vec<String>,
         timeout: Duration,
         prefer_directml: bool,
-    ) -> Result<SemanticRerankResult, String> {
+    ) -> Result<SemanticRerankResult, TaskError> {
         let model = MlSemanticModel::BgeRerankerV2M3;
         let request = MlRequest::Rerank {
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
@@ -478,7 +486,10 @@ impl SemanticRuntimeState {
                 scores,
                 timings,
             }),
-            other => Err(format!("protocol: unexpected reranker response: {other:?}")),
+            other => Err(TaskError::worker(
+                MlErrorKind::Protocol,
+                format!("unexpected reranker response: {other:?}"),
+            )),
         }
     }
 
@@ -494,7 +505,7 @@ impl SemanticRuntimeState {
     /// A no-op when no worker is running or nothing is loaded — otherwise this
     /// would start a worker process for the sole purpose of telling it to
     /// release nothing.
-    pub async fn unload_model(self: &Arc<Self>, app: AppHandle) -> Result<(), String> {
+    pub async fn unload_model(self: &Arc<Self>, app: AppHandle) -> Result<(), TaskError> {
         {
             let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             if inner.process.is_none() || inner.loaded_model.is_none() {
@@ -526,7 +537,10 @@ impl SemanticRuntimeState {
                 inner.loaded_model = None;
                 Ok(())
             }
-            other => Err(format!("protocol: unexpected unload response: {other:?}")),
+            other => Err(TaskError::worker(
+                MlErrorKind::Protocol,
+                format!("unexpected unload response: {other:?}"),
+            )),
         }
     }
 
@@ -537,7 +551,7 @@ impl SemanticRuntimeState {
         body: Arc<Vec<u8>>,
         timeout: Duration,
         prefer_directml: bool,
-    ) -> Result<MlResponse, String> {
+    ) -> Result<MlResponse, TaskError> {
         // One deadline spans the wait for the worker, provider selection, the
         // first attempt, and any CPU fallback, so the caller never waits
         // materially longer than its own timeout. It is computed before the gate
@@ -602,7 +616,7 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         prefer_directml: bool,
         model: Option<MlSemanticModel>,
-    ) -> Result<MlProvider, String> {
+    ) -> Result<MlProvider, TaskError> {
         if let Some(provider) = self.cached_provider_for_request(prefer_directml, model) {
             return Ok(provider);
         }
@@ -613,11 +627,19 @@ impl SemanticRuntimeState {
             state_for_start.ensure_process(&app_for_start, MlProvider::DirectMl)
         })
         .await
-        .map_err(|error| format!("worker_stopped: semantic startup task failed: {error}"))??;
+        .map_err(|error| {
+            TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("semantic startup task failed: {error}"),
+            )
+        })??;
 
         self.cached_provider_for_request(prefer_directml, model)
             .ok_or_else(|| {
-                "protocol: DirectML worker did not publish its supported model set".to_string()
+                TaskError::worker(
+                    MlErrorKind::Protocol,
+                    "DirectML worker did not publish its supported model set",
+                )
             })
     }
 
@@ -642,7 +664,7 @@ impl SemanticRuntimeState {
         mut request: MlRequest,
         body: Arc<Vec<u8>>,
         deadline: Instant,
-    ) -> Result<MlResponse, String> {
+    ) -> Result<MlResponse, TaskError> {
         let request_id = request.request_id();
         let watch = RequestWatch {
             deadline,
@@ -676,8 +698,9 @@ impl SemanticRuntimeState {
             scheduler.admit_operation(key, cold, false)?;
         }
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
-            return Err(format!(
-                "timeout: semantic request {request_id} has no remaining budget for {provider:?}"
+            return Err(TaskError::worker(
+                MlErrorKind::Timeout,
+                format!("semantic request {request_id} has no remaining budget for {provider:?}"),
             ));
         }
         let state_for_start = self.clone();
@@ -687,7 +710,12 @@ impl SemanticRuntimeState {
             state_for_start.ensure_process_watched(&app_for_start, provider, Some(&startup_watch))
         })
         .await
-        .map_err(|error| format!("worker_stopped: semantic startup task failed: {error}"))??;
+        .map_err(|error| {
+            TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("semantic startup task failed: {error}"),
+            )
+        })??;
         watch.check(self)?;
         let _cpu_budget = RequestCpuBudget::apply(
             process.clone(),
@@ -696,16 +724,20 @@ impl SemanticRuntimeState {
         let request_model = request_model(&request);
         if let Some(model) = request_model {
             if !process.supported_models.contains(&model) {
-                return Err(format!(
-                    "provider_unavailable: {provider:?} worker does not support {}",
-                    descriptor(model).model_id
+                return Err(TaskError::worker(
+                    MlErrorKind::ProviderUnavailable,
+                    format!(
+                        "{provider:?} worker does not support {}",
+                        descriptor(model).model_id
+                    ),
                 ));
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!(
-                "timeout: semantic request {request_id} has no remaining budget for {provider:?}"
+            return Err(TaskError::worker(
+                MlErrorKind::Timeout,
+                format!("semantic request {request_id} has no remaining budget for {provider:?}"),
             ));
         }
         // The worker sees the remaining budget, not the caller's original timeout,
@@ -722,12 +754,12 @@ impl SemanticRuntimeState {
         let mut task =
             tokio::task::spawn_blocking(move || process_for_request.request(&request, &body));
         let mut peak_private = usage_before.map_or(0, |u| u.private_bytes);
-        let mut cancellation: Option<(Instant, String)> = None;
+        let mut cancellation: Option<(Instant, TaskError)> = None;
         let mut probe = tokio::time::interval(Duration::from_millis(25));
         let response = loop {
             tokio::select! {
                 result = &mut task => {
-                    break result.map_err(|e| format!("worker_stopped: semantic request task failed: {e}"))?;
+                    break result.map_err(|e| TaskError::worker(MlErrorKind::WorkerStopped, format!("semantic request task failed: {e}")))?;
                 }
                 _ = probe.tick() => {
                     if let Some(usage) = process.usage() { peak_private = peak_private.max(usage.peak_since(usage_before)); }
@@ -737,7 +769,7 @@ impl SemanticRuntimeState {
                         let error = watch.check(self).err().or_else(|| overrun.then(|| {
                             if let (Some(scheduler), Some(key)) = (&scheduler, &cost_key) { scheduler.revoke_cost(key); }
                             if let Some(lease) = &watch.lease { lease.revoke("cost_overrun"); }
-                            "background_paused: cost_overrun".into()
+                            TaskError::Paused("cost_overrun")
                         }));
                         if let Some(error) = error {
                             cancellation = Some((Instant::now(), error));
@@ -798,7 +830,7 @@ impl SemanticRuntimeState {
                 kind,
                 message,
             }) if response_id == request_id => {
-                let error = format!("{kind}: {message}");
+                let error = TaskError::from(MlError::from_response(&kind, message.clone()));
                 if kind != "cancelled" {
                     self.record_failure(&kind, &message, elapsed_ms);
                 }
@@ -811,17 +843,18 @@ impl SemanticRuntimeState {
                 Ok(response)
             }
             Ok(response) => {
-                let error = format!(
-                    "protocol: unexpected semantic response for request {request_id}: {response:?}"
+                let error = TaskError::worker(
+                    MlErrorKind::Protocol,
+                    format!("unexpected semantic response for request {request_id}: {response:?}"),
                 );
-                self.record_failure("protocol", &error, elapsed_ms);
+                self.record_failure("protocol", error.message(), elapsed_ms);
                 self.restart_process("protocol_mismatch");
                 Err(error)
             }
             Err(error) => {
-                let (kind, message) = split_error(&error);
+                let (kind, message) = (error.code(), error.message());
                 self.record_failure(kind, message, elapsed_ms);
-                if request_failure_requires_restart(kind) {
+                if request_failure_requires_restart(error.worker_kind()) {
                     self.restart_process("request_failure");
                 }
                 Err(error)
@@ -934,7 +967,7 @@ impl SemanticRuntimeState {
         &self,
         app: &AppHandle,
         requested_provider: MlProvider,
-    ) -> Result<Arc<SemanticMlChild>, String> {
+    ) -> Result<Arc<SemanticMlChild>, TaskError> {
         self.ensure_process_watched(app, requested_provider, None)
     }
 
@@ -943,7 +976,7 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         requested_provider: MlProvider,
         watch: Option<&RequestWatch>,
-    ) -> Result<Arc<SemanticMlChild>, String> {
+    ) -> Result<Arc<SemanticMlChild>, TaskError> {
         if let Some(watch) = watch {
             watch.check(self)?;
         }
@@ -978,18 +1011,18 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         provider: MlProvider,
         watch: Option<&RequestWatch>,
-    ) -> Result<Arc<SemanticMlChild>, String> {
+    ) -> Result<Arc<SemanticMlChild>, TaskError> {
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .state = "starting".to_string();
         let result = self.start_process_inner(app, provider, watch);
         if let Err(error) = &result {
-            if background_policy::is_pause(error) {
+            if error.is_pause() {
                 self.inner.lock().unwrap_or_else(|e| e.into_inner()).state = "stopped".into();
                 return result;
             }
-            let (kind, message) = split_error(error);
+            let (kind, message) = (error.code(), error.message());
             let mut inner = self
                 .inner
                 .lock()
@@ -1009,16 +1042,23 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         provider: MlProvider,
         watch: Option<&RequestWatch>,
-    ) -> Result<Arc<SemanticMlChild>, String> {
+    ) -> Result<Arc<SemanticMlChild>, TaskError> {
         let executable = resolve_semantic_executable(app)?;
         let ort_dylib = resolve_ort_dylib(app, &executable)?;
         let runtime_dir = ort_dylib.parent().ok_or_else(|| {
-            "provider_unavailable: ONNX Runtime DLL has no parent directory".to_string()
+            TaskError::worker(
+                MlErrorKind::ProviderUnavailable,
+                "ONNX Runtime DLL has no parent directory",
+            )
         })?;
         let runtime_path =
             prepend_runtime_search_path(runtime_dir, std::env::var_os("PATH").as_deref())?;
-        let appdata = file_in_local_appdata()
-            .ok_or_else(|| "model_missing: local app data directory is unavailable".to_string())?;
+        let appdata = file_in_local_appdata().ok_or_else(|| {
+            TaskError::worker(
+                MlErrorKind::ModelMissing,
+                "local app data directory is unavailable",
+            )
+        })?;
         let models_root = appdata.join("models");
         let onnx_models_root = appdata.join("models-onnx");
         let mut command = Command::new(&executable);
@@ -1045,24 +1085,29 @@ impl SemanticRuntimeState {
             executable.display(),
             ort_dylib.display()
         );
-        let child = command
-            .spawn()
-            .map_err(|error| format!("worker_stopped: failed to start semantic worker: {error}"))?;
+        let child = command.spawn().map_err(|error| {
+            TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("failed to start semantic worker: {error}"),
+            )
+        })?;
         let mut pending = PendingSemanticChild::new(child);
         let job = assign_kill_on_close_job(pending.child())?;
         if watch.is_some_and(|w| w.lease.is_some()) {
             set_cpu_rate(job.0, Some(CPU_RATE_PERCENT))?;
         }
-        let stdin = pending
-            .child_mut()
-            .stdin
-            .take()
-            .ok_or("worker_stopped: semantic worker stdin unavailable")?;
-        let stdout = pending
-            .child_mut()
-            .stdout
-            .take()
-            .ok_or("worker_stopped: semantic worker stdout unavailable")?;
+        let stdin = pending.child_mut().stdin.take().ok_or_else(|| {
+            TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                "semantic worker stdin unavailable",
+            )
+        })?;
+        let stdout = pending.child_mut().stdout.take().ok_or_else(|| {
+            TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                "semantic worker stdout unavailable",
+            )
+        })?;
         if let Some(stderr) = pending.child_mut().stderr.take() {
             std::thread::Builder::new()
                 .name("carbonpaper-semantic-log".to_string())
@@ -1072,7 +1117,12 @@ impl SemanticRuntimeState {
                         tracing::info!("[ML:SEMANTIC:WORKER] {line}");
                     }
                 })
-                .map_err(|error| format!("worker_stopped: failed to start log reader: {error}"))?;
+                .map_err(|error| {
+                    TaskError::worker(
+                        MlErrorKind::WorkerStopped,
+                        format!("failed to start log reader: {error}"),
+                    )
+                })?;
         }
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -1083,19 +1133,32 @@ impl SemanticRuntimeState {
                 let ready = read_response(&mut reader);
                 let _ = sender.send((ready, reader));
             })
-            .map_err(|error| format!("worker_stopped: failed to start handshake: {error}"))?;
+            .map_err(|error| {
+                TaskError::worker(
+                    MlErrorKind::WorkerStopped,
+                    format!("failed to start handshake: {error}"),
+                )
+            })?;
         let started = Instant::now();
         let (ready, stdout) = loop {
             if let Some(watch) = watch {
                 watch.check(self)?;
             }
             if started.elapsed() >= STARTUP_TIMEOUT {
-                return Err("timeout: semantic worker startup timed out".into());
+                return Err(TaskError::worker(
+                    MlErrorKind::Timeout,
+                    "semantic worker startup timed out",
+                ));
             }
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(ready) => break ready,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => return Err("worker_stopped: semantic handshake disconnected".into()),
+                Err(_) => {
+                    return Err(TaskError::worker(
+                        MlErrorKind::WorkerStopped,
+                        "semantic handshake disconnected",
+                    ))
+                }
             }
         };
         match ready {
@@ -1130,11 +1193,13 @@ impl SemanticRuntimeState {
                 inner.last_error = None;
                 Ok(process)
             }
-            Ok(response) => Err(format!(
-                "protocol: invalid semantic worker handshake: {response:?}"
+            Ok(response) => Err(TaskError::worker(
+                MlErrorKind::Protocol,
+                format!("invalid semantic worker handshake: {response:?}"),
             )),
-            Err(error) => Err(format!(
-                "worker_stopped: semantic worker startup failed: {error}"
+            Err(error) => Err(TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("semantic worker startup failed: {error}"),
             )),
         }
     }
@@ -1206,14 +1271,14 @@ impl SemanticRuntimeState {
         inner.last_elapsed_ms = Some(elapsed_ms);
     }
 
-    fn disable_directml_for_session(&self, error: &str) {
+    fn disable_directml_for_session(&self, error: &TaskError) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|failure| failure.into_inner());
         inner.directml_disabled_for_session = true;
         inner.last_error_kind = Some("provider_unavailable".to_string());
-        inner.last_error = Some(truncate_error(error));
+        inner.last_error = Some(truncate_error(&error.to_string()));
     }
 
     fn restart_process(&self, reason: &str) {
@@ -1343,7 +1408,7 @@ async fn acquire_request_slot(
     gate: &tokio::sync::Mutex<()>,
     deadline: Instant,
     request_id: u64,
-) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+) -> Result<tokio::sync::MutexGuard<'_, ()>, TaskError> {
     let wait = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.lock());
     tokio::pin!(wait);
     let result = loop {
@@ -1354,9 +1419,12 @@ async fn acquire_request_slot(
         }
     };
     result.map_err(|_| {
-        format!(
-            "timeout: semantic request {request_id} gave up waiting for the semantic worker \
+        TaskError::worker(
+            MlErrorKind::Timeout,
+            format!(
+                "semantic request {request_id} gave up waiting for the semantic worker \
                  to finish another request"
+            ),
         )
     })
 }
@@ -1526,85 +1594,22 @@ fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().clamp(1, u64::MAX as u128) as u64
 }
 
-/// Error kinds emitted by the protocol layer, the semantic engine, and this
-/// supervisor. `split_error` only trusts these prefixes; anything else is
-/// classified as `protocol`, which deliberately sits outside the DirectML
-/// fallback list so a malformed message can never disable DirectML or mask a
-/// caller bug as an inference failure.
-const KNOWN_ERROR_KINDS: &[&str] = &[
-    "invalid_request",
-    "limit_exceeded",
-    "timeout",
-    "cancelled",
-    "model_missing",
-    "model_mismatch",
-    "provider_unavailable",
-    "inference",
-    "protocol",
-    "transport",
-    "worker_stopped",
-];
-
-fn split_error(error: &str) -> (&str, &str) {
-    match error.split_once(": ") {
-        Some((kind, message)) if KNOWN_ERROR_KINDS.contains(&kind) => (kind, message),
-        _ => ("protocol", error),
-    }
+fn should_fallback_from_directml(error: &TaskError) -> bool {
+    error.is_transient_worker_failure()
 }
 
-fn should_fallback_from_directml(error: &str) -> bool {
-    matches!(
-        split_error(error).0,
-        "provider_unavailable" | "inference" | "timeout" | "worker_stopped" | "transport"
-    )
+pub(crate) fn is_transient_worker_failure(error: &TaskError) -> bool {
+    error.is_transient_worker_failure()
 }
 
-/// Failures which usually describe a broken worker/provider rather than a bad
-/// screenshot. These are retried by the scheduler as a whole, so individual
-/// rows must not be put into their long per-item backoff.
-pub(crate) fn is_transient_worker_failure(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    let lower = lower
-        .strip_prefix("embed failed: ")
-        .unwrap_or(lower.as_str());
-    [
-        "timeout:",
-        "transport:",
-        "worker_stopped:",
-        "provider_unavailable:",
-        "inference:",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
+pub(crate) fn is_deterministic_worker_failure(error: &TaskError) -> bool {
+    error.is_deterministic_worker_failure()
 }
 
-/// Failures which will not be fixed by restarting the worker. The scheduler
-/// opens its circuit immediately and waits for an explicit user action.
-pub(crate) fn is_deterministic_worker_failure(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    let lower = lower
-        .strip_prefix("embed failed: ")
-        .unwrap_or(lower.as_str());
-    [
-        "invalid_request:",
-        "limit_exceeded:",
-        "model_missing:",
-        "model_mismatch:",
-        "protocol:",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
-}
-
-/// `invalid_request` and `limit_exceeded` on this path can only come from local
-/// validation that rejects a request before any byte reaches the pipe; the worker
-/// and its loaded model are still healthy, so restarting would only throw away a
-/// warm model. Worker-reported errors of the same kinds arrive as
-/// `MlResponse::Error` and never reach this classification.
-fn request_failure_requires_restart(kind: &str) -> bool {
+fn request_failure_requires_restart(kind: Option<MlErrorKind>) -> bool {
     !matches!(
         kind,
-        "invalid_request" | "limit_exceeded" | "cancelled" | "background_paused"
+        Some(MlErrorKind::InvalidRequest | MlErrorKind::LimitExceeded | MlErrorKind::Cancelled)
     )
 }
 
@@ -1615,19 +1620,20 @@ fn truncate_error(error: &str) -> String {
 fn prepend_runtime_search_path(
     runtime_dir: &Path,
     inherited_path: Option<&OsStr>,
-) -> Result<OsString, String> {
+) -> Result<OsString, TaskError> {
     let mut paths = vec![runtime_dir.to_path_buf()];
     if let Some(inherited_path) = inherited_path {
         paths.extend(std::env::split_paths(inherited_path));
     }
     std::env::join_paths(paths).map_err(|error| {
-        format!(
-            "provider_unavailable: failed to construct semantic runtime DLL search path: {error}"
+        TaskError::worker(
+            MlErrorKind::ProviderUnavailable,
+            format!("failed to construct semantic runtime DLL search path: {error}"),
         )
     })
 }
 
-fn resolve_semantic_executable(app: &AppHandle) -> Result<PathBuf, String> {
+fn resolve_semantic_executable(app: &AppHandle) -> Result<PathBuf, TaskError> {
     if let Some(path) = crate::app_bound::protected_resource("carbonpaper-semantic-worker.exe")? {
         return Ok(path);
     }
@@ -1650,10 +1656,13 @@ fn resolve_semantic_executable(app: &AppHandle) -> Result<PathBuf, String> {
     if debug.is_file() {
         return Ok(debug);
     }
-    Err("worker_stopped: carbonpaper-semantic-worker.exe was not found".to_string())
+    Err(TaskError::worker(
+        MlErrorKind::WorkerMissing,
+        "carbonpaper-semantic-worker.exe was not found",
+    ))
 }
 
-fn resolve_ort_dylib(app: &AppHandle, executable: &std::path::Path) -> Result<PathBuf, String> {
+fn resolve_ort_dylib(app: &AppHandle, executable: &std::path::Path) -> Result<PathBuf, TaskError> {
     if let Some(path) = crate::app_bound::protected_resource("onnxruntime/1.24.2/onnxruntime.dll")?
     {
         crate::app_bound::protected_resource(
@@ -1685,16 +1694,23 @@ fn resolve_ort_dylib(app: &AppHandle, executable: &std::path::Path) -> Result<Pa
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| {
-            "provider_unavailable: pinned ONNX Runtime 1.24.2 DLL was not found".to_string()
+            TaskError::worker(
+                MlErrorKind::ProviderUnavailable,
+                "pinned ONNX Runtime 1.24.2 DLL was not found",
+            )
         })
 }
 
-fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> {
+fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, TaskError> {
     // SAFETY: all Windows handles are checked before use and ownership is transferred to
     // `SemanticJobHandle` only after successful assignment.
     unsafe {
-        let job = CreateJobObjectW(None, None)
-            .map_err(|error| format!("worker_stopped: failed to create Job Object: {error}"))?;
+        let job = CreateJobObjectW(None, None).map_err(|error| {
+            TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("failed to create Job Object: {error}"),
+            )
+        })?;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if let Err(error) = SetInformationJobObject(
@@ -1704,15 +1720,17 @@ fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> 
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) {
             let _ = CloseHandle(job);
-            return Err(format!(
-                "worker_stopped: failed to configure Job Object: {error}"
+            return Err(TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("failed to configure Job Object: {error}"),
             ));
         }
         let process_handle = HANDLE(child.as_raw_handle() as *mut _);
         if let Err(error) = AssignProcessToJobObject(job, process_handle) {
             let _ = CloseHandle(job);
-            return Err(format!(
-                "worker_stopped: failed to assign semantic worker to Job Object: {error}"
+            return Err(TaskError::worker(
+                MlErrorKind::WorkerStopped,
+                format!("failed to assign semantic worker to Job Object: {error}"),
             ));
         }
         Ok(SemanticJobHandle(job))
@@ -2005,7 +2023,9 @@ mod tests {
         assert_eq!(unsafe { read_budget().Anonymous.CpuRate }, 500);
         drop(limited);
         assert_eq!(read_budget().ControlFlags.0, 0);
-        assert!(!request_failure_requires_restart("cancelled"));
+        assert!(!request_failure_requires_restart(Some(
+            MlErrorKind::Cancelled
+        )));
         assert!(process.is_running());
         drop(InFlightSemanticRequest {
             process: process.clone(),
@@ -2164,94 +2184,108 @@ mod tests {
 
     #[test]
     fn directml_fallback_is_limited_to_provider_and_runtime_failures() {
-        for error in [
-            "provider_unavailable: DirectML is unavailable",
-            "inference: DirectML kernel failed",
-            "timeout: DirectML request timed out",
-            "worker_stopped: DirectML worker exited",
-            "transport: failed to read ML frame length: pipe closed",
+        for kind in [
+            MlErrorKind::ProviderUnavailable,
+            MlErrorKind::Inference,
+            MlErrorKind::Timeout,
+            MlErrorKind::WorkerStopped,
+            MlErrorKind::Transport,
         ] {
-            assert!(should_fallback_from_directml(error), "{error}");
+            let error = TaskError::worker(
+                kind,
+                "model_missing: diagnostic wording cannot change fallback",
+            );
+            assert!(should_fallback_from_directml(&error), "{error}");
         }
-
-        for error in [
-            "invalid_request: unsupported operation",
-            "limit_exceeded: batch is too large",
-            "model_missing: model has not been downloaded",
-            "model_mismatch: model checksum differs",
-            "cancelled: request was cancelled",
-            "protocol: response id differs",
-            // Unprefixed or unrecognized messages must classify as protocol, not
-            // inference, so they can never disable DirectML for the session.
-            "semantic text batch must contain 1..=32 items",
-            "ML request body length mismatch: header=1, actual=2",
+        for kind in [
+            MlErrorKind::InvalidRequest,
+            MlErrorKind::LimitExceeded,
+            MlErrorKind::ModelMissing,
+            MlErrorKind::ModelMismatch,
+            MlErrorKind::Cancelled,
+            MlErrorKind::Protocol,
+            MlErrorKind::WorkerMissing,
         ] {
-            assert!(!should_fallback_from_directml(error), "{error}");
+            let error =
+                TaskError::worker(kind, "inference: diagnostic wording cannot enable fallback");
+            assert!(!should_fallback_from_directml(&error), "{error}");
         }
     }
 
     #[test]
     fn local_validation_failures_do_not_restart_the_worker() {
-        assert!(!request_failure_requires_restart("invalid_request"));
-        assert!(!request_failure_requires_restart("limit_exceeded"));
         for kind in [
-            "timeout",
-            "transport",
-            "protocol",
-            "worker_stopped",
-            "inference",
-            "model_missing",
-            "model_mismatch",
+            MlErrorKind::InvalidRequest,
+            MlErrorKind::LimitExceeded,
+            MlErrorKind::Cancelled,
         ] {
-            assert!(request_failure_requires_restart(kind), "{kind}");
+            assert!(!request_failure_requires_restart(Some(kind)));
+        }
+        for kind in [
+            MlErrorKind::Timeout,
+            MlErrorKind::Transport,
+            MlErrorKind::Protocol,
+            MlErrorKind::WorkerStopped,
+            MlErrorKind::Inference,
+            MlErrorKind::ModelMissing,
+            MlErrorKind::ModelMismatch,
+        ] {
+            assert!(request_failure_requires_restart(Some(kind)), "{kind:?}");
         }
     }
 
     #[test]
-    fn unrecognized_error_kinds_are_classified_as_protocol() {
+    fn unrecognized_wire_error_kinds_are_classified_as_protocol() {
         assert_eq!(
-            split_error("inference: kernel failed"),
-            ("inference", "kernel failed")
+            MlError::from_response("inference", "kernel failed".into()).kind,
+            MlErrorKind::Inference
         );
         assert_eq!(
-            split_error("transport: failed to write ML frame: broken pipe"),
-            ("transport", "failed to write ML frame: broken pipe")
+            MlError::from_response("transport", "broken pipe".into()).kind,
+            MlErrorKind::Transport
         );
-        assert_eq!(
-            split_error("semantic text batch must contain 1..=32 items").0,
-            "protocol"
-        );
-        assert_eq!(
-            split_error("ML timeout must be within 1..=600000 ms: 600001").0,
-            "protocol"
-        );
+        for message in [
+            "timeout: expired",
+            "cancelled: stopped",
+            "provider_unavailable: missing",
+        ] {
+            assert_eq!(
+                MlError::from_response("unknown", message.into()).kind,
+                MlErrorKind::Protocol
+            );
+        }
     }
 
     #[test]
-    fn index_failure_classification_requires_a_known_error_prefix() {
-        for error in [
-            "timeout: semantic worker timed out",
-            "embed failed: transport: pipe closed",
-            "worker_stopped: process exited",
-            "embed failed: inference: provider failed",
+    fn index_failure_classification_uses_the_kind_not_diagnostic_text() {
+        for kind in [
+            MlErrorKind::Timeout,
+            MlErrorKind::Transport,
+            MlErrorKind::WorkerStopped,
+            MlErrorKind::Inference,
         ] {
-            assert!(is_transient_worker_failure(error), "{error}");
-            assert!(!is_deterministic_worker_failure(error), "{error}");
+            let error = TaskError::worker(kind, "model_missing: arbitrary message");
+            assert!(is_transient_worker_failure(&error));
+            assert!(!is_deterministic_worker_failure(&error));
         }
-        for error in [
-            "protocol: vector count mismatch",
-            "embed failed: model_missing: model is unavailable",
-            "invalid_request: empty batch",
+        for kind in [
+            MlErrorKind::Protocol,
+            MlErrorKind::ModelMissing,
+            MlErrorKind::InvalidRequest,
+            MlErrorKind::WorkerMissing,
         ] {
-            assert!(is_deterministic_worker_failure(error), "{error}");
-            assert!(!is_transient_worker_failure(error), "{error}");
+            let error = TaskError::worker(kind, "cancelled: arbitrary message");
+            assert!(is_deterministic_worker_failure(&error));
+            assert!(!is_transient_worker_failure(&error));
+            assert!(!error.is_pause());
         }
-        for error in [
+        for message in [
             "commit failed: protocol: database busy",
             "worker reported inference: but did not provide a kind",
         ] {
-            assert!(!is_transient_worker_failure(error), "{error}");
-            assert!(!is_deterministic_worker_failure(error), "{error}");
+            let error = TaskError::from(message);
+            assert!(!is_transient_worker_failure(&error));
+            assert!(!is_deterministic_worker_failure(&error));
         }
     }
 
@@ -2338,8 +2372,8 @@ mod tests {
         let error = acquire_request_slot(&gate, deadline, 7)
             .await
             .expect_err("a held gate must not be waited out past the deadline");
-        assert_eq!(split_error(&error).0, "timeout");
-        assert!(error.contains("request 7"), "{error}");
+        assert_eq!(error.worker_kind(), Some(MlErrorKind::Timeout));
+        assert!(error.message().contains("request 7"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2), "returned late");
         drop(held);
 
@@ -2362,7 +2396,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             cancel.revoke("foreground_request");
         });
-        assert!(result.unwrap_err().contains("foreground_request"));
+        assert!(matches!(
+            result.unwrap_err(),
+            TaskError::Paused("foreground_request")
+        ));
         drop(held);
         assert!(
             acquire_request_slot(&gate, Instant::now() + Duration::from_secs(1), 124)
@@ -2378,7 +2415,7 @@ mod tests {
         let error = acquire_request_slot(&gate, Instant::now(), 9)
             .await
             .expect_err("an expired deadline cannot acquire a held gate");
-        assert_eq!(split_error(&error).0, "timeout");
+        assert_eq!(error.worker_kind(), Some(MlErrorKind::Timeout));
     }
 
     #[test]

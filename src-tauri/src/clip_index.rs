@@ -9,11 +9,13 @@ use crate::background_scheduler::{
 use crate::clip_contract::{clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector};
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
+use crate::ml_protocol::MlErrorKind;
 use crate::ml_protocol::{MlImageInput, MlSemanticModel};
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{
     BackgroundReadError, DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind, StorageState,
 };
+use crate::task_error::TaskError;
 use chrono::{Duration as ChronoDuration, Utc};
 use image::RgbImage;
 use serde::Serialize;
@@ -325,7 +327,7 @@ pub async fn run_scheduled_slice(
     app: &AppHandle,
     manual: bool,
     quantum: Option<&AutomaticSliceContext>,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     if !manual
         && crate::background_scheduler::prefer_staged(
             app,
@@ -349,7 +351,7 @@ pub async fn run_scheduled_slice(
 async fn run_automatic_quantum(
     app: &AppHandle,
     quantum: &AutomaticSliceContext,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut batches = 0u32;
     let mut has_more = true;
@@ -438,7 +440,7 @@ async fn run_scheduled_request(
     run_maintenance: bool,
     _run_ann_maintenance: bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
     if manual && run.stopped_by_user() {
@@ -627,7 +629,7 @@ async fn run_pass(
     mode: PassMode,
     run_maintenance: bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
-) -> Result<PassOutcome, String> {
+) -> Result<PassOutcome, TaskError> {
     if !may_run(app, mode) {
         return Ok(PassOutcome::refused(if mode.is_manual() {
             "maintenance_in_progress"
@@ -769,7 +771,7 @@ async fn drain_until_done(
     app: &AppHandle,
     storage: Arc<StorageState>,
     mode: PassMode,
-) -> Result<PassOutcome, String> {
+) -> Result<PassOutcome, TaskError> {
     debug_assert!(mode.is_manual());
     let mut total = PassOutcome::default();
     let mut fast_retry_used = false;
@@ -818,7 +820,7 @@ struct ClaimedJob {
 }
 
 struct EncodeChunkFailure {
-    error: String,
+    error: TaskError,
     claimed: Vec<ClaimedJob>,
     deferred_reason: Option<&'static str>,
 }
@@ -830,7 +832,7 @@ async fn drain_queue(
     locked: bool,
     fast_retry_used: &mut bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
-) -> Result<PassOutcome, String> {
+) -> Result<PassOutcome, TaskError> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     if let Some((quantum, made_progress)) = automatic_context {
         if let Some(reason) = quantum.stop_reason(&semantic, made_progress) {
@@ -848,7 +850,7 @@ async fn drain_queue(
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
     let mut indexed = 0usize;
     let mut outcome = PassOutcome::default();
-    let mut failure: Option<String> = None;
+    let mut failure: Option<TaskError> = None;
 
     while !pending.is_empty() {
         let stopped = if mode.is_manual() && run.stopped_by_user() {
@@ -1008,7 +1010,7 @@ async fn encode_chunk(
         if pixels.is_none() && crate::background_policy::is_background() {
             lease.revoke("waiting_for_evaluation");
             return Err(EncodeChunkFailure {
-                error: "background_paused: unknown image size".into(),
+                error: TaskError::Paused("unknown_image_size"),
                 claimed,
                 deferred_reason: Some("background_paused"),
             });
@@ -1044,7 +1046,7 @@ async fn encode_chunk(
     })
     .await
     .map_err(|error| EncodeChunkFailure {
-        error: format!("image read task failed: {error}"),
+        error: format!("image read task failed: {error}").into(),
         claimed: retry_claimed,
         deferred_reason: None,
     })?;
@@ -1067,7 +1069,7 @@ async fn encode_chunk(
         .any(|result| matches!(result, Err(BackgroundReadError::AuthRequired)))
     {
         return Err(EncodeChunkFailure {
-            error: "AUTH_REQUIRED".to_string(),
+            error: TaskError::AuthenticationRequired,
             claimed,
             deferred_reason: None,
         });
@@ -1116,7 +1118,7 @@ async fn encode_chunk(
     if let Some((quantum, made_progress)) = automatic_context {
         if let Some(reason) = quantum.stop_reason(semantic, made_progress) {
             return Err(EncodeChunkFailure {
-                error: reason.as_str().to_string(),
+                error: reason.as_str().into(),
                 claimed: jobs,
                 deferred_reason: Some(reason.as_str()),
             });
@@ -1127,7 +1129,7 @@ async fn encode_chunk(
             Ok(guard) => Some(guard),
             Err(_) => {
                 return Err(EncodeChunkFailure {
-                    error: "semantic_worker_busy".to_string(),
+                    error: "semantic_worker_busy".into(),
                     claimed: jobs,
                     deferred_reason: Some("semantic_worker_busy"),
                 });
@@ -1140,7 +1142,7 @@ async fn encode_chunk(
         if let Some(reason) = quantum.stop_reason(semantic, made_progress) {
             drop(worker_guard);
             return Err(EncodeChunkFailure {
-                error: reason.as_str().to_string(),
+                error: reason.as_str().into(),
                 claimed: jobs,
                 deferred_reason: Some(reason.as_str()),
             });
@@ -1162,10 +1164,13 @@ async fn encode_chunk(
     let vectors = match embedded {
         Ok(result) if result.vectors.len() == jobs.len() => result.vectors,
         Ok(result) => {
-            let error = format!(
-                "protocol: semantic worker returned {} vectors for {} images",
-                result.vectors.len(),
-                jobs.len()
+            let error = TaskError::worker(
+                MlErrorKind::Protocol,
+                format!(
+                    "semantic worker returned {} vectors for {} images",
+                    result.vectors.len(),
+                    jobs.len()
+                ),
             );
             return Err(EncodeChunkFailure {
                 error,
@@ -1175,9 +1180,8 @@ async fn encode_chunk(
         }
         Err(error) => {
             return Err(EncodeChunkFailure {
-                deferred_reason: crate::background_policy::is_pause(&error)
-                    .then_some("background_paused"),
-                error: format!("embed failed: {error}"),
+                deferred_reason: error.is_pause().then_some("background_paused"),
+                error,
                 claimed: jobs,
             });
         }
@@ -1268,14 +1272,17 @@ fn load_images(
 /// screenshot, and it confirms that screenshot is still live — a check that
 /// reads `is_deleted` and decrypts nothing. Everything else stays queued rather
 /// than being excluded on a guess.
-async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<ClaimedJob>, String> {
+async fn claim_batch(
+    storage: Arc<StorageState>,
+    locked: bool,
+) -> Result<Vec<ClaimedJob>, TaskError> {
     let execution = crate::background_policy::current_execution();
     let limit = if execution.is_some() {
         1
     } else {
         DRAIN_BATCH as u32
     };
-    tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, TaskError> {
         let generation = storage.db_generation();
         if let Some(lease) = &execution {
             lease.check()?;
@@ -1298,10 +1305,7 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
                 storage.map_image_hashes_to_screenshot_ids(&hashes)?,
             )
         } else {
-            (
-                indexable_hashes(&storage, &hashes).map_err(|error| error.to_string())?,
-                HashMap::new(),
-            )
+            (indexable_hashes(&storage, &hashes)?, HashMap::new())
         };
 
         let mut claimed = Vec::with_capacity(jobs.len());
@@ -1366,10 +1370,21 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
                     spec: job.spec,
                     lease_token,
                 }),
-                Err(error) => tracing::debug!(
+                Err(error) if error.is_pause() => tracing::debug!(
                     "[CLIP:INDEX] could not claim {}: {error}",
                     job.spec.subject_key
                 ),
+                Err(error) => {
+                    for job in &claimed {
+                        let _ = storage.requeue_derived_index_job(
+                            &job.spec,
+                            &job.lease_token,
+                            "claim_failed",
+                            "claim batch could not finish",
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(claimed)
@@ -1382,7 +1397,7 @@ async fn commit_batch(
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
     vectors: Vec<Vec<f32>>,
-) -> Result<usize, String> {
+) -> Result<usize, TaskError> {
     let execution = crate::background_policy::current_execution();
     tokio::task::spawn_blocking(move || {
         let mut indexed = 0usize;
@@ -1422,9 +1437,9 @@ async fn commit_batch(
                         &job.spec,
                         &job.lease_token,
                         "commit_deferred",
-                        &error,
+                        &error.to_string(),
                     );
-                    if !crate::background_policy::is_pause(&error) {
+                    if !error.is_pause() {
                         tracing::warn!(
                             "[CLIP:INDEX] commit failed for {}: {error}",
                             job.spec.subject_key
@@ -1479,9 +1494,13 @@ async fn fail_claims(
     .await;
 }
 
-async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJob>, error: &str) {
+async fn settle_failed_claims(
+    storage: Arc<StorageState>,
+    claimed: Vec<ClaimedJob>,
+    error: &TaskError,
+) {
     if crate::semantic_runtime::is_deterministic_worker_failure(error) {
-        fail_claims(storage, claimed, "embed_failed", error).await;
+        fail_claims(storage, claimed, "embed_failed", &error.to_string()).await;
     } else {
         release_claims(
             storage,
@@ -1498,8 +1517,8 @@ async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJo
 /// A safety net rather than a live path — see the module header. It also cleans
 /// up after the step-7 migration, which can import a row for a screenshot the
 /// user deleted between the snapshot and the commit.
-async fn reap_orphans(storage: Arc<StorageState>) -> Result<(), String> {
-    let removed = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+async fn reap_orphans(storage: Arc<StorageState>) -> Result<(), TaskError> {
+    let removed = tokio::task::spawn_blocking(move || -> Result<usize, TaskError> {
         let subjects = storage.list_orphaned_clip_image_subjects(MAINTENANCE_BATCH)?;
         let mut removed = 0;
         for subject in &subjects {
@@ -1527,19 +1546,18 @@ async fn reap_orphans(storage: Arc<StorageState>) -> Result<(), String> {
 async fn reconcile_missing(
     storage: Arc<StorageState>,
     scope: RepairScope,
-) -> Result<usize, String> {
+) -> Result<usize, TaskError> {
     if scope == RepairScope::Suspended {
         return Ok(0);
     }
     let window = scan_window(scope);
     let (queued, excluded) =
-        tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+        tokio::task::spawn_blocking(move || -> Result<(usize, usize), TaskError> {
             let hashes = storage.list_clip_image_index_candidates(window, MAINTENANCE_BATCH)?;
             if hashes.is_empty() {
                 return Ok((0, 0));
             }
-            let indexable =
-                indexable_hashes(&storage, &hashes).map_err(|error| error.to_string())?;
+            let indexable = indexable_hashes(&storage, &hashes)?;
             let mut queued = 0;
             let mut excluded = 0;
             for hash in &hashes {

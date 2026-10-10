@@ -5,6 +5,7 @@
 //! becoming authoritative; consumers must be able to rebuild it from SQLite.
 
 use super::StorageState;
+use crate::task_error::TaskError;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rand::RngCore;
 use rusqlite::{params, OptionalExtension};
@@ -458,7 +459,7 @@ impl StorageState {
     pub fn mark_derived_index_job_processing(
         &self,
         spec: &DerivedIndexJobSpec,
-    ) -> Result<String, String> {
+    ) -> Result<String, TaskError> {
         validate_job_spec(spec)?;
         let lease_token = new_lease_token();
         let guard = self.get_connection_named("mark_derived_index_job_processing")?;
@@ -488,9 +489,7 @@ impl StorageState {
             )
             .map_err(|error| format!("Failed to claim derived index job: {error}"))?;
         if changed == 0 {
-            return Err(
-                "Derived index job is missing, already claimed, or no longer queueable".to_string(),
-            );
+            return Err(TaskError::Paused("derived_job_busy"));
         }
         Ok(lease_token)
     }
@@ -704,6 +703,7 @@ impl StorageState {
     /// becomes query-visible.
     pub fn commit_derived_embedding(&self, write: &DerivedEmbeddingWrite) -> Result<(), String> {
         self.commit_derived_embedding_with_receipt(write, EmbeddingCommitContext::default())
+            .map_err(Into::into)
     }
 
     pub(crate) fn commit_archive_embedding(
@@ -712,7 +712,7 @@ impl StorageState {
         generation: u64,
         revisions: &[(i64, Option<i64>)],
         execution: Option<&crate::background_policy::ExecutionLease>,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         self.commit_derived_embedding_with_receipt(
             write,
             EmbeddingCommitContext {
@@ -728,7 +728,7 @@ impl StorageState {
         &self,
         write: &DerivedEmbeddingWrite,
         receipt: &crate::processing_stage::TaskReceipt,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         self.processing_stage.check_receipt(receipt)?;
         use carbonpaper_app_bound::protocol::Consumer;
         if !matches!(
@@ -755,7 +755,7 @@ impl StorageState {
         &self,
         write: &DerivedEmbeddingWrite,
         context: EmbeddingCommitContext<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         let receipt = context.receipt;
         validate_job_spec(&write.job)?;
         validate_required_text("lease_token", &write.lease_token, MAX_METADATA_BYTES)?;
@@ -771,7 +771,7 @@ impl StorageState {
             .generation
             .is_some_and(|g| g != self.db_generation())
         {
-            return Err("background_paused: embedding database changed".into());
+            return Err(TaskError::Paused("database_changed"));
         }
         for (id, expected) in context.revisions {
             let current: Option<i64> = conn
@@ -785,7 +785,7 @@ impl StorageState {
                 .optional()
                 .map_err(|e| e.to_string())?;
             if current != *expected {
-                return Err("background_paused: embedding source changed".into());
+                return Err(TaskError::Paused("embedding_source_changed"));
             }
         }
         // Sampled before the write so the resident cache can tell "I was
@@ -795,7 +795,7 @@ impl StorageState {
             if !self.processing_stage.available()
                 || !self.staged_source_current_on_conn(conn, receipt)?
             {
-                return Err("Staged input changed before embedding commit".into());
+                return Err(TaskError::Paused("staged_source_changed"));
             }
             if write.job.index_kind == DerivedIndexKind::ClipImage {
                 let matches: bool = conn
@@ -814,7 +814,7 @@ impl StorageState {
             .transaction()
             .map_err(|error| format!("Failed to start derived embedding transaction: {error}"))?;
         if !derived_subject_is_active(&tx, write.job.index_kind, &write.job.subject_key)? {
-            return Err("Cannot commit a derived embedding for an inactive subject".to_string());
+            return Err(TaskError::Paused("inactive_subject"));
         }
         let completed = tx
             .execute(
@@ -840,10 +840,7 @@ impl StorageState {
             )
             .map_err(|error| format!("Failed to complete derived index job: {error}"))?;
         if completed == 0 {
-            return Err(
-                "Derived index worker lease is stale or the job is no longer processing"
-                    .to_string(),
-            );
+            return Err(TaskError::Paused("derived_lease_stale"));
         }
         tx.execute(
             r#"
@@ -3132,7 +3129,7 @@ mod tests {
         assert!(storage
             .commit_archive_embedding(&write, generation, &revisions, Some(&execution))
             .unwrap_err()
-            .contains("input_resumed"));
+            .is_pause());
         storage
             .db
             .lock()
@@ -3148,12 +3145,12 @@ mod tests {
         assert!(storage
             .commit_archive_embedding(&write, generation, &revisions, None)
             .unwrap_err()
-            .contains("source changed"));
+            .is_pause());
         storage.bump_db_generation();
         assert!(storage
             .commit_archive_embedding(&write, generation, &[], None)
             .unwrap_err()
-            .contains("database changed"));
+            .is_pause());
         storage
             .requeue_derived_index_job(&spec, &lease_token, "paused", "try next pass")
             .unwrap();
@@ -3179,15 +3176,12 @@ mod tests {
         assert!(storage
             .save_ann_build_checkpoint(&state)
             .unwrap_err()
-            .contains("generation changed"));
+            .is_pause());
         assert!(storage
             .freeze_ann_page(&mut state, 1)
             .unwrap_err()
-            .contains("generation changed"));
-        assert!(storage
-            .cleanup_ann_inputs(&state)
-            .unwrap_err()
-            .contains("generation changed"));
+            .is_pause());
+        assert!(storage.cleanup_ann_inputs(&state).unwrap_err().is_pause());
         // The runtime token is refreshed only after reading a durable state in
         // the new process; it is intentionally absent from the serialized form.
         let restored = storage.ann_build_checkpoint().unwrap().unwrap();
@@ -3302,11 +3296,11 @@ mod tests {
         assert!(storage
             .save_ann_build_checkpoint(&restored)
             .unwrap_err()
-            .contains("database changed"));
+            .is_pause());
         assert!(storage
             .frozen_ann_page(&restored, 0, 1)
             .unwrap_err()
-            .contains("database changed"));
+            .is_pause());
     }
 
     #[test]
@@ -3571,6 +3565,43 @@ mod tests {
             .get_query_visible_embedding(DerivedIndexKind::SemanticText, "19")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn busy_claims_defer_but_database_errors_do_not() {
+        let (_temp, storage) = test_storage();
+        let spec = job(DerivedIndexKind::SemanticText, "22");
+        let lease = queue_and_claim(&storage, &spec);
+        assert!(storage
+            .mark_derived_index_job_processing(&spec)
+            .unwrap_err()
+            .is_pause());
+        storage
+            .requeue_derived_index_job(&spec, &lease, "test", "retry")
+            .unwrap();
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_claim BEFORE UPDATE ON derived_index_jobs
+             WHEN NEW.status='processing' BEGIN
+             SELECT RAISE(ABORT, 'background_paused: simulated storage failure'); END;",
+            )
+            .unwrap();
+        let error = storage
+            .mark_derived_index_job_processing(&spec)
+            .unwrap_err();
+        assert!(matches!(error, TaskError::Failed(_)));
+        assert!(!error.is_pause());
+        let job = storage
+            .get_derived_index_job(spec.index_kind, &spec.subject_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, DerivedIndexJobStatus::Pending);
+        assert_eq!(job.attempts, 0);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! committed M2 oracle.
 
 use crate::ml_protocol::MlSemanticModel;
+use crate::ml_protocol::{MlError, MlErrorKind};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -228,7 +229,7 @@ pub fn resolve_semantic_model(
     model: MlSemanticModel,
     models_root: &Path,
     onnx_models_root: &Path,
-) -> Result<ResolvedSemanticModel, String> {
+) -> Result<ResolvedSemanticModel, MlError> {
     let descriptor = descriptor(model);
     let append_subdir = |root: &Path| match descriptor.subdir {
         Some(subdir) => root.join(subdir),
@@ -249,11 +250,14 @@ pub fn resolve_semantic_model(
                 .all(|file| base.join(file.relative_path).is_file())
         })
         .ok_or_else(|| {
-            format!(
-                "model_missing: pinned files for {} were not found under {} or {}",
-                descriptor.model_id,
-                onnx_models_root.display(),
-                models_root.display()
+            MlError::new(
+                MlErrorKind::ModelMissing,
+                format!(
+                    "pinned files for {} were not found under {} or {}",
+                    descriptor.model_id,
+                    onnx_models_root.display(),
+                    models_root.display()
+                ),
             )
         })?;
 
@@ -273,31 +277,38 @@ pub fn resolve_semantic_model(
 fn verify_model_files(
     descriptor: &SemanticModelDescriptor,
     base_dir: &Path,
-) -> Result<String, String> {
+) -> Result<String, MlError> {
     let mut model_fingerprint = None;
     for spec in descriptor.files {
         let path = base_dir.join(spec.relative_path);
         let metadata = path.metadata().map_err(|error| {
-            format!(
-                "model_missing: failed to inspect {}: {error}",
-                path.display()
+            MlError::new(
+                MlErrorKind::ModelMissing,
+                format!("failed to inspect {}: {error}", path.display()),
             )
         })?;
         if metadata.len() != spec.size {
-            return Err(format!(
-                "model_mismatch: size mismatch for {}: expected={}, actual={}",
-                path.display(),
-                spec.size,
-                metadata.len()
+            return Err(MlError::new(
+                MlErrorKind::ModelMismatch,
+                format!(
+                    "size mismatch for {}: expected={}, actual={}",
+                    path.display(),
+                    spec.size,
+                    metadata.len()
+                ),
             ));
         }
-        let actual = sha256_file(&path)?;
+        let actual =
+            sha256_file(&path).map_err(|error| MlError::new(MlErrorKind::Inference, error))?;
         if !actual.eq_ignore_ascii_case(spec.sha256) {
-            return Err(format!(
-                "model_mismatch: sha256 mismatch for {}: expected={}, actual={}",
-                path.display(),
-                spec.sha256,
-                actual
+            return Err(MlError::new(
+                MlErrorKind::ModelMismatch,
+                format!(
+                    "sha256 mismatch for {}: expected={}, actual={}",
+                    path.display(),
+                    spec.sha256,
+                    actual
+                ),
             ));
         }
         if spec.relative_path == descriptor.model_file {
@@ -305,9 +316,12 @@ fn verify_model_files(
         }
     }
     model_fingerprint.ok_or_else(|| {
-        format!(
-            "model_mismatch: descriptor for {} has no model fingerprint",
-            descriptor.model_id
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!(
+                "descriptor for {} has no model fingerprint",
+                descriptor.model_id
+            ),
         )
     })
 }

@@ -515,7 +515,7 @@ async fn interruption_and_configuration_changes_leave_the_task_retryable() {
         || inferred.get().then_some("foreground_request"),
     )
     .await;
-    assert!(result.err().unwrap().starts_with("deferred:"));
+    assert!(result.err().unwrap().is_pause());
     assert_eq!(assignment_count(storage), 0);
     assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
     storage
@@ -524,7 +524,7 @@ async fn interruption_and_configuration_changes_leave_the_task_retryable() {
     assert!(storage
         .commit_staged_smart_cluster(&work.receipt, &targets, &[(id, 4.0)], false)
         .unwrap_err()
-        .starts_with("deferred:"));
+        .is_pause());
     storage
         .processing_stage
         .release(&work.receipt, false)
@@ -567,7 +567,10 @@ async fn changed_vectors_or_sources_cannot_complete_a_staged_smart_task() {
     .await
     .err()
     .unwrap();
-    assert_eq!(error, "deferred: waiting_for_index");
+    assert_eq!(
+        error,
+        crate::task_error::TaskError::Paused("waiting_for_index")
+    );
     sql(storage, "DELETE FROM ocr_results WHERE screenshot_id=1");
     assert!(storage
         .commit_staged_smart_cluster(&work.receipt, &targets, &[], false)

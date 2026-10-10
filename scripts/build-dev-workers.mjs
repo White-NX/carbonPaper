@@ -68,7 +68,10 @@ function rootInputFiles() {
     path.join(root, 'scripts', 'build-dev-workers.mjs'),
     path.join(tauriDir, 'src', 'bin', 'ml.rs'),
     path.join(tauriDir, 'src', 'ann_format.rs'),
+    path.join(tauriDir, 'src', 'ann_protocol.rs'),
+    path.join(tauriDir, 'src', 'ann_worker.rs'),
     path.join(tauriDir, 'src', 'ml_protocol.rs'),
+    path.join(tauriDir, 'src', 'semantic_metrics.rs'),
     path.join(tauriDir, 'src', 'bin', 'office.rs'),
     path.join(tauriDir, 'src', 'office_com.rs'),
     path.join(tauriDir, 'src', 'office_protocol.rs'),
@@ -93,6 +96,8 @@ function semanticInputFiles() {
     path.join(tauriDir, 'src', 'ml_protocol.rs'),
     path.join(tauriDir, 'src', 'clip_preprocess.rs'),
     path.join(tauriDir, 'src', 'semantic_engine.rs'),
+    path.join(tauriDir, 'src', 'semantic_cancellation.rs'),
+    path.join(tauriDir, 'src', 'semantic_metrics.rs'),
     path.join(tauriDir, 'src', 'semantic_models.rs'),
   ].sort();
 }
