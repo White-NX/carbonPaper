@@ -17,7 +17,6 @@ fn row(id: i64) -> RawTimelineRow {
         process_enc: encrypt("browser.exe"),
         metadata_enc: encrypt(r#"{"process_path":"browser.exe","unused":"ignored"}"#),
         key_enc: Some(vec![1]),
-        icon_enc: None,
         icon_id: Some(10),
         shared_icon_enc: encrypt("shared icon"),
         shared_icon_key: Some(vec![2]),

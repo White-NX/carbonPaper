@@ -802,6 +802,7 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        super::migration::dedup::migrate(conn)?;
         Self::init_recap_tables(conn)?;
         let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
         if recovered > 0 {
@@ -1120,8 +1121,6 @@ impl StorageState {
         // Browser extension metadata columns
         Self::add_column_if_missing(conn, "screenshots", "source", "TEXT")?;
         Self::add_column_if_missing(conn, "screenshots", "page_url_enc", "BLOB")?;
-        Self::add_column_if_missing(conn, "screenshots", "page_icon_enc", "BLOB")?;
-        Self::add_column_if_missing(conn, "screenshots", "visible_links_enc", "BLOB")?;
 
         // Content-addressed dedup references
         Self::add_column_if_missing(conn, "screenshots", "page_icon_id", "INTEGER")?;

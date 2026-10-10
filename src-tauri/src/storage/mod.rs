@@ -102,8 +102,6 @@ pub struct StorageState {
     lock_holder: Mutex<&'static str>,
     /// Approximate OCR row count for O(1) IDF lookups (initialized from DB, maintained on insert/delete)
     ocr_row_count: AtomicU64,
-    /// Whether dedup migration has already been performed this session
-    dedup_migrated: AtomicBool,
     /// Whether bitmap index migration has already been attempted this session
     bitmap_index_migrated: AtomicBool,
     /// Whether thumbnail warmup has already completed this session
@@ -232,7 +230,6 @@ impl StorageState {
             lazy_indexer_shutdown: AtomicBool::new(false),
             lock_holder: Mutex::new(""),
             ocr_row_count: AtomicU64::new(0),
-            dedup_migrated: AtomicBool::new(false),
             bitmap_index_migrated: AtomicBool::new(false),
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),

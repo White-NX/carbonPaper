@@ -40,7 +40,6 @@ struct RawTimelineRow {
     process_enc: Option<Vec<u8>>,
     metadata_enc: Option<Vec<u8>>,
     key_enc: Option<Vec<u8>>,
-    icon_enc: Option<Vec<u8>>,
     icon_id: Option<i64>,
     shared_icon_enc: Option<Vec<u8>>,
     shared_icon_key: Option<Vec<u8>>,
@@ -202,7 +201,7 @@ fn timeline_rows_sql(bucket: Option<i64>) -> String {
         SELECT s.id, s.image_path, s.created_at,
         CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
         s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
-        s.content_key_encrypted, s.page_icon_enc, s.page_icon_id,
+        s.content_key_encrypted, s.page_icon_id,
         pi.icon_enc, pi.icon_key_encrypted, s.category
         FROM picks CROSS JOIN screenshots s ON s.id = picks.picked_id
         LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
@@ -268,11 +267,10 @@ fn read_rows(
                         process_enc: row.get(8)?,
                         metadata_enc: row.get(9)?,
                         key_enc: row.get(10)?,
-                        icon_enc: row.get(11)?,
-                        icon_id: row.get(12)?,
-                        shared_icon_enc: row.get(13)?,
-                        shared_icon_key: row.get(14)?,
-                        category: row.get(15)?,
+                        icon_id: row.get(11)?,
+                        shared_icon_enc: row.get(12)?,
+                        shared_icon_key: row.get(13)?,
+                        category: row.get(14)?,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -341,9 +339,6 @@ fn hydrate(
             .and_then(|meta| meta.get("process_path"))
             .and_then(|value| value.as_str())
             .map(str::to_owned);
-        if icon.is_none() {
-            icon = decrypt_string(row.icon_enc.as_ref(), key, None);
-        }
         if icon.is_none() {
             if let Some(id) = row.icon_id {
                 check()?;

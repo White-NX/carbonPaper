@@ -91,7 +91,6 @@ pub async fn credential_verify_user(
         {
             scheduler.wake();
         }
-        storage_state.try_dedup_migration();
         storage_state.try_bitmap_index_migration();
         if let Err(e) =
             mcp_server::restore_if_enabled(app, &state, &storage_state, &mcp_state).await

@@ -1357,7 +1357,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence";
@@ -1810,7 +1810,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -1878,7 +1878,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -2089,7 +2089,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -2161,7 +2161,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
