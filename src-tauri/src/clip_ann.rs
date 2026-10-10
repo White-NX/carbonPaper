@@ -22,7 +22,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::os::windows::io::AsRawHandle;
@@ -30,7 +30,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 use usearch::{Index, MetricKind, ScalarKind};
@@ -369,22 +369,17 @@ impl BoundedTopK {
             }));
             return;
         }
-        let replace = self
-            .heap
-            .peek()
-            .map(|worst| {
-                score
-                    .total_cmp(&worst.0.score)
-                    .then_with(|| worst.0.subject_key.as_str().cmp(subject_key))
-                    .is_gt()
-            })
-            .unwrap_or(true);
-        if replace {
-            let _ = self.heap.pop();
-            self.heap.push(Reverse(TopCandidate {
-                score,
-                subject_key: subject_key.to_string(),
-            }));
+        if let Some(mut worst) = self.heap.peek_mut() {
+            if score
+                .total_cmp(&worst.0.score)
+                .then_with(|| worst.0.subject_key.as_str().cmp(subject_key))
+                .is_gt()
+            {
+                // Reuse the evicted key's allocation and repair the heap once.
+                worst.0.score = score;
+                worst.0.subject_key.clear();
+                worst.0.subject_key.push_str(subject_key);
+            }
         }
     }
 
@@ -453,10 +448,12 @@ impl ClipAnnState {
         storage: &StorageState,
         query: &[f32],
         k: usize,
+        deadline: Option<Instant>,
     ) -> Result<Option<ClipAnnQuery>, String> {
         if !enabled() || query.len() != CLIP_DIMENSIONS || k == 0 {
             return Ok(None);
         }
+        check_ann_deadline(deadline)?;
         let (generation, tail) =
             match self.generation_snapshot_with_tail(storage, |covered_epoch| {
                 storage.list_derived_ann_tail(
@@ -470,52 +467,7 @@ impl ClipAnnState {
                 Err(error) if error.starts_with("ann_tail_too_large:") => return Ok(None),
                 Err(error) => return Err(error),
             };
-        let changed: HashSet<&str> = tail.iter().map(|row| row.subject_key.as_str()).collect();
-        let candidate_count = ann_candidate_count(generation.manifest.row_count as usize, k);
-        let matches = generation
-            .index
-            .search(query, candidate_count)
-            .map_err(|error| format!("ann_search_failed:{error}"))?;
-
-        let mut merged: HashMap<String, f32> =
-            HashMap::with_capacity(matches.keys.len() + tail.len());
-        for key in matches.keys {
-            let Some(ordinal) = key
-                .checked_sub(1)
-                .and_then(|value| usize::try_from(value).ok())
-            else {
-                return Err("ann_search_returned_invalid_key".to_string());
-            };
-            let subject_key = generation.flat.key(ordinal)?;
-            if changed.contains(subject_key) {
-                continue;
-            }
-            let score = dot_product(query, generation.flat.vector(ordinal)?);
-            merged.insert(subject_key.to_string(), score);
-        }
-        for DerivedAnnTailRow {
-            subject_key,
-            vector,
-        } in &tail
-        {
-            if let Some(vector) = vector {
-                if vector.len() == query.len() {
-                    merged.insert(subject_key.clone(), dot_product(query, vector));
-                }
-            } else {
-                merged.remove(subject_key);
-            }
-        }
-        let mut candidates: Vec<ScoredSubject> = merged
-            .into_iter()
-            .map(|(subject_key, score)| ScoredSubject { subject_key, score })
-            .collect();
-        candidates.sort_unstable_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.subject_key.cmp(&b.subject_key))
-        });
-        candidates.truncate(k);
+        let candidates = ann_candidates(&generation, &tail, query, k, deadline)?;
         Ok(Some(ClipAnnQuery {
             candidates,
             mode: "ann",
@@ -795,6 +747,64 @@ impl ClipAnnState {
             }
         }
     }
+}
+
+fn check_ann_deadline(deadline: Option<Instant>) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("query_deadline_exceeded_during_ann".to_string());
+    }
+    Ok(())
+}
+
+fn ann_candidates(
+    generation: &GenerationReader,
+    tail: &[DerivedAnnTailRow],
+    query: &[f32],
+    k: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<ScoredSubject>, String> {
+    check_ann_deadline(deadline)?;
+    let changed: HashSet<&str> = tail.iter().map(|row| row.subject_key.as_str()).collect();
+    let candidate_count = ann_candidate_count(generation.manifest.row_count as usize, k);
+    let matches = generation
+        .index
+        .search(query, candidate_count)
+        .map_err(|error| format!("ann_search_failed:{error}"))?;
+    check_ann_deadline(deadline)?;
+
+    // Base keys are unique and every changed key is suppressed before merging
+    // the latest tail row. Keep only the best k scores instead of allocating
+    // and sorting all ANN candidates plus up to MAX_TAIL_ROWS changed vectors.
+    let mut top = BoundedTopK::new(k);
+    for (index, key) in matches.keys.into_iter().enumerate() {
+        if index % 64 == 0 {
+            check_ann_deadline(deadline)?;
+        }
+        let Some(ordinal) = key
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Err("ann_search_returned_invalid_key".to_string());
+        };
+        let subject_key = generation.flat.key(ordinal)?;
+        if !changed.contains(subject_key) {
+            top.push(
+                dot_product(query, generation.flat.vector(ordinal)?),
+                subject_key,
+            );
+        }
+    }
+    for (index, row) in tail.iter().enumerate() {
+        if index % 64 == 0 {
+            check_ann_deadline(deadline)?;
+        }
+        if let Some(vector) = &row.vector {
+            if vector.len() == query.len() {
+                top.push(dot_product(query, vector), &row.subject_key);
+            }
+        }
+    }
+    Ok(top.into_sorted())
 }
 
 fn exact_candidates(
@@ -1563,6 +1573,66 @@ mod tests {
         }
         assert_eq!(bounded.into_sorted(), full);
     }
+
+    #[test]
+    fn ann_topk_matches_exact_merge_with_updates_tombstones_and_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = test_reader(
+            temp.path(),
+            30,
+            &["a", "b", "c", "d"],
+            &[
+                vec![1.0, 0.0],
+                vec![0.0, 1.0],
+                vec![0.8, 0.6],
+                vec![0.6, 0.8],
+            ],
+        );
+        let tail = vec![
+            DerivedAnnTailRow {
+                subject_key: "a".to_string(),
+                vector: Some(vec![0.2, 0.98]),
+            },
+            DerivedAnnTailRow {
+                subject_key: "b".to_string(),
+                vector: Some(vec![1.0, 0.0]),
+            },
+            DerivedAnnTailRow {
+                subject_key: "c".to_string(),
+                vector: None,
+            },
+            DerivedAnnTailRow {
+                subject_key: "new-z".to_string(),
+                vector: Some(vec![0.9, 0.44]),
+            },
+            DerivedAnnTailRow {
+                subject_key: "new-a".to_string(),
+                vector: Some(vec![0.9, 0.44]),
+            },
+        ];
+        for k in [1, 2, 3, 10] {
+            let actual = ann_candidates(&reader, &tail, &[1.0, 0.0], k, None).unwrap();
+            let expected = exact_candidates(&reader, &tail, &[1.0, 0.0], k, None).unwrap();
+            assert_eq!(actual, expected);
+        }
+        let keys: Vec<_> = ann_candidates(&reader, &tail, &[1.0, 0.0], 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.subject_key)
+            .collect();
+        assert_eq!(keys, ["b", "new-a", "new-z", "d", "a"]);
+    }
+
+    #[test]
+    fn ann_stops_before_searching_an_expired_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = test_reader(temp.path(), 31, &["a"], &[vec![1.0, 0.0]]);
+        assert_eq!(
+            ann_candidates(&reader, &[], &[1.0, 0.0], 1, Some(Instant::now())).unwrap_err(),
+            "query_deadline_exceeded_during_ann"
+        );
+    }
+
 
     #[test]
     fn disarm_prevents_an_old_startup_token_from_installing() {
