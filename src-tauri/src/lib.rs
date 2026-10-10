@@ -253,8 +253,8 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     let mut waiting_for_unlock_logged = false;
 
     loop {
-        // Retention and delete-queue work would race the MiniLM migration's
-        // Chroma snapshot; stand still while maintenance mode is active.
+        // Retention and delete-queue work must yield while maintenance owns
+        // the archive and its derived indexes.
         if maintenance::is_active() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
@@ -919,6 +919,9 @@ pub fn run() {
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
+                // Finish preference migrations before exposing runtime controls
+                // or spawning any task that can start an inference worker.
+                commands::utility::migrate_dml_config();
                 ai::recap::start_scheduler(app.handle().clone());
 
                 build_tray(app)?;
@@ -1096,7 +1099,7 @@ pub fn run() {
 
                         // One scheduler arbitrates all four automatic model
                         // tasks. Their business queues remain durable in
-                        // SQLite/Chroma; only admission and slice ordering live
+                        // SQLite; only admission and slice ordering live
                         // in this loop.
                         let scheduler = app
                             .state::<Arc<background_scheduler::BackgroundSchedulerState>>()
@@ -1107,10 +1110,6 @@ pub fn run() {
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
                 }
-
-                // Apply preference migrations before any monitor can spawn a
-                // worker that reads the unified DirectML setting.
-                commands::utility::migrate_dml_config();
 
                 if registry_config::get_bool("game_mode_enabled").unwrap_or(false) {
                     tracing::info!("Restoring game mode monitor on startup");
