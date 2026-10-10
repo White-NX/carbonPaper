@@ -17,12 +17,21 @@ pub const MAINTENANCE_IN_PROGRESS: &str = "MAINTENANCE_IN_PROGRESS";
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static REASON: Mutex<Option<String>> = Mutex::new(None);
+// A runtime action owns a read permit through its final await. Maintenance can
+// enter only after those actions finish, and rejects new actions until restore.
+static RUNTIME_CONTROL: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+pub(crate) fn runtime_control_guard() -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    RUNTIME_CONTROL
+        .try_read()
+        .map_err(|_| MAINTENANCE_IN_PROGRESS.to_string())
+}
 
 /// RAII guard: maintenance mode ends when the guard drops, so a panicking or
 /// early-returning worker cannot leave the app locked. The generic end event is
 /// neutral because callers own the operation-specific success or failure state.
 pub struct MaintenanceGuard {
-    _private: (),
+    _runtime_control: tokio::sync::RwLockWriteGuard<'static, ()>,
 }
 
 impl Drop for MaintenanceGuard {
@@ -44,21 +53,19 @@ impl Drop for MaintenanceGuard {
 }
 
 /// Enter maintenance mode. Returns `None` if another maintenance task is
-/// already active.
+/// already active or a runtime action is still draining.
 pub fn enter(reason: &str) -> Option<MaintenanceGuard> {
-    if ACTIVE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return None;
-    }
+    let runtime_control = RUNTIME_CONTROL.try_write().ok()?;
+    ACTIVE.store(true, Ordering::SeqCst);
     *REASON.lock().unwrap_or_else(|error| error.into_inner()) = Some(reason.to_string());
     crate::background_activity::global_maintenance_start(reason);
     tracing::info!(
         "[BACKGROUND] event=start task=maintenance kind={} source=archive",
         reason
     );
-    Some(MaintenanceGuard { _private: () })
+    Some(MaintenanceGuard {
+        _runtime_control: runtime_control,
+    })
 }
 
 pub fn is_active() -> bool {
@@ -104,13 +111,21 @@ mod tests {
 
     #[test]
     fn guard_is_exclusive_and_releases_on_drop() {
+        let action = runtime_control_guard().unwrap();
+        assert!(enter("action still running").is_none());
+        drop(action);
         let guard = enter("test").expect("first enter succeeds");
         assert!(is_active());
         assert!(enter("second").is_none());
         assert_eq!(super::guard().unwrap_err(), MAINTENANCE_IN_PROGRESS);
+        assert_eq!(
+            runtime_control_guard().unwrap_err(),
+            MAINTENANCE_IN_PROGRESS
+        );
         drop(guard);
         assert!(!is_active());
         assert!(super::guard().is_ok());
+        assert!(runtime_control_guard().is_ok());
     }
 
     #[test]

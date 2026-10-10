@@ -596,27 +596,13 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let monitor_running = app_handle.state::<MonitorState>().is_running();
-                    let cs = app_handle.state::<Arc<CaptureState>>();
-                    if monitor_running {
-                        if cs.paused.load(Ordering::SeqCst) {
-                            let _ = monitor::resume_monitor_impl(cs, app_handle.clone()).await;
-                        } else {
-                            let _ = monitor::pause_monitor_impl(cs, app_handle.clone()).await;
-                        }
-                    } else {
-                        refresh_tray_menu(&app_handle);
-                    }
+                    let _ = monitor::control(&app_handle, monitor::MonitorAction::TogglePause).await;
                 });
             }
             MENU_ID_RESTART => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<MonitorState>();
-                    let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::stop_monitor_impl(state, cs, app_handle.clone()).await;
-                    let start_state = app_handle.state::<MonitorState>();
-                    let _ = monitor::start_monitor_impl(start_state, app_handle.clone()).await;
+                    let _ = monitor::control(&app_handle, monitor::MonitorAction::Restart).await;
                 });
             }
             MENU_ID_LIGHTWEIGHT => {
@@ -1208,9 +1194,7 @@ pub fn run() {
                 {
                     let app_handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
-                        let state = app_handle.state::<MonitorState>();
-                        let app_handle_clone = app_handle.clone();
-                        if let Err(e) = monitor::start_monitor_impl(state, app_handle_clone).await {
+                        if let Err(e) = monitor::control(&app_handle, monitor::MonitorAction::Start).await {
                             tracing::error!("Failed to auto-start monitor: {}", e);
                         }
                     });

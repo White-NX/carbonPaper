@@ -362,7 +362,7 @@ impl OfficeRuntimeState {
     /// release the worker process.
     ///
     /// Must be awaited before the database is closed or replaced — by
-    /// `stop_monitor_impl`, by backup export/import, and by the
+    /// monitor stop, by backup export/import, and by the
     /// data-directory switch. Association writes carry screenshot ids that
     /// only mean something in the database they came from, and the worker has
     /// no reason to keep talking to Office once capture has stopped.

@@ -164,7 +164,7 @@ async fn run_repair(
 ) {
     tracing::info!("[BLIND_INDEX_REPAIR] starting stale-posting repair");
 
-    let restore = maintenance_support::pause_capture_for_maintenance(&app).await;
+    let restore = maintenance_support::pause_capture_for_maintenance(&app, &maintenance).await;
     let result = match restore.as_ref() {
         Ok(_) => {
             let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -192,7 +192,7 @@ async fn run_repair(
     };
 
     if let Ok(restore) = restore.as_ref() {
-        maintenance_support::restore_monitor_after_maintenance(&app, restore).await;
+        maintenance_support::restore_monitor_after_maintenance(&app, restore, &maintenance).await;
     }
 
     match result {
