@@ -30,6 +30,7 @@ pub mod error;
 mod error_window;
 mod i18n;
 mod idle;
+mod index_pipeline;
 mod index_progress;
 mod legacy_python_cleanup;
 mod legacy_vector_discard;

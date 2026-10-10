@@ -7,9 +7,15 @@
 //! searches.
 
 use crate::background_scheduler::{
-    deferred_release_note, AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
+    AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
 };
 use crate::credential_manager::CredentialManagerState;
+pub use crate::index_pipeline::IndexRunSummary as SemanticIndexRunSummary;
+pub(crate) use crate::index_pipeline::MAX_ATTEMPTS;
+use crate::index_pipeline::{
+    self, may_run, scheduled_pass_mode, IndexPipeline, JobLease, PassMode, PassOutcome,
+    FOREGROUND_QUERY_STOP, MAINTENANCE_STARTED, STOPPED_BY_USER,
+};
 use crate::minilm_contract::{
     build_minilm_task_text, minilm_job_spec, validate_minilm_vector, MINILM_OCR_SNIPPET_CHARS,
 };
@@ -20,9 +26,7 @@ use crate::storage::{
     BackgroundReadError, DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind, StorageState,
 };
 use crate::task_error::TaskError;
-use chrono::{Duration as ChronoDuration, Utc};
-use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -49,15 +53,6 @@ const DRAIN_BATCH: usize = 16;
 /// wait for it — and the idle gate is re-checked between chunks, which is also
 /// the longest encoding can keep running after the user comes back.
 const ENCODE_CHUNK: usize = 4;
-
-/// Encode attempts before a subject is left alone. A job that spends this
-/// budget stops being claimable and starts being counted as `exhausted` in the
-/// backend diagnostic, because nothing will retry it on its own.
-pub(crate) const MAX_ATTEMPTS: u32 = 5;
-
-/// Backoff between encode attempts. Idle windows are long; retrying a failing
-/// model load every minute inside one would burn the budget in five minutes.
-const RETRY_BACKOFF_MINUTES: i64 = 30;
 
 /// Deadline for one batch encode, including a cold model load. Background work,
 /// so it is generous next to the 5 s a user-facing query is allowed.
@@ -102,30 +97,13 @@ const MANUAL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// the click accomplished anything.
 const MANUAL_FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(5 * 60);
 
-/// The one stop reason a manual drain resumes from instead of ending on.
-///
-/// A drain reports it when a foreground query took the worker mid-batch; the
-/// claims it was holding are released uncharged, exactly as for every other
-/// interruption, and [`drain_until_done`] waits for the lease to clear and
-/// claims a fresh batch. Idle passes report the same string and do end on it,
-/// which is why the constant names the condition rather than the response.
-const FOREGROUND_QUERY_STOP: &str = "foreground_query";
-
 /// Reason for a manual run that spent [`MANUAL_FOREGROUND_WAIT_BUDGET`] waiting
 /// for a worker it never got. Distinguished from [`DEADLINE_REACHED`] because
 /// the two say different things to the user: one machine is slow, the other was
 /// busy answering that user's own searches.
 const WAITED_OUT_BY_FOREGROUND: &str = "foreground_query_held_the_worker";
 
-/// The stop reasons a run ends on, as opposed to the one it may resume from.
-///
-/// Named rather than written inline because each is produced from two or three
-/// places and read by comparison against [`FOREGROUND_QUERY_STOP`]. Two of them
-/// colliding by value is the failure that comparison cannot survive, and
-/// several copies of a string literal is how such a collision gets written by
-/// accident.
-const STOPPED_BY_USER: &str = "stopped_by_user";
-const MAINTENANCE_STARTED: &str = "maintenance_started";
+/// The manual run exhausted its wall-clock ceiling.
 const DEADLINE_REACHED: &str = "deadline_reached";
 
 /// Progress of the running manual pass, emitted after every encoded chunk.
@@ -390,87 +368,7 @@ async fn run_scheduled_request(
     Ok(ScheduledSliceResult::complete(backlog > 0).with_processed(outcome.indexed))
 }
 
-fn scheduled_pass_mode(manual: bool) -> PassMode {
-    if manual {
-        PassMode::Manual
-    } else {
-        PassMode::Idle
-    }
-}
-
-/// What is allowed to stop a pass.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PassMode {
-    /// Background work: runs only inside an idle window and stands down the
-    /// moment the user comes back.
-    Idle,
-    /// The user asked for this run, so the idle gate does not apply and the
-    /// queue drains without yielding to another background task. Every other
-    /// guard still does — maintenance mode, the locked session, the ledger's
-    /// retry budget — and the run stops on the user's word or on the runaway
-    /// deadline.
-    ///
-    /// The unified scheduler owns admission: the command enqueues and returns,
-    /// so by the time this runs nobody is awaiting it. That is why an encode
-    /// failure propagates out of the pass instead of being folded into a run
-    /// summary — see the failure match at the end of [`drain_queue`].
-    Manual,
-}
-
-impl PassMode {
-    fn is_manual(self) -> bool {
-        self == Self::Manual
-    }
-
-    fn yields_after_chunk(self) -> bool {
-        self == Self::Idle
-    }
-}
-
-/// Outcome of one manual run, as reported to Settings → Advanced.
-#[derive(Debug, Clone, Serialize)]
-pub struct SemanticIndexRunSummary {
-    /// True when the unified scheduler accepted the request.
-    pub queued: bool,
-    /// False when something refused before any encoding was attempted;
-    /// `skipped_reason` then says which guard it was.
-    pub started: bool,
-    /// Screenshots that became query-visible during this run.
-    pub indexed: u64,
-    /// Screenshots whose encode failed and which kept a retry attempt.
-    pub failed: u64,
-    /// Screenshots still waiting afterwards. `None` when the ledger could not
-    /// be read, which is honestly "not known" rather than zero.
-    pub remaining: Option<u64>,
-    /// Screenshots whose retry budget is spent. Nothing clears these on its own.
-    pub stalled: Option<u64>,
-    /// Why the run stopped early, or why it never started.
-    pub skipped_reason: Option<String>,
-}
-
 pub type SemanticIndexRunState = crate::index_progress::IndexRunState<false>;
-
-/// Whether background semantic work may run right now.
-///
-/// The idle gate is the whole point of the step-5 scheduling decision: a
-/// 118 MB model load and a batch of transformer forward passes must never land
-/// while someone is using the machine. Maintenance mode is checked too, because
-/// a migration rewriting the derived store would race these writes — and that
-/// one binds a manual run as well, since the user cannot consent their way out
-/// of a concurrent rewrite of the store being written to.
-fn may_run(app: &AppHandle, mode: PassMode) -> bool {
-    if crate::maintenance::is_active() {
-        return false;
-    }
-    if mode.is_manual() {
-        return true;
-    }
-    crate::background_scheduler::environment_gate_reason(
-        app,
-        crate::background_scheduler::EnvironmentPolicy::Automatic,
-    )
-    .is_none()
-}
 
 /// One pass: expire, repair, then drain as much of the queue as the mode allows.
 async fn run_pass(
@@ -724,24 +622,6 @@ async fn drain_until_done(
     Ok(total)
 }
 
-/// What one drain achieved, and why it stopped if it stopped early.
-#[derive(Debug, Default)]
-struct PassOutcome {
-    indexed: u64,
-    failed: u64,
-    stopped_because: Option<&'static str>,
-    refused: Option<&'static str>,
-}
-
-impl PassOutcome {
-    fn refused(reason: &'static str) -> Self {
-        Self {
-            refused: Some(reason),
-            ..Self::default()
-        }
-    }
-}
-
 /// Delete rows that aged out of the retention window.
 ///
 /// Deletion with the screenshot is already transactional in the schema, so what
@@ -844,10 +724,46 @@ struct ClaimedJob {
     lease_token: String,
 }
 
-struct EncodeChunkFailure {
-    error: TaskError,
-    claimed: Vec<ClaimedJob>,
-    deferred_reason: Option<&'static str>,
+type EncodeChunkFailure = index_pipeline::EncodeChunkFailure<ClaimedJob>;
+
+impl JobLease for ClaimedJob {
+    fn spec(&self) -> &DerivedIndexJobSpec {
+        &self.spec
+    }
+    fn lease_token(&self) -> &str {
+        &self.lease_token
+    }
+}
+
+struct MinilmPipeline;
+impl IndexPipeline for MinilmPipeline {
+    type Job = ClaimedJob;
+    const KIND: DerivedIndexKind = DerivedIndexKind::SemanticText;
+    const CHUNK_SIZE: usize = ENCODE_CHUNK;
+    async fn claim(
+        storage: Arc<StorageState>,
+        _locked: bool,
+    ) -> Result<Vec<ClaimedJob>, TaskError> {
+        claim_batch(storage).await
+    }
+    async fn encode<'a>(
+        app: &'a AppHandle,
+        semantic: &'a Arc<SemanticRuntimeState>,
+        storage: Arc<StorageState>,
+        claimed: Vec<ClaimedJob>,
+        context: Option<(&'a AutomaticSliceContext, bool)>,
+    ) -> Result<u64, EncodeChunkFailure> {
+        encode_chunk(app, semantic, storage, claimed, context)
+            .await
+            .map(|result| result.indexed)
+    }
+    fn stopped_by_user(app: &AppHandle) -> bool {
+        app.state::<Arc<SemanticIndexRunState>>().stopped_by_user()
+    }
+    fn report_chunk(app: &AppHandle, processed: u64, indexed: u64) {
+        app.state::<Arc<SemanticIndexRunState>>()
+            .report_chunk(app, processed, indexed);
+    }
 }
 
 struct EncodeChunkSuccess {
@@ -861,176 +777,18 @@ async fn drain_queue(
     fast_retry_used: &mut bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<PassOutcome, TaskError> {
-    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
-    if let Some((quantum, made_progress)) = automatic_context {
-        if let Some(reason) = quantum.stop_reason(&semantic, made_progress) {
-            return Ok(PassOutcome {
-                stopped_because: Some(reason.as_str()),
-                ..PassOutcome::default()
-            });
-        }
-    }
-    let claimed = claim_batch(storage.clone()).await?;
-    if claimed.is_empty() {
-        return Ok(PassOutcome::default());
-    }
-    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
-    let mut pending: VecDeque<ClaimedJob> = claimed.into();
-    let mut outcome = PassOutcome::default();
-    let mut failure: Option<TaskError> = None;
-    while !pending.is_empty() {
-        // The user may have come back since the claim, or since the previous
-        // chunk. Release the rest of the leases without charging the retry
-        // budget — nothing failed, the window just closed. A manual run has no
-        // idle window to lose, so for it that only ever fires on maintenance
-        // mode or on the stop button.
-        //
-        // A foreground query is checked separately, for a separate reason, and
-        // — unlike the idle gate — it binds a manual run too. The idle signal is
-        // up to ten seconds stale (`idle.rs` polls `GetLastInputInfo` every
-        // 10 s), while a search arriving a second after the user touches the
-        // keyboard has a 5 s budget to reach the one semantic worker this loop
-        // is occupying. Waiting for `is_idle` to catch up would spend most of
-        // that budget.
-        //
-        // The manual case is not the same trade and was originally left out of
-        // it: consent to run covers competing for the worker, but not what
-        // competing costs here. This pass wants MiniLM, so a chunk of it
-        // landing between two cross-encoder chunks evicts the model that query
-        // is using and charges the next chunk a reload
-        // (`semantic_runtime.rs::BACKGROUND_PASS_GUARD`) — and a reranked query
-        // now offers fourteen such gaps rather than one
-        // (`rerank.rs::FOREGROUND_RERANK_CHUNK`). Interleaving therefore makes
-        // both sides slower than running them in sequence, which is not a trade
-        // the user consented to and not one they can see. So the run stands
-        // aside here and resumes in `drain_until_done`; only the idle pass ends.
-        let stopped = if mode.is_manual() && run.stopped_by_user() {
-            Some(STOPPED_BY_USER)
-        } else if !may_run(app, mode) {
-            Some(if mode.is_manual() {
-                MAINTENANCE_STARTED
-            } else {
-                "idle_lost"
-            })
-        } else if semantic.foreground_waiting() {
-            Some(FOREGROUND_QUERY_STOP)
-        } else {
-            None
-        };
-        if let Some(reason) = stopped {
-            release_claims(
-                storage.clone(),
-                Vec::from(std::mem::take(&mut pending)),
-                reason,
-                "the pass stopped before this subject was encoded",
-            )
-            .await;
-            outcome.stopped_because = Some(reason);
-            break;
-        }
-        let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
-        let chunk_len = chunk.len() as u64;
-        let encoded_result =
-            encode_chunk(app, &semantic, storage.clone(), chunk, automatic_context).await;
-        let encoded_result = match encoded_result {
-            Err(failure) if failure.deferred_reason.is_some() => {
-                let reason = failure
-                    .deferred_reason
-                    .expect("deferred encode failures carry a reason");
-                let mut unattempted = failure.claimed;
-                unattempted.extend(pending.drain(..));
-                release_claims(
-                    storage.clone(),
-                    unattempted,
-                    reason,
-                    deferred_release_note(reason),
-                )
-                .await;
-                outcome.stopped_because = Some(reason);
-                break;
-            }
-            Err(failure)
-                if mode.is_manual()
-                    && !*fast_retry_used
-                    && crate::semantic_runtime::is_transient_worker_failure(&failure.error) =>
-            {
-                *fast_retry_used = true;
-                tracing::warn!(
-                    "[SEMANTIC:INDEX] manual encode failed; restarting worker for one immediate retry: {}",
-                    failure.error
-                );
-                semantic.restart_for_manual_retry();
-                encode_chunk(app, &semantic, storage.clone(), failure.claimed, None).await
-            }
-            other => other,
-        };
-        match encoded_result {
-            Ok(success) => {
-                outcome.indexed += success.indexed;
-                // The whole chunk left the queue; not all of it necessarily
-                // became a vector, since an invalid one is discarded rather
-                // than retried. Both are progress, only one is an index.
-                if mode.is_manual() {
-                    run.report_chunk(app, chunk_len, success.indexed);
-                }
-                if mode.yields_after_chunk() && !pending.is_empty() {
-                    // One automatic request unit is one worker request and
-                    // commit. Return the rest of this broader database claim
-                    // without charging attempts; the admitted model quantum
-                    // may immediately claim the next unit without rotating the
-                    // durable scheduler row.
-                    release_claims(
-                        storage.clone(),
-                        Vec::from(std::mem::take(&mut pending)),
-                        "slice_yielded",
-                        "the scheduler completed one MiniLM batch",
-                    )
-                    .await;
-                    break;
-                }
-            }
-            Err(chunk_failure) => {
-                outcome.failed += chunk_len;
-                // Failed subjects remain queued; attempts are not completed progress.
-                // Whatever broke the worker will break every remaining chunk the
-                // same way, and charging the retry budget for an attempt that was
-                // never made would spend it on the worker's behalf.
-                if !pending.is_empty() {
-                    release_claims(
-                        storage.clone(),
-                        Vec::from(std::mem::take(&mut pending)),
-                        "batch_aborted",
-                        "an earlier chunk of the same pass failed to encode",
-                    )
-                    .await;
-                }
-                settle_failed_claims(storage.clone(), chunk_failure.claimed, &chunk_failure.error)
-                    .await;
-                failure = Some(chunk_failure.error);
-                break;
-            }
-        }
-    }
-
-    if outcome.indexed > 0 {
-        tracing::info!("[SEMANTIC:INDEX] indexed {} screenshot(s)", outcome.indexed);
-    }
-    match failure {
-        // The failure propagates rather than being folded into the summary:
-        // the command that asked for this run enqueued it and returned, so
-        // nothing is awaiting a report and only the scheduler's durable retry
-        // and backoff can act on it. Reporting it as a pass that stopped early
-        // would have the scheduler defer by a single tick and re-enter without
-        // counting the attempt, which is a tight loop against a worker that is
-        // already down.
-        Some(error) => Err(error),
-        None => Ok(outcome),
-    }
+    index_pipeline::drain_queue::<MinilmPipeline>(
+        app,
+        storage,
+        mode,
+        false,
+        fast_retry_used,
+        automatic_context,
+    )
+    .await
 }
 
-/// Encode and commit one chunk. The chunk's leases are returned to the caller
-/// on worker failure so it can choose between the manual fast retry and the
-/// scheduler's durable backoff policy.
+/// Prepare text inputs, run inference, and validate the text revision at commit.
 async fn encode_chunk(
     app: &AppHandle,
     semantic: &Arc<SemanticRuntimeState>,
@@ -1310,68 +1068,6 @@ async fn commit_batch(
     .map_err(|error| format!("commit task failed: {error}"))?
 }
 
-/// Hand claimed jobs back without charging the retry budget.
-async fn release_claims(
-    storage: Arc<StorageState>,
-    claimed: Vec<ClaimedJob>,
-    reason_code: &'static str,
-    reason: &'static str,
-) {
-    let _ = tokio::task::spawn_blocking(move || {
-        for job in claimed {
-            let _ =
-                storage.requeue_derived_index_job(&job.spec, &job.lease_token, reason_code, reason);
-        }
-    })
-    .await;
-}
-
-/// Record an encode failure against the retry budget with a backoff.
-async fn fail_claims(
-    storage: Arc<StorageState>,
-    claimed: Vec<ClaimedJob>,
-    error_code: &'static str,
-    error: &str,
-) {
-    let next_retry_at = (Utc::now() + ChronoDuration::minutes(RETRY_BACKOFF_MINUTES))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    let error = error.to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        for job in claimed {
-            let _ = storage.mark_derived_index_job_failed(
-                &job.spec,
-                &job.lease_token,
-                error_code,
-                &error,
-                Some(&next_retry_at),
-            );
-        }
-    })
-    .await;
-}
-
-/// Worker-wide failures belong to the scheduler, not to each screenshot. A
-/// deterministic contract/model failure remains on the per-subject ledger so
-/// it can be diagnosed and rebuilt explicitly.
-async fn settle_failed_claims(
-    storage: Arc<StorageState>,
-    claimed: Vec<ClaimedJob>,
-    error: &TaskError,
-) {
-    if crate::semantic_runtime::is_deterministic_worker_failure(error) {
-        fail_claims(storage, claimed, "embed_failed", &error.to_string()).await;
-    } else {
-        release_claims(
-            storage,
-            claimed,
-            "worker_retry",
-            "semantic worker failure; scheduler will retry the batch",
-        )
-        .await;
-    }
-}
-
 /// Run an indexing pass right now, outside the idle gate.
 ///
 /// Section 4 of the removal roadmap permits heavy machine learning to gate on
@@ -1483,7 +1179,7 @@ mod tests {
     fn indexing_configuration_respects_protocol_and_deadline_envelopes() {
         assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
         assert!(DRAIN_BATCH <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
-        assert!(MAX_ATTEMPTS > 0 && RETRY_BACKOFF_MINUTES > 0);
+        assert!(MAX_ATTEMPTS > 0);
         assert!(!EMBED_TIMEOUT.is_zero() && EMBED_TIMEOUT <= MANUAL_DEADLINE);
         assert!(MANUAL_FOREGROUND_WAIT_BUDGET < MANUAL_DEADLINE);
     }
@@ -1600,31 +1296,5 @@ mod tests {
             .await;
             assert_eq!(result, Some(expected));
         }
-    }
-
-    #[test]
-    fn a_scheduled_manual_request_uses_the_complete_drain_mode() {
-        // The scheduler owns admission, not the meaning of the user's action.
-        // Once admitted, a manual request must keep the worker until the queue
-        // is empty (or a real manual stop condition fires).
-        let mode = scheduled_pass_mode(true);
-        assert_eq!(mode, PassMode::Manual);
-        assert!(mode.is_manual());
-        assert!(!mode.yields_after_chunk());
-        assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
-    }
-
-    #[test]
-    fn a_refused_pass_reports_no_work_rather_than_silence() {
-        // The summary has to distinguish "ran and found nothing" from "never
-        // ran": both have `indexed = 0`, and only the second has a reason.
-        let refused = PassOutcome::refused("session_locked");
-        assert_eq!(refused.indexed, 0);
-        assert_eq!(refused.refused, Some("session_locked"));
-
-        let empty = PassOutcome::default();
-        assert_eq!(empty.indexed, 0);
-        assert!(empty.refused.is_none());
-        assert!(empty.stopped_because.is_none());
     }
 }
