@@ -234,6 +234,7 @@ pub struct ClipQueryRequest<'a> {
     /// Unix seconds, inclusive.
     start_time: Option<f64>,
     end_time: Option<f64>,
+    include_ocr: bool,
 }
 
 impl<'a> ClipQueryRequest<'a> {
@@ -252,7 +253,15 @@ impl<'a> ClipQueryRequest<'a> {
             process_names,
             start_time,
             end_time,
+            include_ocr: true,
         }
+    }
+
+    /// Image grids render metadata and thumbnails; text consumers retain the
+    /// default OCR prefix and can use the same ranking and pagination path.
+    pub(crate) fn with_ocr(mut self, include_ocr: bool) -> Self {
+        self.include_ocr = include_ocr;
+        self
     }
 }
 
@@ -395,6 +404,7 @@ async fn run_rust_clip_query(
         .collect();
     let start_time = request.start_time;
     let end_time = request.end_time;
+    let include_ocr = request.include_ocr;
 
     // Keep synchronous database reads and CNG work off the async runtime. OCR
     // is presentation data: decrypt it only after filtering and pagination.
@@ -407,6 +417,17 @@ async fn run_rust_clip_query(
         let scan_started = Instant::now();
         *scan_stage.lock().unwrap_or_else(|error| error.into_inner()) = "database_wait";
         let _foreground_db = scan_storage.foreground_db_read();
+        let ann_snapshot = match query_stage(&scan_stage, "ann_snapshot", || {
+            ann_state.prepare_query(&scan_storage, &query_vec, Some(deadline))
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
+            Err(error) => {
+                tracing::warn!("[CLIP:ANN] snapshot unavailable, using exact fallback: {error}");
+                ann_state.disarm();
+                None
+            }
+        };
         let mut candidate_filter =
             ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline);
         let filtered = search_candidates(
@@ -415,31 +436,50 @@ async fn run_rust_clip_query(
             deadline,
             |requested| {
                 query_stage(&scan_stage, "ann", || {
-                    app_ann_query(&ann_state, &scan_storage, &query_vec, requested, deadline)
+                    app_ann_query(
+                        &ann_state,
+                        ann_snapshot.as_ref(),
+                        &scan_storage,
+                        &query_vec,
+                        requested,
+                        deadline,
+                    )
                 })
             },
             |scored| {
                 candidate_filter.filter(scored, |hashes| {
-                    query_stage(&scan_stage, "metadata", || {
-                        load_candidate_summaries(&scan_storage, hashes, deadline)
+                    query_stage(&scan_stage, "candidate_metadata", || {
+                        if process_names.is_empty() {
+                            scan_storage.clip_candidate_metadata(hashes, deadline)
+                        } else {
+                            load_candidate_summaries(&scan_storage, hashes, deadline)
+                        }
                     })
                 })
             },
             || {
                 query_stage(&scan_stage, "exact", || {
-                    app_exact_query(&ann_state, &scan_storage, &query_vec, fetch, deadline)
+                    app_exact_query(
+                        ann_snapshot.as_ref(),
+                        &scan_storage,
+                        &query_vec,
+                        fetch,
+                        deadline,
+                    )
                 })
             },
         )?;
-        let results = hydrate_page(filtered, offset, limit, deadline, |ids| {
-            query_stage(&scan_stage, "ocr", || {
+        let page = paginate(filtered, offset, limit);
+        let page = resolve_page_metadata(page, |ids| {
+            query_stage(&scan_stage, "metadata", || {
                 scan_storage
-                    .get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(
-                        ids,
-                        CLIP_OCR_SNIPPET_CHARS,
-                        Some(deadline),
-                    )
+                    .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
                     .map_err(|error| format!("hydrate_failed: {error}"))
+            })
+        })?;
+        let results = hydrate_page(page, 0, limit, deadline, |ids| {
+            query_stage(&scan_stage, "ocr", || {
+                load_page_texts(&scan_storage, ids, deadline, include_ocr)
             })
         })?;
         if Instant::now() >= deadline {
@@ -488,13 +528,17 @@ fn query_stage<T>(
 
 fn app_ann_query(
     state: &crate::clip_ann::ClipAnnState,
+    snapshot: Option<&crate::clip_ann::ClipAnnSnapshot>,
     storage: &StorageState,
     query: &[f32],
     fetch: usize,
     deadline: Instant,
 ) -> Result<CandidateSource, String> {
-    match state.query(storage, query, fetch, Some(deadline)) {
-        Ok(Some(result)) => {
+    let Some(snapshot) = snapshot else {
+        return Ok(CandidateSource::Unavailable);
+    };
+    match snapshot.query(fetch, Some(deadline)) {
+        Ok(result) => {
             tracing::debug!(
                 "[CLIP:ANN] query mode={} tail={} candidates={}",
                 result.mode,
@@ -503,11 +547,10 @@ fn app_ann_query(
             );
             Ok(CandidateSource::Ann(result.candidates))
         }
-        Ok(None) => Ok(CandidateSource::Unavailable),
         Err(error) if error.starts_with("query_deadline_exceeded") => Err(error),
         Err(error) => {
             tracing::warn!("[CLIP:ANN] query failed, using exact fallback: {error}");
-            let fallback = app_exact_query(state, storage, query, fetch, deadline);
+            let fallback = app_exact_query(Some(snapshot), storage, query, fetch, deadline);
             state.disarm();
             fallback.map(CandidateSource::ExactFallback)
         }
@@ -515,13 +558,16 @@ fn app_ann_query(
 }
 
 fn app_exact_query(
-    state: &crate::clip_ann::ClipAnnState,
+    snapshot: Option<&crate::clip_ann::ClipAnnSnapshot>,
     storage: &StorageState,
     query: &[f32],
     fetch: usize,
     deadline: Instant,
 ) -> Result<Vec<crate::storage::ScoredSubject>, String> {
-    match state.exact_from_generation(storage, query, fetch, Some(deadline))? {
+    match snapshot
+        .map(|snapshot| snapshot.exact(fetch, Some(deadline)))
+        .transpose()?
+    {
         Some(result) => {
             tracing::debug!(
                 "[CLIP:ANN] query mode={} tail={} candidates={}",
@@ -612,6 +658,7 @@ fn search_candidates<T>(
 struct ClipHit {
     subject: ScoredSubject,
     summary: BackgroundScreenshotSummary,
+    summary_complete: bool,
 }
 
 /// Only live for this query: later queries must observe current deletion,
@@ -689,6 +736,7 @@ impl<'a> ClipCandidateFilter<'a> {
                         .map(|summary| ClipHit {
                             subject: subject.clone(),
                             summary: summary.clone(),
+                            summary_complete: !self.process_names.is_empty(),
                         })
                 })
                 .collect();
@@ -739,6 +787,34 @@ fn load_candidate_summaries(
         .collect())
 }
 
+fn resolve_page_metadata(
+    page: Vec<ClipHit>,
+    load: impl FnOnce(&[i64]) -> Result<Vec<BackgroundScreenshotSummary>, String>,
+) -> Result<Vec<ClipHit>, String> {
+    let missing: Vec<i64> = page
+        .iter()
+        .filter(|hit| !hit.summary_complete)
+        .map(|hit| hit.summary.id)
+        .collect();
+    if missing.is_empty() {
+        return Ok(page);
+    }
+    let summaries: HashMap<_, _> = load(&missing)?
+        .into_iter()
+        .map(|row| (row.id, row))
+        .collect();
+    Ok(page
+        .into_iter()
+        .filter_map(|mut hit| {
+            if !hit.summary_complete {
+                hit.summary = summaries.get(&hit.summary.id)?.clone();
+                hit.summary_complete = true;
+            }
+            Some(hit)
+        })
+        .collect())
+}
+
 fn hydrate_page(
     hits: Vec<ClipHit>,
     offset: usize,
@@ -759,7 +835,10 @@ fn hydrate_page(
         return Err("query_deadline_exceeded_during_ocr".to_string());
     }
     let mut rows = Vec::with_capacity(page.len());
-    for ClipHit { subject, summary } in page {
+    for ClipHit {
+        subject, summary, ..
+    } in page
+    {
         let id = summary.id;
         let process_name = summary.process_name.clone().unwrap_or_default();
         let window_title = summary.window_title.clone().unwrap_or_default();
@@ -796,9 +875,26 @@ fn hydrate_page(
     Ok(rows)
 }
 
-/// OCR characters returned with a hit. Both result views cut the text to 150
-/// characters for display; this leaves room for that without decrypting whole
-/// documents for a page nobody scrolls.
+fn load_page_texts(
+    storage: &StorageState,
+    ids: &[i64],
+    deadline: Instant,
+    include_ocr: bool,
+) -> Result<HashMap<i64, String>, String> {
+    if !include_ocr {
+        return Ok(HashMap::new());
+    }
+    storage
+        .get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(
+            ids,
+            CLIP_OCR_SNIPPET_CHARS,
+            Some(deadline),
+        )
+        .map_err(|error| format!("hydrate_failed: {error}"))
+}
+
+/// OCR characters returned to text consumers. The quick-search dropdown cuts
+/// the text to 150 characters; image grids explicitly omit this prefix.
 const CLIP_OCR_SNIPPET_CHARS: usize = 1_000;
 
 /// Unix seconds for a hit, or `None` when the screenshot has no usable
@@ -877,6 +973,41 @@ fn paginate<T>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     rows.into_iter().skip(offset).take(limit).collect()
 }
 
+/// The fixture uses the production SQL/CNG readers. `legacy` reproduces the
+/// pre-scalability metadata reads for an unfiltered request, after the #233 fix.
+#[cfg(test)]
+pub(crate) fn benchmark_hydration(
+    storage: &StorageState,
+    scored: Vec<ScoredSubject>,
+    offset: usize,
+    limit: usize,
+    include_ocr: bool,
+    legacy: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut filter = ClipCandidateFilter::new(offset + limit, &[], None, None, deadline);
+    let mut hits = filter.filter(scored, |keys| {
+        if legacy {
+            load_candidate_summaries(storage, keys, deadline)
+        } else {
+            storage.clip_candidate_metadata(keys, deadline)
+        }
+    })?;
+    if legacy {
+        for hit in &mut hits {
+            hit.summary_complete = true;
+        }
+    }
+    let page = resolve_page_metadata(paginate(hits, offset, limit), |ids| {
+        storage
+            .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
+            .map_err(|error| error.to_string())
+    })?;
+    hydrate_page(page, 0, limit, deadline, |ids| {
+        load_page_texts(storage, ids, deadline, include_ocr)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +1026,7 @@ mod tests {
                 timestamp: created_secs.map(|value| value as i64),
                 category: Some("category".to_string()),
             },
+            summary_complete: true,
         }
     }
 
@@ -1137,6 +1269,76 @@ mod tests {
             .unwrap_err(),
             "query_deadline_exceeded_before_ocr"
         );
+    }
+
+    #[test]
+    fn metadata_decryption_is_limited_to_the_page_after_skipping_old_results() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut filter = ClipCandidateFilter::new(1_100, &[], None, None, deadline);
+        let hits = filter
+            .filter(scored(2_200), |keys| {
+                Ok(keys
+                    .iter()
+                    .map(|key| {
+                        let mut summary = summary_for_key(key);
+                        summary.window_title = None;
+                        (key.clone(), summary)
+                    })
+                    .collect())
+            })
+            .unwrap();
+        let mut private_reads = 0;
+        let page = resolve_page_metadata(paginate(hits, 1_000, 100), |ids| {
+            private_reads += ids.len();
+            Ok(ids
+                .iter()
+                .map(|id| summary_for_key(&format!("subject-{}", id - 1)))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(private_reads, 100);
+        assert_eq!(page[0].summary.id, 1_001);
+        assert!(page
+            .iter()
+            .all(|hit| hit.summary_complete && hit.summary.window_title.is_some()));
+    }
+
+    #[test]
+    fn decrypted_process_filters_do_not_repeat_their_metadata_reads() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let processes = vec!["chrome.exe".to_string()];
+        let mut filter = ClipCandidateFilter::new(2, &processes, None, None, deadline);
+        let hits = filter
+            .filter(scored(3), |keys| {
+                Ok(keys
+                    .iter()
+                    .map(|key| (key.clone(), summary_for_key(key)))
+                    .collect())
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_page_metadata(hits, |_| panic!("already decrypted for filtering"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn image_grids_skip_ocr_reads_and_other_consumers_keep_the_default() {
+        let request = ClipQueryRequest::new("game", None, None, &[], None, None);
+        assert!(request.include_ocr);
+        assert!(!request.with_ocr(false).include_ocr);
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(crate::credential_manager::CredentialManagerState::new(
+            temp.path().to_path_buf(),
+        ));
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(load_page_texts(&storage, &[1], deadline, false)
+            .unwrap()
+            .is_empty());
+        assert!(load_page_texts(&storage, &[1], deadline, true).is_err());
     }
 
     #[test]

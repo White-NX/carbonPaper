@@ -1720,6 +1720,49 @@ impl StorageState {
         })
     }
 
+    /// Resolve ranking/filter fields without private-key work. Process-filtered
+    /// CLIP queries still use decrypted summaries; their encrypted process name
+    /// remains authoritative even for legacy rows with inconsistent plaintext.
+    pub(crate) fn clip_candidate_metadata(
+        &self,
+        hashes: &[String],
+        deadline: Instant,
+    ) -> Result<std::collections::HashMap<String, BackgroundScreenshotSummary>, String> {
+        check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let result = self.with_vector_scan_connection("clip_candidate_metadata", |conn| {
+            let _deadline = super::connection::QueryDeadline::install(conn, Some(deadline))
+                .map_err(|error| error.to_string())?;
+            let mut result = std::collections::HashMap::new();
+            for chunk in hashes.chunks(500) {
+                check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), process_name, category
+                     FROM screenshots WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+                     ORDER BY created_at DESC, id DESC"
+                );
+                let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+                let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, BackgroundScreenshotSummary {
+                        id: row.get(1)?, timestamp: row.get(2)?, process_name: row.get(3)?,
+                        category: row.get(4)?, window_title: None,
+                    }))
+                }).map_err(|error| error.to_string())?;
+                for row in rows {
+                    let (hash, metadata) = row.map_err(|error| error.to_string())?;
+                    result.entry(hash).or_insert(metadata);
+                }
+            }
+            check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+            Ok(result)
+        });
+        check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+        result
+    }
+
     pub fn get_index_storage_stats(&self) -> Result<IndexStorageStats, String> {
         Ok(IndexStorageStats {
             screenshots_count: self.count_active_screenshots()?,
@@ -4313,6 +4356,38 @@ mod ocr_lifecycle_tests {
         assert!(result.stepped_pages > 1);
         assert!(result.reclaimed_pages > 1);
         assert!(result.freelist_after < result.freelist_before);
+    }
+
+    #[test]
+    fn clip_candidates_preserve_live_ids_and_optional_utc_timestamps_without_decryption() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = super::super::test_storage_with_schema(temp.path().to_path_buf());
+        {
+            let guard = storage
+                .get_connection_named("clip_metadata_fixture")
+                .unwrap();
+            guard.as_ref().unwrap().execute_batch(
+                "INSERT INTO screenshots(id,image_path,image_hash,created_at,process_name,is_deleted,window_title_enc)
+                 VALUES(1,'1.enc','live','1970-01-01 00:00:01','editor.exe',0,X'ff'),
+                       (2,'2.enc','deleted','2026-10-01 00:00:00','editor.exe',1,X'ff'),
+                       (3,'3.enc','invalid','invalid timestamp',NULL,0,X'ff');"
+            ).unwrap();
+        }
+        let keys = ["live", "deleted", "invalid", "missing"].map(str::to_string);
+        let metadata = storage
+            .clip_candidate_metadata(&keys, Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata["live"].id, 1);
+        assert_eq!(metadata["live"].timestamp, Some(1));
+        assert_eq!(metadata["live"].process_name.as_deref(), Some("editor.exe"));
+        assert!(metadata["live"].window_title.is_none());
+        assert_eq!(metadata["invalid"].id, 3);
+        assert!(metadata["invalid"].timestamp.is_none());
+        assert!(storage
+            .clip_candidate_metadata(&keys, Instant::now())
+            .unwrap_err()
+            .starts_with("query_deadline_exceeded"));
     }
 
     #[test]

@@ -246,6 +246,7 @@ pub async fn monitor_search_nl(
     start_time: Option<f64>,
     end_time: Option<f64>,
     _fuzzy: Option<bool>,
+    include_ocr: Option<bool>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let process_names = process_names.unwrap_or_default();
@@ -261,7 +262,8 @@ pub async fn monitor_search_nl(
             &process_names,
             start_time,
             end_time,
-        ),
+        )
+        .with_ocr(include_ocr.unwrap_or(true)),
     )
     .await?;
     Ok(serde_json::json!({ "status": "success", "results": results, "backend": "rust" }))

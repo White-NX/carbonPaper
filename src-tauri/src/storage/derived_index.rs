@@ -13,12 +13,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SUBJECT_KEY_BYTES: usize = 1024;
 pub(super) const MAX_METADATA_BYTES: usize = 4096;
 const MAX_VECTOR_DIMENSIONS: usize = 65_536;
 const LEASE_TOKEN_BYTES: usize = 16;
+
+const ANN_TAIL_UPDATES_SQL: &str = r#"
+    SELECT c.subject_key,
+           CASE WHEN j.status = 'completed'
+                  AND j.model_id = e.model_id AND j.model_revision = e.model_revision
+                  AND j.embedding_version = e.embedding_version
+                  AND j.source_fingerprint = e.source_fingerprint
+                THEN e.dimensions END,
+           CASE WHEN j.status = 'completed'
+                  AND j.model_id = e.model_id AND j.model_revision = e.model_revision
+                  AND j.embedding_version = e.embedding_version
+                  AND j.source_fingerprint = e.source_fingerprint
+                THEN e.vector_f32 END
+    FROM derived_ann_changes c INDEXED BY idx_derived_ann_changes_epoch
+    LEFT JOIN derived_embeddings e
+      ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
+    LEFT JOIN derived_index_jobs j
+      ON j.index_kind = c.index_kind AND j.subject_key = c.subject_key
+    WHERE c.index_kind = ?1 AND c.change_epoch > ?2
+    ORDER BY c.change_epoch, c.subject_key
+    LIMIT ?3
+"#;
 
 #[derive(Default)]
 struct EmbeddingCommitContext<'a> {
@@ -2298,6 +2320,77 @@ impl StorageState {
             }
             Ok(out)
         })
+    }
+
+    /// Read the data epoch and its latest changes in one SQLite snapshot.
+    /// A cached epoch makes unchanged queries constant-size; the epoch index
+    /// limits a refresh to subjects changed since the preceding query.
+    pub(crate) fn derived_ann_tail_updates(
+        &self,
+        index_kind: DerivedIndexKind,
+        covered_epoch: u64,
+        cached_epoch: Option<u64>,
+        hard_limit: u64,
+        deadline: Option<Instant>,
+    ) -> Result<(u64, Vec<DerivedAnnTailRow>), String> {
+        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if expired() {
+            return Err("query_deadline_exceeded_during_ann_tail".to_string());
+        }
+        let result = self.with_vector_scan_connection("derived_ann_tail_updates", |conn| {
+            let _deadline = super::connection::QueryDeadline::install(conn, deadline)
+                .map_err(|error| error.to_string())?;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|error| error.to_string())?;
+            let epoch = u64::try_from(read_derived_data_epoch(&tx, index_kind)?)
+                .map_err(|_| "Invalid ANN data epoch")?;
+            if epoch < covered_epoch || cached_epoch.is_some_and(|cached| epoch < cached) {
+                return Err("ann_data_epoch_regressed".to_string());
+            }
+            if cached_epoch == Some(epoch) {
+                return Ok((epoch, Vec::new()));
+            }
+            let after = cached_epoch.unwrap_or(covered_epoch).max(covered_epoch);
+            let mut statement = tx
+                .prepare(ANN_TAIL_UPDATES_SQL)
+                .map_err(|error| error.to_string())?;
+            let mut rows = statement
+                .query(params![
+                    index_kind.as_str(),
+                    sqlite_i64(after, "ANN cached epoch")?,
+                    sqlite_i64(hard_limit.saturating_add(1), "ANN tail limit")?,
+                ])
+                .map_err(|error| error.to_string())?;
+            let mut changes = Vec::new();
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                if expired() {
+                    return Err("query_deadline_exceeded_during_ann_tail".to_string());
+                }
+                let dimensions: Option<i64> = row.get(1).map_err(|error| error.to_string())?;
+                let blob: Option<Vec<u8>> = row.get(2).map_err(|error| error.to_string())?;
+                let vector = match (dimensions, blob) {
+                    (Some(dimensions), Some(blob)) => Some(decode_vector(
+                        &blob,
+                        usize::try_from(dimensions).map_err(|_| "Invalid ANN tail dimensions")?,
+                    )?),
+                    _ => None,
+                };
+                changes.push(DerivedAnnTailRow {
+                    subject_key: row.get(0).map_err(|error| error.to_string())?,
+                    vector,
+                });
+                if changes.len() as u64 > hard_limit {
+                    return Err(format!("ann_tail_too_large:{}", changes.len()));
+                }
+            }
+            Ok((epoch, changes))
+        });
+        if expired() {
+            Err("query_deadline_exceeded_during_ann_tail".to_string())
+        } else {
+            result
+        }
     }
 
     pub(crate) fn derived_index_snapshot_for_ann(
@@ -4746,6 +4839,102 @@ mod tests {
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].subject_key, "hash-delete");
         assert!(tail[0].vector.is_none());
+    }
+
+    #[test]
+    fn ann_tail_updates_return_only_new_epochs_and_preserve_tombstones() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "a"),
+            ann_vector(0),
+        )
+        .unwrap();
+        let (first_epoch, first) = storage
+            .derived_ann_tail_updates(DerivedIndexKind::ClipImage, 0, None, 100, None)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let unchanged = storage
+            .derived_ann_tail_updates(DerivedIndexKind::ClipImage, 0, Some(first_epoch), 100, None)
+            .unwrap();
+        assert_eq!(unchanged.0, first_epoch);
+        assert!(unchanged.1.is_empty());
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "b"),
+            ann_vector(1),
+        )
+        .unwrap();
+        storage
+            .delete_derived_index_subject(DerivedIndexKind::ClipImage, "a")
+            .unwrap();
+        let (next_epoch, next) = storage
+            .derived_ann_tail_updates(DerivedIndexKind::ClipImage, 0, Some(first_epoch), 100, None)
+            .unwrap();
+        assert!(next_epoch > first_epoch);
+        assert_eq!(next.len(), 2);
+        assert!(next
+            .iter()
+            .any(|row| row.subject_key == "a" && row.vector.is_none()));
+        assert!(next
+            .iter()
+            .any(|row| row.subject_key == "b" && row.vector.is_some()));
+        assert!(storage
+            .derived_ann_tail_updates(
+                DerivedIndexKind::ClipImage,
+                0,
+                Some(next_epoch + 1),
+                100,
+                None
+            )
+            .is_err());
+        assert!(storage
+            .derived_ann_tail_updates(DerivedIndexKind::ClipImage, 0, None, 1, None)
+            .unwrap_err()
+            .starts_with("ann_tail_too_large:"));
+        assert!(storage
+            .derived_ann_tail_updates(
+                DerivedIndexKind::ClipImage,
+                0,
+                None,
+                100,
+                Some(Instant::now())
+            )
+            .unwrap_err()
+            .starts_with("query_deadline_exceeded"));
+        // A deadline must not leave a SQLite progress callback installed.
+        assert_eq!(
+            storage
+                .derived_ann_tail_updates(DerivedIndexKind::ClipImage, 0, None, 100, None)
+                .unwrap()
+                .1
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn incremental_ann_lookup_does_not_walk_older_changes() {
+        let (_temp, storage) = test_storage();
+        let guard = storage.get_connection_named("seed_ann_delta_plan").unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<50000)
+             INSERT INTO derived_ann_changes(index_kind,subject_key,change_epoch)
+             SELECT 'clip_image', printf('%08d',x), x FROM n;",
+        )
+        .unwrap();
+        let mut statement = conn.prepare(ANN_TAIL_UPDATES_SQL).unwrap();
+        let keys: Vec<String> = statement
+            .query_map(params!["clip_image", 49999i64, 20001i64], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(keys, ["00050000"]);
+        assert!(
+            statement.get_status(rusqlite::StatementStatus::VmStep) < 500,
+            "the epoch index should seek directly to the single new row"
+        );
     }
 
     #[test]

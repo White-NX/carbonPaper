@@ -362,6 +362,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
         categories = [],
         startTime = null,
         endTime = null,
+        includeOcr = true,
         fuzzy = true
     } = options || {};
     
@@ -376,6 +377,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
                 startTime,
                 endTime,
                 fuzzy,
+                ...(includeOcr === false ? { includeOcr: false } : {}),
             });
             if (response.error) {
                 throw new Error(response.error);
