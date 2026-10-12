@@ -87,13 +87,27 @@
       "received": "已接收内容",
       "receivedCounts": "思考 {{reasoning}} 字符，回复 {{text}} 字符",
       "requestId": "请求编号",
-      "attempts": { "initial": "整理活动", "repair": "补全与修复", "summary": "归纳概述" },
+      "attempts": {
+        "initial": "整理活动",
+        "repair": "补全与修复",
+        "summary": "归纳概述"
+      },
       "stages": {
-        "preparing": "准备回顾", "collecting": "读取记录", "screening": "筛选内容",
-        "waiting": "等待模型响应", "thinking": "模型正在思考", "writing": "生成回顾正文",
-        "validating": "校验回顾", "summarizing": "归纳时段概述", "saving": "保存回顾", "running": "进行中",
-        "ready": "已完成", "partial": "部分内容待补全", "failed": "生成失败",
-        "cancelled": "已停止", "paused": "等待全屏应用退出后继续"
+        "preparing": "准备回顾",
+        "collecting": "读取记录",
+        "screening": "筛选内容",
+        "waiting": "等待模型响应",
+        "thinking": "模型正在思考",
+        "writing": "生成回顾正文",
+        "validating": "校验回顾",
+        "summarizing": "归纳时段概述",
+        "saving": "保存回顾",
+        "running": "进行中",
+        "ready": "已完成",
+        "partial": "部分内容待补全",
+        "failed": "生成失败",
+        "cancelled": "已停止",
+        "paused": "等待全屏应用退出后继续"
       }
     },
     "diagnostics": {
@@ -104,7 +118,11 @@
       "finishing": "正在完成回顾",
       "steps": "处理步骤",
       "requestContent": "请求内容",
-      "tabs": { "reply": "回复预览", "reasoning": "思考过程", "requestDetails": "请求信息" },
+      "tabs": {
+        "reply": "回复预览",
+        "reasoning": "思考过程",
+        "requestDetails": "请求信息"
+      },
       "model": "模型",
       "requestDuration": "请求耗时",
       "totalRequestDuration": "请求累计耗时 {{duration}}",
