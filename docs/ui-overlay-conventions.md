@@ -155,3 +155,25 @@ caller to handle. The plugin owns the OS dialog through the calling WebView.
 Selecting a path does not authenticate or start work. A cancelled selection
 returns to the existing form; the caller uses `withAuth` only after a path has
 been selected. Python executable selection has been removed.
+
+## Windows Hello entry points
+
+Frontend verification goes through `src/lib/auth_api.js`:
+
+| Trigger | Policy |
+|---|---|
+| Lock-screen unlock button | `requestAuth({ mode: 'unlock' })` initializes credentials, then verifies; missing-key initialization gets one retry. |
+| Unlock button within blocking maintenance | `requestAuth({ mode: 'gate' })` verifies the existing setup and leaves the gate visible on failure. |
+| Explicit protected action | `withAuth(operation, { promptMode: 'action' })` requests verification only after `AUTH_REQUIRED`, then retries within `maxRetries` (default one). Direct verification uses `requestAuth({ mode: 'action' })`. |
+| Mount effects, polling, automatic restore, background work | `withAuth(operation, { promptMode: 'defer' })` reports `AUTH_REQUIRED` to the session UI and waits for the user to unlock. It never opens Hello. This is the default. |
+
+`autoPrompt: true` remains a compatibility spelling for an explicit action;
+`promptMode` takes precedence. Do not use it for automatic effects. Index-health
+reads, automatic capture-filter application, and resumed smart-cluster downloads
+(including their settings write) defer authentication. Resumed downloads keep
+their queued intent until the authenticated readiness state returns.
+
+Each WebView shares a pending frontend request. Cancellation becomes
+`AUTH_CANCELLED`, provider unavailability becomes `AUTH_NOT_AVAILABLE`, and
+unrelated errors propagate. A failed or cancelled attempt releases the pending
+request so a later explicit click can retry; it does not schedule another prompt.

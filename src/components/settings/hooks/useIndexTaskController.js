@@ -26,7 +26,7 @@ export function useIndexTaskController(kind, progress, refresh, t) {
       try {
         // Verification wakes the existing request and preserves its progress.
         const result = ['waiting_for_unlock', 'waiting_for_verification'].includes(progress.phase)
-          ? (await requestAuth() ? { queued: true } : null)
+          ? (await requestAuth({ mode: 'action' }) ? { queued: true } : null)
           : await withAuth(() => invoke(`${kind}_index_run_now`), { autoPrompt: true });
         setSummary(result);
         await refresh({ fresh: true });

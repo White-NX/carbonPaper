@@ -105,7 +105,7 @@ describe('API contract payloads', () => {
     expectWithAuth(3, { autoPrompt: true });
     expectWithAuth(4, { autoPrompt: true });
     expectWithAuth(5);
-    expectWithAuth(6, { autoPrompt: true });
+    expectWithAuth(6, { promptMode: 'defer' });
   });
 
   it('sends natural-language retrieval payloads', async () => {

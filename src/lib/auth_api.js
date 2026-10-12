@@ -2,7 +2,7 @@
  * 认证管理 API - Windows Hello 会话管理
  * 
  * 用户数据在加密存储中，访问前需要 Windows Hello 认证。
- * 认证成功后，会话有效期为 15 分钟或直到应用进入后台。
+ * 会话期限与前后台策略由后端管理。后台工作等待解锁；显式操作可请求认证。
  */
 
 import { invoke } from '@tauri-apps/api/core';
@@ -45,20 +45,35 @@ export const checkAuthSession = async () => {
     }
 };
 
+const missingKey = (error) => /KeyNotFound|Credential key not found/i.test(String(error));
+
+async function verifyForPrompt(mode) {
+    if (mode === 'unlock') await invoke('credential_initialize');
+    try {
+        return await invoke('credential_verify_user');
+    } catch (error) {
+        if (mode !== 'unlock' || !missingKey(error)) throw error;
+        // Preserve the lock screen's one initialization retry for a missing key.
+        await invoke('credential_initialize');
+        return invoke('credential_verify_user');
+    }
+}
+
 /**
- * 请求用户认证（弹出 Windows Hello 对话框）
- * 会自动去重，多个调用会共享同一个认证请求
+ * 请求 Windows Hello；同一 WebView 中的并发调用共享一个结果。
+ * `unlock` 初始化凭据，`action` 和 `gate` 验证已有凭据。
  * @returns {Promise<boolean>} 认证是否成功
  */
-export const requestAuth = async () => {
+export const requestAuth = async ({ mode = 'action' } = {}) => {
+    if (!['unlock', 'action', 'gate'].includes(mode)) throw new Error('INVALID_AUTH_PROMPT_MODE');
     // 如果已经有认证请求在进行中，返回同一个 Promise
     if (pendingAuthRequest) {
         return pendingAuthRequest;
     }
     
-    pendingAuthRequest = (async () => {
+    const authenticate = async () => {
         try {
-            const result = await invoke('credential_verify_user');
+            const result = await verifyForPrompt(mode);
             
             if (result) {
                 // 认证成功，清除缓存
@@ -66,21 +81,28 @@ export const requestAuth = async () => {
                 lastCheckTime = Date.now();
             }
             
+            if (!result) {
+                cachedAuthStatus = false;
+                emitAuthRequired();
+            }
             return result;
         } catch (e) {
             console.error("Authentication failed", e);
             cachedAuthStatus = false;
+            emitAuthRequired();
             
             // 用户取消了认证
-            if (e.toString().includes('cancelled') || e.toString().includes('UserCancelled')) {
+            if (/cancelled|canceled|UserCancelled|AUTH_CANCELLED/i.test(String(e))) {
                 throw new Error('AUTH_CANCELLED');
+            }
+            if (/WindowsHelloNotAvailable|Windows Hello is not available/i.test(String(e))) {
+                throw new Error('AUTH_NOT_AVAILABLE');
             }
             
             throw e;
-        } finally {
-            pendingAuthRequest = null;
         }
-    })();
+    };
+    pendingAuthRequest = authenticate().finally(() => { pendingAuthRequest = null; });
     
     return pendingAuthRequest;
 };
@@ -116,16 +138,20 @@ export const setForegroundState = async (inForeground) => {
 
 /**
  * 包装器：自动处理认证的 API 调用
- * 如果返回 AUTH_REQUIRED 错误，自动请求认证并重试
+ * AUTH_REQUIRED 默认通知锁屏；显式操作可请求认证并在限额内重试。
  * 
  * @param {Function} apiCall - 要调用的 API 函数
  * @param {Object} options - 选项
  * @param {boolean} options.autoPrompt - 是否自动弹出认证对话框（默认 false）
+ * @param {'defer'|'action'} options.promptMode - 明确等待解锁或为用户操作请求认证；优先于 autoPrompt
  * @param {number} options.maxRetries - 最大重试次数（默认 1）
  * @returns {Promise<any>} API 调用结果
  */
 export const withAuth = async (apiCall, options = {}) => {
     const { autoPrompt = false, maxRetries = 1 } = options;
+    const promptMode = options.promptMode ?? (autoPrompt ? 'action' : 'defer');
+    if (!['defer', 'action'].includes(promptMode)) throw new Error('INVALID_AUTH_PROMPT_MODE');
+    if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) throw new Error('INVALID_AUTH_RETRY_LIMIT');
     
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
@@ -135,14 +161,14 @@ export const withAuth = async (apiCall, options = {}) => {
             
             // 检查是否是认证错误
             if (errorStr.includes('AUTH_REQUIRED')) {
-                if (!autoPrompt) {
+                if (promptMode === 'defer') {
                     emitAuthRequired();
                     throw new Error('AUTH_REQUIRED');
                 }
                 
                 if (attempt < maxRetries) {
                     // 请求认证
-                    const authResult = await requestAuth();
+                    const authResult = await requestAuth({ mode: 'action' });
                     if (authResult) {
                         // 认证成功，重试 API 调用
                         continue;

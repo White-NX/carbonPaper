@@ -511,7 +511,7 @@ export const resumeOfficeDocument = async (screenshotId) => {
     return withAuth(() => invoke('office_resume_document', { screenshotId }));
 };
 
-export const updateMonitorFilters = async (filters) => {
+export const updateMonitorFilters = async (filters, authOptions = { autoPrompt: true }) => {
     return withAuth(async () => {
         try {
             const response = await invoke('monitor_update_filters', { filters });
@@ -527,7 +527,7 @@ export const updateMonitorFilters = async (filters) => {
             console.error("Failed to update monitor filters", e);
             throw e;
         }
-    }, { autoPrompt: true });
+    }, authOptions);
 };
 
 export const deleteScreenshot = async (screenshotId) => {
@@ -732,6 +732,6 @@ export const getBackgroundIndexProgress = async () => {
 export const getIndexHealth = async () => {
     return withAuth(
         () => invoke('storage_get_index_health'),
-        { autoPrompt: true },
+        { promptMode: 'defer' },
     );
 };
