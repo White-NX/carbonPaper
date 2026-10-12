@@ -10,7 +10,7 @@ export default function MigrationProgressDialog({ isOpen, onCancel, progress = {
   const cancelling = cancellation.pending || cancellation.requested;
 
   return (
-    <Dialog isOpen={isOpen} onClose={onCancel} disableClose title={t('settings.storageManagement.migration.dialog_title')} maxWidth="max-w-xl">
+    <Dialog isOpen={isOpen} onClose={onCancel} disableClose title={t('settings.storageManagement.migration.storage_dialog_title')} maxWidth="max-w-xl">
       <div className="space-y-3 p-4">
         {error && <Banner tone="error">{t('settings.storageManagement.migration.error_default')}: {error}</Banner>}
         <ProgressBlock
