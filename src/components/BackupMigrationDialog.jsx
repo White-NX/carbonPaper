@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { open, save } from '@tauri-apps/plugin-dialog';
+import { selectBackupExportPath, selectBackupImportPath } from '../lib/native_dialogs';
 import { Dialog } from './Dialog';
 import { Lock, FileUp, FileDown, ShieldAlert, CheckCircle2, RefreshCw } from 'lucide-react';
 import { withAuth } from '../lib/auth_api';
@@ -48,10 +48,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
       setStatus('processing');
 
       if (mode === 'export') {
-        const filePath = await save({
-          filters: [{ name: 'CarbonPaper Backup', extensions: ['zip'] }],
-          defaultPath: 'CarbonPaper_Backup.zip'
-        });
+        const filePath = await selectBackupExportPath();
         if (!filePath) {
           setStatus('idle');
           return;
@@ -59,11 +56,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
 
         await withAuth(() => invoke('storage_export_backup', { password, exportPath: filePath }), { autoPrompt: true });
       } else {
-        const filePath = await open({
-          filters: [{ name: 'CarbonPaper Backup', extensions: ['zip'] }],
-          multiple: false,
-          directory: false
-        });
+        const filePath = await selectBackupImportPath();
         if (!filePath) {
           setStatus('idle');
           return;

@@ -2,13 +2,13 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { selectStorageDirectory } from '../../../lib/native_dialogs';
 import { runMonitorAction } from '../../../lib/settings_api';
 import { withAuth } from '../../../lib/auth_api';
 import { useStorageMigration } from './useStorageMigration';
 
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => vi.fn()) }));
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
+vi.mock('../../../lib/native_dialogs', () => ({ selectStorageDirectory: vi.fn() }));
 vi.mock('../../../lib/auth_api', () => ({ withAuth: vi.fn((call) => call()) }));
 vi.mock('../../../lib/settings_api', () => ({ runMonitorAction: vi.fn(async () => {}), notifySettingsChanged: vi.fn(async () => {}) }));
 
@@ -22,7 +22,7 @@ function deferred() {
 let migration;
 beforeEach(() => {
   migration = deferred();
-  open.mockResolvedValue('D:/NewStorage');
+  selectStorageDirectory.mockResolvedValue('D:/NewStorage');
   listen.mockReset().mockImplementation(async () => vi.fn());
   withAuth.mockReset().mockImplementation((call) => call());
   invoke.mockReset().mockImplementation(async (command) => {
@@ -43,6 +43,16 @@ async function startMigration() {
 }
 
 describe('storage migration cancellation', () => {
+  it('does not offer or run a migration when directory selection is cancelled', async () => {
+    selectStorageDirectory.mockResolvedValueOnce(null);
+    const { result } = renderHook(() => useStorageMigration({ storage: {}, t: (key) => key }));
+    await act(async () => { await result.current.handleChangeStoragePath(); });
+    expect(result.current.isMigrationChoiceDialogOpen).toBe(false);
+    expect(result.current.pendingTargetPath).toBe('');
+    expect(invoke).not.toHaveBeenCalled();
+    expect(runMonitorAction).not.toHaveBeenCalled();
+  });
+
   it('deduplicates cancellation and waits for the migration command to settle', async () => {
     const cancellation = deferred();
     const original = invoke.getMockImplementation();

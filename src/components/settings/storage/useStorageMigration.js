@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { selectStorageDirectory } from '../../../lib/native_dialogs';
 import { withAuth } from '../../../lib/auth_api';
 import { runMonitorAction, notifySettingsChanged } from '../../../lib/settings_api';
 import { useSettingsActivity } from '../SettingsActivityContext';
@@ -164,10 +164,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
 
   const handleChangeStoragePath = async () => {
     try {
-      const selected = await open({ directory: true });
-      if (!selected) return;
-
-      const targetPath = Array.isArray(selected) ? selected[0] : selected;
+      const targetPath = await selectStorageDirectory();
       if (!targetPath) return;
 
       const normalizedCurrent = currentStoragePath.replace(/[\\/]+$/, '');

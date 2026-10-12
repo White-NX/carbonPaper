@@ -18,8 +18,8 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({
-  open: vi.fn(),
+vi.mock('../../lib/native_dialogs', () => ({
+  selectStorageDirectory: vi.fn(),
 }));
 
 vi.mock('../../lib/monitor_api', () => ({

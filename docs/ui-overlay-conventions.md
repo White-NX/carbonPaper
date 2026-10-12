@@ -142,3 +142,16 @@ Translation keys are defined only in `src/i18n/locales/*.json`. New code does
 not pass inline default strings to `t()`; the locale files are the single
 source of truth, and `npm run i18n:check` verifies that both languages have the
 same keys and that every literal key used in the source exists.
+
+## Native file selection
+
+`src/lib/native_dialogs.js` owns the three current file-picker workflows:
+backup export destination, backup import archive, and storage directory.
+Production code imports its named helpers instead of the Tauri dialog plugin.
+They preserve archive filters, request a single selection, and normalize an
+empty result to `null`. Invalid results and native failures reject for the
+caller to handle. The plugin owns the OS dialog through the calling WebView.
+
+Selecting a path does not authenticate or start work. A cancelled selection
+returns to the existing form; the caller uses `withAuth` only after a path has
+been selected. Python executable selection has been removed.
