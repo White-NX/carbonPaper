@@ -169,9 +169,11 @@ Frontend verification goes through `src/lib/auth_api.js`:
 
 `autoPrompt: true` remains a compatibility spelling for an explicit action;
 `promptMode` takes precedence. Do not use it for automatic effects. Index-health
-reads, automatic capture-filter application, and resumed smart-cluster downloads
-(including their settings write) defer authentication. Resumed downloads keep
-their queued intent until the authenticated readiness state returns.
+reads, automatic capture-filter application, automatic search-index security
+upgrades, and resumed smart-cluster downloads (including their settings write)
+defer authentication. Resumed downloads keep their queued intent until the
+authenticated readiness state returns. The security-upgrade component mounts
+only while authenticated; a lost session defers admission until its next mount.
 
 Each WebView shares a pending frontend request. Cancellation becomes
 `AUTH_CANCELLED`, provider unavailability becomes `AUTH_NOT_AVAILABLE`, and

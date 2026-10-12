@@ -50,7 +50,9 @@ export default function HmacMigrationDialog() {
 
         if (!status.is_running) {
           try {
-            await withAuth(() => invoke('storage_run_hmac_migration'), { autoPrompt: true });
+            // This starts from a mount effect. App remounts it after unlock if
+            // the session expires between the status check and admission.
+            await withAuth(() => invoke('storage_run_hmac_migration'), { promptMode: 'defer' });
             if (isMounted) setIsOpen(false);
           } catch (err) {
             if (!formatError(err).includes('ALREADY_RUNNING')) {
@@ -59,6 +61,7 @@ export default function HmacMigrationDialog() {
           }
         }
       } catch (err) {
+        if (formatError(err).includes('AUTH_REQUIRED')) return;
         console.error('[HMAC_MIGRATE] Error:', err);
         if (didOpen && isMounted) setError(formatError(err));
       }
