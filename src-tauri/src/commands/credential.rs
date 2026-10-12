@@ -14,7 +14,7 @@ use tauri::Manager;
 ///
 /// Authentication: not required because this command bootstraps authentication.
 /// Returns a success message string; rejects non-Windows platforms.
-/// Frontend: `components/AuthMask.jsx` and `lib/monitor_api.js`.
+/// Frontend: `lib/auth_api.js` (explicit unlock) and `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn credential_initialize(
     app: tauri::AppHandle,
@@ -68,35 +68,56 @@ pub async fn credential_initialize(
 ///
 /// Authentication: this command performs authentication and therefore needs no session.
 /// Returns `true` after verification succeeds; errors include OS verification failures.
-/// Frontend: `components/AuthMask.jsx`.
+/// Concurrent windows share the first caller's owner HWND and result. A later
+/// request performs fresh verification even if the session is still valid.
+/// Frontend: `lib/auth_api.js`.
 #[tauri::command]
 pub async fn credential_verify_user(
     app: tauri::AppHandle,
     window: tauri::Window,
     state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
-    mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<bool, String> {
     #[cfg(windows)]
     {
         let owner_hwnd = window
             .hwnd()
-            .map_err(|e| format!("Failed to get main window handle: {}", e))?;
-        credential_manager::force_verify_and_unlock_master_key(&state, Some(owner_hwnd.0 as isize))
-            .map_err(|e| format!("Verification failed: {}", e))?;
+            .map_err(|e| format!("Failed to get calling window handle: {}", e))?
+            .0 as isize;
+        let credentials = state.inner().clone();
+        let storage = storage_state.inner().clone();
+        state
+            .verification
+            .run(async move {
+                let verification_state = credentials.clone();
+                tokio::task::spawn_blocking(move || {
+                    credential_manager::force_verify_and_unlock_master_key(
+                        &verification_state,
+                        Some(owner_hwnd),
+                    )
+                    .map_err(|e| format!("Verification failed: {}", e))
+                })
+                .await
+                .map_err(|e| format!("Verification task failed: {}", e))??;
 
-        crate::settings_window::broadcast_auth_state(&app);
-        if let Some(scheduler) =
-            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-        {
-            scheduler.wake();
-        }
-        storage_state.try_bitmap_index_migration();
-        if let Err(e) =
-            mcp_server::restore_if_enabled(app, &state, &storage_state, &mcp_state).await
-        {
-            tracing::warn!("Failed to restore MCP after authentication: {}", e);
-        }
+                // Run completion work once, even if the original window closes.
+                crate::settings_window::broadcast_auth_state(&app);
+                if let Some(scheduler) =
+                    app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.wake();
+                }
+                storage.try_bitmap_index_migration();
+                let mcp_state = app.state::<mcp_server::McpRuntimeState>();
+                if let Err(e) =
+                    mcp_server::restore_if_enabled(app.clone(), &credentials, &storage, &mcp_state)
+                        .await
+                {
+                    tracing::warn!("Failed to restore MCP after authentication: {}", e);
+                }
+                Ok(())
+            })
+            .await?;
 
         Ok(true)
     }
@@ -107,7 +128,6 @@ pub async fn credential_verify_user(
         let _ = &window;
         let _ = &state;
         let _ = &storage_state;
-        let _ = &mcp_state;
         Err("Windows Hello is only available on Windows".to_string())
     }
 }

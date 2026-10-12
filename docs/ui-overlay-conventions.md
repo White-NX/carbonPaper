@@ -177,3 +177,12 @@ Each WebView shares a pending frontend request. Cancellation becomes
 `AUTH_CANCELLED`, provider unavailability becomes `AUTH_NOT_AVAILABLE`, and
 unrelated errors propagate. A failed or cancelled attempt releases the pending
 request so a later explicit click can retry; it does not schedule another prompt.
+
+The backend credential state also coordinates in-flight verification across
+windows. The first request supplies the native owner HWND; overlapping requests
+share its success, cancellation, or failure and its post-authentication work.
+The application owns the job, so closing a waiting window does not admit another
+prompt while native verification is running. Native verification runs on a
+blocking worker rather than holding the async executor. Once the job settles,
+a later explicit request starts fresh verification even with a valid session;
+the retained-key and fresh-consent rules remain in `credential_manager.rs`.
