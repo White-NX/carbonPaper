@@ -23,6 +23,7 @@ import { useAppTheme } from './hooks/useAppTheme';
 import { useAppWindowActions, usePowerSavingState, useWindowMaximizedState } from './hooks/useAppWindowState';
 import { useAppNotifications } from './hooks/useAppNotifications';
 import { useAuthSession } from './hooks/useAuthSession';
+import { DialogVisibilityContext } from './hooks/useDialogFocus';
 import { useCriticalErrors } from './hooks/useCriticalErrors';
 import { useMonitorLifecycle } from './hooks/useMonitorLifecycle';
 import { useRequiredModels } from './hooks/useRequiredModels';
@@ -242,6 +243,7 @@ function App() {
 
   return (
     <OverlayCoordinatorProvider value={overlays.value}>
+    <DialogVisibilityContext.Provider value={isAuthenticated}>
     <div
       data-tauri-drag-region
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
@@ -407,6 +409,7 @@ function App() {
         onClose={() => setShowOcrModelRepair(false)}
       />
     </div>
+    </DialogVisibilityContext.Provider>
     </OverlayCoordinatorProvider>
   );
 }

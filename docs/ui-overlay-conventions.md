@@ -7,9 +7,17 @@ three visual styles, four stacking values and a dozen copies of the same
 button class string. New overlays follow these rules; old ones are brought in
 line when they are touched.
 
-On-demand dialogs opened from a button (confirmations, the OCR repair card,
-dialogs inside settings) keep using `components/Dialog.jsx`. This page is about
-overlays the app raises by itself.
+On-demand dialogs opened from a button (including recap corrections and
+sources, the OCR repair card, and dialogs inside settings) use
+`components/Dialog.jsx`; short decisions use `ConfirmDialog`.
+
+Main and settings are separate WebViews. Each owns its DOM and focus stack.
+Both provide `DialogVisibilityContext` from their authenticated session, so
+protected dialogs disappear on lock without discarding their owner's state.
+In the main window, ordinary dialogs also yield while any startup overlay
+holds the coordinator. The settings discard-and-close confirmation explicitly
+uses `allowWhenLocked`; it may appear above the lock but never above maintenance
+or a fatal surface.
 
 ## Building blocks
 
@@ -41,6 +49,10 @@ Every overlay declares one of four layers, from lowest to highest:
 3. `maintenance` — blocking index or database work. It sits above the gate
    because a run that waits for authentication offers its own unlock button.
 4. `fatal` — the critical error window. Nothing may cover it.
+
+Ordinary dialogs use the `dialog` and `confirmation` bands. The one approved
+discard-and-close decision uses `lockedAction` above the gate. These bands also
+live in `layers.js`; visibility and keyboard ownership follow the same rules.
 
 Never write a `z-*` value on an overlay directly. If a new kind of overlay does
 not fit one of these bands, add a band to `layers.js` and explain it there.

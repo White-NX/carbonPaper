@@ -47,6 +47,9 @@ import {
   smartClusterDrainNow,
 } from '../lib/semantic_api';
 import { getSmartClusterWorkerStatus } from '../lib/monitor_api';
+import AuthMask from './AuthMask';
+import { DialogVisibilityContext } from '../hooks/useDialogFocus';
+import { OverlayCoordinatorProvider, useOverlayCoordinator } from './overlay';
 
 const cluster = {
   id: 7,
@@ -124,6 +127,25 @@ describe('SmartClustersView deletion confirmation', () => {
     await waitFor(() => expect(authRequired).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     window.removeEventListener('cp-auth-required', authRequired);
+  });
+
+  it('hides an existing confirmation when the main-window session locks before deletion', async () => {
+    function MainWindow({ authenticated }) {
+      const coordinator = useOverlayCoordinator();
+      return <OverlayCoordinatorProvider value={coordinator.value}>
+        <DialogVisibilityContext.Provider value={authenticated}>
+          <AuthMask isVisible={!authenticated} authError={null} setAuthError={vi.fn()} onAuthSuccess={vi.fn()} />
+          <SmartClustersView active isAuthenticated={authenticated} />
+        </DialogVisibilityContext.Provider>
+      </OverlayCoordinatorProvider>;
+    }
+    const user = userEvent.setup();
+    const view = render(<MainWindow authenticated />);
+    await openDeleteDialog(user);
+    view.rerender(<MainWindow authenticated={false} />);
+    expect(screen.getByRole('dialog', { name: 'authMask.title' })).toBeVisible();
+    expect(screen.queryByRole('dialog', { name: 'smartClusters.confirmDeleteTitle' })).not.toBeInTheDocument();
+    expect(deleteSmartCluster).not.toHaveBeenCalled();
   });
 });
 

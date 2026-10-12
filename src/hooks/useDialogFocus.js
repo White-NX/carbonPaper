@@ -1,8 +1,12 @@
 import { createContext, useContext, useLayoutEffect, useRef } from 'react';
+import { useActiveOverlay } from '../components/overlay/coordinator';
 
 export const DialogVisibilityContext = createContext(true);
 export function useDialogVisibility(isOpen, allowWhenLocked = false) {
-  return (useContext(DialogVisibilityContext) || allowWhenLocked) && isOpen;
+  const authenticated = useContext(DialogVisibilityContext);
+  const activeOverlay = useActiveOverlay();
+  const hasScreen = activeOverlay === null || (allowWhenLocked && activeOverlay === 'auth');
+  return Boolean(isOpen && (authenticated || allowWhenLocked) && hasScreen);
 }
 
 const dialogs = [];
