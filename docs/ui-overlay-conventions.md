@@ -80,6 +80,13 @@ inside the remaining dialog, and removing a covered parent never moves focus
 away from the active child. Body scrolling stays locked until the last
 dialog releases it.
 
+Storage-directory migration stays open until its operation settles. Its view
+declares `disableClose` and offers an explicit cancel action owned by
+`useStorageMigration`. Cancellation is deduplicated, an accepted request waits
+for the worker to settle, and a failed request leaves progress visible with a
+retryable error. Cancelling before admission prevents the migration from
+starting, including after authentication retries.
+
 ## One overlay at a time
 
 `App` owns an overlay coordinator (`src/components/overlay/coordinator.js`).

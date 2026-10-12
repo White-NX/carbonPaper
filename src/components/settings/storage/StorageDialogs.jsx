@@ -13,6 +13,8 @@ export default function StorageDialogs({
   isMigrating,
   migrationProgress,
   migrationError,
+  migrationCancellation,
+  onCancelMigration,
   isMigrationChoiceDialogOpen,
   pendingTargetPath,
   onCancelMigrationChoice,
@@ -39,7 +41,8 @@ export default function StorageDialogs({
 
       <MigrationProgressDialog
         isOpen={isMigrating}
-        onClose={() => { /* prevent closing while migrating */ }}
+        onCancel={onCancelMigration}
+        cancellation={migrationCancellation}
         progress={migrationProgress}
         error={migrationError}
       />

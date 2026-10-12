@@ -30,6 +30,8 @@ export default function StorageManagementSection({
     isMigrating,
     migrationProgress,
     migrationError,
+    migrationCancellation,
+    handleCancelMigration,
     isUpdatingStoragePath,
     isMigrationChoiceDialogOpen,
     pendingTargetPath,
@@ -184,6 +186,8 @@ export default function StorageManagementSection({
         isMigrating={isMigrating}
         migrationProgress={migrationProgress}
         migrationError={migrationError}
+        migrationCancellation={migrationCancellation}
+        onCancelMigration={handleCancelMigration}
         isMigrationChoiceDialogOpen={isMigrationChoiceDialogOpen}
         pendingTargetPath={pendingTargetPath}
         onCancelMigrationChoice={handleCancelMigrationChoice}
