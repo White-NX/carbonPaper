@@ -50,6 +50,10 @@ Every overlay declares one of four layers, from lowest to highest:
    because a run that waits for authentication offers its own unlock button.
 4. `fatal` — the critical error window. Nothing may cover it.
 
+`ErrorWindow` keeps its normal and illustrated modes. Both expose the same
+labelled `alertdialog`, block Escape, and isolate the entire window, including
+the title bar. Restart, exit, and presentation switching remain explicit actions.
+
 Ordinary dialogs use the `dialog` and `confirmation` bands. The one approved
 discard-and-close decision uses `lockedAction` above the gate. These bands also
 live in `layers.js`; visibility and keyboard ownership follow the same rules.
