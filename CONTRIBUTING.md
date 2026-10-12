@@ -51,12 +51,11 @@ The value `1` explicitly selects WAL. An unset, empty, or invalid value uses the
 WAL policy; invalid values also produce a warning. To restore the default in PowerShell,
 run `Remove-Item Env:CARBONPAPER_WAL_EXPERIMENT -ErrorAction SilentlyContinue` and restart.
 The policy is resolved once per process and also applies after backup restore or a data
-directory change. A maintenance command that switches to DELETE changes the current
-database mode; keep the `0` override set if subsequent opens should continue using DELETE.
+directory change. Keep the `0` override set if subsequent opens should continue using DELETE.
 
 Conversions require a local, writable database directory and free space of at least twice
 the database file group's size plus 64 MiB. If a supported conversion cannot complete,
-startup retains the effective journal mode, records the failure, and retries on a later
+startup retains the effective journal mode, logs the failure, and retries on a later
 initialization. Already-WAL startup does not require this conversion space.
 
 Backups and directory migrations drain database activity and preserve `screenshots.db`,

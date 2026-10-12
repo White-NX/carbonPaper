@@ -4,11 +4,10 @@
 //! dialog to show. Any operation that mutates, exports, imports, or reveals user data
 //! requires a valid authenticated session.
 
-use crate::capture::CaptureState;
 use crate::credential_manager::{
     get_cached_master_key, CredentialManagerState, MASTER_KEY_FILE_NAME,
 };
-use crate::monitor::{start_monitor_impl, stop_monitor_impl, MonitorState};
+use crate::monitor::{control_in_maintenance, MonitorAction, MonitorState};
 use crate::storage::database_snapshot::{
     self, BACKUP_MANIFEST_FILE_NAME, BACKUP_MASTER_KEY_FILE_NAME, BACKUP_METADATA_FILE_NAME,
 };
@@ -188,24 +187,6 @@ pub async fn storage_run_hmac_migration(
     .map_err(|e| format!("Migration task panicked: {}", e))?
 }
 
-/// Requests cancellation of the active HMAC migration.
-///
-/// Authentication: required. Returns `{ "status": "cancel_requested" | "idle",
-/// "is_running": boolean }`.
-#[tauri::command]
-pub async fn storage_hmac_migration_cancel(
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    state: tauri::State<'_, Arc<StorageState>>,
-) -> Result<serde_json::Value, String> {
-    super::check_auth_required(&credential_state)?;
-
-    let in_progress = state.request_hmac_migration_cancel();
-    Ok(serde_json::json!({
-        "status": if in_progress { "cancel_requested" } else { "idle" },
-        "is_running": in_progress
-    }))
-}
-
 /// Lists screenshot files that still exist as plaintext paths.
 ///
 /// Authentication: required. Returns a JSON array of path strings.
@@ -255,20 +236,16 @@ pub async fn storage_migrate_data_dir(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     monitor_state: tauri::State<'_, MonitorState>,
-    capture_state: tauri::State<'_, Arc<CaptureState>>,
     target: String,
     migrate_data_files: bool,
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
 
-    let Some(_maintenance) = crate::maintenance::enter("migrate_data_dir") else {
+    let Some(maintenance) = crate::maintenance::enter("migrate_data_dir") else {
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
 
     let was_running = monitor_state.is_running();
-    monitor_state
-        .migration_lock
-        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let office_runtime = app_handle
         .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
@@ -279,12 +256,7 @@ pub async fn storage_migrate_data_dir(
     // Stop producers before acquiring the blocking maintenance gate. The gate
     // protects database connections; it is not a substitute for stopping a
     // monitor writer that can issue a new statement between copies.
-    let _ = stop_monitor_impl(
-        monitor_state.clone(),
-        capture_state.clone(),
-        app_handle.clone(),
-    )
-    .await;
+    let _ = control_in_maintenance(&app_handle, MonitorAction::Stop, &maintenance).await;
     office_runtime
         .quiesce(std::time::Duration::from_secs(5))
         .await;
@@ -304,13 +276,10 @@ pub async fn storage_migrate_data_dir(
         office_runtime.resume();
     }
 
-    monitor_state
-        .migration_lock
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-
     if was_running && storage_ready {
-        let monitor_state_for_start = app_handle.state::<MonitorState>();
-        if let Err(error) = start_monitor_impl(monitor_state_for_start, app_handle.clone()).await {
+        if let Err(error) =
+            control_in_maintenance(&app_handle, MonitorAction::Start, &maintenance).await
+        {
             tracing::error!("Migration: Failed to restart monitor after data move: {error}");
         }
     }
@@ -364,14 +333,13 @@ pub async fn storage_export_backup(
     app_handle: tauri::AppHandle,
     state: State<'_, Arc<StorageState>>,
     monitor_state: State<'_, MonitorState>,
-    capture_state: State<'_, Arc<CaptureState>>,
     credential_state: State<'_, Arc<CredentialManagerState>>,
     password: String,
     export_path: String,
 ) -> Result<(), String> {
     super::check_auth_required(&credential_state)?;
 
-    let Some(_maintenance) = crate::maintenance::enter("backup_export") else {
+    let Some(maintenance) = crate::maintenance::enter("backup_export") else {
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
 
@@ -379,18 +347,9 @@ pub async fn storage_export_backup(
 
     let was_running = monitor_state.is_running();
 
-    monitor_state
-        .migration_lock
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
     let result = async {
         tracing::info!("Migration: Releasing resources (stopping monitor and storage)");
-        let _ = stop_monitor_impl(
-            monitor_state.clone(),
-            capture_state.clone(),
-            app_handle.clone(),
-        )
-        .await;
+        let _ = control_in_maintenance(&app_handle, MonitorAction::Stop, &maintenance).await;
         app_handle
             .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
             .quiesce(std::time::Duration::from_secs(5))
@@ -533,14 +492,11 @@ pub async fn storage_export_backup(
     .await;
     let (result, init_result) = result;
 
-    monitor_state
-        .migration_lock
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-
     if was_running && init_result.is_ok() {
         tracing::info!("Migration: Restarting monitor after export");
-        let monitor_state_for_start = app_handle.state::<MonitorState>();
-        if let Err(e) = start_monitor_impl(monitor_state_for_start, app_handle.clone()).await {
+        if let Err(e) =
+            control_in_maintenance(&app_handle, MonitorAction::Start, &maintenance).await
+        {
             tracing::error!("Migration: Failed to restart monitor after export: {}", e);
         }
     }
@@ -558,14 +514,13 @@ pub async fn storage_import_backup(
     app_handle: tauri::AppHandle,
     state: State<'_, Arc<StorageState>>,
     monitor_state: State<'_, MonitorState>,
-    capture_state: State<'_, Arc<CaptureState>>,
     credential_state: State<'_, Arc<CredentialManagerState>>,
     password: String,
     backup_zip_path: String,
 ) -> Result<(), String> {
     super::check_auth_required(&credential_state)?;
 
-    let Some(_maintenance) = crate::maintenance::enter("backup_import") else {
+    let Some(maintenance) = crate::maintenance::enter("backup_import") else {
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
 
@@ -573,19 +528,10 @@ pub async fn storage_import_backup(
 
     let was_running = monitor_state.is_running();
 
-    monitor_state
-        .migration_lock
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
     let result = async {
         // 1. Prepare
         tracing::info!("Migration: Releasing resources for import");
-        let _ = stop_monitor_impl(
-            monitor_state.clone(),
-            capture_state.clone(),
-            app_handle.clone(),
-        )
-        .await;
+        let _ = control_in_maintenance(&app_handle, MonitorAction::Stop, &maintenance).await;
         // The restored database numbers its screenshots independently, so an
         // association write that survived this point would attach a document
         // to whichever unrelated screenshot reuses the id.
@@ -728,14 +674,11 @@ pub async fn storage_import_backup(
     .await;
     let (result, init_result) = result;
 
-    monitor_state
-        .migration_lock
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-
     if was_running && init_result.is_ok() {
         tracing::info!("Migration: Restarting monitor after import");
-        let monitor_state_for_start = app_handle.state::<MonitorState>();
-        if let Err(e) = start_monitor_impl(monitor_state_for_start, app_handle.clone()).await {
+        if let Err(e) =
+            control_in_maintenance(&app_handle, MonitorAction::Start, &maintenance).await
+        {
             tracing::error!("Migration: Failed to restart monitor after import: {}", e);
         }
     }

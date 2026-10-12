@@ -9,6 +9,7 @@ const tauriDir = path.join(root, 'src-tauri');
 const workerDir = path.join(tauriDir, 'semantic-worker');
 const isRelease = process.argv.includes('--release');
 const profile = isRelease ? 'release' : 'debug';
+const prepareCommand = isRelease ? 'prepare:release-assets' : 'prepare:dev-assets';
 const manifest = JSON.parse(
   readFileSync(path.join(root, 'scripts', 'release-assets', 'onnxruntime-directml.json'), 'utf8'),
 );
@@ -26,10 +27,6 @@ const stagedExeChanged = copyFileIfChanged(exe, stagedExe);
 
 const runtimeDir = path.join(tauriDir, 'pre-bundle', ...manifest.bundle_path.split('/'));
 mkdirSync(runtimeDir, { recursive: true });
-const localAppData = process.env.LOCALAPPDATA;
-const legacyRuntimeDir = localAppData
-  ? path.join(localAppData, 'carbonpaper', '.venv', 'Lib', 'site-packages', 'onnxruntime', 'capi')
-  : null;
 
 function sha256(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
@@ -50,23 +47,14 @@ function copyFileIfChanged(source, destination) {
 for (const pkg of manifest.packages) {
   for (const file of pkg.files) {
     const staged = path.join(runtimeDir, file.name);
-    if (!existsSync(staged) && !isRelease && legacyRuntimeDir) {
-      const legacy = path.join(legacyRuntimeDir, file.name);
-      if (existsSync(legacy)) copyFileIfChanged(legacy, staged);
-    }
     if (!existsSync(staged)) {
       throw new Error(
-        `Pinned semantic runtime asset is missing: ${staged}. Run npm run prepare:release-assets.`,
+        `Pinned semantic runtime asset is missing: ${staged}. Run npm run ${prepareCommand}.`,
       );
     }
     const actual = sha256(staged);
     if (actual !== file.sha256) {
-      // Development venv wheels may package byte-different DLLs from the pinned NuGet
-      // artifacts. Keep those outside release staging and require the manifest for release.
-      if (isRelease) {
-        throw new Error(`${file.name} checksum mismatch: expected ${file.sha256}, got ${actual}`);
-      }
-      console.warn(`Development ${file.name} uses legacy wheel checksum ${actual}`);
+      throw new Error(`${file.name} checksum mismatch: expected ${file.sha256}, got ${actual}. Run npm run ${prepareCommand} to restore the pinned runtime.`);
     }
   }
 }

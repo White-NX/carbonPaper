@@ -54,10 +54,6 @@ impl StorageState {
             return Err("ALREADY_RUNNING".to_string());
         }
 
-        // Reset cancellation flag
-        self.hmac_migration_cancel_requested
-            .store(false, Ordering::SeqCst);
-
         let result = self.run_hmac_migration_internal(&mut progress_callback);
 
         self.hmac_migration_in_progress
@@ -108,10 +104,6 @@ impl StorageState {
         // 3. Migration loop with explicit lock yielding
         const MIGRATE_BATCH_SIZE: i64 = 500;
         loop {
-            if self.is_hmac_migration_cancel_requested() {
-                return Err("Cancelled".to_string());
-            }
-
             // CRITICAL: Scope the MutexGuard to the smallest possible area
             let batch_result = {
                 let guard = self.get_connection_named("hmac_migrate_batch")?;

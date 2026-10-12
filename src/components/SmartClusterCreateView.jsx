@@ -17,9 +17,9 @@ import { useTauriEventListener } from '../hooks/useTauriEventListener';
  * 文字会被当成语义锚点直接拿去匹配，示例写成什么样，用户就会照着写成什么样。
  */
 const EXAMPLES = [
-  { key: 'smartClusterCreate.exampleReceipts', fallback: '网上购物的订单和收据' },
-  { key: 'smartClusterCreate.exampleTravel', fallback: '旅行计划和行程安排' },
-  { key: 'smartClusterCreate.exampleReading', fallback: '读到的长文章和技术资料' },
+  'smartClusterCreate.exampleReceipts',
+  'smartClusterCreate.exampleTravel',
+  'smartClusterCreate.exampleReading',
 ];
 
 /**
@@ -244,7 +244,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
       skips.map(([id]) => scoreById[Number(id)]),
     );
     if (threshold === null || Number.isNaN(threshold)) {
-      setError(t('smartClusterCreate.errorNoThreshold', '候选样本评分数据异常，请返回上一步重新检索'));
+      setError(t('smartClusterCreate.errorNoThreshold'));
       return;
     }
 
@@ -293,16 +293,16 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
   const progressLabel = useMemo(() => {
     switch (progress?.phase) {
       case 'retrieving':
-        return t('smartClusterCreate.progressRetrieving', '正在召回候选快照…');
+        return t('smartClusterCreate.progressRetrieving');
       case 'loading_model':
-        return t('smartClusterCreate.progressLoadingModel', '正在准备…');
+        return t('smartClusterCreate.progressLoadingModel');
       case 'reranking':
-        return t('smartClusterCreate.progressPicking', '正在重排候选快照 {{scored}}/{{total}}', {
+        return t('smartClusterCreate.progressPicking', {
           scored: Number(progress.scored) || 0,
           total: Number(progress.total) || 0,
         });
       default:
-        return t('smartClusterCreate.progressStarting', '正在准备…');
+        return t('smartClusterCreate.progressStarting');
     }
   }, [progress, t]);
 
@@ -323,14 +323,14 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
                 autoFocus
                 value={description}
                 onChange={(event) => setDescription(event.target.value)}
-                placeholder={t('smartClusterCreate.placeholder', '输入自然语言描述（如：网上购物的订单和收据）')}
+                placeholder={t('smartClusterCreate.placeholder')}
                 className="min-w-0 flex-1 bg-transparent text-sm text-ide-text outline-none placeholder:text-ide-muted"
               />
               {description && (
                 <button
                   type="button"
                   onClick={() => setDescription('')}
-                  title={t('common.clear', '清空')}
+                  title={t('common.clear')}
                   className="grid h-7 w-7 place-items-center rounded-md text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
                 >
                   <X className="h-3.5 w-3.5" />
@@ -339,7 +339,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
               <button
                 type="submit"
                 disabled={!description.trim() || !modelReady}
-                title={t('smartClusterCreate.find', '检索候选')}
+                title={t('smartClusterCreate.find')}
                 className="grid h-[30px] w-[30px] shrink-0 place-items-center rounded-md bg-ide-accent text-white transition hover:brightness-110 disabled:opacity-40"
               >
                 <Search className="h-4 w-4" />
@@ -350,7 +350,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
               onClick={onCancel}
               className="ml-auto shrink-0 rounded px-3 py-1.5 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
             >
-              {t('common.cancel', '取消')}
+              {t('common.cancel')}
             </button>
           </>
         ) : (
@@ -362,7 +362,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
               className="flex shrink-0 items-center gap-1.5 rounded px-2 py-1.5 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text disabled:opacity-40"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              {t('common.back', '上一步')}
+              {t('common.back')}
             </button>
             <span className="min-w-0 flex-1 truncate text-sm text-ide-text" title={committed}>
               {committed}
@@ -375,7 +375,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
                 className="flex shrink-0 items-center gap-1.5 rounded border border-ide-border px-3 py-1.5 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text disabled:opacity-40"
               >
                 <Square className="h-3 w-3" />
-                {stopping ? t('smartClusterCreate.stopping', '正在停止…') : t('smartClusterCreate.stop', '停止')}
+                {stopping ? t('smartClusterCreate.stopping') : t('smartClusterCreate.stop')}
               </button>
             )}
             <button
@@ -384,7 +384,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
               disabled={saving}
               className="shrink-0 rounded px-3 py-1.5 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text disabled:opacity-40"
             >
-              {t('common.cancel', '取消')}
+              {t('common.cancel')}
             </button>
           </>
         )}
@@ -442,8 +442,8 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
         <div className="flex shrink-0 items-center gap-3 border-t border-ide-border bg-ide-panel px-6 py-3">
           <span className="text-xs text-ide-muted">
             {counts.keep >= MIN_KEEPS
-              ? t('smartClusterCreate.readyHint', '已选 {{count}} 张正例', { count: counts.keep })
-              : t('smartClusterCreate.needMore', '还需标注 {{count}} 张正例', {
+              ? t('smartClusterCreate.readyHint', { count: counts.keep })
+              : t('smartClusterCreate.needMore', {
                 count: MIN_KEEPS - counts.keep,
               })}
           </span>
@@ -453,7 +453,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
             disabled={counts.keep < MIN_KEEPS}
             className="ml-auto flex items-center gap-1.5 rounded-md bg-ide-accent px-4 py-1.5 text-xs font-medium text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {t('common.next', '下一步')}
+            {t('common.next')}
             <ArrowRight className="h-3.5 w-3.5" />
           </button>
         </div>
@@ -467,7 +467,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
             disabled={saving}
             className="rounded px-3 py-1.5 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text disabled:opacity-40"
           >
-            {t('common.cancel', '取消')}
+            {t('common.cancel')}
           </button>
           <button
             type="button"
@@ -476,7 +476,7 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
             className="flex items-center gap-1.5 rounded-md bg-ide-accent px-4 py-1.5 text-xs font-medium text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
-            {t('smartClusterCreate.create', '创建')}
+            {t('smartClusterCreate.create')}
           </button>
         </div>
       )}
@@ -487,9 +487,9 @@ export default function SmartClusterCreateView({ onSelectScreenshot, onSave, onC
 /** 顶栏第二行的三步指示。 */
 function StepTrail({ current, t }) {
   const labels = [
-    t('smartClusterCreate.step1', '描述'),
-    t('smartClusterCreate.step2', '标定'),
-    t('smartClusterCreate.step3', '命名'),
+    t('smartClusterCreate.step1'),
+    t('smartClusterCreate.step2'),
+    t('smartClusterCreate.step3'),
   ];
   return (
     <div className="flex items-center gap-2">
@@ -526,7 +526,6 @@ function DescribeStep({ modelReady, onPick, t }) {
       <p className="text-sm leading-relaxed text-ide-text/90">
         {t(
           'smartClusterCreate.intro',
-          '输入描述并标记样本，程序将自动匹配并归档历史与未来的相关快照。',
         )}
       </p>
 
@@ -536,16 +535,15 @@ function DescribeStep({ modelReady, onPick, t }) {
           <p className="text-xs leading-relaxed text-amber-400">
             {t(
               'smartClusterCreate.modelMissing',
-              '智能聚类重排模型尚未就绪，请前往「设置 → 功能管理」下载依赖组件。',
             )}
           </p>
         </div>
       )}
 
-      <p className="mt-8 text-xs text-ide-muted">{t('smartClusterCreate.examplesTitle', '示例描述')}</p>
+      <p className="mt-8 text-xs text-ide-muted">{t('smartClusterCreate.examplesTitle')}</p>
       <div className="mt-2.5 grid gap-2 sm:grid-cols-3">
-        {EXAMPLES.map(({ key, fallback }) => {
-          const text = t(key, fallback);
+        {EXAMPLES.map((key) => {
+          const text = t(key);
           return (
             <button
               key={key}
@@ -564,7 +562,6 @@ function DescribeStep({ modelReady, onPick, t }) {
         <p>
           {t(
             'smartClusterCreate.scopeNote',
-            '候选样本取自近 30 天快照记录；后台归档仅在系统空闲时执行。',
           )}
         </p>
       </div>
@@ -597,7 +594,7 @@ function PickStep({
           </div>
           {stopping && (
             <span className="text-[11px] opacity-70">
-              {t('smartClusterCreate.stoppingHint', '正在停止，等待当前批次完成…')}
+              {t('smartClusterCreate.stoppingHint')}
             </span>
           )}
         </div>
@@ -611,8 +608,8 @@ function PickStep({
         <Sparkles className="h-6 w-6 opacity-40" />
         <span>
           {cancelled
-            ? t('smartClusterCreate.stoppedNotice', '检索已停止，未产生结果')
-            : t('smartClusterCreate.noResults', '未找到相关快照，请尝试调整描述内容')}
+            ? t('smartClusterCreate.stoppedNotice')
+            : t('smartClusterCreate.noResults')}
         </span>
       </div>
     );
@@ -621,7 +618,7 @@ function PickStep({
   return (
     <div className="px-6 py-4">
       <p className="mb-3.5 text-xs text-ide-muted">
-        {t('smartClusterCreate.pickHint', '标记符合描述的快照（正例），排除无关快照（反例）。点击卡片可预览大图。')}
+        {t('smartClusterCreate.pickHint')}
       </p>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
         {results.map((r) => {
@@ -632,7 +629,7 @@ function PickStep({
                 <button
                   type="button"
                   onClick={(event) => { event.stopPropagation(); onToggle(r.screenshot_id, 'keep'); }}
-                  title={t('smartClusterCreate.markKeep', '正例')}
+                  title={t('smartClusterCreate.markKeep')}
                   className={`rounded p-1 transition-all ${
                     mark === 'keep'
                       ? 'bg-emerald-500 text-white shadow-md'
@@ -644,7 +641,7 @@ function PickStep({
                 <button
                   type="button"
                   onClick={(event) => { event.stopPropagation(); onToggle(r.screenshot_id, 'skip'); }}
-                  title={t('smartClusterCreate.markSkip', '排除')}
+                  title={t('smartClusterCreate.markSkip')}
                   className={`rounded p-1 transition-all ${
                     mark === 'skip'
                       ? 'bg-rose-500 text-white shadow-md'
@@ -685,7 +682,7 @@ function NameStep({ name, onNameChange, color, onColorChange, keepCount, descrip
   return (
     <div className="mx-auto max-w-lg px-6 py-10">
       <label className="block text-xs text-ide-muted" htmlFor="smart-cluster-name">
-        {t('smartClusterCreate.nameLabel', '聚类名称')}
+        {t('smartClusterCreate.nameLabel')}
       </label>
       <input
         id="smart-cluster-name"
@@ -696,10 +693,10 @@ function NameStep({ name, onNameChange, color, onColorChange, keepCount, descrip
         className="mt-2 h-10 w-full rounded-lg border border-ide-border bg-ide-bg px-3.5 text-sm text-ide-text outline-none transition-colors focus:border-ide-accent focus:ring-2 focus:ring-ide-accent/20"
       />
       <p className="mt-2 text-[11px] leading-relaxed text-ide-muted/80">
-        {t('smartClusterCreate.nameHint', '名称用于列表标识，修改名称不会变更匹配规则。')}
+        {t('smartClusterCreate.nameHint')}
       </p>
 
-      <p className="mt-7 text-xs text-ide-muted">{t('smartClusterCreate.colorLabel', '标记颜色')}</p>
+      <p className="mt-7 text-xs text-ide-muted">{t('smartClusterCreate.colorLabel')}</p>
       <div className="mt-2.5 flex flex-wrap gap-2">
         {COLOR_CHOICES.map((choice) => (
           <button
@@ -726,7 +723,6 @@ function NameStep({ name, onNameChange, color, onColorChange, keepCount, descrip
         <p className="mt-2 text-xs leading-relaxed text-ide-muted">
           {t(
             'smartClusterCreate.summary',
-            '程序将基于所选的 {{count}} 张样本计算匹配阈值，自动归档后续捕获的相似快照。',
             { count: keepCount },
           )}
         </p>

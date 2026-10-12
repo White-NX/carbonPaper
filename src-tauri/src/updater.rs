@@ -304,12 +304,7 @@ pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
                 check.version.as_deref(),
                 None,
             );
-            updater_apply_impl(
-                app.clone(),
-                app.state::<crate::monitor::MonitorState>(),
-                app.state::<std::sync::Arc<crate::capture::CaptureState>>(),
-            )
-            .await
+            updater_apply_impl(app.clone()).await
         }
         .await;
 
@@ -625,11 +620,8 @@ async fn updater_extract_impl() -> Result<(), String> {
     Ok(())
 }
 
-async fn updater_apply_impl(
-    app: AppHandle,
-    monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
-    capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
-) -> Result<(), String> {
+async fn updater_apply_impl(app: AppHandle) -> Result<(), String> {
+    let _runtime_control = crate::maintenance::runtime_control_guard()?;
     tracing::info!("Update apply: preparing update");
 
     let staging = staging_dir()?;
@@ -648,7 +640,7 @@ async fn updater_apply_impl(
         crate::app_bound::install_runtime(extract_dir.clone(), false).await?;
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(15),
-            crate::monitor::stop_monitor_impl(monitor_state, capture_state, app.clone()),
+            crate::monitor::control(&app, crate::monitor::MonitorAction::Stop),
         )
         .await;
         return crate::app_bound::schedule_restart(&app);
@@ -668,7 +660,7 @@ async fn updater_apply_impl(
     tracing::info!("Update apply: stopping monitor before update");
     match tokio::time::timeout(
         tokio::time::Duration::from_secs(15),
-        crate::monitor::stop_monitor_impl(monitor_state, capture_state, app.clone()),
+        crate::monitor::control(&app, crate::monitor::MonitorAction::Stop),
     )
     .await
     {
@@ -789,8 +781,6 @@ pub async fn updater_install(
         std::sync::Arc<crate::credential_manager::CredentialManagerState>,
     >,
     state: tauri::State<'_, UpdaterState>,
-    monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
-    capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
 ) -> Result<(), String> {
     crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
@@ -809,5 +799,5 @@ pub async fn updater_install(
     );
     updater_extract_impl().await?;
     let _ = app.emit("updater-phase", serde_json::json!({ "phase": "applying" }));
-    updater_apply_impl(app, monitor_state, capture_state).await
+    updater_apply_impl(app).await
 }

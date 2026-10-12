@@ -45,7 +45,6 @@
     "welcome": "把一天的经过串起来",
     "intro": "按时间回看做过的事情，串起同一件事的经过，随时打开当时的画面。",
     "configure": "前往设置",
-    "schedule": "每四小时自动整理一次",
     "generating": "正在整理回顾…",
     "generate": "补全回顾",
     "regenerate": "重新生成",
@@ -56,28 +55,14 @@
     "correct": "纠正关联",
     "summaryPending": "时段概述待补全，可先查看具体经过。",
     "summaryUnavailable": "时段概述暂时无法更新，具体经过仍可查看。",
-    "taskInDetails": "这项活动的具体经过可在下方查看。",
-    "details": "查看经过与来源",
-    "source": "来源记录",
-    "locate": "在时间线上定位",
-    "relatedTask": "相关任务：{{title}}",
-    "allActivities": "查看全部活动",
-    "empty": "这里会显示已整理的活动。可以补全已结束时段的回顾。",
-    "partial": "已有回顾可供查看，部分内容尚待补全。",
-    "failed": "此时段回顾生成失败",
     "errorDetails": "查看错误详情",
-    "errorLogHint": "可在应用日志中搜索 [RECAP]，查看失败阶段和请求记录。",
-    "allRecords": "{{start}}–{{end}} 的记录（{{count}} 条）",
     "remoteConsent": "生成回顾和语义筛查会把选取的屏幕文字发送到你配置的模型服务。",
     "allowRemote": "允许发送并继续",
     "progress": {
       "title": "生成过程",
       "completed": "已处理 {{count}} / {{total}} 个时段",
       "completedLabel": "时段处理进度",
-      "period": "正在整理 {{start}} 起的时段",
-      "reply": "查看回复预览",
       "previewLimited": "较长的内容仅保留开头预览。",
-      "requestDetails": "请求详情",
       "outputLimit": "请求输出上限（含思考）",
       "inputUsage": "输入 token",
       "outputUsage": "输出 token（含思考）",
@@ -87,13 +72,27 @@
       "received": "已接收内容",
       "receivedCounts": "思考 {{reasoning}} 字符，回复 {{text}} 字符",
       "requestId": "请求编号",
-      "attempts": { "initial": "整理活动", "repair": "补全与修复", "summary": "归纳概述" },
+      "attempts": {
+        "initial": "整理活动",
+        "repair": "补全与修复",
+        "summary": "归纳概述"
+      },
       "stages": {
-        "preparing": "准备回顾", "collecting": "读取记录", "screening": "筛选内容",
-        "waiting": "等待模型响应", "thinking": "模型正在思考", "writing": "生成回顾正文",
-        "validating": "校验回顾", "summarizing": "归纳时段概述", "saving": "保存回顾", "running": "进行中",
-        "ready": "已完成", "partial": "部分内容待补全", "failed": "生成失败",
-        "cancelled": "已停止", "paused": "等待全屏应用退出后继续"
+        "preparing": "准备回顾",
+        "collecting": "读取记录",
+        "screening": "筛选内容",
+        "waiting": "等待模型响应",
+        "thinking": "模型正在思考",
+        "writing": "生成回顾正文",
+        "validating": "校验回顾",
+        "summarizing": "归纳时段概述",
+        "saving": "保存回顾",
+        "running": "进行中",
+        "ready": "已完成",
+        "partial": "部分内容待补全",
+        "failed": "生成失败",
+        "cancelled": "已停止",
+        "paused": "等待全屏应用退出后继续"
       }
     },
     "diagnostics": {
@@ -104,7 +103,11 @@
       "finishing": "正在完成回顾",
       "steps": "处理步骤",
       "requestContent": "请求内容",
-      "tabs": { "reply": "回复预览", "reasoning": "思考过程", "requestDetails": "请求信息" },
+      "tabs": {
+        "reply": "回复预览",
+        "reasoning": "思考过程",
+        "requestDetails": "请求信息"
+      },
       "model": "模型",
       "requestDuration": "请求耗时",
       "totalRequestDuration": "请求累计耗时 {{duration}}",
@@ -253,14 +256,6 @@
   "settings": {
     "general": {
       "title": "通用选项",
-      "language": {
-        "label": "语言",
-        "description": "选择界面显示语言。"
-      },
-      "telemetry": {
-        "label": "允许发送遥测诊断数据",
-        "description": "允许程序将不包含隐私数据的错误日志上传至遥测服务器。"
-      },
       "powerSaving": {
         "label": "节能模式",
         "description": "使用电池供电时自动暂停捕获记录服务，插入电源后自动恢复运行。"
@@ -268,7 +263,6 @@
       "gameMode": {
         "label": "游戏模式",
         "description": "启用后将在游戏启动时禁用DML和截图以获得更好的游戏性能。",
-        "requires_dml": "需要先启用 DirectML 加速",
         "active": "已激活：DirectML 已临时关闭",
         "inactive": "GPU 负载正常",
         "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）",
@@ -294,23 +288,6 @@
             "label": "自定义",
             "description": "分别调整电池节能和游戏性能保护。"
           }
-        }
-      },
-      "lightweightMode": {
-        "startHidden": {
-          "label": "启动时隐藏窗口（轻量模式启动）",
-          "description": "启动时不显示界面，仅运行后台服务，可通过托盘菜单打开界面"
-        },
-        "autoSwitch": {
-          "label": "自动切换到轻量模式",
-          "description": "窗口关闭后自动切换到轻量模式以节省内存",
-          "delayLabel": "延迟时间：",
-          "delayUnit": "分钟"
-        },
-        "switchNow": {
-          "label": "立即切换到轻量模式",
-          "description": "关闭界面并释放内存，可通过托盘菜单重新打开",
-          "button": "切换"
         }
       },
       "windowBehavior": {
@@ -359,7 +336,6 @@
       "monitor": {
         "title": "捕获记录服务",
         "tooltip": "用于屏幕捕获、记录归档与隐私检测。",
-        "status": "状态：{{status}}",
         "status_label": "状态：",
         "description": "控制后台的捕获记录服务。",
         "starting": "正在启动...",
@@ -436,74 +412,40 @@
           },
           "until_close": {
             "label": "直到退出应用",
-            "description": "保持解锁，直到完全退出应用。",
-            "warning": true
+            "description": "保持解锁，直到完全退出应用。"
           }
         },
         "current": {
           "unlocked": "已解锁",
-          "locked": "已锁定",
-          "label": "当前会话："
+          "locked": "已锁定"
         },
-        "lock_now": "立即锁定",
-        "locking": "锁定中..."
+        "lock_now": "立即锁定"
       }
     },
     "advanced": {
-      "loading": "加载中...",
-      "warning": "这些设置可能会影响监控服务的性能和稳定性，甚至影响操作系统整体性能。请谨慎调整。",
       "quick_restart": "快速重启",
-      "terms": {
-        "directml": "DirectML 是微软的 GPU 推理接口。它可以在兼容显卡上加速 OCR，但可能与游戏或图形密集应用争用 GPU。"
-      },
       "cpu": {
         "title": "CPU 占用限制",
         "label": "限制 CPU 占用率",
         "description": "限制后台处理的 CPU 占用，减少对其他应用的影响。",
-        "percent_label": "CPU 限制百分比",
-        "changed_notice": "CPU 限制更改将在下次启动监控服务时生效"
+        "percent_label": "CPU 限制百分比"
       },
       "ocr": {
         "title": "OCR 处理",
-        "single_flight": "固定单任务模式",
-        "single_flight_desc": "OCR 直接处理未经过 JPEG 的 RGB 捕获帧。为限制内存占用，OCR 运行期间不会排队新的完整 RGB 帧。",
-        "pause_label": "OCR 队列有任务时暂停截图",
-        "pause_desc": "开启后，当 OCR 队列中有未处理任务时将暂停截图，减少资源占用",
-        "queue_limit_label": "限制 OCR 任务队列大小",
-        "queue_limit_desc": "超过此大小时，暂停所有截图直到队列消化",
-        "max_queue_label": "最大队列大小",
         "timeout_label": "OCR 超时时间",
         "timeout_desc": "单次文字识别的最长等待时间。",
         "seconds": "秒",
-        "info": "OCR 队列设置会即时生效，无需重启监控服务",
         "invalidTimeout": "请输入 30 至 600 之间的整数。"
       },
       "rust_ocr": {
         "title": "OCR 引擎",
-        "raw_rgb": "Rust Raw RGB OCR",
-        "raw_rgb_desc": "隔离的 Rust ML 进程直接读取 RGB 捕获帧。",
-        "use_rust": "使用 Rust OCR",
-        "rust_desc": "使用隔离的 Rust ML 进程直接处理 RGB 捕获帧。",
-        "model_ready": "PP-OCRv5 Mobile 已安装",
-        "model_missing": "需要安装 PP-OCRv5 Mobile 模型",
-        "model_bundled": "PP-OCRv5 Mobile 随 CarbonPaper 安装",
-        "model_repaired": "PP-OCRv5 Mobile 已通过在线修复安装",
-        "model_damaged": "PP-OCRv5 Mobile 安装资源缺失或损坏",
-        "model_checking": "正在检查模型…",
         "model_downloading": "下载中…",
-        "model_download": "下载模型",
-        "model_repair": "在线修复",
-        "status_loading": "正在读取状态…",
-        "status_counts": "成功 {{success}} · 失败 {{failure}} · 最近 {{elapsed}} ms",
-        "restart": "重启 Rust ML 进程",
-        "retry_failed": "重试失败截图（{{count}}）"
+        "model_repair": "在线修复"
       },
       "dml": {
         "title": "DirectML 推理加速",
         "label": "使用显卡加速",
         "description": "使用兼容 DirectX 12 的显卡加速识别和向量处理。",
-        "notice": "注意：在主要 GPU 上运行 DirectML 可能会影响游戏性能。",
-        "changed_notice": "DirectML 设置将在下次启动监控服务时生效",
         "gpu_select": "选择 GPU 设备",
         "gpu_loading": "正在检测 GPU...",
         "gpu_none": "未检测到兼容的 GPU",
@@ -513,7 +455,6 @@
         "title": "后台自动整理",
         "label": "锁定后继续自动整理",
         "description": "成功解锁一次后，应用可在本次运行期间继续整理记录。关闭应用后需要重新解锁。",
-        "status": "当前状态",
         "refresh": "刷新状态",
         "states": {
           "waiting_for_idle": "等待空闲",
@@ -529,12 +470,7 @@
         "profile": "执行档",
         "waitReason": "等待原因",
         "pauses": "暂停次数",
-        "yieldLatency": "最近退让耗时",
-        "task": "任务",
-        "eligible": "使用期间处理",
-        "backlogAge": "积压时间",
-        "verified": "已验证",
-        "pendingEvaluation": "等待评估"
+        "yieldLatency": "最近退让耗时"
       },
       "network": {
         "title": "联网功能",
@@ -625,12 +561,9 @@
       },
       "classification_backend": {
         "title": "截图内容自动分类",
-        "label": "Rust BGE 分类推理",
-        "description": "根据窗口标题、文字内容和你的纠正记录进行分类。",
         "successes": "Rust 成功次数",
         "failures": "Rust 失败次数",
-        "last_elapsed": "最近一次推理",
-        "last_error": "最近错误"
+        "last_elapsed": "最近一次推理"
       },
       "vacuum": {
         "title": "数据库维护",
@@ -722,11 +655,8 @@
         "copying": "正在拷贝文件: {{copied}}/{{total}}",
         "current_file": "当前文件: {{file}}",
         "completed": "完成",
-        "cancel": "取消",
         "upgrading": "正在升级搜索索引…",
         "background_tip": "您可以放心关闭此窗口。升级将在后台继续进行，搜索结果将随进度逐渐恢复。",
-        "preparing": "正在初始化迁移...",
-        "indexing_detailed": "正在构建安全索引: {{processed}} / {{total}}",
         "search_unavailable_title": "搜索功能受限",
         "search_unavailable_desc": "数据库正在进行安全升级，搜索索引正在重建中。在此期间，搜索结果可能不完整或暂时不可用。升级完成后将自动恢复。"
       },
@@ -802,9 +732,7 @@
           "1hour": "1 小时",
           "today": "今天"
         },
-        "button": "{{label}}内",
         "confirmTitle": "确认？",
-        "confirmMessage": "这会删除所选时间范围内的快照和 OCR 记录，且无法撤销。确定继续吗？",
         "yes": "是",
         "no": "否",
         "chooseRange": "选择时间范围",
@@ -820,7 +748,6 @@
     "save_filters": {
       "synced": "过滤规则已保存并生效。",
       "saved_local_not_running": "规则已保存，将在下次开始记录时生效。",
-      "saved_local_unsupported": "",
       "saved_local_sync_failed": "规则已保存，暂时无法应用。请重试，或重新启动记录服务。"
     },
     "autolaunch": {
@@ -834,22 +761,13 @@
     },
     "extension": {
       "title": "浏览器扩展",
-      "description": "管理 CarbonPaper 浏览器扩展",
       "chrome": {
-        "name": "Chrome / Chromium 内核浏览器",
-        "label": "安装",
-        "registered": "已注册",
-        "registering": "注册中..."
+        "name": "Chrome / Chromium 内核浏览器"
       },
       "edge": {
-        "name": "Microsoft Edge",
-        "label": "安装",
-        "registered": "已注册",
-        "registering": "注册中..."
+        "name": "Microsoft Edge"
       },
       "status": {
-        "registered": "已注册",
-        "not_registered": "未注册",
         "checking": "正在检查…",
         "connected": "已连接",
         "configured": "已配置，未连接",
@@ -857,7 +775,6 @@
         "unavailable": "连接状态暂不可用"
       },
       "enhance": {
-        "label": "扩展增强",
         "description": "为浏览器记录保存页面网址、标题和链接，方便再次打开原网页。",
         "global": "启用扩展增强"
       },
@@ -866,9 +783,7 @@
         "empty": "当前没有浏览器连接。",
         "pid": "PID {{pid}}"
       },
-      "success": "扩展安装成功。请在浏览器中启用该未打包扩展。",
       "error": "安装失败：{{error}}",
-      "help": "点击按钮后，请在浏览器扩展管理页面中加载显示路径的未打包扩展。",
       "tutorial": {
         "title": "查看安装步骤",
         "step1": "点击对应浏览器的“设置浏览器”或“重新配置”，准备扩展文件并打开扩展管理页面。",
@@ -890,7 +805,6 @@
     "ai_embedding": {
       "title": "AI 助手访问",
       "description": "管理人工智能嵌入服务",
-      "mcp_service": "MCP 服务",
       "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、智能归档信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
       "enable_label": "MCP 服务",
       "start_button": "启动",
@@ -906,7 +820,6 @@
       "token": {
         "title": "授权令牌",
         "description": "AI 工具连接时需要使用此令牌进行身份验证。",
-        "show_once_warning": "此令牌仅显示一次，关闭后无法再次查看。请立即复制并保存。",
         "copy": "复制",
         "copied": "已复制",
         "reset": "重置令牌",
@@ -914,13 +827,11 @@
         "reset_confirm_message": "重置令牌将使所有已配置的 AI 工具连接失效，需要重新配置。确定继续？"
       },
       "status": {
-        "running": "服务运行中",
         "stopped": "服务已停止",
         "starting": "正在启动服务",
         "pending_auth": "服务已启用，完成 Windows Hello 认证后会自动启动",
         "error": "服务启动失败",
-        "port_label": "端口",
-        "auth_required": "需要先在应用中完成 Windows Hello 认证才能处理数据请求"
+        "port_label": "端口"
       },
       "connection_info": {
         "title": "连接信息",
@@ -993,7 +904,6 @@
       },
       "content_filter": {
         "title": "内容过滤",
-        "description": "基于合规规则过滤 MCP 服务返回结果中的标记内容。",
         "level_label": "基于关键词的合规化保护",
         "levels": {
           "standard": {
@@ -1039,7 +949,6 @@
         "pii": {
           "title": "个人信息检测",
           "description": "找出返回给 AI 的内容中的手机号、身份证号、银行卡号、密码等个人信息，并按所选的过滤方式处理。",
-          "toggle_label": "启用个人信息检测",
           "entity_types_label": "检测的信息类型",
           "entity_types": {
             "PHONE_NUMBER": "手机号码",
@@ -1121,8 +1030,7 @@
           "activeClusters": "已启用",
           "drainNow": "处理待整理记录",
           "rescanAll": "重新匹配记录",
-          "retry": "重试下载",
-          "openManagement": "打开智能聚类管理"
+          "retry": "重试下载"
         },
         "indexHealth": {
           "label": "检索与维护",
@@ -1134,8 +1042,7 @@
           "vectorRows": "向量",
           "deleteQueue": "删除队列",
           "smartPending": "智能聚类待处理"
-        },
-        "disabled_notice": "此功能已禁用"
+        }
       },
       "models": {
         "title": "模型管理",
@@ -1188,8 +1095,7 @@
       "saveFailed": "保存失败：{{error}}",
       "operationFailed": "操作失败：{{error}}",
       "retryApply": "重试应用",
-      "savedPendingRestart": "更改已保存，重新启动记录服务后生效。",
-      "saved": "已保存。"
+      "savedPendingRestart": "更改已保存，重新启动记录服务后生效。"
     },
     "details": {
       "options": "更多选项",
@@ -1205,7 +1111,16 @@
       "unknown": "状态暂不可用"
     },
     "maintenance": {
-      "manageIndexes": "管理检索索引"
+      "manageIndexes": "管理检索索引",
+      "thumbnails": {
+        "title": "截图预览",
+        "description": "提前准备缩略图，让浏览历史截图更流畅。",
+        "running": "正在准备预览",
+        "stopping": "正在停止…",
+        "stop": "停止",
+        "resume": "继续准备",
+        "stopped": "已停止准备，可随时继续。"
+      }
     },
     "about": {
       "updates": "应用更新",
@@ -1219,7 +1134,6 @@
       "repository": "项目主页",
       "repositoryDescription": "查看源代码、反馈问题或参与开发。",
       "developers": "开发预览",
-      "preview": "预览",
       "previews": {
         "error": "错误窗口",
         "ocr": "识别组件修复提醒",
@@ -1300,15 +1214,10 @@
     "clear": "清空",
     "refresh": "刷新"
   },
-  "delete": {
-    "failure": "删除失败: {{error}}",
-    "success": "成功删除 {{count}} 条记录"
-  },
   "updateModal": {
     "title": "新版本已发布",
     "titleCritical": "需要关键更新",
     "version": "版本 {{version}}",
-    "releaseNotes": "更新日志",
     "downloadInstall": "下载并安装",
     "later": "稍后",
     "background": "后台下载",
@@ -1319,21 +1228,6 @@
     "applying": "正在应用更新...",
     "downloadFailed": "下载失败: {{error}}",
     "criticalNotice": "该更新包含重要的安全修复或功能改进，为了您的数据安全和最佳体验，需要尽快更新。"
-  },
-  "save_filters": {
-    "synced": "已保存并同步到监控服务",
-    "saved_local_not_running": "已保存到本地，监控服务未启动，启动后会自动同步",
-    "saved_local_unsupported": "已保存到本地，但当前运行的监控进程不支持过滤命令，请重启监控服务",
-    "saved_local_sync_failed": "已保存到本地，同步失败：{{error}}"
-  },
-  "autolaunch": {
-    "read_error": "读取开机自启动状态失败",
-    "enabled": "已写入开机启动项",
-    "disabled": "已移除开机启动项",
-    "action_failed": "操作失败：{{error}}"
-  },
-  "analysis": {
-    "load_failed": "加载分析数据失败：{{error}}"
   },
   "topbar": {
     "settings": "设置",
@@ -1355,8 +1249,7 @@
     "showOcr": "显示OCR内容",
     "openFloatingPreview": "在独立窗口中查看",
     "openMainPreview": "在主窗口/预览中查看",
-    "float": "独立预览",
-    "alpha": "alpha"
+    "float": "独立预览"
   },
   "snapshotSource": {
     "open": "打开关联内容",
@@ -1577,11 +1470,7 @@
       "placeholder_nl": "描述你想找的画面，比如「月亮」",
       "go": "搜索",
       "searching": "搜索中...",
-      "enter_keyword": "输入关键词或选择筛选器开始。",
-      "press_enter": "在顶部搜索框按回车可快速跳转到此处。",
       "did_you_know": "你知道吗：{{msg}}",
-      "no_results": "未找到匹配结果",
-      "adjust": "调整筛选或尝试其他关键词。",
       "no_results_for": "没有找到包含「{{query}}」的截图",
       "no_results_filtered": "当前筛选条件下没有任何截图。",
       "no_results_hint": "尝试使用其他关键词或清除筛选条件。",
@@ -1600,7 +1489,6 @@
     },
     "processes": {
       "all": "所有进程",
-      "label": "进程",
       "select": "选择进程",
       "clear": "清除",
       "no_data": "无进程数据",
@@ -1675,13 +1563,6 @@
       "run_in_background": "后台运行"
     }
   },
-  "aboutSection": {
-    "debug": {
-      "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知",
-      "preview_app_bound_offer": "预览后台整理升级弹窗",
-      "preview_app_bound_repair": "预览后台整理修复弹窗"
-    }
-  },
   "clipBackfill": {
     "title": "画面索引补算",
     "lead": "有 {{count}} 张截图还没有画面索引。在完成索引之前，它们不会出现在主搜索框的自然语言搜索结果里。",
@@ -1743,8 +1624,7 @@
     "restart": "重启 CarbonPaper",
     "exit": "退出",
     "switchToNormal": "切换到正常模式",
-    "switchToXibao": "切换到喜报模式",
-    "triggerTest": "触发测试错误窗口"
+    "switchToXibao": "切换到喜报模式"
   },
   "ocrModelRepair": {
     "title": "OCR 模型修复",

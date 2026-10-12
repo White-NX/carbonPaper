@@ -21,6 +21,7 @@ const LIFECYCLE_IDLE: u64 = 0;
 const LIFECYCLE_DRAINING: u64 = u64::MAX;
 
 pub struct MonitorState {
+    control: tokio::sync::Mutex<()>,
     /// Which capture session owns the monitor: `LIFECYCLE_IDLE`,
     /// `LIFECYCLE_DRAINING`, or the id of the running session.
     ///
@@ -40,20 +41,18 @@ pub struct MonitorState {
     /// Set to true during a stop, after a capture loop ended on its own, and
     /// at application exit; cleared by the next start
     pub stopping: AtomicBool,
-    /// Prevents the monitor from restarting during migration tasks
-    pub migration_lock: AtomicBool,
 }
 
 impl MonitorState {
     pub fn new() -> Self {
         Self {
+            control: tokio::sync::Mutex::new(()),
             lifecycle: AtomicU64::new(LIFECYCLE_IDLE),
             next_session: AtomicU64::new(1),
             game_mode_dml_suppressed: AtomicBool::new(false),
             game_mode_permanently_suppressed: AtomicBool::new(false),
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
-            migration_lock: AtomicBool::new(false),
         }
     }
 
@@ -247,36 +246,27 @@ pub async fn monitor_search_nl(
     start_time: Option<f64>,
     end_time: Option<f64>,
     _fuzzy: Option<bool>,
+    include_ocr: Option<bool>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
-    let limit = limit.unwrap_or(20).min(crate::clip_query::MAX_CLIP_RESULTS);
-    let offset = offset.unwrap_or(0).min(crate::clip_query::MAX_CLIP_OFFSET);
     let process_names = process_names.unwrap_or_default();
 
     // `fuzzy` is retained in the command contract but does not apply to
     // text-to-image similarity.
-    match crate::clip_query::try_rust_clip_query(
+    let results = crate::clip_query::search(
         &app,
-        crate::clip_query::ClipQueryRequest {
-            query: &query,
-            limit,
-            offset,
-            process_names: &process_names,
+        crate::clip_query::ClipQueryRequest::new(
+            &query,
+            limit.map(u64::from),
+            offset.map(u64::from),
+            &process_names,
             start_time,
             end_time,
-        },
+        )
+        .with_ocr(include_ocr.unwrap_or(true)),
     )
-    .await
-    {
-        crate::clip_query::ClipQueryOutcome::Served(results) => Ok(serde_json::json!({
-            "status": "success",
-            "results": results,
-            "backend": "rust",
-        })),
-        crate::clip_query::ClipQueryOutcome::Unavailable(reason) => {
-            Err(format!("CLIP search unavailable: {reason}"))
-        }
-    }
+    .await?;
+    Ok(serde_json::json!({ "status": "success", "results": results, "backend": "rust" }))
 }
 
 #[tauri::command]
@@ -492,15 +482,59 @@ pub async fn monitor_remove_local_anchors_by_process(
     Ok(serde_json::json!({"status":"success","removed_count":removed}))
 }
 
-/// Starts the Rust capture loop.
-pub async fn start_monitor_impl(
-    state: State<'_, MonitorState>,
-    app: AppHandle,
-) -> Result<String, String> {
-    if state.migration_lock.load(Ordering::SeqCst) {
-        return Err("Cannot start monitor: Migration is currently in progress".to_string());
-    }
+#[derive(Clone, Copy)]
+pub(crate) enum MonitorAction {
+    Start,
+    Stop,
+    Pause,
+    Resume,
+    Restart,
+    TogglePause,
+}
 
+/// Shared by commands, tray actions, power events and startup. The admission
+/// permit spans the whole operation, including model checks and capture drain.
+pub(crate) async fn control(app: &AppHandle, action: MonitorAction) -> Result<String, String> {
+    let _admission = crate::maintenance::runtime_control_guard()?;
+    apply_control(app, action).await
+}
+
+pub(crate) async fn control_in_maintenance(
+    app: &AppHandle,
+    action: MonitorAction,
+    _owner: &crate::maintenance::MaintenanceGuard,
+) -> Result<String, String> {
+    apply_control(app, action).await
+}
+
+async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String, String> {
+    let state = app.state::<MonitorState>();
+    let _control = state.control.lock().await;
+    match action {
+        MonitorAction::Start => start_capture(app).await,
+        MonitorAction::Stop => stop_capture(app).await,
+        MonitorAction::Restart => {
+            stop_capture(app).await?;
+            start_capture(app).await
+        }
+        MonitorAction::Pause => Ok(set_capture_paused(app, true)),
+        MonitorAction::Resume => Ok(set_capture_paused(app, false)),
+        MonitorAction::TogglePause => {
+            if state.is_running() {
+                let paused = app
+                    .state::<Arc<CaptureState>>()
+                    .paused
+                    .load(Ordering::SeqCst);
+                Ok(set_capture_paused(app, !paused))
+            } else {
+                Ok("Monitor stopped".into())
+            }
+        }
+    }
+}
+
+async fn start_capture(app: &AppHandle) -> Result<String, String> {
+    let state = app.state::<MonitorState>();
     // Check if required model files are complete
     if let Ok(model_status) = crate::model_management::check_model_files().await {
         if let Some(obj) = model_status.as_object() {
@@ -527,14 +561,9 @@ pub async fn start_monitor_impl(
 }
 
 #[tauri::command]
-pub async fn start_monitor(
-    window: tauri::Window,
-    state: State<'_, MonitorState>,
-    app: AppHandle,
-) -> Result<String, String> {
+pub async fn start_monitor(window: tauri::Window, app: AppHandle) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
-    crate::maintenance::guard()?;
-    start_monitor_impl(state, app).await
+    control(&app, MonitorAction::Start).await
 }
 
 #[tauri::command]
@@ -713,12 +742,9 @@ async fn drain_capture_session(app: &AppHandle, capture_state: &CaptureState, re
         .await;
 }
 
-/// Stops the Rust capture loop.
-pub async fn stop_monitor_impl(
-    state: State<'_, MonitorState>,
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
+async fn stop_capture(app: &AppHandle) -> Result<String, String> {
+    let state = app.state::<MonitorState>();
+    let capture_state = app.state::<Arc<CaptureState>>();
     // Own the session before signalling its loop: a loop that panics from
     // here on finds its session taken and leaves the rest to this stop.
     let took_over = state.take_over_for_stop();
@@ -753,57 +779,29 @@ pub async fn stop_monitor_impl(
 }
 
 #[tauri::command]
-pub async fn stop_monitor(
-    window: tauri::Window,
-    state: State<'_, MonitorState>,
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
+pub async fn stop_monitor(window: tauri::Window, app: AppHandle) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
-    crate::maintenance::guard()?;
-    stop_monitor_impl(state, capture_state, app).await
+    control(&app, MonitorAction::Stop).await
 }
 
-/// Pauses screenshot capture without stopping the capture loop.
-pub async fn pause_monitor_impl(
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
-    capture_state.paused.store(true, Ordering::SeqCst);
-    crate::refresh_tray_menu(&app);
-    Ok(serde_json::json!({ "status": "paused" }).to_string())
+fn set_capture_paused(app: &AppHandle, paused: bool) -> String {
+    app.state::<Arc<CaptureState>>()
+        .paused
+        .store(paused, Ordering::SeqCst);
+    crate::refresh_tray_menu(app);
+    serde_json::json!({ "status": if paused { "paused" } else { "resumed" } }).to_string()
 }
 
 #[tauri::command]
-pub async fn pause_monitor(
-    window: tauri::Window,
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
+pub async fn pause_monitor(window: tauri::Window, app: AppHandle) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
-    crate::maintenance::guard()?;
-    pause_monitor_impl(capture_state, app).await
-}
-
-/// Resumes screenshot capture after a pause.
-pub async fn resume_monitor_impl(
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
-    capture_state.paused.store(false, Ordering::SeqCst);
-    crate::refresh_tray_menu(&app);
-    Ok(serde_json::json!({ "status": "resumed" }).to_string())
+    control(&app, MonitorAction::Pause).await
 }
 
 #[tauri::command]
-pub async fn resume_monitor(
-    window: tauri::Window,
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
+pub async fn resume_monitor(window: tauri::Window, app: AppHandle) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
-    crate::maintenance::guard()?;
-    resume_monitor_impl(capture_state, app).await
+    control(&app, MonitorAction::Resume).await
 }
 
 #[tauri::command]

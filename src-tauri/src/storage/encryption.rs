@@ -1,4 +1,4 @@
-//! Row-level and ChromaDB encryption/decryption helpers.
+//! Row-level encryption/decryption helpers.
 
 use crate::credential_manager::{
     decrypt_row_key_with_cng, decrypt_row_key_with_cng_silent, decrypt_with_master_key,
@@ -92,82 +92,6 @@ impl StorageState {
 
         Self::zeroize_bytes(&mut row_key);
         decrypted
-    }
-
-    /// Encrypt text for ChromaDB storage.
-    pub fn encrypt_for_chromadb(&self, text: &str) -> Result<String, String> {
-        if text.is_empty() {
-            return Ok(text.to_string());
-        }
-
-        let (encrypted_data, encrypted_key) = self.encrypt_payload_with_row_key(text.as_bytes())?;
-        let payload = serde_json::json!({
-            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted_data),
-            "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted_key)
-        });
-
-        Ok(format!("ENC2:{}", payload.to_string()))
-    }
-
-    /// Decrypt text from ChromaDB storage.
-    pub fn decrypt_from_chromadb(&self, encrypted: &str) -> Result<String, String> {
-        if !self.is_session_valid() {
-            return Err("AUTH_REQUIRED".to_string());
-        }
-        self.decrypt_from_chromadb_with_mode(encrypted, false)
-            .map_err(|error| error.to_string())
-    }
-
-    fn decrypt_from_chromadb_with_mode(
-        &self,
-        encrypted: &str,
-        silent: bool,
-    ) -> Result<String, BackgroundReadError> {
-        if encrypted.is_empty()
-            || (!encrypted.starts_with("ENC2:") && !encrypted.starts_with("ENC:"))
-        {
-            return Ok(encrypted.to_string());
-        }
-
-        if encrypted.starts_with("ENC:") {
-            return Err(BackgroundReadError::Other(
-                "Legacy ENC format is no longer supported. Please migrate data.".to_string(),
-            ));
-        }
-
-        let data = &encrypted[5..]; // Remove "ENC2:" prefix
-        let payload: serde_json::Value = serde_json::from_str(data).map_err(|e| {
-            BackgroundReadError::Other(format!("Failed to parse encrypted payload: {}", e))
-        })?;
-        let enc_data_b64 = payload
-            .get("data")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| BackgroundReadError::Other("Missing data field".to_string()))?;
-        let enc_key_b64 = payload
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| BackgroundReadError::Other("Missing key field".to_string()))?;
-
-        let encrypted_data =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, enc_data_b64)
-                .map_err(|e| {
-                    BackgroundReadError::Other(format!("Failed to decode encrypted data: {}", e))
-                })?;
-        let encrypted_key =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, enc_key_b64)
-                .map_err(|e| {
-                    BackgroundReadError::Other(format!("Failed to decode encrypted key: {}", e))
-                })?;
-
-        let decrypted = if silent {
-            self.decrypt_payload_with_row_key_silent(&encrypted_data, &encrypted_key)?
-        } else {
-            self.decrypt_payload_with_row_key(&encrypted_data, &encrypted_key)
-                .map_err(BackgroundReadError::Other)?
-        };
-        String::from_utf8(decrypted).map_err(|e| {
-            BackgroundReadError::Other(format!("Invalid UTF-8 in decrypted data: {}", e))
-        })
     }
 
     /// Get public key (for backward-compatible IPC/interface).

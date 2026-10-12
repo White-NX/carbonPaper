@@ -275,17 +275,6 @@ pub fn stop_idle_monitor(idle_state: &Arc<IdleState>) {
     }
 }
 
-#[tauri::command]
-pub fn get_idle_state(idle_state: tauri::State<'_, Arc<IdleState>>) -> serde_json::Value {
-    serde_json::json!({
-        "is_idle": idle_state.is_idle.load(Ordering::SeqCst),
-        "idle_secs": idle_state.idle_secs.load(Ordering::SeqCst),
-        "fullscreen_exclusive": idle_state.fullscreen_exclusive.load(Ordering::SeqCst),
-        "ac_connected": idle_state.ac_connected.load(Ordering::SeqCst),
-        "threshold_secs": IDLE_THRESHOLD_SECS,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

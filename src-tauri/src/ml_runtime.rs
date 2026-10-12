@@ -162,7 +162,7 @@ impl MlChild {
         }
         drop(image);
         let mut stdout = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
-        read_response(&mut *stdout)
+        read_response(&mut *stdout).map_err(Into::into)
     }
 }
 

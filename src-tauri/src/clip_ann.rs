@@ -22,7 +22,9 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::os::windows::io::AsRawHandle;
@@ -30,7 +32,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 use usearch::{Index, MetricKind, ScalarKind};
@@ -41,7 +43,9 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 
+mod query_snapshot;
 mod resumable;
+pub(crate) use query_snapshot::ClipAnnSnapshot;
 pub(crate) use resumable::run_scheduled_slice;
 
 const ANN_FILE_FORMAT_VERSION: u32 = 1;
@@ -274,6 +278,7 @@ struct GenerationReader {
     manifest: DerivedAnnGeneration,
     flat: MappedFlatIndex,
     data_dir: PathBuf,
+    tail_cache: query_snapshot::TailCache,
     // Drop the USearch view before the backing mmap it aliases.
     index: Index,
     _ann_map: memmap2::Mmap,
@@ -369,22 +374,17 @@ impl BoundedTopK {
             }));
             return;
         }
-        let replace = self
-            .heap
-            .peek()
-            .map(|worst| {
-                score
-                    .total_cmp(&worst.0.score)
-                    .then_with(|| worst.0.subject_key.as_str().cmp(subject_key))
-                    .is_gt()
-            })
-            .unwrap_or(true);
-        if replace {
-            let _ = self.heap.pop();
-            self.heap.push(Reverse(TopCandidate {
-                score,
-                subject_key: subject_key.to_string(),
-            }));
+        if let Some(mut worst) = self.heap.peek_mut() {
+            if score
+                .total_cmp(&worst.0.score)
+                .then_with(|| worst.0.subject_key.as_str().cmp(subject_key))
+                .is_gt()
+            {
+                // Reuse the evicted key's allocation and repair the heap once.
+                worst.0.score = score;
+                worst.0.subject_key.clear();
+                worst.0.subject_key.push_str(subject_key);
+            }
         }
     }
 
@@ -423,13 +423,13 @@ pub struct ClipAnnQuery {
 }
 
 impl ClipAnnState {
-    fn generation_snapshot_with_tail<F>(
+    fn generation_snapshot_with_tail<F, T>(
         &self,
         storage: &StorageState,
         load_tail: F,
-    ) -> Result<Option<(Arc<GenerationReader>, Vec<DerivedAnnTailRow>)>, String>
+    ) -> Result<Option<(Arc<GenerationReader>, T)>, String>
     where
-        F: FnOnce(u64) -> Result<Vec<DerivedAnnTailRow>, String>,
+        F: FnOnce(&GenerationReader) -> Result<T, String>,
     {
         let slot = self
             .generation
@@ -444,83 +444,31 @@ impl ClipAnnState {
         // Keep the reader slot pinned until its epoch-dependent tail has been
         // materialized. Publication takes the write side of this same lock
         // across manifest pruning and reader replacement.
-        let tail = load_tail(generation.manifest.covered_epoch)?;
+        let tail = load_tail(generation)?;
         Ok(Some((Arc::clone(generation), tail)))
     }
 
-    pub fn query(
+    pub(crate) fn prepare_query(
         &self,
         storage: &StorageState,
         query: &[f32],
-        k: usize,
-    ) -> Result<Option<ClipAnnQuery>, String> {
-        if !enabled() || query.len() != CLIP_DIMENSIONS || k == 0 {
+        deadline: Option<Instant>,
+    ) -> Result<Option<ClipAnnSnapshot>, String> {
+        if !enabled() || query.len() != CLIP_DIMENSIONS {
             return Ok(None);
         }
-        let (generation, tail) =
-            match self.generation_snapshot_with_tail(storage, |covered_epoch| {
-                storage.list_derived_ann_tail(
-                    DerivedIndexKind::ClipImage,
-                    covered_epoch,
-                    MAX_TAIL_ROWS,
-                )
-            }) {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => return Ok(None),
-                Err(error) if error.starts_with("ann_tail_too_large:") => return Ok(None),
-                Err(error) => return Err(error),
-            };
-        let changed: HashSet<&str> = tail.iter().map(|row| row.subject_key.as_str()).collect();
-        let candidate_count = ann_candidate_count(generation.manifest.row_count as usize, k);
-        let matches = generation
-            .index
-            .search(query, candidate_count)
-            .map_err(|error| format!("ann_search_failed:{error}"))?;
-
-        let mut merged: HashMap<String, f32> =
-            HashMap::with_capacity(matches.keys.len() + tail.len());
-        for key in matches.keys {
-            let Some(ordinal) = key
-                .checked_sub(1)
-                .and_then(|value| usize::try_from(value).ok())
-            else {
-                return Err("ann_search_returned_invalid_key".to_string());
-            };
-            let subject_key = generation.flat.key(ordinal)?;
-            if changed.contains(subject_key) {
-                continue;
-            }
-            let score = dot_product(query, generation.flat.vector(ordinal)?);
-            merged.insert(subject_key.to_string(), score);
-        }
-        for DerivedAnnTailRow {
-            subject_key,
-            vector,
-        } in &tail
-        {
-            if let Some(vector) = vector {
-                if vector.len() == query.len() {
-                    merged.insert(subject_key.clone(), dot_product(query, vector));
-                }
-            } else {
-                merged.remove(subject_key);
-            }
-        }
-        let mut candidates: Vec<ScoredSubject> = merged
-            .into_iter()
-            .map(|(subject_key, score)| ScoredSubject { subject_key, score })
-            .collect();
-        candidates.sort_unstable_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.subject_key.cmp(&b.subject_key))
-        });
-        candidates.truncate(k);
-        Ok(Some(ClipAnnQuery {
-            candidates,
-            mode: "ann",
-            tail_rows: tail.len(),
-        }))
+        check_ann_deadline(deadline)?;
+        let (generation, tail) = match self.generation_snapshot_with_tail(storage, |generation| {
+            generation
+                .tail_cache
+                .load(storage, generation.manifest.covered_epoch, deadline)
+        }) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(None),
+            Err(error) if error.starts_with("ann_tail_too_large:") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        ClipAnnSnapshot::new(generation, tail, query, deadline).map(Some)
     }
 
     pub fn has_generation(&self) -> bool {
@@ -536,36 +484,6 @@ impl ClipAnnState {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
-    }
-
-    pub fn exact_from_generation(
-        &self,
-        storage: &StorageState,
-        query: &[f32],
-        k: usize,
-        deadline: Option<std::time::Instant>,
-    ) -> Result<Option<ClipAnnQuery>, String> {
-        if !enabled() || query.len() != CLIP_DIMENSIONS || k == 0 {
-            return Ok(None);
-        }
-        let (generation, tail) =
-            match self.generation_snapshot_with_tail(storage, |covered_epoch| {
-                storage.list_derived_ann_tail(
-                    DerivedIndexKind::ClipImage,
-                    covered_epoch,
-                    MAX_TAIL_ROWS,
-                )
-            }) {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => return Ok(None),
-                Err(_) => return Ok(None),
-            };
-        let candidates = exact_candidates(&generation, &tail, query, k, deadline)?;
-        Ok(Some(ClipAnnQuery {
-            candidates,
-            mode: "flat_exact",
-            tail_rows: tail.len(),
-        }))
     }
 
     pub(crate) fn disarm(&self) {
@@ -584,6 +502,13 @@ impl ClipAnnState {
     }
 
     pub(crate) fn reclaim_builder(&self, memory_pressure: bool) {
+        if memory_pressure {
+            if let Ok(generation) = self.generation.try_read() {
+                if let Some(generation) = generation.as_ref() {
+                    generation.tail_cache.evict();
+                }
+            }
+        }
         if let Ok(mut slot) = self.resumable_worker.try_lock() {
             if slot
                 .as_ref()
@@ -797,6 +722,85 @@ impl ClipAnnState {
     }
 }
 
+fn check_ann_deadline(deadline: Option<Instant>) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("query_deadline_exceeded_during_ann".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn ann_candidates(
+    generation: &GenerationReader,
+    tail: &[DerivedAnnTailRow],
+    query: &[f32],
+    k: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<ScoredSubject>, String> {
+    let changed: HashSet<&str> = tail.iter().map(|row| row.subject_key.as_str()).collect();
+    ann_candidates_with_tail(
+        generation,
+        query,
+        k,
+        deadline,
+        |key| changed.contains(key),
+        tail.iter().filter_map(|row| {
+            row.vector
+                .as_ref()
+                .filter(|v| v.len() == query.len())
+                .map(|v| (row.subject_key.as_str(), dot_product(query, v)))
+        }),
+    )
+}
+
+fn ann_candidates_with_tail<'a>(
+    generation: &GenerationReader,
+    query: &[f32],
+    k: usize,
+    deadline: Option<Instant>,
+    changed: impl Fn(&str) -> bool,
+    tail_scores: impl Iterator<Item = (&'a str, f32)>,
+) -> Result<Vec<ScoredSubject>, String> {
+    check_ann_deadline(deadline)?;
+    let candidate_count = ann_candidate_count(generation.manifest.row_count as usize, k);
+    let matches = generation
+        .index
+        .search(query, candidate_count)
+        .map_err(|error| format!("ann_search_failed:{error}"))?;
+    check_ann_deadline(deadline)?;
+
+    // Base keys are unique and every changed key is suppressed before merging
+    // the latest tail row. Keep only the best k scores instead of allocating
+    // and sorting all ANN candidates plus up to MAX_TAIL_ROWS changed vectors.
+    let mut top = BoundedTopK::new(k);
+    for (index, key) in matches.keys.into_iter().enumerate() {
+        if index % 64 == 0 {
+            check_ann_deadline(deadline)?;
+        }
+        let Some(ordinal) = key
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Err("ann_search_returned_invalid_key".to_string());
+        };
+        let subject_key = generation.flat.key(ordinal)?;
+        if !changed(subject_key) {
+            top.push(
+                dot_product(query, generation.flat.vector(ordinal)?),
+                subject_key,
+            );
+        }
+    }
+    for (index, (key, score)) in tail_scores.enumerate() {
+        if index % 64 == 0 {
+            check_ann_deadline(deadline)?;
+        }
+        top.push(score, key);
+    }
+    Ok(top.into_sorted())
+}
+
+#[cfg(test)]
 fn exact_candidates(
     generation: &GenerationReader,
     tail: &[DerivedAnnTailRow],
@@ -805,6 +809,29 @@ fn exact_candidates(
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<ScoredSubject>, String> {
     let changed: HashSet<&str> = tail.iter().map(|row| row.subject_key.as_str()).collect();
+    exact_candidates_with_tail(
+        generation,
+        query,
+        k,
+        deadline,
+        |key| changed.contains(key),
+        tail.iter().filter_map(|row| {
+            row.vector
+                .as_ref()
+                .filter(|v| v.len() == query.len())
+                .map(|v| (row.subject_key.as_str(), dot_product(query, v)))
+        }),
+    )
+}
+
+fn exact_candidates_with_tail<'a>(
+    generation: &GenerationReader,
+    query: &[f32],
+    k: usize,
+    deadline: Option<Instant>,
+    changed: impl Fn(&str) -> bool,
+    tail_scores: impl Iterator<Item = (&'a str, f32)>,
+) -> Result<Vec<ScoredSubject>, String> {
     let mut top = BoundedTopK::new(k);
     for ordinal in 0..generation.flat.rows() {
         if ordinal % 4096 == 0
@@ -813,21 +840,17 @@ fn exact_candidates(
             return Err("query_deadline_exceeded_during_flat_exact".to_string());
         }
         let key = generation.flat.key(ordinal)?;
-        if !changed.contains(key) {
+        if !changed(key) {
             top.push(dot_product(query, generation.flat.vector(ordinal)?), key);
         }
     }
-    for (index, row) in tail.iter().enumerate() {
+    for (index, (key, score)) in tail_scores.enumerate() {
         if index % 1024 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
             return Err("query_deadline_exceeded_during_flat_exact".to_string());
         }
-        if let Some(vector) = &row.vector {
-            if vector.len() == query.len() {
-                top.push(dot_product(query, vector), &row.subject_key);
-            }
-        }
+        top.push(score, key);
     }
     Ok(top.into_sorted())
 }
@@ -975,26 +998,29 @@ fn rebuild_needed(storage: &StorageState, force: bool) -> Result<bool, String> {
     let existing = existing.unwrap();
     let tail =
         storage.derived_ann_tail_count(DerivedIndexKind::ClipImage, existing.covered_epoch)?;
-    let threshold =
-        REBUILD_TAIL_ROWS.max(existing.row_count.saturating_mul(REBUILD_TAIL_PERCENT) / 100);
-    if tail < threshold {
-        return Ok(false);
-    }
     let created = chrono::DateTime::parse_from_rfc3339(&existing.created_at)
         .or_else(|_| {
             chrono::NaiveDateTime::parse_from_str(&existing.created_at, "%Y-%m-%d %H:%M:%S")
                 .map(|value| value.and_utc().fixed_offset())
         })
         .ok();
-    Ok(created
-        .and_then(|value| {
-            chrono::Utc::now()
-                .signed_duration_since(value.with_timezone(&chrono::Utc))
-                .to_std()
-                .ok()
-        })
-        .map(|age| age >= MIN_REBUILD_INTERVAL)
-        .unwrap_or(true))
+    let age = created.and_then(|value| {
+        chrono::Utc::now()
+            .signed_duration_since(value.with_timezone(&chrono::Utc))
+            .to_std()
+            .ok()
+    });
+    Ok(tail_rebuild_due(existing.row_count, tail, age))
+}
+
+fn tail_rebuild_due(base_rows: u64, tail_rows: u64, age: Option<Duration>) -> bool {
+    // A proportional threshold alone exceeds the query overlay cap above
+    // 400k base rows. Leave half the cap for writes landing during a rebuild.
+    let threshold = REBUILD_TAIL_ROWS
+        .max(base_rows.saturating_mul(REBUILD_TAIL_PERCENT) / 100)
+        .min(MAX_TAIL_ROWS / 2);
+    tail_rows >= threshold
+        && (tail_rows >= MAX_TAIL_ROWS * 3 / 4 || age.is_none_or(|age| age >= MIN_REBUILD_INTERVAL))
 }
 
 fn write_ann_snapshot_page(
@@ -1106,6 +1132,7 @@ fn open_generation_validated(
         manifest,
         flat,
         data_dir: data_dir.to_path_buf(),
+        tail_cache: query_snapshot::TailCache::default(),
         index,
         _ann_map: ann_map,
         _ann_file: ann_file,
@@ -1323,7 +1350,11 @@ mod tests {
         StorageState::new(data_dir.to_path_buf(), credential)
     }
 
-    fn test_manifest(generation: u64, rows: u64, dimensions: u32) -> DerivedAnnGeneration {
+    pub(super) fn test_manifest(
+        generation: u64,
+        rows: u64,
+        dimensions: u32,
+    ) -> DerivedAnnGeneration {
         DerivedAnnGeneration {
             index_kind: DerivedIndexKind::ClipImage,
             generation,
@@ -1350,7 +1381,7 @@ mod tests {
         }
     }
 
-    fn test_reader(
+    pub(super) fn test_reader(
         data_dir: &Path,
         generation: u64,
         keys: &[&str],
@@ -1418,6 +1449,7 @@ mod tests {
             manifest: test_manifest(generation, keys.len() as u64, dimensions),
             flat,
             data_dir: data_dir.to_path_buf(),
+            tail_cache: query_snapshot::TailCache::default(),
             index,
             _ann_map: ann_map,
             _ann_file: file,
@@ -1450,6 +1482,32 @@ mod tests {
         assert!(!startup_bootstrap_ready(false, false));
         assert!(!startup_bootstrap_ready(true, true));
         assert!(startup_bootstrap_ready(true, false));
+    }
+
+    #[test]
+    fn large_indexes_rebuild_before_the_query_tail_cap() {
+        for rows in [100_000, 400_000, 1_000_000, 2_000_000, u64::MAX] {
+            assert!(!tail_rebuild_due(
+                rows,
+                REBUILD_TAIL_ROWS - 1,
+                Some(MIN_REBUILD_INTERVAL)
+            ));
+            assert!(tail_rebuild_due(
+                rows,
+                MAX_TAIL_ROWS / 2,
+                Some(MIN_REBUILD_INTERVAL)
+            ));
+            assert!(!tail_rebuild_due(
+                rows,
+                MAX_TAIL_ROWS / 2,
+                Some(Duration::ZERO)
+            ));
+            assert!(tail_rebuild_due(
+                rows,
+                MAX_TAIL_ROWS * 3 / 4,
+                Some(Duration::ZERO)
+            ));
+        }
     }
 
     #[test]
@@ -1565,6 +1623,66 @@ mod tests {
     }
 
     #[test]
+    fn ann_topk_matches_exact_merge_with_updates_tombstones_and_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = test_reader(
+            temp.path(),
+            30,
+            &["a", "b", "c", "d"],
+            &[
+                vec![1.0, 0.0],
+                vec![0.0, 1.0],
+                vec![0.8, 0.6],
+                vec![0.6, 0.8],
+            ],
+        );
+        let tail = vec![
+            DerivedAnnTailRow {
+                subject_key: "a".to_string(),
+                vector: Some(vec![0.2, 0.98]),
+            },
+            DerivedAnnTailRow {
+                subject_key: "b".to_string(),
+                vector: Some(vec![1.0, 0.0]),
+            },
+            DerivedAnnTailRow {
+                subject_key: "c".to_string(),
+                vector: None,
+            },
+            DerivedAnnTailRow {
+                subject_key: "new-z".to_string(),
+                vector: Some(vec![0.9, 0.44]),
+            },
+            DerivedAnnTailRow {
+                subject_key: "new-a".to_string(),
+                vector: Some(vec![0.9, 0.44]),
+            },
+        ];
+        for k in [1, 2, 3, 10] {
+            let actual = ann_candidates(&reader, &tail, &[1.0, 0.0], k, None).unwrap();
+            let expected = exact_candidates(&reader, &tail, &[1.0, 0.0], k, None).unwrap();
+            assert_eq!(actual, expected);
+        }
+        let keys: Vec<_> = ann_candidates(&reader, &tail, &[1.0, 0.0], 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.subject_key)
+            .collect();
+        assert_eq!(keys, ["b", "new-a", "new-z", "d", "a"]);
+    }
+
+    #[test]
+    fn ann_stops_before_searching_an_expired_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = test_reader(temp.path(), 31, &["a"], &[vec![1.0, 0.0]]);
+        assert_eq!(
+            ann_candidates(&reader, &[], &[1.0, 0.0], 1, Some(Instant::now())).unwrap_err(),
+            "query_deadline_exceeded_during_ann"
+        );
+    }
+
+
+    #[test]
     fn disarm_prevents_an_old_startup_token_from_installing() {
         let temp = tempfile::tempdir().unwrap();
         let storage = test_storage(temp.path());
@@ -1669,8 +1787,10 @@ mod tests {
         let query_storage = storage.clone();
         let query = std::thread::spawn(move || {
             let (reader, tail) = query_state
-                .generation_snapshot_with_tail(&query_storage, |covered_epoch| {
-                    tail_started_tx.send(covered_epoch).unwrap();
+                .generation_snapshot_with_tail(&query_storage, |generation| {
+                    tail_started_tx
+                        .send(generation.manifest.covered_epoch)
+                        .unwrap();
                     release_tail_rx.recv().unwrap();
                     Ok(vec![DerivedAnnTailRow {
                         subject_key: "new".to_string(),
@@ -1842,6 +1962,7 @@ mod tests {
             },
             flat,
             data_dir: temp.path().to_path_buf(),
+            tail_cache: query_snapshot::TailCache::default(),
             index,
             _ann_map: ann_map,
             _ann_file: file,

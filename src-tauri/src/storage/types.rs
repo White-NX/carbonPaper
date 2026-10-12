@@ -244,8 +244,6 @@ pub(super) struct RawScreenshotRow {
     pub(super) created_at: String,
     pub(super) source: Option<String>,
     pub(super) page_url_enc: Option<Vec<u8>>,
-    pub(super) page_icon_enc: Option<Vec<u8>>,
-    pub(super) visible_links_enc: Option<Vec<u8>>,
     // Dedup table references (from LEFT JOIN)
     pub(super) page_icon_ref_enc: Option<Vec<u8>>,
     pub(super) page_icon_ref_key: Option<Vec<u8>>,
@@ -290,48 +288,14 @@ impl RawScreenshotRow {
                 .and_then(|v| String::from_utf8(v).ok()),
             _ => None,
         };
-        let page_icon = match (self.page_icon_enc.as_ref(), row_key.as_ref()) {
-            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                .ok()
-                .and_then(|v| String::from_utf8(v).ok()),
-            _ => None,
-        }
-        .or_else(|| {
-            // Fall back to dedup table data
-            match (
-                self.page_icon_ref_enc.as_ref(),
-                self.page_icon_ref_key.as_ref(),
-            ) {
-                (Some(data), Some(key)) => {
-                    let dedup_row_key = decrypt_row_key_with_cng(credential, key).ok()?;
-                    let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
-                    String::from_utf8(decrypted).ok()
-                }
-                _ => None,
-            }
-        });
-        let visible_links = match (self.visible_links_enc.as_ref(), row_key.as_ref()) {
-            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                .ok()
-                .and_then(|v| String::from_utf8(v).ok())
-                .and_then(|s| serde_json::from_str::<Vec<VisibleLink>>(&s).ok()),
-            _ => None,
-        }
-        .or_else(|| {
-            // Fall back to dedup table data
-            match (
-                self.link_set_ref_enc.as_ref(),
-                self.link_set_ref_key.as_ref(),
-            ) {
-                (Some(data), Some(key)) => {
-                    let dedup_row_key = decrypt_row_key_with_cng(credential, key).ok()?;
-                    let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
-                    let s = String::from_utf8(decrypted).ok()?;
-                    serde_json::from_str::<Vec<VisibleLink>>(&s).ok()
-                }
-                _ => None,
-            }
-        });
+        let decrypt_shared = |data: Option<Vec<u8>>, key: Option<Vec<u8>>| -> Option<String> {
+            let key = zeroize::Zeroizing::new(decrypt_row_key_with_cng(credential, &key?).ok()?);
+            let decrypted = decrypt_with_master_key(&key, &data?).ok()?;
+            String::from_utf8(decrypted).ok()
+        };
+        let page_icon = decrypt_shared(self.page_icon_ref_enc, self.page_icon_ref_key);
+        let visible_links = decrypt_shared(self.link_set_ref_enc, self.link_set_ref_key)
+            .and_then(|value| serde_json::from_str::<Vec<VisibleLink>>(&value).ok());
 
         if let Some(ref mut key) = row_key {
             StorageState::zeroize_bytes(key);
@@ -380,15 +344,13 @@ impl RawScreenshotRow {
             created_at: row.get(13)?,
             source: row.get(14)?,
             page_url_enc: row.get(15)?,
-            page_icon_enc: row.get(16)?,
-            visible_links_enc: row.get(17)?,
-            // Dedup table references from LEFT JOIN (columns 18-21)
-            page_icon_ref_enc: row.get(18)?,
-            page_icon_ref_key: row.get(19)?,
-            link_set_ref_enc: row.get(20)?,
-            link_set_ref_key: row.get(21)?,
-            category: row.get(22)?,
-            category_confidence: row.get(23)?,
+            // Dedup table references from LEFT JOIN (columns 16-19)
+            page_icon_ref_enc: row.get(16)?,
+            page_icon_ref_key: row.get(17)?,
+            link_set_ref_enc: row.get(18)?,
+            link_set_ref_key: row.get(19)?,
+            category: row.get(20)?,
+            category_confidence: row.get(21)?,
         })
     }
 }

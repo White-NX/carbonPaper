@@ -7,6 +7,7 @@
 //! examples. New snapshots are evaluated in a background worker; matches
 //! above the threshold are recorded in `smart_cluster_assignments`.
 
+use crate::task_error::TaskError;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -340,10 +341,10 @@ impl StorageState {
         &self,
         generation: u64,
         ids: &[i64],
-    ) -> Result<Vec<(i64, Option<i64>)>, String> {
+    ) -> Result<Vec<(i64, Option<i64>)>, TaskError> {
         let guard = self.get_connection_named("archive_scoring_source_revisions")?;
         if self.db_generation() != generation {
-            return Err("background_paused: database changed".into());
+            return Err(TaskError::Paused("database_changed"));
         }
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         ids.iter()
@@ -373,13 +374,13 @@ impl StorageState {
         targets: &[SmartClusterScoringTarget],
         assignments: &[(i64, i64, f64)],
         execution: Option<&crate::background_policy::ExecutionLease>,
-    ) -> Result<(u64, u64), String> {
+    ) -> Result<(u64, u64), TaskError> {
         let guard = self.get_connection_named("commit_archive_scoring_group")?;
         if let Some(execution) = execution {
             execution.check()?;
         }
         if self.db_generation() != generation {
-            return Err("background_paused: database changed".into());
+            return Err(TaskError::Paused("database_changed"));
         }
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -390,14 +391,14 @@ impl StorageState {
                 .zip(targets)
                 .all(|(a, b)| a.same_scoring_configuration(b))
         {
-            return Err("background_paused: smart cluster configuration changed".into());
+            return Err(TaskError::Paused("smart_cluster_configuration_changed"));
         }
         for (id, revision) in revisions {
             let current: Option<i64> = tx.query_row("SELECT COALESCE(r.revision,0) FROM screenshots s
                 LEFT JOIN screenshot_processing_revisions r ON r.screenshot_id=s.id WHERE s.id=?1 AND s.is_deleted=0", [id], |r| r.get(0))
                 .optional().map_err(|e| e.to_string())?;
             if current != *revision {
-                return Err("background_paused: scoring source changed".into());
+                return Err(TaskError::Paused("scoring_source_changed"));
             }
         }
         for (cluster, id, score) in assignments {
@@ -1452,7 +1453,7 @@ mod tests {
         assert!(storage
             .commit_archive_scoring_group(generation, &revisions, &targets, &assignments, None)
             .unwrap_err()
-            .contains("source changed"));
+            .is_pause());
         assert_eq!(storage.count_smart_cluster_pending().unwrap(), 2);
         let assigned: i64 = storage
             .db
@@ -1491,7 +1492,7 @@ mod tests {
         assert!(storage
             .commit_archive_scoring_group(generation, &revisions, &empty_targets, &[], None)
             .unwrap_err()
-            .contains("configuration changed"));
+            .is_pause());
         let current = storage.list_smart_cluster_scoring_targets().unwrap();
         let lease = crate::background_policy::ExecutionLease::new(
             "smart_cluster",
@@ -1502,12 +1503,12 @@ mod tests {
         assert!(storage
             .commit_archive_scoring_group(generation, &revisions, &current, &[], Some(&lease))
             .unwrap_err()
-            .contains("foreground_request"));
+            .is_pause());
         storage.bump_db_generation();
         assert!(storage
             .commit_archive_scoring_group(generation, &revisions, &current, &[], None)
             .unwrap_err()
-            .contains("database changed"));
+            .is_pause());
         assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
     }
 
@@ -1540,7 +1541,7 @@ mod tests {
         assert!(storage
             .commit_archive_scoring_group(generation, &revisions, &[], &[], None)
             .unwrap_err()
-            .contains("source changed"));
+            .is_pause());
         assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
     }
 

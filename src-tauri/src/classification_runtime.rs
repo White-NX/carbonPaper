@@ -220,7 +220,7 @@ async fn embed_bge_chunks(
                         "foreground_busy: BGE classification yielded after a foreground query arrived: {error}"
                     )
                 } else {
-                    error
+                    error.to_string()
                 }
             })?;
 

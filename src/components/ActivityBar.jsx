@@ -6,7 +6,7 @@ const NAV_ITEMS = [
   { id: 'preview', icon: Layout, i18nKey: 'activityBar.preview' },
   { id: 'advanced-search', icon: SearchIcon, i18nKey: 'activityBar.advancedSearch' },
   { id: 'recap', icon: CalendarDays, i18nKey: 'recap.title' },
-  { id: 'smart-cluster', icon: Sparkles, i18nKey: 'activityBar.smartCluster', fallback: '智能聚类' },
+  { id: 'smart-cluster', icon: Sparkles, i18nKey: 'activityBar.smartCluster' },
 ];
 
 export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggleExpand }) {
@@ -20,13 +20,9 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
     >
       {/* Navigation icons */}
       <nav className="flex-1 flex flex-col pt-1">
-        {NAV_ITEMS.map(({ id, icon: Icon, i18nKey, fallback }) => {
+        {NAV_ITEMS.map(({ id, icon: Icon, i18nKey }) => {
           const isActive = activeTab === id;
-          const label = (() => {
-            const translated = t(i18nKey);
-            // i18next returns the key itself when missing — fall back to provided text
-            return translated === i18nKey && fallback ? fallback : translated;
-          })();
+          const label = t(i18nKey);
           return (
             <button
               key={id}

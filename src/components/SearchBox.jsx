@@ -104,7 +104,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <button
                     onClick={handleCancelCluster}
                     className="relative z-10 p-1 mr-2 text-rose-500 hover:text-rose-600 transition-colors shrink-0"
-                    title={t('search.task.stopTooltip', '停止处理智能聚类')}
+                    title={t('search.task.stopTooltip')}
                 >
                     <Square size={14} fill="currentColor" />
                 </button>
@@ -196,7 +196,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                     onClick={handleCancelCluster}
                                     className="px-2.5 py-1 bg-rose-500 hover:bg-rose-600 text-white rounded text-xs transition-colors font-medium shrink-0"
                                 >
-                                    {t('search.task.stop', '停止')}
+                                    {t('search.task.stop')}
                                 </button>
                             )}
                         </div>
@@ -266,7 +266,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                             className="shrink-0 flex items-center gap-2 px-3.5 py-2.5 bg-ide-panel hover:bg-ide-hover border-t border-ide-border text-xs text-ide-muted hover:text-ide-text transition-colors cursor-pointer text-left w-full select-none group"
                         >
                             <CornerDownLeft size={13} className="text-ide-muted group-hover:text-ide-accent transition-colors shrink-0" />
-                            <span className="truncate">{t('search.pressEnterToViewMore', '按下 [Enter] 查看更多结果')}</span>
+                            <span className="truncate">{t('search.pressEnterToViewMore')}</span>
                         </button>
                     )}
                 </div>

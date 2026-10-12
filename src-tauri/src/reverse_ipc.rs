@@ -18,12 +18,11 @@ use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::Security::GetTokenInformation;
 use windows::Win32::Security::{
     InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Holds pre-built security descriptor and ACL buffers whose addresses are referenced
 /// by the SECURITY_ATTRIBUTES pointer fields. Bundling them in a struct guarantees
@@ -36,20 +35,12 @@ struct PipeSecurityContext {
 
 /// Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe.
 fn get_security_context() -> Result<PipeSecurityContext, String> {
-    // SAFETY: `token_handle` is writable output storage; on success this function owns
-    // the process-token handle and closes it exactly once after the inner helper returns.
-    unsafe {
-        let mut token_handle = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
-            .map_err(|e| format!("OpenProcessToken failed: {}", e))?;
-
-        let result = get_security_context_inner(token_handle);
-        let _ = windows::Win32::Foundation::CloseHandle(token_handle);
-        result
-    }
+    let token = crate::windows_platform::current_process_token()
+        .map_err(|error| format!("OpenProcessToken failed: {error}"))?;
+    get_security_context_inner(token.0)
 }
 
-/// Inner helper so that `?` returns to `get_security_context` which always closes token_handle.
+/// The caller owns the token through the complete security-context query.
 fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContext, String> {
     // SAFETY: `token_handle` is live for this call; queried buffer sizes determine every
     // allocation, SID/ACL pointers refer into owned buffers retained by the returned
@@ -125,39 +116,16 @@ fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContex
 
 /// Return whether `pid` is `expected_ancestor_pid` or a bounded-depth descendant.
 fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
-    };
     if pid == expected_ancestor_pid {
         return true;
     }
-
-    let mut parent_by_pid = std::collections::HashMap::<u32, u32>::new();
-    // SAFETY: the snapshot handle is checked before use, `PROCESSENTRY32.dwSize` is set as
-    // required, and the owned snapshot is closed after synchronous enumeration.
-    unsafe {
-        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            Ok(snapshot) => snapshot,
-            Err(_) => return false,
-        };
-        let mut entry = PROCESSENTRY32 {
-            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
-            ..std::mem::zeroed()
-        };
-        if Process32First(snapshot, &mut entry).is_ok() {
-            loop {
-                parent_by_pid.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-                if Process32Next(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-    }
+    let Some(processes) = crate::windows_platform::process_tree() else {
+        return false;
+    };
 
     let mut current = pid;
     for _ in 0..8 {
-        let Some(parent) = parent_by_pid.get(&current).copied() else {
+        let Some(parent) = processes.get(&current).map(|(parent, _)| *parent) else {
             return false;
         };
         if parent == expected_ancestor_pid {
@@ -187,67 +155,14 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 // NMH Pipe Server
 
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 /// Compute deterministic NMH pipe name from current user's Windows SID.
 /// Both CarbonPaper and carbonpaper-nmh.exe use this same formula.
 pub fn compute_nmh_pipe_name() -> Result<String, String> {
-    let sid = get_current_user_sid()?;
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}carbonpaper_nmh_salt", sid));
-    let hash = hasher.finalize();
-    let hex_hash = hex::encode(hash);
-    Ok(format!(r"\\.\pipe\carbon_nmh_{}", &hex_hash[..16]))
-}
-
-/// Get the current user's SID string via Windows API
-fn get_current_user_sid() -> Result<String, String> {
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    // SAFETY: token and SID buffers are allocated from sizes returned by Windows; all
-    // handles and `LocalAlloc` strings are released once, and every output pointer refers
-    // to live writable storage for the duration of its synchronous call.
-    unsafe {
-        let mut token_handle = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
-            .map_err(|e| format!("OpenProcessToken failed: {}", e))?;
-
-        // Get required buffer size
-        let mut return_length = 0u32;
-        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
-
-        let mut buffer = vec![0u8; return_length as usize];
-        GetTokenInformation(
-            token_handle,
-            TokenUser,
-            Some(buffer.as_mut_ptr() as *mut _),
-            return_length,
-            &mut return_length,
-        )
-        .map_err(|e| format!("GetTokenInformation failed: {}", e))?;
-
-        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
-        let mut sid_string = PWSTR::null();
-        ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
-            .map_err(|e| format!("ConvertSidToStringSid failed: {}", e))?;
-
-        let result = sid_string
-            .to_string()
-            .map_err(|e| format!("SID string conversion failed: {}", e))?;
-
-        // Free the allocated string
-        windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(
-            sid_string.0 as *mut _,
-        ));
-        let _ = windows::Win32::Foundation::CloseHandle(token_handle);
-
-        Ok(result)
-    }
+    Ok(crate::nmh_protocol::pipe_name(
+        &crate::windows_platform::current_user_sid()?,
+    ))
 }
 
 /// Generate a random 32-byte auth token and write it to the data dir.
@@ -853,34 +768,7 @@ fn select_session<'a>(
         .max_by_key(|s| s.last_seen_ms)
 }
 
-/// Query the full executable path of a process by PID (empty on failure).
-fn query_process_image_path(pid: u32) -> Option<String> {
-    use windows::core::PWSTR;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    // SAFETY: the process handle is checked and owned locally; the UTF-16 buffer and size
-    // pointer are valid for the query, and the handle is closed exactly once.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let result = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut size,
-        );
-        let _ = windows::Win32::Foundation::CloseHandle(handle);
-        if result.is_ok() && size > 0 {
-            Some(String::from_utf16_lossy(&buf[..size as usize]))
-        } else {
-            None
-        }
-    }
-}
+use crate::windows_platform::process_image_path as query_process_image_path;
 
 /// Drop sessions whose browser process is gone, or whose PID now belongs to
 /// a different executable (PID-reuse guard).

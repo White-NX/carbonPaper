@@ -9,6 +9,31 @@ use std::time::{Duration, Instant};
 /// Keep lock waits bounded and explicit on every connection.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Interrupt synchronous SQLite work at a query's deadline, including scans
+/// that have not yielded their first row. Never leave a handler on a reused
+/// connection after returning to its owner.
+pub(super) struct QueryDeadline<'a> {
+    conn: &'a Connection,
+    deadline: Option<Instant>,
+}
+
+impl<'a> QueryDeadline<'a> {
+    pub(super) fn install(conn: &'a Connection, deadline: Option<Instant>) -> Result<Self> {
+        if let Some(deadline) = deadline {
+            conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+        }
+        Ok(Self { conn, deadline })
+    }
+}
+
+impl Drop for QueryDeadline<'_> {
+    fn drop(&mut self) {
+        if self.deadline.is_some() {
+            let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
+        }
+    }
+}
+
 /// Keep SQLite's normal automatic checkpoint policy explicit across the
 /// bundled primary and independent connections.
 pub(crate) const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
@@ -866,6 +891,27 @@ mod tests {
             "connection must close before maintenance is admitted"
         );
         assert!(gate.try_write("after_close").is_some());
+    }
+
+    #[test]
+    fn query_deadline_interrupts_sql_and_is_cleared_before_connection_reuse() {
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000)
+                   SELECT sum(x) FROM n";
+        {
+            let _guard = QueryDeadline::install(&conn, Some(Instant::now())).unwrap();
+            let error = conn
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::OperationInterrupted)
+            );
+        }
+        assert_eq!(
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap(),
+            50_005_000
+        );
     }
 
     #[test]

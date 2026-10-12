@@ -487,7 +487,7 @@ export default function SnapshotPreviewDock({
 
   if (!tabs?.length || !activeTab || !resolvedActiveKey) return null;
 
-  const processName = record.process_name || activeTab.process_name || activeTab.metadata?.process_name || t('advancedSearch.unknown', 'Unknown');
+  const processName = record.process_name || activeTab.process_name || activeTab.metadata?.process_name || t('advancedSearch.unknown');
   const rawWindowTitle = record.window_title || activeTab.window_title || activeTab.metadata?.window_title || null;
   const windowTitle = rawWindowTitle || '—';
   const displayTitle = rawWindowTitle || processName;

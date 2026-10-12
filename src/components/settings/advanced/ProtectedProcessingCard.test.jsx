@@ -4,7 +4,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ProtectedProcessingCard from './ProtectedProcessingCard';
 import { getAppBoundStatus, installAppBound, setAppBoundPolicy, uninstallAppBound } from '../../../lib/app_bound_api';
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (_key, fallback) => fallback }) }));
+vi.mock('react-i18next', async () => {
+  const { createInstance } = await import('i18next');
+  const { default: translation } = await import('../../../i18n/locales/zh-CN.json');
+  const i18n = createInstance();
+  await i18n.init({ lng: 'zh-CN', resources: { 'zh-CN': { translation } } });
+  const t = i18n.getFixedT('zh-CN');
+  return { useTranslation: () => ({ t }) };
+});
 vi.mock('../../../lib/app_bound_api', async (importOriginal) => ({
   ...await importOriginal(), getAppBoundStatus: vi.fn(), installAppBound: vi.fn(), setAppBoundPolicy: vi.fn(), uninstallAppBound: vi.fn(),
 }));

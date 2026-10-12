@@ -1,5 +1,6 @@
 //! Persistent inputs for newly captured work. This module never unwraps archive
 //! row keys and never changes CredentialManagerState's archive authorization.
+use crate::task_error::{TaskError, TaskResult};
 use crate::{
     background_scheduler::{AutomaticSliceContext, EnvironmentPolicy, ScheduledSliceResult},
     ml_protocol::{MlImageInput, MlSemanticModel},
@@ -857,28 +858,35 @@ impl ProcessingStaging {
         Ok(())
     }
 
-    pub fn check_receipt(&self, receipt: &TaskReceipt) -> Result<(), String> {
+    pub fn check_receipt(&self, receipt: &TaskReceipt) -> TaskResult<()> {
         if !self.available() {
-            return Err(BrokerError::Disabled.to_string());
+            return Err(BrokerError::Disabled.into());
         }
         {
             let issued = self.issued.lock().map_err(|_| "staging lock poisoned")?;
             let Some(original) = issued.get(&receipt.lease_id) else {
-                return Err(BrokerError::LeaseExpired.to_string());
+                return Err(BrokerError::LeaseExpired.into());
             };
             if original.receipt != *receipt {
-                return Err(BrokerError::AccessDenied.to_string());
+                return Err(BrokerError::AccessDenied.into());
             }
             if original.deadline <= protocol::now_secs() {
-                return Err(BrokerError::LeaseExpired.to_string());
+                return Err(BrokerError::LeaseExpired.into());
             }
         }
-        self.with_store(|s| {
-            if s.generation!=receipt.db_generation || s.dataset_id!=receipt.dataset_id { return Err("staging generation changed".into()); }
-            let valid:bool=s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_work w JOIN staged_inputs i USING(task_id) WHERE w.task_id=?1 AND w.consumer=?2
-                AND w.state='processing' AND w.lease_id=?3 AND w.deadline>?4 AND i.state='active')",params![receipt.task_id,receipt.consumer.bit(),receipt.lease_id,protocol::now_secs()],|r|r.get(0)).map_err(|e|e.to_string())?;
-            if valid { Ok(()) } else { Err(BrokerError::LeaseExpired.to_string()) }
-        })
+        let (same_generation, valid) = self.with_store(|s| {
+            let same_generation = s.generation == receipt.db_generation && s.dataset_id == receipt.dataset_id;
+            let valid = s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_work w JOIN staged_inputs i USING(task_id) WHERE w.task_id=?1 AND w.consumer=?2
+                AND w.state='processing' AND w.lease_id=?3 AND w.deadline>?4 AND i.state='active')", params![receipt.task_id, receipt.consumer.bit(), receipt.lease_id, protocol::now_secs()], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())?;
+            Ok((same_generation, valid))
+        })?;
+        if !same_generation {
+            return Err(TaskError::Paused("staging_generation_changed"));
+        }
+        if !valid {
+            return Err(BrokerError::LeaseExpired.into());
+        }
+        Ok(())
     }
 
     fn renew_live_leases(&self) -> Result<(), String> {
@@ -1381,7 +1389,7 @@ pub(crate) async fn run_model_slice(
     app: &AppHandle,
     consumer: Consumer,
     quantum: Option<&AutomaticSliceContext>,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut processed = 0u64;
@@ -1425,8 +1433,7 @@ pub(crate) async fn run_model_slice(
                 .await;
             }
             Err(error) => {
-                let deferred =
-                    error.starts_with("deferred:") || crate::background_policy::is_pause(&error);
+                let deferred = error.is_pause();
                 let release_storage = storage.clone();
                 let receipt = work.receipt.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -1436,7 +1443,7 @@ pub(crate) async fn run_model_slice(
                 })
                 .await;
                 if !deferred {
-                    return Err("Staged model processing failed".into());
+                    return Err(error);
                 }
                 break;
             }
@@ -1453,7 +1460,7 @@ async fn encode_staged(
     storage: &Arc<StorageState>,
     semantic: &Arc<SemanticRuntimeState>,
     work: &StagedWork,
-) -> Result<(), String> {
+) -> Result<(), TaskError> {
     crate::background_policy::check_current()?;
     let input = &work.input;
     let (spec, text) = match work.receipt.consumer {
@@ -1474,7 +1481,7 @@ async fn encode_staged(
         }
     };
     if !storage.staged_source_is_current(&work.receipt)? {
-        return Err("deferred: source changed".into());
+        return Err(TaskError::Paused("staged_source_changed"));
     }
     if let Some(existing) =
         storage.get_query_visible_embedding(spec.index_kind, &spec.subject_key)?
@@ -1484,17 +1491,15 @@ async fn encode_staged(
         }
     }
     storage.ensure_derived_index_job(&spec)?;
-    let lease_token = storage
-        .mark_derived_index_job_processing(&spec)
-        .map_err(|_| "deferred: derived job busy")?;
+    let lease_token = storage.mark_derived_index_job_processing(&spec)?;
     let result = async {
         let _worker = crate::semantic_runtime::BACKGROUND_PASS_GUARD
             .try_lock()
-            .map_err(|_| "deferred: model busy")?;
+            .map_err(|_| TaskError::Paused("semantic_worker_busy"))?;
         if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::Automatic)
             .is_some()
         {
-            return Err("deferred: user active".into());
+            return Err(TaskError::Paused("user_active"));
         }
         let embedded = if let Some(text) = &text {
             semantic
@@ -1553,7 +1558,7 @@ async fn encode_staged(
             },
             &work.receipt,
         )?;
-        Ok::<_, String>(())
+        Ok::<_, TaskError>(())
     }
     .await;
     match result {

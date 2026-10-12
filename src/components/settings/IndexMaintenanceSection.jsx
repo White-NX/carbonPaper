@@ -4,6 +4,7 @@ import { Loader2 } from 'lucide-react';
 import { SemanticBackendCard, ClipBackendCard } from './advanced/InferenceCards';
 import { SettingsDisclosure, SettingsDivider, SettingsRow, SettingsStatus } from './SettingsPrimitives';
 import { SettingsButton } from './SettingsControls';
+import { ProgressBlock } from '../overlay/ProgressBlock';
 
 export default function IndexMaintenanceSection({ controller: r }) {
   const { t } = useTranslation();
@@ -25,6 +26,20 @@ export default function IndexMaintenanceSection({ controller: r }) {
         indexRunning={r.clipIndexRunning} indexPhase={r.clipIndexPhase} indexRetryAt={r.clipIndexRetryAt} indexStopping={r.clipIndexStopping}
         indexProgress={r.clipIndexProgress} indexRun={r.clipIndexRun} indexError={r.clipIndexError} backfill={r.clipBackfill} backfillBusy={r.clipBackfillBusy} onBackfillDecision={r.handleClipBackfillDecision} />
     </SettingsDisclosure>
+    {(r.thumbnailWarmup?.running || r.thumbnailWarmup?.cancel_requested || r.thumbnailWarmupError) && <>
+      <SettingsDivider />
+      <SettingsRow label={t('settings.maintenance.thumbnails.title')} description={t('settings.maintenance.thumbnails.description')}
+        control={<SettingsButton onClick={r.handleThumbnailWarmup}
+          disabled={r.thumbnailWarmupBusy || (r.thumbnailWarmup?.running && r.thumbnailWarmup.cancel_requested)}>
+          {t(r.thumbnailWarmup?.running ? 'settings.maintenance.thumbnails.stop' : 'settings.maintenance.thumbnails.resume')}
+        </SettingsButton>}>
+        {r.thumbnailWarmup?.running
+          ? <ProgressBlock current={r.thumbnailWarmup.processed} total={r.thumbnailWarmup.total}
+            label={t(r.thumbnailWarmup.cancel_requested ? 'settings.maintenance.thumbnails.stopping' : 'settings.maintenance.thumbnails.running')} />
+          : r.thumbnailWarmup?.cancel_requested && <SettingsStatus>{t('settings.maintenance.thumbnails.stopped')}</SettingsStatus>}
+        {r.thumbnailWarmupError && <SettingsStatus tone="error">{r.thumbnailWarmupError}</SettingsStatus>}
+      </SettingsRow>
+    </>}
     <SettingsDivider />
     <SettingsRow label={t('settings.advanced.vacuum.label')} description={t('settings.advanced.vacuum.description')}
       control={<SettingsButton onClick={r.handleManualVacuum} disabled={r.vacuumRunning}

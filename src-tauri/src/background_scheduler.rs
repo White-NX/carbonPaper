@@ -9,6 +9,7 @@ use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{BackgroundTaskState, DerivedIndexKind, StorageState};
+use crate::task_error::TaskError;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -801,7 +802,7 @@ async fn execute_slice(
     kind: BackgroundTaskKind,
     manual: bool,
     automatic_context: Option<&AutomaticSliceContext>,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     // A queued row can outlive a settings change. Check every dispatch path,
     // including automatic model quanta, before loading a model. Explicit
     // maintenance remains available when disabled.
@@ -1175,7 +1176,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 runtime.wake.notify_one();
             }
             Err(error) => {
-                if background_policy::is_pause(&error) {
+                if error.is_pause() {
                     let _ = storage.defer_background_task(
                         kind.as_str(),
                         now_ms().saturating_add(250),
@@ -1190,10 +1191,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                     processed,
                     started.elapsed().as_millis(),
                 );
-                let normalized = error.to_ascii_lowercase();
-                if normalized.contains("auth_required")
-                    || normalized.contains("authentication required")
-                {
+                if matches!(error, TaskError::AuthenticationRequired) {
                     // CredentialManagerState records native CNG denials at the
                     // failed unwrap. A task's generic AUTH_REQUIRED must not
                     // revoke read access for an otherwise authenticated app.
@@ -1244,7 +1242,11 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         },
                     );
                     let terminal_failed = storage
-                        .mark_background_task_terminal_failure(kind.as_str(), failures, &error)
+                        .mark_background_task_terminal_failure(
+                            kind.as_str(),
+                            failures,
+                            &error.to_string(),
+                        )
                         .unwrap_or(false);
                     *runtime
                         .blocked_reason
@@ -1290,15 +1292,17 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 .unwrap_or_else(|| {
                     now_ms().saturating_add(retry_delay(failures).as_millis() as i64)
                 });
-                let _ =
-                    storage.mark_background_task_failed(kind.as_str(), failures, retry_at, &error);
+                let _ = storage.mark_background_task_failed(
+                    kind.as_str(),
+                    failures,
+                    retry_at,
+                    &error.to_string(),
+                );
                 if kind == BackgroundTaskKind::SmartCluster && manual {
                     let worker =
                         app.state::<Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>();
                     worker.record_scheduled_failure(&app, false);
                 }
-                if !normalized.contains("monitor_unavailable")
-                    && !normalized.contains("monitor not started")
                 {
                     *runtime
                         .blocked_reason
@@ -1565,21 +1569,30 @@ mod tests {
     #[test]
     fn smart_cluster_failure_policy_opens_on_deterministic_errors_or_budget() {
         let mismatch = crate::smart_cluster_scoring::scheduled_failure_policy(
-            "model_mismatch: reranker returned 3 scores",
+            &TaskError::worker(
+                crate::ml_protocol::MlErrorKind::ModelMismatch,
+                "reranker returned 3 scores",
+            ),
             1,
         );
         assert_eq!(mismatch.code, "model_mismatch");
         assert!(mismatch.terminal);
 
         let first = crate::smart_cluster_scoring::scheduled_failure_policy(
-            "rerank_failed: worker returned an inference error",
+            &TaskError::worker(
+                crate::ml_protocol::MlErrorKind::Inference,
+                "worker returned an inference error",
+            ),
             1,
         );
         assert_eq!(first.code, "inference_failed");
         assert!(!first.terminal);
 
         let exhausted = crate::smart_cluster_scoring::scheduled_failure_policy(
-            "rerank_failed: worker returned an inference error",
+            &TaskError::worker(
+                crate::ml_protocol::MlErrorKind::Inference,
+                "worker returned an inference error",
+            ),
             crate::smart_cluster_scoring::MAX_SCHEDULED_FAILURES,
         );
         assert!(exhausted.terminal);

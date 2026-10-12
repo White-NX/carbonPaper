@@ -1,13 +1,14 @@
 //! Resumable ANN task. Frozen input, files and complete graph checkpoints each
 //! have their own commit boundary; queries keep using the previous generation.
 use super::*;
-use crate::ann_protocol::{AnnReply, AnnRequest, ANN_WORKER_PROTOCOL};
+use crate::ann_protocol::{AnnErrorKind, AnnReply, AnnRequest, ANN_WORKER_PROTOCOL};
 use crate::background_policy::{
     self as policy, CostKey, CostSample, ExecutionProfile, IO_BYTES_PER_SECOND, IO_CHUNK_BYTES,
 };
 use crate::background_resources::{process_usage, set_cpu_rate};
 use crate::background_scheduler::{BackgroundSchedulerState, ScheduledSliceResult, TASK_ANN_BUILD};
 use crate::storage::{AnnBuildCheckpoint, AnnCheckpointFile};
+use crate::task_error::TaskError;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::process::ChildStdin;
@@ -37,7 +38,7 @@ impl BuildWorker {
     pub(super) fn expired(&self) -> bool {
         self.last_used.elapsed() >= Duration::from_secs(300)
     }
-    fn spawn(app: &AppHandle, generation: u64, db_generation: u64) -> Result<Self, String> {
+    fn spawn(app: &AppHandle, generation: u64, db_generation: u64) -> Result<Self, TaskError> {
         let child = Command::new(resolve_ml_executable(app)?)
             .arg("--ann-session")
             .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
@@ -84,11 +85,11 @@ impl BuildWorker {
             last_used: Instant::now(),
         })
     }
-    fn write(&mut self, request: &AnnRequest) -> Result<(), String> {
+    fn write(&mut self, request: &AnnRequest) -> Result<(), TaskError> {
         serde_json::to_writer(&mut self.stdin, request).map_err(|e| e.to_string())?;
         writeln!(self.stdin)
             .and_then(|_| self.stdin.flush())
-            .map_err(|e| e.to_string())
+            .map_err(|e| TaskError::from(e.to_string()))
     }
 
     async fn request(
@@ -97,7 +98,7 @@ impl BuildWorker {
         state: &AnnBuildCheckpoint,
         open: bool,
         directory: &Path,
-    ) -> Result<AnnReply, String> {
+    ) -> Result<AnnReply, TaskError> {
         policy::check_current()?;
         let lease = policy::current_execution();
         let background = lease
@@ -135,7 +136,7 @@ impl BuildWorker {
         let baseline = before_usage.map_or(0, |u| u.private_bytes);
         let mut peak = baseline;
         let started = Instant::now();
-        let mut cancelled: Option<(Instant, String)> = None;
+        let mut cancelled: Option<(Instant, TaskError)> = None;
         let reply = loop {
             if let Some(usage) = process_usage(HANDLE(self.child.as_raw_handle())) {
                 peak = peak.max(usage.peak_since(before_usage));
@@ -155,7 +156,7 @@ impl BuildWorker {
                         if let Some(lease) = &lease {
                             lease.revoke("cost_overrun");
                         }
-                        Some("background_paused: ANN cost overrun".into())
+                        Some(TaskError::Paused("ANN_cost_overrun"))
                     } else if started.elapsed() > Duration::from_secs(300) {
                         Some("ANN builder failed: stage watchdog expired".into())
                     } else {
@@ -183,7 +184,13 @@ impl BuildWorker {
             return Err(error);
         }
         if let Some(error) = &reply.error {
-            return Err(error.clone());
+            return Err(match reply.error_kind {
+                Some(AnnErrorKind::Paused) => TaskError::Paused("ann_worker_paused"),
+                Some(AnnErrorKind::InvalidCheckpoint) => {
+                    TaskError::InvalidCheckpoint(error.clone())
+                }
+                _ => TaskError::Failed(error.clone()),
+            });
         }
         if let Some(lease) = &lease {
             for sample in &reply.samples {
@@ -230,7 +237,7 @@ fn check_checkpoint_name(state: &AnnBuildCheckpoint, name: &str) -> bool {
         && !name.contains(['/', '\\', ':'])
 }
 
-fn header(state: &AnnBuildCheckpoint) -> Result<Header, String> {
+fn header(state: &AnnBuildCheckpoint) -> Result<Header, TaskError> {
     Header::for_snapshot(
         state.generation,
         state.covered_epoch,
@@ -242,9 +249,10 @@ fn header(state: &AnnBuildCheckpoint) -> Result<Header, String> {
         expansion_search(state.frozen_rows as usize) as u32,
         state.key_bytes,
     )
+    .map_err(Into::into)
 }
 
-async fn io_rest(bytes: u64) -> Result<(), String> {
+async fn io_rest(bytes: u64) -> Result<(), TaskError> {
     if policy::is_background() {
         let until =
             Instant::now() + Duration::from_secs_f64(bytes as f64 / IO_BYTES_PER_SECOND as f64);
@@ -265,7 +273,7 @@ fn materialize_page(
     storage: &StorageState,
     state: &mut AnnBuildCheckpoint,
     directory: &Path,
-) -> Result<u64, String> {
+) -> Result<u64, TaskError> {
     let path = directory.join(format!(".{}.partial", state.flat_name()));
     let h = header(state)?;
     if state.materialized_rows > 0 && !path.exists() {
@@ -295,7 +303,7 @@ fn materialize_page(
                 storage.save_ann_build_checkpoint(state)?;
                 return Ok(0);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     };
     let page = storage.frozen_ann_page(state, state.materialized_rows, 64)?;
@@ -323,7 +331,7 @@ fn materialize_page(
     Ok(bytes)
 }
 
-async fn hash_file(path: &Path) -> Result<String, String> {
+async fn hash_file(path: &Path) -> Result<String, TaskError> {
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
     let mut bytes = vec![0u8; IO_CHUNK_BYTES];
@@ -339,7 +347,7 @@ async fn hash_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-async fn digest_matches(path: &Path, expected: Option<&str>) -> Result<bool, String> {
+async fn digest_matches(path: &Path, expected: Option<&str>) -> Result<bool, TaskError> {
     if !path.is_file() || expected.is_none() {
         return Ok(false);
     }
@@ -351,7 +359,7 @@ async fn digest_matches(path: &Path, expected: Option<&str>) -> Result<bool, Str
 async fn recover_publication(
     state: &mut AnnBuildCheckpoint,
     directory: &Path,
-) -> Result<bool, String> {
+) -> Result<bool, TaskError> {
     if !digest_matches(
         &directory.join(state.flat_name()),
         state.flat_checksum.as_deref(),
@@ -382,7 +390,7 @@ async fn recover_publication(
     Ok(true)
 }
 
-fn manifest(state: &AnnBuildCheckpoint) -> Result<DerivedAnnGeneration, String> {
+fn manifest(state: &AnnBuildCheckpoint) -> Result<DerivedAnnGeneration, TaskError> {
     Ok(DerivedAnnGeneration {
         index_kind: DerivedIndexKind::ClipImage,
         generation: state.generation,
@@ -420,7 +428,7 @@ fn manifest(state: &AnnBuildCheckpoint) -> Result<DerivedAnnGeneration, String> 
 pub(crate) async fn run_scheduled_slice(
     app: &AppHandle,
     manual: bool,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let deadline = Instant::now() + Duration::from_secs(1800);
     loop {
         let result = run_unit(app, manual).await?;
@@ -444,7 +452,7 @@ fn wait_for_idle() -> ScheduledSliceResult {
     ScheduledSliceResult::skipped("waiting_for_idle")
 }
 
-async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult, String> {
+async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult, TaskError> {
     if !enabled() {
         return Ok(ScheduledSliceResult::skipped("disabled"));
     }
@@ -466,7 +474,7 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
     let db_generation = storage.db_generation();
     let dataset = storage.processing_dataset_id()?;
     let mut state = match storage.ann_build_checkpoint() {
-        Err(error) if error.starts_with("invalid ANN checkpoint metadata:") => None,
+        Err(error) if matches!(error, TaskError::InvalidCheckpoint(_)) => None,
         result => result?,
     };
     let contract = format!("{CLIP_VECTOR_SPACE_REVISION}:{ANN_IMPLEMENTATION_VERSION}:{FORMAT_VERSION}:{ANN_WORKER_PROTOCOL}");
@@ -567,9 +575,9 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     policy::check_current()?;
     if storage.db_generation() != db_generation {
-        return Err("background_paused: database changed".into());
+        return Err(TaskError::Paused("database_changed"));
     }
-    let result: Result<ScheduledSliceResult, String> = async {
+    let result: Result<ScheduledSliceResult, TaskError> = async {
         match state.phase.as_str() {
             "freeze" => {
                 storage
@@ -649,7 +657,7 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                         // scratch buffer. Recreate the worker from a complete
                         // checkpoint; the authoritative frozen rows survive.
                         slot.take();
-                        if error.contains("checkpoint") && !policy::is_pause(&error) {
+                        if matches!(error, TaskError::InvalidCheckpoint(_)) && !error.is_pause() {
                             state.complete = state.previous.take();
                             storage.save_ann_build_checkpoint(&state)?;
                             return Ok(ScheduledSliceResult::skipped("checkpoint_recovery"));
@@ -770,14 +778,14 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                 if storage.db_generation() != db_generation
                     || storage.processing_dataset_id()? != state.dataset_id
                 {
-                    return Err("background_paused: database changed".into());
+                    return Err(TaskError::Paused("database_changed"));
                 }
                 if !ann.publish_from_lifecycle(
                     lifecycle,
                     &storage,
                     PreparedGeneration::new(reader),
                 )? {
-                    return Err("background_paused: ANN lifecycle changed".into());
+                    return Err(TaskError::Paused("ANN_lifecycle_changed"));
                 }
                 state.phase = "cleanup".into();
                 storage.save_ann_build_checkpoint(&state)?;
@@ -796,8 +804,8 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
     }
     .await;
     if let Err(error) = &result {
-        if !policy::is_pause(error) {
-            record_ann_build_failure(app, &storage, &ann, lifecycle, error)?;
+        if !error.is_pause() {
+            record_ann_build_failure(app, &storage, &ann, lifecycle, &error.to_string())?;
         }
     }
     result

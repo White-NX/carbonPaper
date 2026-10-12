@@ -266,31 +266,6 @@ pub async fn get_nm_host_status() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub async fn register_nm_host_chrome(
-    window: tauri::Window,
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-) -> Result<(), String> {
-    crate::settings_window::check_settings_ui(&window)?;
-    crate::commands::check_auth_required(&credential_state)?;
-
-    // Use wildcard for allowed_origins to support any extension ID during development
-    let manifest_path = write_nm_manifest(&[EXTENSION_ID])?;
-    register_nm_host(CHROME_REG_KEY, &manifest_path)
-}
-
-#[tauri::command]
-pub async fn register_nm_host_edge(
-    window: tauri::Window,
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-) -> Result<(), String> {
-    crate::settings_window::check_settings_ui(&window)?;
-    crate::commands::check_auth_required(&credential_state)?;
-
-    let manifest_path = write_nm_manifest(&[EXTENSION_ID])?;
-    register_nm_host(EDGE_REG_KEY, &manifest_path)
-}
-
-#[tauri::command]
 pub async fn install_browser_extension(
     window: tauri::Window,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -406,9 +381,4 @@ fn open_browser_extensions_page(browser: &str, url: &str) {
         "Could not find {} browser executable, skipping extensions page open",
         browser
     );
-}
-
-#[tauri::command]
-pub async fn sync_extension_if_needed() -> Result<bool, String> {
-    sync_installed_extension()
 }

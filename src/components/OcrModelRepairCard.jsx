@@ -66,7 +66,7 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
       onClose={repairing ? () => {} : onClose}
       disableClose={repairing}
       hideCloseButton={repairing}
-      title={t('ocrModelRepair.title', 'OCR 模型修复')}
+      title={t('ocrModelRepair.title')}
       maxWidth="max-w-xl"
     >
       <div className="p-6 space-y-5">
@@ -78,13 +78,13 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
             <div>
               <h2 className="text-base font-semibold text-ide-text">
                 {installed
-                  ? t('ocrModelRepair.ready', 'OCR 模型已就绪')
-                  : t('ocrModelRepair.missing', 'OCR 当前不可用')}
+                  ? t('ocrModelRepair.ready')
+                  : t('ocrModelRepair.missing')}
               </h2>
               <p className="text-sm text-ide-muted mt-2 leading-relaxed">
                 {installed
-                  ? t('ocrModelRepair.readyDescription', '新的截图将恢复生成 OCR 文本。')
-                  : t('ocrModelRepair.description', 'CarbonPaper 会继续保存截图，修复 Rust OCR 模型后即可恢复生成 OCR 文本。')}
+                  ? t('ocrModelRepair.readyDescription')
+                  : t('ocrModelRepair.description')}
               </p>
             </div>
           </div>
@@ -93,7 +93,7 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
         {!installed && (
           <div className="space-y-3">
             <p className="text-sm text-ide-text">
-              {t('ocrModelRepair.noAuth', '修复不需要解锁。下载完成后会校验文件大小和 SHA-256，下一次 OCR 会自动载入新模型。')}
+              {t('ocrModelRepair.noAuth')}
             </p>
             {modelStatus?.path && (
               <p className="text-xs text-ide-muted break-all">{modelStatus.path}</p>
@@ -101,7 +101,7 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
             {repairing && (
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-ide-muted">
-                  <span>{progress?.file || t('ocrModelRepair.preparing', '正在准备下载…')}</span>
+                  <span>{progress?.file || t('ocrModelRepair.preparing')}</span>
                   <span>
                     {progress?.asset_index && progress?.asset_count
                       ? `${progress.asset_index}/${progress.asset_count}${percent == null ? '' : ` · ${percent}%`}`
@@ -122,7 +122,7 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
         {checking && (
           <div className="flex items-center gap-2 text-sm text-ide-muted">
             <Loader2 className="w-4 h-4 animate-spin" />
-            {t('ocrModelRepair.checking', '正在检查模型状态…')}
+            {t('ocrModelRepair.checking')}
           </div>
         )}
 
@@ -138,7 +138,7 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
             disabled={repairing}
             className="px-4 py-2 rounded border border-ide-border text-sm text-ide-text hover:bg-ide-hover disabled:opacity-50"
           >
-            {installed ? t('ocrModelRepair.close', '关闭') : t('ocrModelRepair.later', '稍后处理')}
+            {installed ? t('ocrModelRepair.close') : t('ocrModelRepair.later')}
           </button>
           {!installed && (
             <button
@@ -150,8 +150,8 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
                 ? <Loader2 className="w-4 h-4 animate-spin" />
                 : <Download className="w-4 h-4" />}
               {repairing
-                ? t('ocrModelRepair.repairing', '正在修复…')
-                : t('ocrModelRepair.repair', '立即修复模型')}
+                ? t('ocrModelRepair.repairing')
+                : t('ocrModelRepair.repair')}
             </button>
           )}
         </div>

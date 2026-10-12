@@ -12,14 +12,17 @@
 //!   - Named Pipe (data): v2 frame (4-byte LE length prefix + JSON)
 //!   - Named Pipe (cmd):  CarbonPaper connects here to request captures
 
-use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const IPC_PROTOCOL_VERSION: u32 = 2;
-const IPC_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+#[path = "../nmh_protocol.rs"]
+mod nmh_protocol;
+#[cfg(windows)]
+#[path = "../windows_platform.rs"]
+mod windows_platform;
+use nmh_protocol::IPC_PROTOCOL_VERSION;
 
 /// The browser main process that (indirectly) spawned this NMH.
 #[derive(Clone, Debug)]
@@ -428,43 +431,19 @@ fn handle_message(
     }
 }
 
-fn write_pipe_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
-    if body.len() > IPC_MAX_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "IPC request too large: {} bytes (max {})",
-                body.len(),
-                IPC_MAX_MESSAGE_BYTES
-            ),
-        ));
-    }
-
-    writer.write_all(&(body.len() as u32).to_le_bytes())?;
+fn write_pipe_frame(writer: &mut impl Write, body: &[u8]) -> io::Result<()> {
+    writer.write_all(&nmh_protocol::frame_prefix(body.len())?)?;
     writer.write_all(body)
 }
 
-fn read_pipe_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > IPC_MAX_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Invalid IPC v{} frame length: {} (max {})",
-                IPC_PROTOCOL_VERSION, len, IPC_MAX_MESSAGE_BYTES
-            ),
-        ));
-    }
-
-    let mut body = vec![0u8; len];
+fn read_pipe_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut prefix = [0u8; 4];
+    reader.read_exact(&mut prefix)?;
+    let mut body = vec![0u8; nmh_protocol::frame_length(prefix)?];
     reader.read_exact(&mut body)?;
     Ok(body)
 }
 
-/// Send a JSON request to the Named Pipe and read the response
 fn send_to_pipe(pipe_name: &str, request: &serde_json::Value) -> serde_json::Value {
     use std::fs::OpenOptions;
 
@@ -510,15 +489,8 @@ fn send_to_pipe(pipe_name: &str, request: &serde_json::Value) -> serde_json::Val
     }
 }
 
-/// Compute deterministic NMH pipe name from current user's Windows SID.
-/// Must match the formula in reverse_ipc.rs.
 fn compute_nmh_pipe_name() -> Result<String, String> {
-    let sid = get_current_user_sid()?;
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}carbonpaper_nmh_salt", sid));
-    let hash = hasher.finalize();
-    let hex_hash = hex::encode(hash);
-    Ok(format!(r"\\.\pipe\carbon_nmh_{}", &hex_hash[..16]))
+    Ok(nmh_protocol::pipe_name(&get_current_user_sid()?))
 }
 
 /// Windows Chromium browsers launch native messaging hosts through
@@ -558,73 +530,9 @@ fn select_browser_ancestor(ancestors: &[(u32, String)]) -> Option<(u32, String)>
 fn detect_browser() -> Option<BrowserInfo> {
     #[cfg(windows)]
     {
-        use std::collections::HashMap;
-        use std::mem;
-
-        extern "system" {
-            fn GetCurrentProcessId() -> u32;
-        }
-
-        extern "system" {
-            fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut std::ffi::c_void;
-            fn Process32FirstW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W)
-                -> i32;
-            fn Process32NextW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
-            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-        }
-
-        const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-
-        #[repr(C)]
-        struct ProcessEntry32W {
-            dw_size: u32,
-            cnt_usage: u32,
-            th32_process_id: u32,
-            th32_default_heap_id: usize,
-            th32_module_id: u32,
-            cnt_threads: u32,
-            th32_parent_process_id: u32,
-            pc_pri_class_base: i32,
-            dw_flags: u32,
-            sz_exe_file: [u16; 260],
-        }
-
-        // SAFETY: the Toolhelp snapshot is checked before use, the local structure layout
-        // matches PROCESSENTRY32W and has `dw_size` initialized, and the snapshot handle
-        // is closed after synchronous enumeration.
-        unsafe {
-            let current_pid = GetCurrentProcessId();
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
-                return None;
-            }
-
-            // Build a map of pid -> (parent_pid, exe_name) for all processes
-            let mut process_map: HashMap<u32, (u32, String)> = HashMap::new();
-            let mut entry: ProcessEntry32W = mem::zeroed();
-            entry.dw_size = mem::size_of::<ProcessEntry32W>() as u32;
-
-            if Process32FirstW(snapshot, &mut entry) != 0 {
-                loop {
-                    let len = entry
-                        .sz_exe_file
-                        .iter()
-                        .position(|&c| c == 0)
-                        .unwrap_or(260);
-                    let name = String::from_utf16_lossy(&entry.sz_exe_file[..len]).to_lowercase();
-                    process_map.insert(entry.th32_process_id, (entry.th32_parent_process_id, name));
-
-                    entry = mem::zeroed();
-                    entry.dw_size = mem::size_of::<ProcessEntry32W>() as u32;
-                    if Process32NextW(snapshot, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-
-            CloseHandle(snapshot);
-
+        let process_map = windows_platform::process_tree()?;
+        {
+            let current_pid = std::process::id();
             // Collect the ancestor chain (excluding this NMH process itself)
             let mut ancestors: Vec<(u32, String)> = Vec::new();
             let mut pid = current_pid;
@@ -662,42 +570,8 @@ fn detect_browser() -> Option<BrowserInfo> {
     }
 }
 
-/// Query the full executable path of a process by PID.
 #[cfg(windows)]
-fn query_process_image_path(pid: u32) -> Option<String> {
-    use std::ffi::c_void;
-
-    extern "system" {
-        fn OpenProcess(desired_access: u32, inherit_handle: i32, pid: u32) -> *mut c_void;
-        fn QueryFullProcessImageNameW(
-            process: *mut c_void,
-            flags: u32,
-            exe_name: *mut u16,
-            size: *mut u32,
-        ) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-
-    // SAFETY: the process handle is checked and owned locally; the UTF-16 output buffer
-    // and size pointer are valid for the synchronous query, then the handle is closed.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return None;
-        }
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
-        if ok != 0 && size > 0 {
-            Some(String::from_utf16_lossy(&buf[..size as usize]))
-        } else {
-            None
-        }
-    }
-}
+use windows_platform::process_image_path as query_process_image_path;
 
 /// Start the command pipe thread that listens for capture requests from the main app.
 /// When a `request_capture` command arrives, it forwards a `capture_request` message
@@ -722,210 +596,134 @@ const CMD_PIPE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// the cancel call). Cancelling when no I/O is pending is a harmless no-op.
 #[cfg(windows)]
 fn with_pipe_io_timeout<T>(
-    pipe: *mut std::ffi::c_void,
+    pipe: windows::Win32::Foundation::HANDLE,
     timeout: std::time::Duration,
     op: impl FnOnce() -> T,
 ) -> T {
-    extern "system" {
-        fn CancelIoEx(file: *mut std::ffi::c_void, overlapped: *const std::ffi::c_void) -> i32;
-    }
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let pipe_addr = pipe as usize;
-    let watchdog = std::thread::spawn(move || {
-        if done_rx.recv_timeout(timeout).is_err() {
-            // SAFETY: the pipe handle outlives this thread (joined below) and
-            // a null OVERLAPPED cancels all pending I/O on the handle.
-            unsafe {
-                CancelIoEx(pipe_addr as *mut std::ffi::c_void, std::ptr::null());
+    let pipe_addr = pipe.0 as usize;
+    // The scoped watchdog joins on both normal return and unwind, before the
+    // caller can release the pipe's RAII handle.
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        scope.spawn(move || {
+            if done_rx.recv_timeout(timeout).is_err() {
+                // SAFETY: the caller's pipe outlives this scope; no OVERLAPPED
+                // pointer asks Windows to cancel all pending I/O on the handle.
+                unsafe {
+                    let _ = windows::Win32::System::IO::CancelIoEx(
+                        windows::Win32::Foundation::HANDLE(pipe_addr as *mut _),
+                        None,
+                    );
+                }
             }
-        }
-    });
-    let result = op();
-    let _ = done_tx.send(());
-    let _ = watchdog.join();
-    result
+        });
+        let result = op();
+        let _ = done_tx.send(());
+        result
+    })
 }
 
 /// Run the synchronous command pipe server loop using Win32 API.
 #[cfg(windows)]
 fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>>) {
-    use std::ffi::c_void;
-    use std::ptr;
-
-    // Win32 Named Pipe API
-    extern "system" {
-        fn CreateNamedPipeW(
-            name: *const u16,
-            open_mode: u32,
-            pipe_mode: u32,
-            max_instances: u32,
-            out_buffer_size: u32,
-            in_buffer_size: u32,
-            default_timeout: u32,
-            security_attributes: *const c_void,
-        ) -> *mut c_void;
-        fn ConnectNamedPipe(pipe: *mut c_void, overlapped: *const c_void) -> i32;
-        fn ReadFile(
-            file: *mut c_void,
-            buffer: *mut u8,
-            bytes_to_read: u32,
-            bytes_read: *mut u32,
-            overlapped: *const c_void,
-        ) -> i32;
-        fn WriteFile(
-            file: *mut c_void,
-            buffer: *const u8,
-            bytes_to_write: u32,
-            bytes_written: *mut u32,
-            overlapped: *const c_void,
-        ) -> i32;
-        fn FlushFileBuffers(file: *mut c_void) -> i32;
-        fn DisconnectNamedPipe(pipe: *mut c_void) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-
-    const PIPE_ACCESS_DUPLEX: u32 = 0x00000003;
-    const PIPE_TYPE_BYTE: u32 = 0x00000000;
-    const PIPE_READMODE_BYTE: u32 = 0x00000000;
-    const PIPE_WAIT: u32 = 0x00000000;
-    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
-    const ERROR_PIPE_CONNECTED: u32 = 535;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED};
+    use windows::Win32::Storage::FileSystem::{
+        FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+    };
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
 
     let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut create_failure_reported = false;
-
     loop {
-        // Create a new pipe instance
-        // SAFETY: `wide_name` is NUL-terminated and remains live; null security attributes
-        // request Windows defaults, and the returned handle is owned by this loop.
-        let pipe = unsafe {
+        // SAFETY: the pipe name is NUL-terminated and live. Default security
+        // attributes retain the host's existing access policy.
+        let raw = unsafe {
             CreateNamedPipeW(
-                wide_name.as_ptr(),
+                PCWSTR(wide_name.as_ptr()),
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,    // max instances
-                4096, // out buffer
-                4096, // in buffer
-                0,    // default timeout
-                ptr::null(),
+                1,
+                4096,
+                4096,
+                0,
+                None,
             )
         };
-
-        if pipe == INVALID_HANDLE_VALUE || pipe.is_null() {
-            // The name is random per NMH instance, so this is a systemic
-            // failure, not contention. Report it once so it's visible in
-            // the extension console instead of silently retrying forever.
+        if raw.is_invalid() {
             if !create_failure_reported {
                 create_failure_reported = true;
-                // SAFETY: `GetLastError` reads thread-local Win32 state without pointers.
-                let err = unsafe { GetLastError() };
+                // SAFETY: read the error from the immediately preceding Win32 call.
+                let error = unsafe { GetLastError() }.0;
                 send_nm_response(
                     stdout_mutex,
                     &serde_json::json!({
                         "type": "nmh_registration_failed",
-                        "error": format!("Failed to create command pipe (Win32 error {}); capture requests unavailable", err)
+                        "error": format!("Failed to create command pipe (Win32 error {error}); capture requests unavailable")
                     }),
                 );
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         }
+        let pipe = windows_platform::OwnedHandle(raw);
         create_failure_reported = false;
-
-        // Wait for client connection
-        // SAFETY: `pipe` is a live, uniquely owned named-pipe handle; a null OVERLAPPED
-        // pointer selects the synchronous connection mode used when the pipe was created.
-        let connected = unsafe { ConnectNamedPipe(pipe, ptr::null()) };
-        if connected == 0 {
-            // SAFETY: `GetLastError` reads thread-local state for the immediately preceding
-            // failed `ConnectNamedPipe` call.
-            let err = unsafe { GetLastError() };
-            if err != ERROR_PIPE_CONNECTED {
-                // SAFETY: ownership of the live pipe handle remains local on this error
-                // path and is released exactly once.
-                unsafe {
-                    CloseHandle(pipe);
-                }
+        // SAFETY: the owned handle is live; no OVERLAPPED selects blocking I/O.
+        if let Err(error) = unsafe { ConnectNamedPipe(pipe.0, None) } {
+            if error.code() != ERROR_PIPE_CONNECTED.to_hresult() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
         }
 
-        // Read request from the command pipe, bounded so a client that
-        // connects but never writes cannot wedge the single-instance pipe.
-        let mut buf = vec![0u8; 4096];
-        let mut bytes_read: u32 = 0;
-        // SAFETY: `pipe` is connected and live; `buf` is uniquely writable for its full
-        // advertised length and `bytes_read` is valid output storage.
-        let read_ok = with_pipe_io_timeout(pipe, CMD_PIPE_IO_TIMEOUT, || unsafe {
-            ReadFile(
-                pipe,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                &mut bytes_read,
-                ptr::null(),
-            )
+        let mut buffer = [0u8; 4096];
+        let mut bytes_read = 0u32;
+        // SAFETY: the connected pipe and writable output buffers outlive the I/O.
+        let read = with_pipe_io_timeout(pipe.0, CMD_PIPE_IO_TIMEOUT, || unsafe {
+            ReadFile(pipe.0, Some(&mut buffer), Some(&mut bytes_read), None)
         });
-
-        if read_ok != 0 && bytes_read > 0 {
-            let request_str = String::from_utf8_lossy(&buf[..bytes_read as usize]);
-
-            if let Ok(req) = serde_json::from_str::<serde_json::Value>(&request_str) {
-                let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
-
-                if command == "request_capture" {
-                    // Forward capture request to extension via stdout NM protocol.
-                    // Only report success to the main app if the stdout write
-                    // actually succeeded — a closed NM port means the extension
-                    // can't capture, and the app should fall back to normal
-                    // screen capture for this frame.
-                    let nm_msg = serde_json::json!({"type": "capture_request"});
-                    let data = serde_json::to_vec(&nm_msg).unwrap_or_default();
-                    let len = (data.len() as u32).to_le_bytes();
-
-                    let forward_result: io::Result<()> = {
-                        let mut handle = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                        handle
-                            .write_all(&len)
-                            .and_then(|_| handle.write_all(&data))
-                            .and_then(|_| handle.flush())
+        if read.is_ok() && bytes_read > 0 {
+            if let Ok(request) =
+                serde_json::from_slice::<serde_json::Value>(&buffer[..bytes_read as usize])
+            {
+                if request.get("command").and_then(|value| value.as_str())
+                    == Some("request_capture")
+                {
+                    let data = serde_json::to_vec(&serde_json::json!({"type": "capture_request"}))
+                        .unwrap_or_default();
+                    let forwarded = {
+                        let mut stdout = stdout_mutex
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        stdout
+                            .write_all(&(data.len() as u32).to_le_bytes())
+                            .and_then(|_| stdout.write_all(&data))
+                            .and_then(|_| stdout.flush())
                     };
-
-                    let response = match forward_result {
+                    let response = match forwarded {
                         Ok(()) => serde_json::json!({"status": "ok", "forwarded": true}),
-                        Err(e) => serde_json::json!({
+                        Err(error) => serde_json::json!({
                             "status": "error",
-                            "error": format!("Failed to forward capture request to extension: {}", e)
+                            "error": format!("Failed to forward capture request to extension: {error}")
                         }),
                     };
-                    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                    let mut written: u32 = 0;
-                    // SAFETY: the pipe is connected; the response slice is live for the
-                    // synchronous write and `written` is valid output storage. The flush
-                    // blocks until the client reads the response, so it shares the same
-                    // watchdog bound as the write.
-                    with_pipe_io_timeout(pipe, CMD_PIPE_IO_TIMEOUT, || unsafe {
-                        WriteFile(
-                            pipe,
-                            response_bytes.as_ptr(),
-                            response_bytes.len() as u32,
-                            &mut written,
-                            ptr::null(),
-                        );
-                        FlushFileBuffers(pipe);
+                    let bytes = serde_json::to_vec(&response).unwrap_or_default();
+                    let mut written = 0u32;
+                    // SAFETY: pipe and bytes remain live until the scoped I/O
+                    // watchdog joins; flushing is bounded by the same timeout.
+                    with_pipe_io_timeout(pipe.0, CMD_PIPE_IO_TIMEOUT, || unsafe {
+                        let _ = WriteFile(pipe.0, Some(&bytes), Some(&mut written), None);
+                        let _ = FlushFileBuffers(pipe.0);
                     });
                 }
             }
         }
-
-        // Disconnect and loop to accept next connection
-        // SAFETY: this loop still uniquely owns the live pipe handle; disconnect happens
-        // before the single closing call and no later code reuses the handle.
+        // SAFETY: disconnect before the owned handle drops; the watchdog has joined.
         unsafe {
-            DisconnectNamedPipe(pipe);
-            CloseHandle(pipe);
+            let _ = DisconnectNamedPipe(pipe.0);
         }
     }
 }
@@ -935,94 +733,11 @@ fn run_command_pipe_server(_pipe_name: &str, _stdout_mutex: &Arc<Mutex<io::Stdou
     // NMH command pipe is only supported on Windows
 }
 
-/// Get the current user's SID string via Windows API
 fn get_current_user_sid() -> Result<String, String> {
     #[cfg(windows)]
     {
-        use std::ptr;
-
-        // Use Win32 API directly through std::os::windows
-        extern "system" {
-            fn GetCurrentProcess() -> *mut std::ffi::c_void;
-            fn OpenProcessToken(
-                process_handle: *mut std::ffi::c_void,
-                desired_access: u32,
-                token_handle: *mut *mut std::ffi::c_void,
-            ) -> i32;
-            fn GetTokenInformation(
-                token_handle: *mut std::ffi::c_void,
-                token_information_class: u32,
-                token_information: *mut u8,
-                token_information_length: u32,
-                return_length: *mut u32,
-            ) -> i32;
-            fn ConvertSidToStringSidW(sid: *const u8, string_sid: *mut *mut u16) -> i32;
-            fn LocalFree(hmem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-        }
-
-        const TOKEN_QUERY: u32 = 0x0008;
-        const TOKEN_USER_INFO: u32 = 1; // TokenUser
-
-        // SAFETY: buffer lengths are obtained from Windows, token and allocated SID-string
-        // handles are released exactly once, and all pointers target live writable storage
-        // for the duration of synchronous Win32 calls.
-        unsafe {
-            let process = GetCurrentProcess();
-            let mut token: *mut std::ffi::c_void = ptr::null_mut();
-            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
-                return Err("OpenProcessToken failed".into());
-            }
-
-            let mut return_length: u32 = 0;
-            GetTokenInformation(
-                token,
-                TOKEN_USER_INFO,
-                ptr::null_mut(),
-                0,
-                &mut return_length,
-            );
-
-            let mut buffer = vec![0u8; return_length as usize];
-            if GetTokenInformation(
-                token,
-                TOKEN_USER_INFO,
-                buffer.as_mut_ptr(),
-                return_length,
-                &mut return_length,
-            ) == 0
-            {
-                CloseHandle(token);
-                return Err("GetTokenInformation failed".into());
-            }
-
-            // TOKEN_USER struct: first field is SID_AND_ATTRIBUTES which starts with a pointer to SID
-            let sid_ptr = *(buffer.as_ptr() as *const *const u8);
-
-            let mut string_sid: *mut u16 = ptr::null_mut();
-            if ConvertSidToStringSidW(sid_ptr, &mut string_sid) == 0 {
-                CloseHandle(token);
-                return Err("ConvertSidToStringSidW failed".into());
-            }
-
-            // Convert wide string to Rust String
-            let mut len = 0;
-            let mut p = string_sid;
-            while *p != 0 {
-                len += 1;
-                p = p.add(1);
-            }
-            let slice = std::slice::from_raw_parts(string_sid, len);
-            let result = String::from_utf16(slice)
-                .map_err(|e| format!("UTF-16 conversion failed: {}", e))?;
-
-            LocalFree(string_sid as *mut _);
-            CloseHandle(token);
-
-            Ok(result)
-        }
+        windows_platform::current_user_sid()
     }
-
     #[cfg(not(windows))]
     {
         Err("NMH is only supported on Windows".into())
@@ -1053,6 +768,7 @@ fn get_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nmh_protocol::IPC_MAX_MESSAGE_BYTES;
 
     #[test]
     fn test_generate_cmd_pipe_name_format() {

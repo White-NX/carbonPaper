@@ -30,6 +30,7 @@ pub mod error;
 mod error_window;
 mod i18n;
 mod idle;
+mod index_pipeline;
 mod index_progress;
 mod legacy_python_cleanup;
 mod legacy_vector_discard;
@@ -43,13 +44,13 @@ mod mcp_token;
 mod minilm_contract;
 mod minilm_index;
 #[allow(dead_code)]
-mod ml_contracts;
 #[allow(dead_code)]
 mod ml_protocol;
 mod ml_runtime;
 mod model_management;
 mod monitor;
 mod native_messaging;
+mod nmh_protocol;
 mod office_protocol;
 mod office_runtime;
 mod office_window;
@@ -57,6 +58,7 @@ mod onboarding;
 mod pii;
 mod power;
 mod processing_stage;
+mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
 mod registry_config;
 mod rerank;
@@ -72,6 +74,7 @@ mod sensitive_filter;
 mod settings_window;
 mod smart_cluster_scoring;
 mod storage;
+mod task_error;
 mod updater;
 
 use analysis::AnalysisState;
@@ -254,8 +257,8 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     let mut waiting_for_unlock_logged = false;
 
     loop {
-        // Retention and delete-queue work would race the MiniLM migration's
-        // Chroma snapshot; stand still while maintenance mode is active.
+        // Retention and delete-queue work must yield while maintenance owns
+        // the archive and its derived indexes.
         if maintenance::is_active() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
@@ -597,27 +600,14 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let monitor_running = app_handle.state::<MonitorState>().is_running();
-                    let cs = app_handle.state::<Arc<CaptureState>>();
-                    if monitor_running {
-                        if cs.paused.load(Ordering::SeqCst) {
-                            let _ = monitor::resume_monitor_impl(cs, app_handle.clone()).await;
-                        } else {
-                            let _ = monitor::pause_monitor_impl(cs, app_handle.clone()).await;
-                        }
-                    } else {
-                        refresh_tray_menu(&app_handle);
-                    }
+                    let _ =
+                        monitor::control(&app_handle, monitor::MonitorAction::TogglePause).await;
                 });
             }
             MENU_ID_RESTART => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<MonitorState>();
-                    let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::stop_monitor_impl(state, cs, app_handle.clone()).await;
-                    let start_state = app_handle.state::<MonitorState>();
-                    let _ = monitor::start_monitor_impl(start_state, app_handle.clone()).await;
+                    let _ = monitor::control(&app_handle, monitor::MonitorAction::Restart).await;
                 });
             }
             MENU_ID_LIGHTWEIGHT => {
@@ -920,6 +910,9 @@ pub fn run() {
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
+                // Finish preference migrations before exposing runtime controls
+                // or spawning any task that can start an inference worker.
+                commands::utility::migrate_dml_config();
                 ai::recap::start_scheduler(app.handle().clone());
 
                 build_tray(app)?;
@@ -1097,7 +1090,7 @@ pub fn run() {
 
                         // One scheduler arbitrates all four automatic model
                         // tasks. Their business queues remain durable in
-                        // SQLite/Chroma; only admission and slice ordering live
+                        // SQLite; only admission and slice ordering live
                         // in this loop.
                         let scheduler = app
                             .state::<Arc<background_scheduler::BackgroundSchedulerState>>()
@@ -1108,10 +1101,6 @@ pub fn run() {
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
                 }
-
-                // Apply preference migrations before any monitor can spawn a
-                // worker that reads the unified DirectML setting.
-                commands::utility::migrate_dml_config();
 
                 if registry_config::get_bool("game_mode_enabled").unwrap_or(false) {
                     tracing::info!("Restoring game mode monitor on startup");
@@ -1210,9 +1199,7 @@ pub fn run() {
                 {
                     let app_handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
-                        let state = app_handle.state::<MonitorState>();
-                        let app_handle_clone = app_handle.clone();
-                        if let Err(e) = monitor::start_monitor_impl(state, app_handle_clone).await {
+                        if let Err(e) = monitor::control(&app_handle, monitor::MonitorAction::Start).await {
                             tracing::error!("Failed to auto-start monitor: {}", e);
                         }
                     });
@@ -1222,7 +1209,6 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::utility::close_process,
             commands::utility::set_app_language,
             monitor::start_monitor,
             monitor::get_monitor_autostart,
@@ -1249,7 +1235,6 @@ pub fn run() {
             office_runtime::office_resume_document,
             semantic_runtime::get_ml_semantic_status,
             semantic_runtime::get_background_index_progress,
-            semantic_runtime::restart_ml_semantic_worker,
             minilm_index::semantic_index_run_now,
             minilm_index::semantic_index_stop_now,
             clip_index::clip_index_run_now,
@@ -1286,13 +1271,9 @@ pub fn run() {
             commands::storage::storage_soft_delete_screenshots,
             commands::storage::storage_get_delete_queue_status,
             commands::storage::storage_get_index_health,
-            commands::storage::storage_save_screenshot,
             commands::storage::storage_set_policy,
             commands::storage::storage_get_policy,
-            commands::storage::storage_get_public_key,
             commands::storage::storage_compute_link_scores,
-            commands::storage::storage_encrypt_for_chromadb,
-            commands::storage::storage_decrypt_from_chromadb,
             commands::storage::storage_update_category,
             commands::storage::storage_get_categories_from_db,
             commands::storage::storage_batch_get_categories,
@@ -1302,12 +1283,8 @@ pub fn run() {
             commands::migration::storage_run_manual_vacuum,
             commands::migration::storage_check_hmac_migration_status,
             commands::migration::storage_run_hmac_migration,
-            commands::migration::storage_hmac_migration_cancel,
             commands::migration::storage_export_backup,
             commands::migration::storage_import_backup,
-            commands::database_mode::storage_get_database_mode_metadata,
-            commands::database_mode::storage_check_database_mode_eligibility,
-            commands::database_mode::storage_transition_wal_to_delete,
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::ai::ai_get_settings,
@@ -1334,8 +1311,6 @@ pub fn run() {
             commands::mcp::mcp_ack_privacy_warning,
             commands::mcp::mcp_reset_token,
             commands::mcp::mcp_copy_token_to_clipboard,
-            commands::mcp::mcp_get_port,
-            commands::mcp::mcp_set_port,
             commands::mcp::mcp_get_sensitive_filter_config,
             commands::mcp::mcp_set_sensitive_filter_config,
             // 高级配置命令
@@ -1384,10 +1359,7 @@ pub fn run() {
             updater::updater_install,
             // Native messaging commands
             native_messaging::get_nm_host_status,
-            native_messaging::register_nm_host_chrome,
-            native_messaging::register_nm_host_edge,
             native_messaging::install_browser_extension,
-            native_messaging::sync_extension_if_needed,
             onboarding::get_onboarding_state,
             onboarding::complete_onboarding,
             native_messaging::detect_installed_browsers,
@@ -1413,7 +1385,6 @@ pub fn run() {
             commands::smart_cluster::smart_cluster_clear_assignments,
             commands::smart_cluster::smart_cluster_status,
             // Idle / power
-            idle::get_idle_state,
             // Error window commands
             commands::utility::get_log_dir,
             commands::utility::get_critical_errors,
@@ -1421,7 +1392,6 @@ pub fn run() {
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
             commands::utility::hide_to_tray,
-            commands::utility::frontend_log,
             // 轻量模式命令
             commands::utility::switch_to_lightweight_mode,
             commands::utility::switch_to_standard_mode,

@@ -658,12 +658,14 @@ pub fn storage_cancel_thumbnail_warmup(
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
 
-    THUMBNAIL_WARMUP_CANCEL.store(true, Ordering::SeqCst);
     {
         let mut progress = THUMBNAIL_WARMUP_PROGRESS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        progress.cancel_requested = true;
+        if progress.running {
+            THUMBNAIL_WARMUP_CANCEL.store(true, Ordering::SeqCst);
+            progress.cancel_requested = true;
+        }
     }
     Ok(thumbnail_warmup_progress_json())
 }
@@ -909,21 +911,6 @@ pub async fn storage_get_index_health(
     Ok(compose_index_health_response(storage_stats))
 }
 
-/// Persists a screenshot and its metadata from a trusted native producer.
-///
-/// Authentication: required. `request` is `SaveScreenshotRequest`; returns
-/// `SaveScreenshotResponse`. This command is registered for internal/native callers.
-#[tauri::command]
-pub async fn storage_save_screenshot(
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    state: tauri::State<'_, Arc<StorageState>>,
-    request: storage::SaveScreenshotRequest,
-) -> Result<storage::SaveScreenshotResponse, String> {
-    check_auth_required(&credential_state)?;
-
-    state.save_screenshot(&request)
-}
-
 /// Scores visible links using aggregate storage statistics.
 ///
 /// Authentication: not required; input contains link features rather than stored user
@@ -934,21 +921,6 @@ pub async fn storage_compute_link_scores(
     links: Vec<storage::VisibleLink>,
 ) -> Result<Vec<storage::ScoredLink>, String> {
     state.compute_link_scores(&links)
-}
-
-/// Returns the storage encryption public key as standard Base64.
-///
-/// Authentication: not required because the public key cannot decrypt data. Returns a
-/// JSON string for trusted native/browser producers.
-#[tauri::command]
-pub async fn storage_get_public_key(
-    state: tauri::State<'_, Arc<StorageState>>,
-) -> Result<String, String> {
-    let key = state.get_public_key()?;
-    Ok(base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &key,
-    ))
 }
 
 /// Merges and persists a partial storage policy update.
@@ -991,33 +963,6 @@ pub async fn storage_get_policy(
         .map_err(|e| format!("Failed to load policy: {}", e))?;
     redact_policy_for_frontend(&mut policy);
     Ok(policy)
-}
-
-/// Encrypts plaintext for the legacy ChromaDB bridge.
-///
-/// Authentication: not required because only the public-key encryption path is used.
-/// Returns an encoded ciphertext string for the monitor process.
-#[tauri::command]
-pub async fn storage_encrypt_for_chromadb(
-    state: tauri::State<'_, Arc<StorageState>>,
-    plaintext: String,
-) -> Result<String, String> {
-    state.encrypt_for_chromadb(&plaintext)
-}
-
-/// Decrypts a legacy ChromaDB ciphertext.
-///
-/// Authentication: required because this uses private key material. Returns the
-/// plaintext string to the trusted caller.
-#[tauri::command]
-pub async fn storage_decrypt_from_chromadb(
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    state: tauri::State<'_, Arc<StorageState>>,
-    encrypted: String,
-) -> Result<String, String> {
-    check_auth_required(&credential_state)?;
-
-    state.decrypt_from_chromadb(&encrypted)
 }
 
 /// Updates a screenshot category and records durable native learning feedback.

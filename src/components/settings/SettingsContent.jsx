@@ -48,7 +48,7 @@ export default function SettingsContent({
   const pendingSection = useRef(new URLSearchParams(window.location.search).get('section'));
   const c = useSettingsDialogController({ isOpen, activeTab, onRecordsDeleted, t });
   const runtimeActive = isOpen && ['privacy', 'maintenance', 'advanced'].includes(activeTab);
-  const runtime = useAdvancedSectionController({ monitorStatus: c.monitorStatus, t, active: runtimeActive, diagnosticsActive: isOpen && activeTab === 'advanced' });
+  const runtime = useAdvancedSectionController({ monitorStatus: c.monitorStatus, t, active: runtimeActive, diagnosticsActive: isOpen && activeTab === 'advanced', maintenanceActive: isOpen && activeTab === 'maintenance' });
   useSettingsActivity('monitor-control', { busy: restarting || ['loading', 'waiting'].includes(c.monitorStatus) });
   useSettingsActivity('update', { busy: c.downloading });
   const navigate = useCallback((tab, section) => {

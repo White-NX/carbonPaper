@@ -24,14 +24,14 @@ impl Control {
             active.1 = true;
         }
     }
-    fn check(&self) -> Result<(), String> {
+    fn check(&self) -> Result<(), AnnError> {
         if self.0.lock().unwrap().1 {
-            Err("background_paused: ANN request revoked".into())
+            Err(AnnError::Paused("ANN request revoked"))
         } else {
             Ok(())
         }
     }
-    fn throttle(&self, bytes: usize, background: bool) -> Result<(), String> {
+    fn throttle(&self, bytes: usize, background: bool) -> Result<(), AnnError> {
         if background {
             let until = Instant::now() + Duration::from_secs_f64(bytes as f64 / IO_RATE as f64);
             while Instant::now() < until {
@@ -121,9 +121,12 @@ impl Session {
             ..Default::default()
         }
     }
-    fn vector(&self, ordinal: usize) -> Result<Cow<'_, [f32]>, String> {
+    fn vector(&self, ordinal: usize) -> Result<Cow<'_, [f32]>, AnnError> {
         if let Some(mapped) = &self.flat_map {
-            return mapped.vector(ordinal).map(Cow::Borrowed);
+            return mapped
+                .vector(ordinal)
+                .map(Cow::Borrowed)
+                .map_err(Into::into);
         }
         let h = self.header.as_ref().ok_or("ANN flat header missing")?;
         if ordinal >= h.row_count as usize {
@@ -141,12 +144,14 @@ impl Session {
                 .collect(),
         ))
     }
-    fn new_index(&self) -> Result<Index, String> {
-        Index::new(&self.options()).map_err(|e| e.to_string())
+    fn new_index(&self) -> Result<Index, AnnError> {
+        Index::new(&self.options()).map_err(|e| AnnError::from(e.to_string()))
     }
-    fn restore_index(&self, bytes: &[u8], rows: u64) -> Result<Index, String> {
+    fn restore_index(&self, bytes: &[u8], rows: u64) -> Result<Index, AnnError> {
         let index = self.new_index()?;
-        index.load_from_buffer(bytes).map_err(|e| e.to_string())?;
+        index
+            .load_from_buffer(bytes)
+            .map_err(|e| AnnError::InvalidCheckpoint(e.to_string()))?;
         index.change_expansion_search(self.options().expansion_search);
         if index.size() as u64 != rows
             || index.dimensions() != self.options().dimensions
@@ -154,7 +159,9 @@ impl Session {
             || index.scalar_kind() != ScalarKind::I8
             || index.connectivity() != self.options().connectivity
         {
-            return Err("ANN checkpoint contract mismatch".into());
+            return Err(AnnError::InvalidCheckpoint(
+                "ANN checkpoint contract mismatch".into(),
+            ));
         }
         index
             .reserve_capacity_and_threads(self.header.as_ref().unwrap().row_count as usize, 1)
@@ -167,7 +174,7 @@ impl Session {
         background: bool,
         control: &Control,
         reply: &mut AnnReply,
-    ) -> Result<(), String> {
+    ) -> Result<(), AnnError> {
         control.check()?;
         let phase = self.phase;
         let start = Instant::now();
@@ -178,7 +185,7 @@ impl Session {
                 let size = self.flat_path.metadata().map_err(|e| e.to_string())?.len();
                 if size > 64 * 1024 * 1024 {
                     if background {
-                        return Err("background_paused: ANN input exceeds B limit".into());
+                        return Err(AnnError::Paused("ANN input exceeds B limit"));
                     }
                     let flat = MappedFlatIndex::open(&self.flat_path)?;
                     self.header = Some(flat.header.clone());
@@ -226,7 +233,9 @@ impl Session {
                         cpu_ms: (cpu_ms() - checksum_cpu).max(0.0),
                     });
                     if self.expected_checksum.as_deref() != Some(digest.as_str()) {
-                        return Err("ANN checkpoint checksum mismatch".into());
+                        return Err(AnnError::InvalidCheckpoint(
+                            "ANN checkpoint checksum mismatch".into(),
+                        ));
                     }
                     self.phase = if phase == Phase::ReadCheckpoint {
                         Phase::Restore
@@ -283,7 +292,7 @@ impl Session {
                 let index = self.index.as_ref().unwrap();
                 let size = index.serialized_length();
                 if background && size > 64 * 1024 * 1024 {
-                    return Err("background_paused: ANN graph exceeds B limit".into());
+                    return Err(AnnError::Paused("ANN graph exceeds B limit"));
                 }
                 self.graph_bytes.resize(size, 0);
                 index
@@ -390,7 +399,7 @@ impl Session {
     }
 }
 
-fn read_chunk(path: &Path, buffer: &mut Vec<u8>) -> Result<usize, String> {
+fn read_chunk(path: &Path, buffer: &mut Vec<u8>) -> Result<usize, AnnError> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let length = file.metadata().map_err(|e| e.to_string())?.len();
     if length > 1024 * 1024 * 1024 {
@@ -453,6 +462,7 @@ pub fn run() -> Result<(), String> {
             checksum: None,
             samples: Vec::new(),
             error: None,
+            error_kind: None,
         };
         let result = match request {
             AnnRequest::Open {
@@ -476,7 +486,10 @@ pub fn run() -> Result<(), String> {
                 .and_then(|s| s.step(background, &control, &mut reply)),
             AnnRequest::Cancel { .. } => unreachable!(),
         };
-        reply.error = result.err();
+        if let Err(error) = result {
+            reply.error_kind = Some(error.kind());
+            reply.error = Some(error.to_string());
+        }
         serde_json::to_writer(&mut writer, &reply).map_err(|e| e.to_string())?;
         writeln!(writer)
             .and_then(|_| writer.flush())
@@ -535,6 +548,7 @@ mod tests {
             checksum: None,
             samples: Vec::new(),
             error: None,
+            error_kind: None,
         }
     }
 
@@ -658,10 +672,10 @@ mod tests {
         session.step(false, &control, &mut reply()).unwrap(); // insert suffix
         session.step(false, &control, &mut reply()).unwrap(); // serialize scratch
         control.cancel(1);
-        assert!(session
-            .step(false, &control, &mut reply())
-            .unwrap_err()
-            .starts_with("background_paused:"));
+        assert!(matches!(
+            session.step(false, &control, &mut reply()),
+            Err(AnnError::Paused(_))
+        ));
         assert_eq!(
             hex::encode(Sha256::digest(
                 std::fs::read(first.checkpoint.as_ref().unwrap()).unwrap()
@@ -684,6 +698,6 @@ mod tests {
                 break;
             }
         }
-        assert!(failure.unwrap().contains("checksum mismatch"));
+        assert!(matches!(failure, Some(AnnError::InvalidCheckpoint(_))));
     }
 }

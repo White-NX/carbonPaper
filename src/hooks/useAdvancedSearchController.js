@@ -213,6 +213,7 @@ export function useAdvancedSearchController({
         startTime: computeTimestamp(startDate),
         endTime: computeTimestamp(endDate),
         fuzzy: mode !== 'nl',
+        ...(mode === 'nl' ? { includeOcr: false } : {}),
       });
       if (searchIdRef.current !== currentSearchId) return;
 
@@ -311,6 +312,7 @@ export function useAdvancedSearchController({
         startTime: computeTimestamp(startDate),
         endTime: computeTimestamp(endDate),
         fuzzy: mode !== 'nl',
+        ...(mode === 'nl' ? { includeOcr: false } : {}),
       });
       if (searchIdRef.current !== currentSearchId) return;
 

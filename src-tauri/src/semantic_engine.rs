@@ -1,5 +1,6 @@
 //! Batch-capable ONNX semantic inference used only by the isolated ML worker.
 
+use crate::ml_protocol::{MlError, MlErrorKind};
 use crate::ml_protocol::{MlImageInput, MlProvider, MlSemanticModel};
 use crate::semantic_cancellation::RequestControl;
 use crate::semantic_models::{
@@ -119,15 +120,19 @@ impl SemanticEngine {
     pub fn begin_request(&mut self, control: Arc<RequestControl>) {
         self.request_control = Some(control);
     }
-    fn check_request(&self) -> Result<(), String> {
+    fn check_request(&self) -> Result<(), MlError> {
         self.request_control.as_ref().map_or(Ok(()), |c| c.check())
     }
-    pub fn request_error(&self, error: String) -> String {
+    pub fn request_error(&self, error: MlError) -> MlError {
         self.check_request().err().unwrap_or(error)
     }
-    fn run_options(&self) -> Result<Arc<RunOptions>, String> {
+    fn run_options(&self) -> Result<Arc<RunOptions>, MlError> {
         self.request_control.as_ref().map_or_else(
-            || RunOptions::new().map(Arc::new).map_err(|e| e.to_string()),
+            || {
+                RunOptions::new()
+                    .map(Arc::new)
+                    .map_err(|e| MlError::new(MlErrorKind::Inference, e.to_string()))
+            },
             |c| c.run_options(),
         )
     }
@@ -136,9 +141,12 @@ impl SemanticEngine {
         &mut self,
         model: MlSemanticModel,
         texts: &[String],
-    ) -> Result<SemanticInference<Vec<Vec<f32>>>, String> {
+    ) -> Result<SemanticInference<Vec<Vec<f32>>>, MlError> {
         if model == MlSemanticModel::BgeRerankerV2M3 {
-            return Err("invalid_request: reranker does not expose text embeddings".to_string());
+            return Err(MlError::new(
+                MlErrorKind::InvalidRequest,
+                "reranker does not expose text embeddings",
+            ));
         }
         let options = self.run_options()?;
         let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
@@ -171,17 +179,22 @@ impl SemanticEngine {
         model: MlSemanticModel,
         images: &[MlImageInput],
         body: &[u8],
-    ) -> Result<SemanticInference<Vec<Vec<f32>>>, String> {
+    ) -> Result<SemanticInference<Vec<Vec<f32>>>, MlError> {
         if model != MlSemanticModel::ChineseClip {
-            return Err("invalid_request: only Chinese-CLIP accepts image embeddings".to_string());
+            return Err(MlError::new(
+                MlErrorKind::InvalidRequest,
+                "only Chinese-CLIP accepts image embeddings",
+            ));
         }
         let options = self.run_options()?;
         let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
         let loaded = self.loaded.as_mut().expect("semantic model is loaded");
-        let preprocessor = loaded
-            .clip_preprocessor
-            .clone()
-            .ok_or_else(|| "model_mismatch: CLIP preprocessor is unavailable".to_string())?;
+        let preprocessor = loaded.clip_preprocessor.clone().ok_or_else(|| {
+            MlError::new(
+                MlErrorKind::ModelMismatch,
+                "CLIP preprocessor is unavailable",
+            )
+        })?;
 
         let preprocess_started = Instant::now();
         let pixels = preprocess_clip_images(&preprocessor, images, body)?;
@@ -206,9 +219,12 @@ impl SemanticEngine {
         model: MlSemanticModel,
         query: &str,
         documents: &[String],
-    ) -> Result<SemanticInference<Vec<f32>>, String> {
+    ) -> Result<SemanticInference<Vec<f32>>, MlError> {
         if model != MlSemanticModel::BgeRerankerV2M3 {
-            return Err("invalid_request: selected model is not a reranker".to_string());
+            return Err(MlError::new(
+                MlErrorKind::InvalidRequest,
+                "selected model is not a reranker",
+            ));
         }
         let options = self.run_options()?;
         let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
@@ -242,7 +258,7 @@ impl SemanticEngine {
         model: MlSemanticModel,
         texts: &[String],
         text_pairs: Option<&[String]>,
-    ) -> Result<SemanticTokenization, String> {
+    ) -> Result<SemanticTokenization, MlError> {
         self.ensure_loaded(model)?;
         let loaded = self.loaded.as_mut().expect("semantic model is loaded");
         let tokens = match text_pairs {
@@ -263,12 +279,15 @@ impl SemanticEngine {
         })
     }
 
-    fn ensure_loaded(&mut self, model: MlSemanticModel) -> Result<(f64, f64), String> {
+    fn ensure_loaded(&mut self, model: MlSemanticModel) -> Result<(f64, f64), MlError> {
         self.check_request()?;
         if !provider_supports_model(self.provider, model) {
-            return Err(format!(
-                "provider_unavailable: DirectML parity is not approved for {}; retry with CPU",
-                descriptor_label(model)
+            return Err(MlError::new(
+                MlErrorKind::ProviderUnavailable,
+                format!(
+                    "DirectML parity is not approved for {}; retry with CPU",
+                    descriptor_label(model)
+                ),
             ));
         }
         if self
@@ -319,24 +338,30 @@ fn descriptor_label(model: MlSemanticModel) -> &'static str {
     crate::semantic_models::descriptor(model).model_id
 }
 
-fn load_tokenizer(resolved: &ResolvedSemanticModel) -> Result<Tokenizer, String> {
+fn load_tokenizer(resolved: &ResolvedSemanticModel) -> Result<Tokenizer, MlError> {
     let mut tokenizer = Tokenizer::from_file(&resolved.tokenizer_path).map_err(|error| {
-        format!(
-            "model_mismatch: failed to load tokenizer {}: {error}",
-            resolved.tokenizer_path.display()
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!(
+                "failed to load tokenizer {}: {error}",
+                resolved.tokenizer_path.display()
+            ),
         )
     })?;
     tokenizer.with_padding(None);
-    tokenizer
-        .with_truncation(None)
-        .map_err(|error| format!("failed to reset tokenizer truncation: {error}"))?;
+    tokenizer.with_truncation(None).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to reset tokenizer truncation: {error}"),
+        )
+    })?;
     Ok(tokenizer)
 }
 
 fn configure_tokenizer(
     tokenizer: &mut Tokenizer,
     descriptor: &crate::semantic_models::SemanticModelDescriptor,
-) -> Result<(), String> {
+) -> Result<(), MlError> {
     let pad_id = tokenizer.token_to_id(descriptor.pad_token).unwrap_or(0);
     tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
@@ -351,7 +376,12 @@ fn configure_tokenizer(
             max_length,
             ..Default::default()
         }))
-        .map_err(|error| format!("tokenizer truncation configuration failed: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("tokenizer truncation configuration failed: {error}"),
+            )
+        })?;
     Ok(())
 }
 
@@ -359,11 +389,16 @@ fn tokenize_texts(
     tokenizer: &mut Tokenizer,
     descriptor: &crate::semantic_models::SemanticModelDescriptor,
     texts: &[String],
-) -> Result<TokenizedBatch, String> {
+) -> Result<TokenizedBatch, MlError> {
     configure_tokenizer(tokenizer, descriptor)?;
     let encodings = tokenizer
         .encode_batch(texts.to_vec(), true)
-        .map_err(|error| format!("semantic tokenization failed: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("semantic tokenization failed: {error}"),
+            )
+        })?;
     tokenized_batch(encodings)
 }
 
@@ -372,15 +407,18 @@ fn tokenize_pairs(
     descriptor: &crate::semantic_models::SemanticModelDescriptor,
     query: &str,
     documents: &[String],
-) -> Result<TokenizedBatch, String> {
+) -> Result<TokenizedBatch, MlError> {
     configure_tokenizer(tokenizer, descriptor)?;
     let inputs = documents
         .iter()
         .map(|document| EncodeInput::Dual(query.to_string().into(), document.clone().into()))
         .collect::<Vec<_>>();
-    let encodings = tokenizer
-        .encode_batch(inputs, true)
-        .map_err(|error| format!("reranker pair tokenization failed: {error}"))?;
+    let encodings = tokenizer.encode_batch(inputs, true).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("reranker pair tokenization failed: {error}"),
+        )
+    })?;
     tokenized_batch(encodings)
 }
 
@@ -389,29 +427,38 @@ fn tokenize_pair_lists(
     descriptor: &crate::semantic_models::SemanticModelDescriptor,
     texts: &[String],
     text_pairs: &[String],
-) -> Result<TokenizedBatch, String> {
+) -> Result<TokenizedBatch, MlError> {
     configure_tokenizer(tokenizer, descriptor)?;
     let inputs = texts
         .iter()
         .zip(text_pairs)
         .map(|(text, pair)| EncodeInput::Dual(text.clone().into(), pair.clone().into()))
         .collect::<Vec<_>>();
-    let encodings = tokenizer
-        .encode_batch(inputs, true)
-        .map_err(|error| format!("pair tokenization failed: {error}"))?;
+    let encodings = tokenizer.encode_batch(inputs, true).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("pair tokenization failed: {error}"),
+        )
+    })?;
     tokenized_batch(encodings)
 }
 
-fn tokenized_batch(encodings: Vec<tokenizers::Encoding>) -> Result<TokenizedBatch, String> {
+fn tokenized_batch(encodings: Vec<tokenizers::Encoding>) -> Result<TokenizedBatch, MlError> {
     let batch = encodings.len();
     let sequence = encodings
         .first()
         .map(tokenizers::Encoding::len)
-        .ok_or_else(|| "invalid_request: tokenizer produced an empty batch".to_string())?;
+        .ok_or_else(|| {
+            MlError::new(
+                MlErrorKind::InvalidRequest,
+                "tokenizer produced an empty batch",
+            )
+        })?;
     if sequence == 0 || encodings.iter().any(|encoding| encoding.len() != sequence) {
-        return Err(
-            "model_mismatch: tokenizer did not return a padded rectangular batch".to_string(),
-        );
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            "tokenizer did not return a padded rectangular batch",
+        ));
     }
     let mut input_ids = Vec::with_capacity(batch * sequence);
     let mut attention_mask = Vec::with_capacity(batch * sequence);
@@ -491,7 +538,7 @@ fn load_session(
     resolved: &ResolvedSemanticModel,
     provider: MlProvider,
     dml_device_id: i32,
-) -> Result<Session, String> {
+) -> Result<Session, MlError> {
     let default_optimization = if resolved.descriptor.model == MlSemanticModel::BgeRerankerV2M3 {
         GraphOptimizationLevel::All
     } else {
@@ -519,39 +566,71 @@ fn load_session(
             ep::CPU::default().with_arena_allocator(false).build(),
         ],
     };
-    let builder = Session::builder()
-        .map_err(|error| format!("provider_unavailable: failed to create ONNX session: {error}"))?;
+    let builder = Session::builder().map_err(|error| {
+        MlError::new(
+            MlErrorKind::ProviderUnavailable,
+            format!("failed to create ONNX session: {error}"),
+        )
+    })?;
     let builder = builder
         .with_optimization_level(optimization)
-        .map_err(|error| format!("provider_unavailable: failed to set optimization: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::ProviderUnavailable,
+                format!("failed to set optimization: {error}"),
+            )
+        })?;
     let builder = builder
         .with_intra_threads(intra_threads())
-        .map_err(|error| format!("provider_unavailable: failed to set intra threads: {error}"))?;
-    let builder = builder
-        .with_inter_threads(1)
-        .map_err(|error| format!("provider_unavailable: failed to set inter threads: {error}"))?;
-    let builder = builder
-        .with_parallel_execution(false)
-        .map_err(|error| format!("provider_unavailable: failed to set execution mode: {error}"))?;
-    let builder = builder
-        .with_memory_pattern(false)
-        .map_err(|error| format!("provider_unavailable: failed to set memory pattern: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::ProviderUnavailable,
+                format!("failed to set intra threads: {error}"),
+            )
+        })?;
+    let builder = builder.with_inter_threads(1).map_err(|error| {
+        MlError::new(
+            MlErrorKind::ProviderUnavailable,
+            format!("failed to set inter threads: {error}"),
+        )
+    })?;
+    let builder = builder.with_parallel_execution(false).map_err(|error| {
+        MlError::new(
+            MlErrorKind::ProviderUnavailable,
+            format!("failed to set execution mode: {error}"),
+        )
+    })?;
+    let builder = builder.with_memory_pattern(false).map_err(|error| {
+        MlError::new(
+            MlErrorKind::ProviderUnavailable,
+            format!("failed to set memory pattern: {error}"),
+        )
+    })?;
     // Completed requests must release CPU before their job cap is restored.
     let builder = builder
         .with_config_entry("session.intra_op.allow_spinning", "0")
         .and_then(|builder| builder.with_config_entry("session.inter_op.allow_spinning", "0"))
         .map_err(|error| {
-            format!("provider_unavailable: failed to disable pool spinning: {error}")
+            MlError::new(
+                MlErrorKind::ProviderUnavailable,
+                format!("failed to disable pool spinning: {error}"),
+            )
         })?;
     let builder = builder
         .with_config_entry("session.use_device_allocator_for_initializers", "0")
         .map_err(|error| {
-            format!("provider_unavailable: failed to set allocator policy: {error}")
+            MlError::new(
+                MlErrorKind::ProviderUnavailable,
+                format!("failed to set allocator policy: {error}"),
+            )
         })?;
     let mut builder = builder
         .with_execution_providers(providers)
         .map_err(|error| {
-            format!("provider_unavailable: failed to configure ONNX provider: {error}")
+            MlError::new(
+                MlErrorKind::ProviderUnavailable,
+                format!("failed to configure ONNX provider: {error}"),
+            )
         })?;
 
     let load_mode = std::env::var("CARBONPAPER_ONNX_LOAD_MODE")
@@ -560,24 +639,32 @@ fn load_session(
     if load_mode == "path" {
         builder
             .commit_from_file(&resolved.model_path)
-            .map_err(|error| format!("inference: failed to load ONNX model from path: {error}"))
+            .map_err(|error| {
+                MlError::new(
+                    MlErrorKind::Inference,
+                    format!("failed to load ONNX model from path: {error}"),
+                )
+            })
     } else {
         let bytes = fs::read(&resolved.model_path).map_err(|error| {
-            format!(
-                "model_missing: failed to read {}: {error}",
-                resolved.model_path.display()
+            MlError::new(
+                MlErrorKind::ModelMissing,
+                format!("failed to read {}: {error}", resolved.model_path.display()),
             )
         })?;
-        builder
-            .commit_from_memory(&bytes)
-            .map_err(|error| format!("inference: failed to load ONNX model from memory: {error}"))
+        builder.commit_from_memory(&bytes).map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("failed to load ONNX model from memory: {error}"),
+            )
+        })
     }
 }
 
 fn validate_session_layout(
     session: &Session,
     resolved: &ResolvedSemanticModel,
-) -> Result<(), String> {
+) -> Result<(), MlError> {
     let mut actual_inputs = session
         .inputs()
         .iter()
@@ -592,9 +679,12 @@ fn validate_session_layout(
     actual_inputs.sort();
     expected_inputs.sort();
     if actual_inputs != expected_inputs {
-        return Err(format!(
-            "model_mismatch: ONNX inputs for {} differ: expected={expected_inputs:?}, actual={actual_inputs:?}",
-            resolved.descriptor.model_id
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!(
+                "ONNX inputs for {} differ: expected={expected_inputs:?}, actual={actual_inputs:?}",
+                resolved.descriptor.model_id
+            ),
         ));
     }
 
@@ -605,9 +695,12 @@ fn validate_session_layout(
         .collect::<Vec<_>>();
     for expected in resolved.descriptor.output_names {
         if !actual_outputs.iter().any(|actual| actual == expected) {
-            return Err(format!(
-                "model_mismatch: ONNX output {expected} is missing for {}: actual={actual_outputs:?}",
-                resolved.descriptor.model_id
+            return Err(MlError::new(
+                MlErrorKind::ModelMismatch,
+                format!(
+                    "ONNX output {expected} is missing for {}: actual={actual_outputs:?}",
+                    resolved.descriptor.model_id
+                ),
             ));
         }
     }
@@ -618,19 +711,34 @@ fn run_transformer_embedding(
     loaded: &mut LoadedModel,
     tokens: &TokenizedBatch,
     options: &RunOptions,
-) -> Result<Vec<Vec<f32>>, String> {
+) -> Result<Vec<Vec<f32>>, MlError> {
     let input_ids = Tensor::from_array(([tokens.batch, tokens.sequence], tokens.input_ids.clone()))
-        .map_err(|error| format!("inference: failed to build input_ids: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("failed to build input_ids: {error}"),
+            )
+        })?;
     let attention_mask = Tensor::from_array((
         [tokens.batch, tokens.sequence],
         tokens.attention_mask.clone(),
     ))
-    .map_err(|error| format!("inference: failed to build attention_mask: {error}"))?;
+    .map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build attention_mask: {error}"),
+        )
+    })?;
     let token_type_ids = Tensor::from_array((
         [tokens.batch, tokens.sequence],
         tokens.token_type_ids.clone(),
     ))
-    .map_err(|error| format!("inference: failed to build token_type_ids: {error}"))?;
+    .map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build token_type_ids: {error}"),
+        )
+    })?;
     let outputs = loaded
         .session
         .run_with_options(
@@ -641,24 +749,39 @@ fn run_transformer_embedding(
             ],
             options,
         )
-        .map_err(|error| format!("inference: transformer ONNX run failed: {error}"))?;
-    let output = outputs
-        .get("last_hidden_state")
-        .ok_or_else(|| "model_mismatch: last_hidden_state output is missing".to_string())?;
-    let (shape, values) = output
-        .try_extract_tensor::<f32>()
-        .map_err(|error| format!("model_mismatch: invalid transformer output: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("transformer ONNX run failed: {error}"),
+            )
+        })?;
+    let output = outputs.get("last_hidden_state").ok_or_else(|| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            "last_hidden_state output is missing",
+        )
+    })?;
+    let (shape, values) = output.try_extract_tensor::<f32>().map_err(|error| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!("invalid transformer output: {error}"),
+        )
+    })?;
     if shape.len() != 3 || shape[0] as usize != tokens.batch || shape[1] as usize != tokens.sequence
     {
-        return Err(format!(
-            "model_mismatch: unexpected transformer output shape {shape}"
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!("unexpected transformer output shape {shape}"),
         ));
     }
     let dimensions = shape[2] as usize;
     if loaded.resolved.descriptor.dimensions != Some(dimensions) {
-        return Err(format!(
-            "model_mismatch: embedding dimensions differ: expected={:?}, actual={dimensions}",
-            loaded.resolved.descriptor.dimensions
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!(
+                "embedding dimensions differ: expected={:?}, actual={dimensions}",
+                loaded.resolved.descriptor.dimensions
+            ),
         ));
     }
     let mut vectors = match loaded.resolved.descriptor.pooling {
@@ -671,8 +794,9 @@ fn run_transformer_embedding(
         ),
         SemanticPooling::Cls => cls_pool(values, tokens.batch, tokens.sequence, dimensions),
         other => {
-            return Err(format!(
-                "model_mismatch: unsupported transformer pooling {other:?}"
+            return Err(MlError::new(
+                MlErrorKind::ModelMismatch,
+                format!("unsupported transformer pooling {other:?}"),
             ))
         }
     };
@@ -686,18 +810,30 @@ fn run_clip_text(
     loaded: &mut LoadedModel,
     tokens: &TokenizedBatch,
     options: &RunOptions,
-) -> Result<Vec<Vec<f32>>, String> {
-    let preprocessor = loaded
-        .clip_preprocessor
-        .as_ref()
-        .ok_or_else(|| "model_mismatch: CLIP preprocessor is unavailable".to_string())?;
+) -> Result<Vec<Vec<f32>>, MlError> {
+    let preprocessor = loaded.clip_preprocessor.as_ref().ok_or_else(|| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            "CLIP preprocessor is unavailable",
+        )
+    })?;
     let input_ids = Tensor::from_array(([tokens.batch, tokens.sequence], tokens.input_ids.clone()))
-        .map_err(|error| format!("inference: failed to build CLIP input_ids: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("failed to build CLIP input_ids: {error}"),
+            )
+        })?;
     let attention_mask = Tensor::from_array((
         [tokens.batch, tokens.sequence],
         tokens.attention_mask.clone(),
     ))
-    .map_err(|error| format!("inference: failed to build CLIP attention_mask: {error}"))?;
+    .map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build CLIP attention_mask: {error}"),
+        )
+    })?;
     let pixels = Tensor::from_array((
         [
             tokens.batch,
@@ -707,7 +843,12 @@ fn run_clip_text(
         ],
         vec![0f32; tokens.batch * 3 * preprocessor.height as usize * preprocessor.width as usize],
     ))
-    .map_err(|error| format!("inference: failed to build CLIP placeholder pixels: {error}"))?;
+    .map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build CLIP placeholder pixels: {error}"),
+        )
+    })?;
     let outputs = loaded
         .session
         .run_with_options(
@@ -718,7 +859,12 @@ fn run_clip_text(
             ],
             options,
         )
-        .map_err(|error| format!("inference: CLIP text ONNX run failed: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("CLIP text ONNX run failed: {error}"),
+            )
+        })?;
     extract_matrix(
         &outputs,
         "text_embeds",
@@ -734,11 +880,18 @@ fn run_clip_image(
     preprocessor: &ClipPreprocessor,
     pixels: Vec<f32>,
     options: &RunOptions,
-) -> Result<Vec<Vec<f32>>, String> {
-    let input_ids = Tensor::from_array(([batch, 1], vec![0i64; batch]))
-        .map_err(|error| format!("inference: failed to build CLIP placeholder ids: {error}"))?;
+) -> Result<Vec<Vec<f32>>, MlError> {
+    let input_ids = Tensor::from_array(([batch, 1], vec![0i64; batch])).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build CLIP placeholder ids: {error}"),
+        )
+    })?;
     let attention_mask = Tensor::from_array(([batch, 1], vec![0i64; batch])).map_err(|error| {
-        format!("inference: failed to build CLIP placeholder attention mask: {error}")
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build CLIP placeholder attention mask: {error}"),
+        )
     })?;
     let pixels = Tensor::from_array((
         [
@@ -749,7 +902,12 @@ fn run_clip_image(
         ],
         pixels,
     ))
-    .map_err(|error| format!("inference: failed to build CLIP pixels: {error}"))?;
+    .map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build CLIP pixels: {error}"),
+        )
+    })?;
     let outputs = loaded
         .session
         .run_with_options(
@@ -760,7 +918,12 @@ fn run_clip_image(
             ],
             options,
         )
-        .map_err(|error| format!("inference: CLIP image ONNX run failed: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("CLIP image ONNX run failed: {error}"),
+            )
+        })?;
     extract_matrix(
         &outputs,
         "image_embeds",
@@ -774,14 +937,24 @@ fn run_reranker(
     loaded: &mut LoadedModel,
     tokens: &TokenizedBatch,
     options: &RunOptions,
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>, MlError> {
     let input_ids = Tensor::from_array(([tokens.batch, tokens.sequence], tokens.input_ids.clone()))
-        .map_err(|error| format!("inference: failed to build reranker input_ids: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("failed to build reranker input_ids: {error}"),
+            )
+        })?;
     let attention_mask = Tensor::from_array((
         [tokens.batch, tokens.sequence],
         tokens.attention_mask.clone(),
     ))
-    .map_err(|error| format!("inference: failed to build reranker attention_mask: {error}"))?;
+    .map_err(|error| {
+        MlError::new(
+            MlErrorKind::Inference,
+            format!("failed to build reranker attention_mask: {error}"),
+        )
+    })?;
     let outputs = loaded
         .session
         .run_with_options(
@@ -791,18 +964,29 @@ fn run_reranker(
             ],
             options,
         )
-        .map_err(|error| format!("inference: reranker ONNX run failed: {error}"))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Inference,
+                format!("reranker ONNX run failed: {error}"),
+            )
+        })?;
     let output = outputs
         .get("logits")
-        .ok_or_else(|| "model_mismatch: logits output is missing".to_string())?;
-    let (shape, values) = output
-        .try_extract_tensor::<f32>()
-        .map_err(|error| format!("model_mismatch: invalid reranker output: {error}"))?;
+        .ok_or_else(|| MlError::new(MlErrorKind::ModelMismatch, "logits output is missing"))?;
+    let (shape, values) = output.try_extract_tensor::<f32>().map_err(|error| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!("invalid reranker output: {error}"),
+        )
+    })?;
     if values.len() != tokens.batch {
-        return Err(format!(
-            "model_mismatch: reranker output shape {shape} has {} values for batch {}",
-            values.len(),
-            tokens.batch
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!(
+                "reranker output shape {shape} has {} values for batch {}",
+                values.len(),
+                tokens.batch
+            ),
         ));
     }
     Ok(values.to_vec())
@@ -814,22 +998,32 @@ fn extract_matrix(
     batch: usize,
     expected_dimensions: Option<usize>,
     normalize: bool,
-) -> Result<Vec<Vec<f32>>, String> {
-    let output = outputs
-        .get(output_name)
-        .ok_or_else(|| format!("model_mismatch: {output_name} output is missing"))?;
-    let (shape, values) = output
-        .try_extract_tensor::<f32>()
-        .map_err(|error| format!("model_mismatch: invalid {output_name} output: {error}"))?;
+) -> Result<Vec<Vec<f32>>, MlError> {
+    let output = outputs.get(output_name).ok_or_else(|| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!("{output_name} output is missing"),
+        )
+    })?;
+    let (shape, values) = output.try_extract_tensor::<f32>().map_err(|error| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!("invalid {output_name} output: {error}"),
+        )
+    })?;
     if shape.len() != 2 || shape[0] as usize != batch {
-        return Err(format!(
-            "model_mismatch: unexpected {output_name} shape {shape}"
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!("unexpected {output_name} shape {shape}"),
         ));
     }
     let dimensions = shape[1] as usize;
     if expected_dimensions != Some(dimensions) {
-        return Err(format!(
-            "model_mismatch: {output_name} dimensions differ: expected={expected_dimensions:?}, actual={dimensions}"
+        return Err(MlError::new(
+            MlErrorKind::ModelMismatch,
+            format!(
+            "{output_name} dimensions differ: expected={expected_dimensions:?}, actual={dimensions}"
+        ),
         ));
     }
     let mut vectors = values
@@ -927,24 +1121,36 @@ fn normalize_vectors(vectors: &mut [Vec<f32>]) {
     }
 }
 
-fn load_clip_preprocessor(path: &Path) -> Result<ClipPreprocessor, String> {
+fn load_clip_preprocessor(path: &Path) -> Result<ClipPreprocessor, MlError> {
     let config: ClipPreprocessorConfig =
         serde_json::from_slice(&fs::read(path).map_err(|error| {
-            format!("model_missing: failed to read {}: {error}", path.display())
+            MlError::new(
+                MlErrorKind::ModelMissing,
+                format!("failed to read {}: {error}", path.display()),
+            )
         })?)
-        .map_err(|error| format!("model_mismatch: invalid {}: {error}", path.display()))?;
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::ModelMismatch,
+                format!("invalid {}: {error}", path.display()),
+            )
+        })?;
     // Shared with the capture path so the two cannot disagree about the size
     // they resize to; see `clip_preprocess.rs`.
     let (width, height) = crate::clip_preprocess::target_size_from_size_value(&config.size)
-        .ok_or_else(|| "model_mismatch: CLIP image size is missing".to_string())?;
-    let mean: [f32; 3] = config
-        .image_mean
-        .try_into()
-        .map_err(|_| "model_mismatch: CLIP image_mean must have 3 values".to_string())?;
-    let std: [f32; 3] = config
-        .image_std
-        .try_into()
-        .map_err(|_| "model_mismatch: CLIP image_std must have 3 values".to_string())?;
+        .ok_or_else(|| MlError::new(MlErrorKind::ModelMismatch, "CLIP image size is missing"))?;
+    let mean: [f32; 3] = config.image_mean.try_into().map_err(|_| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            "CLIP image_mean must have 3 values",
+        )
+    })?;
+    let std: [f32; 3] = config.image_std.try_into().map_err(|_| {
+        MlError::new(
+            MlErrorKind::ModelMismatch,
+            "CLIP image_std must have 3 values",
+        )
+    })?;
     Ok(ClipPreprocessor {
         width,
         height,
@@ -958,22 +1164,24 @@ fn preprocess_clip_images(
     config: &ClipPreprocessor,
     images: &[MlImageInput],
     body: &[u8],
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>, MlError> {
     let plane = config.width as usize * config.height as usize;
     let mut output = Vec::with_capacity(images.len() * plane * 3);
     for input in images {
-        let end = input
-            .offset
-            .checked_add(input.body_len)
-            .ok_or_else(|| "invalid_request: CLIP image offset overflow".to_string())?;
-        let raw = body
-            .get(input.offset..end)
-            .ok_or_else(|| "invalid_request: CLIP image body is truncated".to_string())?;
+        let end = input.offset.checked_add(input.body_len).ok_or_else(|| {
+            MlError::new(MlErrorKind::InvalidRequest, "CLIP image offset overflow")
+        })?;
+        let raw = body.get(input.offset..end).ok_or_else(|| {
+            MlError::new(MlErrorKind::InvalidRequest, "CLIP image body is truncated")
+        })?;
         let image =
             RgbImage::from_raw(input.width, input.height, raw.to_vec()).ok_or_else(|| {
-                format!(
-                    "invalid_request: failed to construct RGB image {}x{}",
-                    input.width, input.height
+                MlError::new(
+                    MlErrorKind::InvalidRequest,
+                    format!(
+                        "failed to construct RGB image {}x{}",
+                        input.width, input.height
+                    ),
                 )
             })?;
         // Shared with the capture path, which pre-resizes a screenshot to this

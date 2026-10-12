@@ -7,11 +7,11 @@ use crate::clip_contract::{
 };
 use crate::ml_protocol::MlSemanticModel;
 use crate::semantic_runtime::SemanticRuntimeState;
-use crate::storage::{DerivedIndexKind, StorageState};
+use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, ScoredSubject, StorageState};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
@@ -227,23 +227,60 @@ pub enum ClipQueryOutcome {
 /// One `search_nl` request, in the shape the Tauri command and the MCP tool
 /// both already speak.
 pub struct ClipQueryRequest<'a> {
-    pub query: &'a str,
-    pub limit: u32,
-    pub offset: u32,
-    pub process_names: &'a [String],
+    query: &'a str,
+    limit: u32,
+    offset: u32,
+    process_names: &'a [String],
     /// Unix seconds, inclusive.
-    pub start_time: Option<f64>,
-    pub end_time: Option<f64>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    include_ocr: bool,
+}
+
+impl<'a> ClipQueryRequest<'a> {
+    pub fn new(
+        query: &'a str,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        process_names: &'a [String],
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+    ) -> Self {
+        Self {
+            query,
+            limit: limit.unwrap_or(20).clamp(1, u64::from(MAX_CLIP_RESULTS)) as u32,
+            offset: offset.unwrap_or(0).min(u64::from(MAX_CLIP_OFFSET)) as u32,
+            process_names,
+            start_time,
+            end_time,
+            include_ocr: true,
+        }
+    }
+
+    /// Image grids render metadata and thumbnails; text consumers retain the
+    /// default OCR prefix and can use the same ranking and pagination path.
+    pub(crate) fn with_ocr(mut self, include_ocr: bool) -> Self {
+        self.include_ocr = include_ocr;
+        self
+    }
+}
+
+/// Shared search behavior; adapters own transport formats and privacy filtering.
+pub async fn search(
+    app: &AppHandle,
+    request: ClipQueryRequest<'_>,
+) -> Result<Vec<serde_json::Value>, String> {
+    match try_rust_clip_query(app, request).await {
+        ClipQueryOutcome::Served(results) => Ok(results),
+        ClipQueryOutcome::Unavailable(reason) => Err(format!("CLIP search unavailable: {reason}")),
+    }
 }
 
 /// Offer one natural-language image query to the Rust CLIP index.
 ///
 /// Anything that stops Rust answering becomes `Unavailable` with a specific
 /// model, migration, or index reason.
-pub async fn try_rust_clip_query(
-    app: &AppHandle,
-    request: ClipQueryRequest<'_>,
-) -> ClipQueryOutcome {
+async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> ClipQueryOutcome {
     let trimmed = request.query.trim();
     if trimmed.is_empty() {
         observe_served();
@@ -342,12 +379,14 @@ async fn run_rust_clip_query(
         ));
     }
 
+    let arm_started = Instant::now();
     let remaining = deadline.saturating_duration_since(Instant::now());
     if !remaining.is_zero() {
         let _ = ann_state
             .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
             .await;
     }
+    let arm_ms = arm_started.elapsed().as_secs_f64() * 1000.0;
 
     // Python's over-fetch, preserved exactly: enough candidates that the
     // post-scan process and time filters still have a full page to paginate.
@@ -365,65 +404,141 @@ async fn run_rust_clip_query(
         .collect();
     let start_time = request.start_time;
     let end_time = request.end_time;
+    let include_ocr = request.include_ocr;
 
-    // Scan, hydrate, and filter share one blocking thread. The scan takes the
-    // process-wide, non-reentrant database mutex and hydration additionally does
-    // per-row CNG decryption; hopping back onto the async runtime between them
-    // would park a tokio worker mid-sequence on the lock the reverse-IPC bridge
-    // also needs.
+    // Keep synchronous database reads and CNG work off the async runtime. OCR
+    // is presentation data: decrypt it only after filtering and pagination.
+    let stage = Arc::new(Mutex::new("queued"));
+    let scan_stage = Arc::clone(&stage);
     let scan_task = tokio::task::spawn_blocking(move || {
         if Instant::now() >= deadline {
             return Err("query_deadline_exceeded_before_scan".to_string());
         }
         let scan_started = Instant::now();
+        *scan_stage.lock().unwrap_or_else(|error| error.into_inner()) = "database_wait";
         let _foreground_db = scan_storage.foreground_db_read();
+        let ann_snapshot = match query_stage(&scan_stage, "ann_snapshot", || {
+            ann_state.prepare_query(&scan_storage, &query_vec, Some(deadline))
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
+            Err(error) => {
+                tracing::warn!("[CLIP:ANN] snapshot unavailable, using exact fallback: {error}");
+                ann_state.disarm();
+                None
+            }
+        };
+        let mut candidate_filter =
+            ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline);
         let filtered = search_candidates(
             fetch,
             target,
             deadline,
-            |requested| app_ann_query(&ann_state, &scan_storage, &query_vec, requested, deadline),
-            |scored| {
-                filter_scored(
-                    &scan_storage,
-                    scored,
-                    &process_names,
-                    start_time,
-                    end_time,
-                    deadline,
-                )
+            |requested| {
+                query_stage(&scan_stage, "ann", || {
+                    app_ann_query(
+                        &ann_state,
+                        ann_snapshot.as_ref(),
+                        &scan_storage,
+                        &query_vec,
+                        requested,
+                        deadline,
+                    )
+                })
             },
-            || app_exact_query(&ann_state, &scan_storage, &query_vec, fetch, deadline),
+            |scored| {
+                candidate_filter.filter(scored, |hashes| {
+                    query_stage(&scan_stage, "candidate_metadata", || {
+                        if process_names.is_empty() {
+                            scan_storage.clip_candidate_metadata(hashes, deadline)
+                        } else {
+                            load_candidate_summaries(&scan_storage, hashes, deadline)
+                        }
+                    })
+                })
+            },
+            || {
+                query_stage(&scan_stage, "exact", || {
+                    app_exact_query(
+                        ann_snapshot.as_ref(),
+                        &scan_storage,
+                        &query_vec,
+                        fetch,
+                        deadline,
+                    )
+                })
+            },
         )?;
+        let page = paginate(filtered, offset, limit);
+        let page = resolve_page_metadata(page, |ids| {
+            query_stage(&scan_stage, "metadata", || {
+                scan_storage
+                    .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
+                    .map_err(|error| format!("hydrate_failed: {error}"))
+            })
+        })?;
+        let results = hydrate_page(page, 0, limit, deadline, |ids| {
+            query_stage(&scan_stage, "ocr", || {
+                load_page_texts(&scan_storage, ids, deadline, include_ocr)
+            })
+        })?;
         if Instant::now() >= deadline {
             return Err("query_deadline_exceeded_after_hydrate".to_string());
         }
-        Ok::<_, String>((
-            paginate(filtered, offset, limit),
-            scan_started.elapsed().as_secs_f64() * 1000.0,
-        ))
+        Ok::<_, String>((results, scan_started.elapsed().as_secs_f64() * 1000.0))
     });
     let remaining = deadline.saturating_duration_since(Instant::now());
     let (results, scan_ms) = tokio::time::timeout(remaining, scan_task)
         .await
-        .map_err(|_| "query_deadline_exceeded".to_string())?
+        .map_err(|_| {
+            let stage = *stage.lock().unwrap_or_else(|error| error.into_inner());
+            tracing::warn!(
+                "[CLIP] query deadline exceeded stage={stage} embed={embed_ms:.1}ms arm={arm_ms:.1}ms total={:.1}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            "query_deadline_exceeded".to_string()
+        })?
         .map_err(|error| format!("scan_task_failed: {error}"))??;
 
     tracing::debug!(
-        "[CLIP] rust nl query embed={embed_ms:.1}ms scan={scan_ms:.1}ms returned={}",
+        "[CLIP] rust nl query embed={embed_ms:.1}ms arm={arm_ms:.1}ms scan={scan_ms:.1}ms returned={}",
         results.len()
     );
     Ok(results)
 }
 
+fn query_stage<T>(
+    progress: &Mutex<&'static str>,
+    stage: &'static str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    *progress.lock().unwrap_or_else(|error| error.into_inner()) = stage;
+    let started = Instant::now();
+    let result = operation();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if result.is_err() {
+        // Also record cooperative deadline failures that finish just before
+        // the async timeout fires. Do not copy private read errors into logs.
+        tracing::warn!("[CLIP] query stage failed stage={stage} elapsed={elapsed_ms:.1}ms");
+    } else {
+        tracing::debug!("[CLIP] stage={stage} elapsed={elapsed_ms:.1}ms");
+    }
+    result
+}
+
 fn app_ann_query(
     state: &crate::clip_ann::ClipAnnState,
+    snapshot: Option<&crate::clip_ann::ClipAnnSnapshot>,
     storage: &StorageState,
     query: &[f32],
     fetch: usize,
     deadline: Instant,
 ) -> Result<CandidateSource, String> {
-    match state.query(storage, query, fetch) {
-        Ok(Some(result)) => {
+    let Some(snapshot) = snapshot else {
+        return Ok(CandidateSource::Unavailable);
+    };
+    match snapshot.query(fetch, Some(deadline)) {
+        Ok(result) => {
             tracing::debug!(
                 "[CLIP:ANN] query mode={} tail={} candidates={}",
                 result.mode,
@@ -432,10 +547,10 @@ fn app_ann_query(
             );
             Ok(CandidateSource::Ann(result.candidates))
         }
-        Ok(None) => Ok(CandidateSource::Unavailable),
+        Err(error) if error.starts_with("query_deadline_exceeded") => Err(error),
         Err(error) => {
             tracing::warn!("[CLIP:ANN] query failed, using exact fallback: {error}");
-            let fallback = app_exact_query(state, storage, query, fetch, deadline);
+            let fallback = app_exact_query(Some(snapshot), storage, query, fetch, deadline);
             state.disarm();
             fallback.map(CandidateSource::ExactFallback)
         }
@@ -443,13 +558,16 @@ fn app_ann_query(
 }
 
 fn app_exact_query(
-    state: &crate::clip_ann::ClipAnnState,
+    snapshot: Option<&crate::clip_ann::ClipAnnSnapshot>,
     storage: &StorageState,
     query: &[f32],
     fetch: usize,
     deadline: Instant,
 ) -> Result<Vec<crate::storage::ScoredSubject>, String> {
-    match state.exact_from_generation(storage, query, fetch, Some(deadline))? {
+    match snapshot
+        .map(|snapshot| snapshot.exact(fetch, Some(deadline)))
+        .transpose()?
+    {
         Some(result) => {
             tracing::debug!(
                 "[CLIP:ANN] query mode={} tail={} candidates={}",
@@ -489,14 +607,14 @@ fn bounded_clip_offset(offset: u32) -> usize {
     offset.min(MAX_CLIP_OFFSET) as usize
 }
 
-fn search_candidates(
+fn search_candidates<T>(
     fetch: usize,
     target: usize,
     deadline: Instant,
     mut ann_query: impl FnMut(usize) -> Result<CandidateSource, String>,
-    mut filter: impl FnMut(Vec<crate::storage::ScoredSubject>) -> Result<Vec<serde_json::Value>, String>,
+    mut filter: impl FnMut(Vec<crate::storage::ScoredSubject>) -> Result<Vec<T>, String>,
     exact_scan: impl FnOnce() -> Result<Vec<crate::storage::ScoredSubject>, String>,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<T>, String> {
     if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
         tracing::debug!(
             "[CLIP:ANN] fetch={fetch} exceeds candidate envelope; using exact for deep pagination"
@@ -535,89 +653,193 @@ fn search_candidates(
     filter(exact_scan()?)
 }
 
-fn filter_scored(
-    storage: &StorageState,
-    scored: Vec<crate::storage::ScoredSubject>,
-    process_names: &[String],
+/// One scored image resolved to the screenshot that represents it.
+#[derive(Debug)]
+struct ClipHit {
+    subject: ScoredSubject,
+    summary: BackgroundScreenshotSummary,
+    summary_complete: bool,
+}
+
+/// Only live for this query: later queries must observe current deletion,
+/// metadata, and authentication state. Cache misses as well as hits so ANN
+/// deepening and the exact fallback do not repeat private reads.
+struct ClipCandidateFilter<'a> {
+    target: usize,
+    process_names: &'a [String],
     start_time: Option<f64>,
     end_time: Option<f64>,
     deadline: Instant,
-) -> Result<Vec<serde_json::Value>, String> {
-    if Instant::now() >= deadline {
-        return Err("query_deadline_exceeded_after_scan".to_string());
+    summaries: HashMap<String, Option<BackgroundScreenshotSummary>>,
+}
+
+impl<'a> ClipCandidateFilter<'a> {
+    fn new(
+        target: usize,
+        process_names: &'a [String],
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            target,
+            process_names,
+            start_time,
+            end_time,
+            deadline,
+            summaries: HashMap::new(),
+        }
     }
-    // The floor is applied before hydration so a rejected hit costs no
-    // decryption. Python applies it inside `search_by_text`, at the same point
-    // relative to everything else.
-    let above_floor: Vec<crate::storage::ScoredSubject> = scored
-        .into_iter()
-        .filter(|subject| subject.score >= CLIP_MIN_SIMILARITY)
-        .collect();
-    let rows = hydrate_with_deadline(storage, &above_floor, deadline)?;
-    Ok(apply_filters(rows, process_names, start_time, end_time))
+
+    fn filter(
+        &mut self,
+        scored: Vec<ScoredSubject>,
+        mut load: impl FnMut(&[String]) -> Result<HashMap<String, BackgroundScreenshotSummary>, String>,
+    ) -> Result<Vec<ClipHit>, String> {
+        if Instant::now() >= self.deadline {
+            return Err("query_deadline_exceeded_after_scan".to_string());
+        }
+        let above_floor: Vec<ScoredSubject> = scored
+            .into_iter()
+            .filter(|subject| subject.score >= CLIP_MIN_SIMILARITY)
+            .collect();
+        let mut hits = Vec::new();
+        let mut cursor: usize = 0;
+        while cursor < above_floor.len() && hits.len() < self.target {
+            if Instant::now() >= self.deadline {
+                return Err("query_deadline_exceeded_during_metadata".to_string());
+            }
+            // Stop once the filtered page is complete. With no process or
+            // time filter this reads only offset + limit summaries instead
+            // of every over-fetched candidate.
+            let batch_len = (self.target - hits.len()).min(MAX_CLIP_RESULTS as usize);
+            let end = cursor.saturating_add(batch_len).min(above_floor.len());
+            let batch = &above_floor[cursor..end];
+            let missing: Vec<String> = batch
+                .iter()
+                .filter(|subject| !self.summaries.contains_key(&subject.subject_key))
+                .map(|subject| subject.subject_key.clone())
+                .collect();
+            if !missing.is_empty() {
+                let mut loaded = load(&missing)?;
+                for key in missing {
+                    let summary = loaded.remove(&key);
+                    self.summaries.insert(key, summary);
+                }
+            }
+            let rows = batch
+                .iter()
+                .filter_map(|subject| {
+                    self.summaries
+                        .get(&subject.subject_key)
+                        .and_then(Option::as_ref)
+                        .map(|summary| ClipHit {
+                            subject: subject.clone(),
+                            summary: summary.clone(),
+                            summary_complete: !self.process_names.is_empty(),
+                        })
+                })
+                .collect();
+            hits.extend(apply_filters(
+                rows,
+                self.process_names,
+                self.start_time,
+                self.end_time,
+            ));
+            cursor = end;
+        }
+        Ok(hits)
+    }
 }
 
-/// One scored image resolved to the screenshot that represents it.
-struct ClipHit {
-    row: serde_json::Value,
-    process_name: String,
-    /// Unix seconds, or `None` when the screenshot has no usable timestamp.
-    created_secs: Option<f64>,
-}
-
-/// Turn scored image hashes into the Python response rows.
-fn hydrate_with_deadline(
+fn load_candidate_summaries(
     storage: &StorageState,
-    scored: &[crate::storage::ScoredSubject],
+    hashes: &[String],
     deadline: Instant,
-) -> Result<Vec<ClipHit>, String> {
-    if scored.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<HashMap<String, BackgroundScreenshotSummary>, String> {
     if Instant::now() >= deadline {
-        return Err("query_deadline_exceeded_before_hydrate".to_string());
+        return Err("query_deadline_exceeded_before_metadata".to_string());
     }
-    let hashes: Vec<String> = scored
-        .iter()
-        .map(|subject| subject.subject_key.clone())
-        .collect();
-    let mapped = storage.map_image_hashes_to_screenshot_ids(&hashes)?;
+    let mapped = storage.map_image_hashes_to_screenshot_ids(hashes)?;
     if Instant::now() >= deadline {
-        return Err("query_deadline_exceeded_during_hydrate".to_string());
+        return Err("query_deadline_exceeded_during_metadata".to_string());
     }
     // Newest capture of each image, which is what `map_image_hashes_to_screenshot_ids`
     // orders for.
-    let representative: HashMap<&String, i64> = mapped
+    let representative: HashMap<String, i64> = mapped
         .iter()
-        .filter_map(|(hash, ids)| ids.first().map(|id| (hash, *id)))
+        .filter_map(|(hash, ids)| ids.first().map(|id| (hash.clone(), *id)))
         .collect();
     let ids: Vec<i64> = representative.values().copied().collect();
 
-    let summaries: HashMap<i64, crate::storage::BackgroundScreenshotSummary> = storage
-        .get_screenshot_summaries_by_ids_silent(&ids)
+    let summaries: HashMap<i64, BackgroundScreenshotSummary> = storage
+        .get_screenshot_summaries_by_ids_silent_with_deadline(&ids, Some(deadline))
         .map_err(|error| format!("hydrate_failed: {error}"))?
         .into_iter()
         .map(|summary| (summary.id, summary))
         .collect();
     if Instant::now() >= deadline {
-        return Err("query_deadline_exceeded_during_hydrate".to_string());
+        return Err("query_deadline_exceeded_during_metadata".to_string());
     }
-    let texts = storage
-        .get_ocr_text_prefixes_by_screenshot_ids_silent(&ids, CLIP_OCR_SNIPPET_CHARS)
-        .map_err(|error| format!("hydrate_failed: {error}"))?;
-    if Instant::now() >= deadline {
-        return Err("query_deadline_exceeded_during_hydrate".to_string());
-    }
+    Ok(representative
+        .into_iter()
+        .filter_map(|(hash, id)| summaries.get(&id).cloned().map(|summary| (hash, summary)))
+        .collect())
+}
 
-    let mut hits = Vec::with_capacity(scored.len());
-    for subject in scored {
-        let Some(id) = representative.get(&subject.subject_key).copied() else {
-            // No live screenshot maps to this image any more.
-            continue;
-        };
-        let Some(summary) = summaries.get(&id) else {
-            continue;
-        };
+fn resolve_page_metadata(
+    page: Vec<ClipHit>,
+    load: impl FnOnce(&[i64]) -> Result<Vec<BackgroundScreenshotSummary>, String>,
+) -> Result<Vec<ClipHit>, String> {
+    let missing: Vec<i64> = page
+        .iter()
+        .filter(|hit| !hit.summary_complete)
+        .map(|hit| hit.summary.id)
+        .collect();
+    if missing.is_empty() {
+        return Ok(page);
+    }
+    let summaries: HashMap<_, _> = load(&missing)?
+        .into_iter()
+        .map(|row| (row.id, row))
+        .collect();
+    Ok(page
+        .into_iter()
+        .filter_map(|mut hit| {
+            if !hit.summary_complete {
+                hit.summary = summaries.get(&hit.summary.id)?.clone();
+                hit.summary_complete = true;
+            }
+            Some(hit)
+        })
+        .collect())
+}
+
+fn hydrate_page(
+    hits: Vec<ClipHit>,
+    offset: usize,
+    limit: usize,
+    deadline: Instant,
+    load_texts: impl FnOnce(&[i64]) -> Result<HashMap<i64, String>, String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let page = paginate(hits, offset, limit);
+    if page.is_empty() {
+        return Ok(Vec::new());
+    }
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_before_ocr".to_string());
+    }
+    let ids: Vec<i64> = page.iter().map(|hit| hit.summary.id).collect();
+    let texts = load_texts(&ids)?;
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_during_ocr".to_string());
+    }
+    let mut rows = Vec::with_capacity(page.len());
+    for ClipHit {
+        subject, summary, ..
+    } in page
+    {
+        let id = summary.id;
         let process_name = summary.process_name.clone().unwrap_or_default();
         let window_title = summary.window_title.clone().unwrap_or_default();
         let ocr_text = texts.get(&id).cloned().unwrap_or_default();
@@ -629,37 +851,50 @@ fn hydrate_with_deadline(
         // `1 - chroma_cosine_distance`.
         let similarity = subject.score;
 
-        hits.push(ClipHit {
-            row: serde_json::json!({
-                // The Chroma document id, reproduced rather than invented, so a
-                // caller keying on `id` cannot tell the backends apart.
-                "id": clip_document_id(&subject.subject_key),
-                "image_path": image_path.clone(),
-                "metadata": {
-                    "image_path": image_path,
-                    "screenshot_id": id,
-                    "process_name": process_name.clone(),
-                    "window_title": window_title,
-                    "category": summary.category.clone().unwrap_or_default(),
-                    "timestamp": created_secs.unwrap_or(0.0),
-                    "created_at": created_at.clone(),
-                    "screenshot_created_at": created_at.clone(),
-                },
-                "ocr_text": ocr_text,
-                "distance": 1.0_f32 - similarity,
-                "similarity": similarity,
-                "screenshot_created_at": created_at,
-            }),
-            process_name,
-            created_secs,
-        });
+        rows.push(serde_json::json!({
+            // The Chroma document id, reproduced rather than invented, so a
+            // caller keying on `id` cannot tell the backends apart.
+            "id": clip_document_id(&subject.subject_key),
+            "image_path": image_path.clone(),
+            "metadata": {
+                "image_path": image_path,
+                "screenshot_id": id,
+                "process_name": process_name.clone(),
+                "window_title": window_title,
+                "category": summary.category.clone().unwrap_or_default(),
+                "timestamp": created_secs.unwrap_or(0.0),
+                "created_at": created_at.clone(),
+                "screenshot_created_at": created_at.clone(),
+            },
+            "ocr_text": ocr_text,
+            "distance": 1.0_f32 - similarity,
+            "similarity": similarity,
+            "screenshot_created_at": created_at,
+        }));
     }
-    Ok(hits)
+    Ok(rows)
 }
 
-/// OCR characters returned with a hit. Both result views cut the text to 150
-/// characters for display; this leaves room for that without decrypting whole
-/// documents for a page nobody scrolls.
+fn load_page_texts(
+    storage: &StorageState,
+    ids: &[i64],
+    deadline: Instant,
+    include_ocr: bool,
+) -> Result<HashMap<i64, String>, String> {
+    if !include_ocr {
+        return Ok(HashMap::new());
+    }
+    storage
+        .get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(
+            ids,
+            CLIP_OCR_SNIPPET_CHARS,
+            Some(deadline),
+        )
+        .map_err(|error| format!("hydrate_failed: {error}"))
+}
+
+/// OCR characters returned to text consumers. The quick-search dropdown cuts
+/// the text to 150 characters; image grids explicitly omit this prefix.
 const CLIP_OCR_SNIPPET_CHARS: usize = 1_000;
 
 /// Unix seconds for a hit, or `None` when the screenshot has no usable
@@ -708,13 +943,17 @@ fn apply_filters(
     process_names: &[String],
     start_time: Option<f64>,
     end_time: Option<f64>,
-) -> Vec<serde_json::Value> {
+) -> Vec<ClipHit> {
     hits.into_iter()
         .filter(|hit| {
-            if !process_names.is_empty() && !process_names.contains(&hit.process_name) {
+            if !process_names.is_empty()
+                && !process_names
+                    .iter()
+                    .any(|name| name == hit.summary.process_name.as_deref().unwrap_or_default())
+            {
                 return false;
             }
-            match hit.created_secs {
+            match created_seconds(hit.summary.timestamp) {
                 Some(created) => {
                     if start_time.is_some_and(|start| created < start) {
                         return false;
@@ -727,12 +966,46 @@ fn apply_filters(
                 None => true,
             }
         })
-        .map(|hit| hit.row)
         .collect()
 }
 
-fn paginate(rows: Vec<serde_json::Value>, offset: usize, limit: usize) -> Vec<serde_json::Value> {
+fn paginate<T>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     rows.into_iter().skip(offset).take(limit).collect()
+}
+
+/// The fixture uses the production SQL/CNG readers. `legacy` reproduces the
+/// pre-scalability metadata reads for an unfiltered request, after the #233 fix.
+#[cfg(test)]
+pub(crate) fn benchmark_hydration(
+    storage: &StorageState,
+    scored: Vec<ScoredSubject>,
+    offset: usize,
+    limit: usize,
+    include_ocr: bool,
+    legacy: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut filter = ClipCandidateFilter::new(offset + limit, &[], None, None, deadline);
+    let mut hits = filter.filter(scored, |keys| {
+        if legacy {
+            load_candidate_summaries(storage, keys, deadline)
+        } else {
+            storage.clip_candidate_metadata(keys, deadline)
+        }
+    })?;
+    if legacy {
+        for hit in &mut hits {
+            hit.summary_complete = true;
+        }
+    }
+    let page = resolve_page_metadata(paginate(hits, offset, limit), |ids| {
+        storage
+            .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
+            .map_err(|error| error.to_string())
+    })?;
+    hydrate_page(page, 0, limit, deadline, |ids| {
+        load_page_texts(storage, ids, deadline, include_ocr)
+    })
 }
 
 #[cfg(test)]
@@ -742,9 +1015,29 @@ mod tests {
 
     fn hit(process: &str, created_secs: Option<f64>) -> ClipHit {
         ClipHit {
-            row: serde_json::json!({ "process_name": process }),
-            process_name: process.to_string(),
-            created_secs,
+            subject: ScoredSubject {
+                subject_key: "image".to_string(),
+                score: 0.75,
+            },
+            summary: BackgroundScreenshotSummary {
+                id: 1,
+                process_name: Some(process.to_string()),
+                window_title: Some("window".to_string()),
+                timestamp: created_secs.map(|value| value as i64),
+                category: Some("category".to_string()),
+            },
+            summary_complete: true,
+        }
+    }
+
+    fn summary_for_key(key: &str) -> BackgroundScreenshotSummary {
+        let index: i64 = key.strip_prefix("subject-").unwrap().parse().unwrap();
+        BackgroundScreenshotSummary {
+            id: index + 1,
+            process_name: Some("chrome.exe".to_string()),
+            window_title: Some(format!("window-{index}")),
+            timestamp: Some(1_785_888_000 + index),
+            category: None,
         }
     }
 
@@ -773,20 +1066,279 @@ mod tests {
                 subject_key: "unreadable".into(),
                 score,
             }];
-            let result = filter_scored(
-                &storage,
-                rows,
-                &[],
-                None,
-                None,
-                Instant::now() + Duration::from_secs(5),
-            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = ClipCandidateFilter::new(1, &[], None, None, deadline)
+                .filter(rows, |hashes| {
+                    load_candidate_summaries(&storage, hashes, deadline)
+                });
             if requires_read {
                 assert!(result.is_err(), "score {score} reaches the protected read");
             } else {
                 assert!(result.unwrap().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn overfetch_and_offset_do_not_decrypt_ocr_outside_the_returned_page() {
+        for (offset, limit) in [(0, 100), (100, 20)] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut filter = ClipCandidateFilter::new(offset + limit, &[], None, None, deadline);
+            let mut summaries_read = Vec::new();
+            let hits = filter
+                .filter(scored(400), |keys| {
+                    summaries_read.extend_from_slice(keys);
+                    Ok(keys
+                        .iter()
+                        .map(|key| (key.clone(), summary_for_key(key)))
+                        .collect())
+                })
+                .unwrap();
+            assert_eq!(summaries_read.len(), offset + limit);
+            let rows = hydrate_page(hits, offset, limit, deadline, |ids| {
+                assert_eq!(
+                    ids,
+                    &((offset + 1) as i64..=(offset + limit) as i64).collect::<Vec<_>>()
+                );
+                Ok(ids.iter().map(|&id| (id, format!("ocr-{id}"))).collect())
+            })
+            .unwrap();
+            assert_eq!(rows.len(), limit);
+            assert_eq!(rows[0]["ocr_text"], format!("ocr-{}", offset + 1));
+            assert_eq!(rows[0]["metadata"]["screenshot_id"], (offset + 1) as i64);
+        }
+    }
+
+    #[test]
+    fn ann_deepening_and_exact_fallback_read_each_summary_once() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let process_names = vec!["missing.exe".to_string()];
+        let mut filter = ClipCandidateFilter::new(10, &process_names, None, None, deadline);
+        let mut reads = HashMap::<String, usize>::new();
+        let exact_calls = Cell::new(0);
+        let hits = search_candidates(
+            100,
+            10,
+            deadline,
+            |requested| Ok(CandidateSource::Ann(scored(requested))),
+            |rows| {
+                filter.filter(rows, |keys| {
+                    for key in keys {
+                        *reads.entry(key.clone()).or_default() += 1;
+                    }
+                    // Missing/deleted screenshots are cached as well.
+                    Ok(keys
+                        .iter()
+                        .filter(|key| *key != "subject-0")
+                        .map(|key| (key.clone(), summary_for_key(key)))
+                        .collect())
+                })
+            },
+            || {
+                exact_calls.set(exact_calls.get() + 1);
+                Ok(scored(100))
+            },
+        )
+        .unwrap();
+        assert_eq!(exact_calls.get(), 1);
+        assert_eq!(reads.len(), 400);
+        assert!(reads.values().all(|count| *count == 1));
+        assert!(hydrate_page(hits, 0, 10, deadline, |_| panic!(
+            "no matching page needs OCR"
+        ))
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn cached_metadata_preserves_new_scores_and_order_after_deepening() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut filter = ClipCandidateFilter::new(10, &[], None, None, deadline);
+        filter
+            .filter(scored(2), |keys| {
+                Ok(keys
+                    .iter()
+                    .map(|key| (key.clone(), summary_for_key(key)))
+                    .collect())
+            })
+            .unwrap();
+        let revised = vec![
+            ScoredSubject {
+                subject_key: "subject-1".to_string(),
+                score: 0.9,
+            },
+            ScoredSubject {
+                subject_key: "subject-0".to_string(),
+                score: 0.4,
+            },
+        ];
+        let hits = filter
+            .filter(revised.clone(), |_| panic!("metadata was already read"))
+            .unwrap();
+        assert_eq!(
+            hits.into_iter().map(|hit| hit.subject).collect::<Vec<_>>(),
+            revised
+        );
+    }
+
+    #[test]
+    fn missing_and_filtered_candidates_do_not_underfill_a_page() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let process_names = vec!["chrome.exe".to_string()];
+        let mut filter =
+            ClipCandidateFilter::new(3, &process_names, Some(100.0), Some(200.0), deadline);
+        let hits = filter
+            .filter(scored(10), |keys| {
+                Ok(keys
+                    .iter()
+                    .filter_map(|key| {
+                        let mut summary = summary_for_key(key);
+                        match summary.id {
+                            1 => return None,
+                            2 => summary.timestamp = Some(50),
+                            3 => {
+                                summary.timestamp = Some(150);
+                                summary.process_name = Some("code.exe".to_string());
+                            }
+                            4 => summary.timestamp = None,
+                            5 => summary.timestamp = Some(100),
+                            _ => summary.timestamp = Some(200),
+                        }
+                        Some((key.clone(), summary))
+                    })
+                    .collect())
+            })
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.summary.id).collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn paged_hydration_preserves_the_search_response_contract() {
+        let rows = hydrate_page(
+            vec![hit("chrome.exe", Some(1_785_888_000.0))],
+            0,
+            1,
+            Instant::now() + Duration::from_secs(5),
+            |ids| {
+                assert_eq!(ids, &[1]);
+                Ok(HashMap::from([(1, "recognized text".to_string())]))
+            },
+        )
+        .unwrap();
+        let created_at = format_created_at(1_785_888_000.0);
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({
+                "id": clip_document_id("image"),
+                "image_path": clip_memory_uri("image"),
+                "metadata": {
+                    "image_path": clip_memory_uri("image"),
+                    "screenshot_id": 1,
+                    "process_name": "chrome.exe",
+                    "window_title": "window",
+                    "category": "category",
+                    "timestamp": 1_785_888_000.0,
+                    "created_at": created_at,
+                    "screenshot_created_at": created_at,
+                },
+                "ocr_text": "recognized text",
+                "distance": 0.25,
+                "similarity": 0.75,
+                "screenshot_created_at": created_at,
+            })]
+        );
+    }
+
+    #[test]
+    fn expired_queries_do_not_start_metadata_or_ocr_reads() {
+        let deadline = Instant::now();
+        let mut filter = ClipCandidateFilter::new(1, &[], None, None, deadline);
+        assert_eq!(
+            filter
+                .filter(scored(1), |_| panic!("expired metadata read"))
+                .unwrap_err(),
+            "query_deadline_exceeded_after_scan"
+        );
+        assert_eq!(
+            hydrate_page(vec![hit("chrome.exe", None)], 0, 1, deadline, |_| panic!(
+                "expired OCR read"
+            ))
+            .unwrap_err(),
+            "query_deadline_exceeded_before_ocr"
+        );
+    }
+
+    #[test]
+    fn metadata_decryption_is_limited_to_the_page_after_skipping_old_results() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut filter = ClipCandidateFilter::new(1_100, &[], None, None, deadline);
+        let hits = filter
+            .filter(scored(2_200), |keys| {
+                Ok(keys
+                    .iter()
+                    .map(|key| {
+                        let mut summary = summary_for_key(key);
+                        summary.window_title = None;
+                        (key.clone(), summary)
+                    })
+                    .collect())
+            })
+            .unwrap();
+        let mut private_reads = 0;
+        let page = resolve_page_metadata(paginate(hits, 1_000, 100), |ids| {
+            private_reads += ids.len();
+            Ok(ids
+                .iter()
+                .map(|id| summary_for_key(&format!("subject-{}", id - 1)))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(private_reads, 100);
+        assert_eq!(page[0].summary.id, 1_001);
+        assert!(page
+            .iter()
+            .all(|hit| hit.summary_complete && hit.summary.window_title.is_some()));
+    }
+
+    #[test]
+    fn decrypted_process_filters_do_not_repeat_their_metadata_reads() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let processes = vec!["chrome.exe".to_string()];
+        let mut filter = ClipCandidateFilter::new(2, &processes, None, None, deadline);
+        let hits = filter
+            .filter(scored(3), |keys| {
+                Ok(keys
+                    .iter()
+                    .map(|key| (key.clone(), summary_for_key(key)))
+                    .collect())
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_page_metadata(hits, |_| panic!("already decrypted for filtering"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn image_grids_skip_ocr_reads_and_other_consumers_keep_the_default() {
+        let request = ClipQueryRequest::new("game", None, None, &[], None, None);
+        assert!(request.include_ocr);
+        assert!(!request.with_ocr(false).include_ocr);
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(crate::credential_manager::CredentialManagerState::new(
+            temp.path().to_path_buf(),
+        ));
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(load_page_texts(&storage, &[1], deadline, false)
+            .unwrap()
+            .is_empty());
+        assert!(load_page_texts(&storage, &[1], deadline, true).is_err());
     }
 
     #[test]
@@ -862,7 +1414,7 @@ mod tests {
                     calls.borrow_mut().push(requested);
                     Ok(CandidateSource::Ann(scored(requested)))
                 },
-                |_| Ok(Vec::new()),
+                |_| Ok(Vec::<serde_json::Value>::new()),
                 || {
                     exact_calls.set(exact_calls.get() + 1);
                     Ok(scored(fetch))
@@ -934,5 +1486,13 @@ mod tests {
         assert_eq!(bounded_clip_offset(9_999), 9_999);
         assert_eq!(bounded_clip_offset(10_000), 10_000);
         assert_eq!(bounded_clip_offset(10_001), 10_000);
+        let defaults = ClipQueryRequest::new("query", None, None, &[], None, None);
+        assert_eq!((defaults.limit, defaults.offset), (20, 0));
+        let bounded =
+            ClipQueryRequest::new("query", Some(u64::MAX), Some(u64::MAX), &[], None, None);
+        assert_eq!(
+            (bounded.limit, bounded.offset),
+            (MAX_CLIP_RESULTS, MAX_CLIP_OFFSET)
+        );
     }
 }

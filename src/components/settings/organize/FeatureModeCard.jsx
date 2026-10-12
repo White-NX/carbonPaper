@@ -20,8 +20,8 @@ export default function FeatureModeCard({
   return (
     <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-3">
       <div>
-        <p className="text-sm text-ide-text font-medium">{t('settings.features.management.featureMode.label', '功能等级')}</p>
-        <p className="text-xs text-ide-muted mt-1">{t('settings.features.management.featureMode.description', '选择截图语义功能的启用深度')}</p>
+        <p className="text-sm text-ide-text font-medium">{t('settings.features.management.featureMode.label')}</p>
+        <p className="text-xs text-ide-muted mt-1">{t('settings.features.management.featureMode.description')}</p>
       </div>
 
       <SettingsSegmentedControl
@@ -56,15 +56,15 @@ export default function FeatureModeCard({
             {[
               {
                 key: 'classification_enabled',
-                label: t('settings.features.management.classification.label', '内容分类'),
-                description: t('settings.features.management.classification.description', '使用 BGE 模型自动分类截图内容'),
+                label: t('settings.features.management.classification.label'),
+                description: t('settings.features.management.classification.description'),
               },
               {
                 key: 'smart_cluster_enabled',
-                label: t('settings.features.management.smartCluster.label', '智能聚类（按描述自动归档）'),
+                label: t('settings.features.management.smartCluster.label'),
                 description: scModelAvailable
-                  ? t('settings.features.management.smartCluster.description', '输入一句话描述（如 "对加利福尼亚山脉的研究"），自动归档相关快照。仅在系统空闲时计算。')
-                  : t('settings.features.management.smartCluster.modelMissing', '请先下载模型'),
+                  ? t('settings.features.management.smartCluster.description')
+                  : t('settings.features.management.smartCluster.modelMissing'),
                 disabled: !scModelAvailable && !config.smart_cluster_enabled,
               },
             ].map((item, index) => (
@@ -78,7 +78,7 @@ export default function FeatureModeCard({
                     checked={Boolean(config[item.key])}
                     onChange={() => onCustomFeatureToggle(item.key)}
                     disabled={disabled || item.disabled}
-                    title={item.disabled ? t('settings.features.management.smartCluster.modelMissing', '请先下载模型') : item.label}
+                    title={item.disabled ? t('settings.features.management.smartCluster.modelMissing') : item.label}
                   />
                 </div>
               </div>

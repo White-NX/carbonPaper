@@ -17,7 +17,7 @@ import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
-import { deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
+import { deleteScreenshot, deleteRecordsByTimeRange, warmupThumbnails } from './lib/monitor_api';
 import { UpdateModal } from './components/UpdateModal';
 import { useAppTheme } from './hooks/useAppTheme';
 import { useAppWindowActions, usePowerSavingState, useWindowMaximizedState } from './hooks/useAppWindowState';
@@ -30,7 +30,7 @@ import { useSelectedSnapshot, normalizeTimestampToMs } from './hooks/useSelected
 import { useRequiredModelDownload } from './hooks/useRequiredModelDownload';
 import { useUpdateManager } from './hooks/useUpdateManager';
 import { useTauriEventListener } from './hooks/useTauriEventListener';
-import { initAuthListeners, withAuth } from './lib/auth_api';
+import { initAuthListeners } from './lib/auth_api';
 import { downloadSizeMb, missingRequiredModels } from './lib/modelSizes';
 import OnboardingOverlay from './components/onboarding/OnboardingOverlay';
 import { useOnboarding } from './components/onboarding/useOnboarding';
@@ -148,7 +148,7 @@ function App() {
 
   useEffect(() => {
     if (backendStatus !== 'online' || !isAuthenticated) return;
-    withAuth(() => invoke('storage_warmup_thumbnails'))
+    warmupThumbnails()
       .catch((err) => console.warn('[Warmup] Thumbnail warmup failed:', err));
   }, [backendStatus, isAuthenticated]);
 

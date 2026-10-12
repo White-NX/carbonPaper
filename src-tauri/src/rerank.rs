@@ -3,9 +3,11 @@
 //! Provides batching, progress reporting, stall handling, and scorer identity tracking
 //! for cross-encoder reranking operations.
 
+use crate::ml_protocol::MlErrorKind;
 use crate::ml_protocol::{MlProvider, MlSemanticModel};
 use crate::semantic_models::descriptor;
 use crate::semantic_runtime::SemanticRuntimeState;
+use crate::task_error::TaskError;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -371,15 +373,15 @@ impl RerankPriority {
 /// it when the promise settles.
 pub const NL_RERANK_PROGRESS_EVENT: &str = "nl-rerank-progress";
 
-/// Error prefix marking a reranked query the user stopped.
+/// Pause reason marking a reranked query the user stopped.
 ///
 /// Distinguished from every other error so callers can report a user-requested
 /// stop as cancellation instead of a model or retrieval failure.
 pub const CANCELLED_BY_USER: &str = "cancelled_by_user";
 
 /// Whether an error from [`rerank_documents`] is the user's stop.
-pub fn is_cancelled(error: &str) -> bool {
-    error.starts_with(CANCELLED_BY_USER)
+pub fn is_cancelled(error: &TaskError) -> bool {
+    matches!(error, TaskError::Paused(CANCELLED_BY_USER))
 }
 
 /// Stage of a reranked query, reported for progress tracking.
@@ -519,7 +521,7 @@ impl Drop for ActiveRerankQuery {
     }
 }
 
-/// Error prefix marking a background rerank that stood down for a foreground
+/// Pause reason marking a background rerank that stood down for a foreground
 /// query rather than failing.
 ///
 /// It travels as an error because that is the only channel `rerank_documents`
@@ -531,8 +533,8 @@ impl Drop for ActiveRerankQuery {
 pub const YIELDED_TO_FOREGROUND: &str = "yielded_to_foreground";
 
 /// Whether an error from [`rerank_documents`] is the stand-down marker.
-pub fn is_yield(error: &str) -> bool {
-    error.starts_with(YIELDED_TO_FOREGROUND)
+pub fn is_yield(error: &TaskError) -> bool {
+    matches!(error, TaskError::Paused(YIELDED_TO_FOREGROUND))
 }
 
 /// Score every document against one query, in protocol-sized chunks.
@@ -572,21 +574,27 @@ pub async fn rerank_documents(
     budget: RerankBudget,
     priority: RerankPriority,
     watcher: Option<&ActiveRerankQuery>,
-) -> Result<Vec<f32>, String> {
-    rerank_chunks(documents, budget, priority.chunk_size(), Instant::now,
-        |scored, total| {
+) -> Result<Vec<f32>, TaskError> {
+    rerank_chunks(
+        documents,
+        budget,
+        priority.chunk_size(),
+        Instant::now,
+        |_scored, _total| {
             crate::background_policy::check_current()?;
             if watcher.is_some_and(ActiveRerankQuery::cancelled) {
-                return Err(format!("{CANCELLED_BY_USER}: stopped after {scored} of {total} documents"));
+                return Err(TaskError::Paused(CANCELLED_BY_USER));
             }
             if priority == RerankPriority::Background && semantic.foreground_waiting() {
-                return Err(format!("{YIELDED_TO_FOREGROUND}: stood down after {scored} of {total} documents so a foreground query could reach the semantic worker"));
+                return Err(TaskError::Paused(YIELDED_TO_FOREGROUND));
             }
             Ok(())
         },
         |chunk, allowance| async move {
-            semantic.rerank(app.clone(), query.to_string(), chunk, allowance, false)
-                .await.map(|result| result.scores)
+            semantic
+                .rerank(app.clone(), query.to_string(), chunk, allowance, false)
+                .await
+                .map(|result| result.scores)
         },
         |count| {
             crate::background_policy::check_current()?;
@@ -595,7 +603,8 @@ pub async fn rerank_documents(
             }
             Ok(())
         },
-    ).await
+    )
+    .await
 }
 
 // Keep request orchestration independent of the process transport. Tests can
@@ -605,13 +614,13 @@ async fn rerank_chunks<F, Fut>(
     budget: RerankBudget,
     chunk_size: usize,
     mut now: impl FnMut() -> Instant,
-    mut before_chunk: impl FnMut(usize, usize) -> Result<(), String>,
+    mut before_chunk: impl FnMut(usize, usize) -> Result<(), TaskError>,
     mut infer: F,
-    mut after_chunk: impl FnMut(usize) -> Result<(), String>,
-) -> Result<Vec<f32>, String>
+    mut after_chunk: impl FnMut(usize) -> Result<(), TaskError>,
+) -> Result<Vec<f32>, TaskError>
 where
     F: FnMut(Vec<String>, Duration) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<f32>, String>>,
+    Fut: std::future::Future<Output = Result<Vec<f32>, TaskError>>,
 {
     if documents.is_empty() {
         return Ok(Vec::new());
@@ -621,18 +630,24 @@ where
     for chunk in documents.chunks(chunk_size) {
         before_chunk(scores.len(), documents.len())?;
         let allowance = clock.allowance(now()).ok_or_else(|| {
-            format!(
-                "timeout: reranking ran out of budget after {} of {} documents",
-                scores.len(),
-                documents.len()
+            TaskError::worker(
+                MlErrorKind::Timeout,
+                format!(
+                    "reranking ran out of budget after {} of {} documents",
+                    scores.len(),
+                    documents.len()
+                ),
             )
         })?;
         let result = infer(chunk.to_vec(), allowance).await?;
         if result.len() != chunk.len() {
-            return Err(format!(
-                "model_mismatch: reranker returned {} scores for {} documents",
-                result.len(),
-                chunk.len()
+            return Err(TaskError::worker(
+                MlErrorKind::ModelMismatch,
+                format!(
+                    "reranker returned {} scores for {} documents",
+                    result.len(),
+                    chunk.len()
+                ),
             ));
         }
         // Preserve the post-inference authorization check before publishing progress.
@@ -773,13 +788,19 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.starts_with("timeout:"));
+        assert!(error.worker_kind() == Some(MlErrorKind::Timeout));
         assert_eq!(calls.get(), 1);
     }
 
     #[tokio::test]
     async fn invalid_worker_scores_stop_the_pass_without_reporting_completion() {
-        for result in [Ok(vec![]), Err("inference failed".to_string())] {
+        for result in [
+            Ok(vec![]),
+            Err(TaskError::worker(
+                MlErrorKind::Inference,
+                "inference failed",
+            )),
+        ] {
             let mut calls = 0;
             let mut reported = 0;
             let failure = rerank_chunks(
@@ -893,11 +914,15 @@ mod tests {
         // has, and both mean something other than "this failed" — so both are
         // recognized by prefix rather than by string equality, since each
         // carries its own progress detail.
-        let stopped = format!("{CANCELLED_BY_USER}: stopped after 24 of 120 documents");
+        let stopped = TaskError::Paused(CANCELLED_BY_USER);
         assert!(is_cancelled(&stopped));
         assert!(!is_yield(&stopped));
-        assert!(!is_cancelled("timeout: reranking ran out of budget"));
-        assert!(!is_cancelled("model_mismatch: reranker returned 3 scores"));
+        assert!(!is_cancelled(&TaskError::from(
+            "timeout: reranking ran out of budget"
+        )));
+        assert!(!is_cancelled(&TaskError::from(
+            "model_mismatch: reranker returned 3 scores"
+        )));
     }
 
     #[test]
@@ -1038,7 +1063,7 @@ mod tests {
                 Instant::now,
                 |_, _| {
                     if calls.get() > 0 {
-                        Err(reason.into())
+                        Err(TaskError::Paused(reason))
                     } else {
                         Ok(())
                     }
@@ -1054,7 +1079,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(error, reason);
+            assert_eq!(error, TaskError::Paused(reason));
             assert_eq!(calls.get(), 1);
             assert_eq!(progress, 2);
         }
@@ -1066,10 +1091,14 @@ mod tests {
         // and say nothing" and "log a fault". Confusing the two either fills
         // the log with warnings every time somebody searches, or silently
         // swallows a broken worker.
-        let yielded = format!("{YIELDED_TO_FOREGROUND}: stood down after 4 of 32 documents");
+        let yielded = TaskError::Paused(YIELDED_TO_FOREGROUND);
         assert!(is_yield(&yielded));
-        assert!(!is_yield("timeout: reranking ran out of budget"));
-        assert!(!is_yield("model_mismatch: reranker returned 3 scores"));
-        assert!(!is_yield(""));
+        assert!(!is_yield(&TaskError::from(
+            "timeout: reranking ran out of budget"
+        )));
+        assert!(!is_yield(&TaskError::from(
+            "model_mismatch: reranker returned 3 scores"
+        )));
+        assert!(!is_yield(&TaskError::from("")));
     }
 }

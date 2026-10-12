@@ -80,6 +80,7 @@
 //! would redo the same work forever and never reach a newly captured screenshot.
 
 use crate::background_scheduler::ScheduledSliceResult;
+use crate::ml_protocol::MlErrorKind;
 use crate::ml_protocol::MlSemanticModel;
 use crate::rerank::{build_rerank_document, ScorerIdentity, RERANK_OCR_SNIPPET_CHARS};
 use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
@@ -87,6 +88,7 @@ use crate::storage::smart_cluster::{
     anchor_text_hash, SmartClusterScorer, SmartClusterScoringTarget,
 };
 use crate::storage::{BackgroundTaskState, DerivedIndexKind, StorageState};
+use crate::task_error::TaskError;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -146,30 +148,19 @@ pub(crate) struct ScheduledFailurePolicy {
 /// safety bound. Known deterministic failures stop immediately; everything
 /// else is retried a few times and then reaches the same terminal state.
 pub(crate) fn scheduled_failure_policy(
-    error: &str,
+    error: &TaskError,
     consecutive_failures: u32,
 ) -> ScheduledFailurePolicy {
-    let lower = error.to_ascii_lowercase();
-    let (code, deterministic) = if lower.contains("model_mismatch") {
-        ("model_mismatch", true)
-    } else if lower.contains("invalid_request") {
-        ("invalid_request", true)
-    } else if lower.contains("protocol:") {
-        ("protocol_error", true)
-    } else if lower.contains("worker_stopped") && lower.contains("was not found") {
-        ("worker_missing", true)
-    } else if lower.contains("timeout:") {
-        ("timeout", false)
-    } else if lower.contains("provider_unavailable") {
-        ("provider_unavailable", false)
-    } else if lower.contains("inference:") || lower.contains("rerank_failed") {
-        ("inference_failed", false)
-    } else {
-        ("scoring_failed", false)
+    let code = match error.worker_kind() {
+        Some(MlErrorKind::Protocol) => "protocol_error",
+        Some(MlErrorKind::Inference) => "inference_failed",
+        Some(kind) => kind.as_str(),
+        None => "scoring_failed",
     };
     ScheduledFailurePolicy {
         code,
-        terminal: deterministic || consecutive_failures >= MAX_SCHEDULED_FAILURES,
+        terminal: error.is_deterministic_worker_failure()
+            || consecutive_failures >= MAX_SCHEDULED_FAILURES,
     }
 }
 
@@ -489,7 +480,7 @@ pub struct SmartClusterWorkerStatus {
 pub async fn run_scheduled_slice(
     app: &AppHandle,
     manual: bool,
-) -> Result<ScheduledSliceResult, String> {
+) -> Result<ScheduledSliceResult, TaskError> {
     let state = app.state::<Arc<SmartClusterWorkerState>>().inner().clone();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let pending_before = tokio::task::spawn_blocking({
@@ -546,7 +537,7 @@ pub async fn run_scheduled_slice(
         }
     }
     if manual && result.is_ok() && pending > 0 && !state.aborted() {
-        result = Err("manual smart cluster drain stopped before the queue was empty".to_string());
+        result = Err("manual smart cluster drain stopped before the queue was empty".into());
     }
     if manual {
         match &result {
@@ -695,7 +686,7 @@ async fn run_pass(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
     forced: bool,
-) -> Result<u64, String> {
+) -> Result<u64, TaskError> {
     if !may_run(app, forced) {
         return Ok(0);
     }
@@ -783,7 +774,7 @@ async fn run_pass(
                 if staged::waiting_reason(&storage)?.is_some() {
                     break Ok(processed);
                 }
-                break Err("smart cluster drain made no progress while work remained".to_string());
+                break Err("smart cluster drain made no progress while work remained".into());
             }
         }
         if batch.stopped_because.is_some() || !batch.more || !forced {
@@ -873,7 +864,7 @@ async fn run_batch(
     state: &Arc<SmartClusterWorkerState>,
     storage: Arc<StorageState>,
     forced: bool,
-) -> Result<BatchProgress, String> {
+) -> Result<BatchProgress, TaskError> {
     if let Some(progress) = staged::run_batch(app, state, storage.clone(), forced).await? {
         return Ok(progress);
     }
@@ -883,7 +874,7 @@ async fn run_batch(
     let generation = storage.db_generation();
     let read = {
         let storage = storage.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<BatchInputs>, String> {
+        tokio::task::spawn_blocking(move || -> Result<Option<BatchInputs>, TaskError> {
             let pending = storage.count_smart_cluster_pending()?;
             if pending <= 0 {
                 return Ok(None);
@@ -1060,10 +1051,7 @@ async fn run_batch(
                     Err(error) => {
                         // Keep this whole group queued so the failed target is
                         // never skipped when the retry succeeds.
-                        return Err(format!(
-                        "rerank_failed: cluster {} could not score its pending snapshots: {error}",
-                        target.id
-                    ));
+                        return Err(error);
                     }
                 };
                 group_assignments.extend(
@@ -1079,7 +1067,7 @@ async fn run_batch(
             }
             crate::background_policy::check_current()?;
             if stand_down_reason(app, state, forced).is_some() {
-                return Err("background_paused: scoring pass stopped".into());
+                return Err(TaskError::Paused("scoring_pass_stopped"));
             }
             let write_storage = storage.clone();
             let configuration = scoring_configuration.clone();
@@ -1124,10 +1112,10 @@ async fn run_batch(
 async fn with_resolved_thresholds<F, Fut>(
     resolution: ThresholdResolution,
     run: F,
-) -> Result<BatchProgress, String>
+) -> Result<BatchProgress, TaskError>
 where
     F: FnOnce(Vec<SmartClusterScoringTarget>, Vec<SmartClusterScoringTarget>) -> Fut,
-    Fut: std::future::Future<Output = Result<BatchProgress, String>>,
+    Fut: std::future::Future<Output = Result<BatchProgress, TaskError>>,
 {
     if let Some(reason) = resolution.interrupted {
         // Resolution stood down part-way, so `usable` is a prefix of the
@@ -1201,7 +1189,7 @@ struct ThresholdResolution {
     unverifiable: usize,
     /// A runtime failure that requires the whole queue batch to remain intact.
     /// The scheduler owns its bounded retry and terminal-failure policy.
-    retry_error: Option<String>,
+    retry_error: Option<TaskError>,
     /// Why the pass stood down before every enabled cluster had been
     /// considered, if it did.
     ///
@@ -1266,9 +1254,9 @@ async fn resolve_thresholds_with<F, Fut, M, Mark>(
 ) -> ThresholdResolution
 where
     F: FnMut(SmartClusterScoringTarget) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<f64>, String>>,
+    Fut: std::future::Future<Output = Result<Option<f64>, TaskError>>,
     M: FnMut(i64, String) -> Mark,
-    Mark: std::future::Future<Output = Result<(), String>>,
+    Mark: std::future::Future<Output = Result<(), TaskError>>,
 {
     let fingerprint = scorer.fingerprint();
     let mut resolution = ThresholdResolution {
@@ -1366,10 +1354,7 @@ where
                     "[SMART_CLUSTER] could not re-derive the threshold for cluster {}: {error}",
                     target.id
                 );
-                resolution.retry_error = Some(format!(
-                    "rerank_failed: cluster {} could not re-derive its threshold: {error}",
-                    target.id
-                ));
+                resolution.retry_error = Some(error);
                 break;
             }
         }
@@ -1381,12 +1366,13 @@ async fn mark_unverifiable(
     storage: Arc<StorageState>,
     cluster_id: i64,
     fingerprint: String,
-) -> Result<(), String> {
+) -> Result<(), TaskError> {
     tokio::task::spawn_blocking(move || {
         storage.mark_smart_cluster_threshold_unverifiable(cluster_id, &fingerprint)
     })
     .await
     .map_err(|error| format!("unverifiable mark task failed: {error}"))?
+    .map_err(Into::into)
 }
 
 /// Re-score a cluster's saved calibration examples and recompute its threshold.
@@ -1400,7 +1386,7 @@ async fn rederive_threshold(
     storage: Arc<StorageState>,
     target: &SmartClusterScoringTarget,
     scorer: &ScorerIdentity,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, TaskError> {
     let cluster_id = target.id;
     let examples = {
         let storage = storage.clone();
@@ -1515,15 +1501,12 @@ pub fn compute_threshold(positives: &[f64], negatives: &[f64]) -> Option<f64> {
 async fn load_documents(
     storage: Arc<StorageState>,
     ids: &[i64],
-) -> Result<HashMap<i64, String>, String> {
+) -> Result<HashMap<i64, String>, TaskError> {
     let ids = ids.to_vec();
-    tokio::task::spawn_blocking(move || -> Result<HashMap<i64, String>, String> {
-        let summaries = storage
-            .get_screenshot_summaries_by_ids_silent(&ids)
-            .map_err(|error| error.to_string())?;
+    tokio::task::spawn_blocking(move || -> Result<HashMap<i64, String>, TaskError> {
+        let summaries = storage.get_screenshot_summaries_by_ids_silent(&ids)?;
         let ocr = storage
-            .get_ocr_text_prefixes_by_screenshot_ids_silent(&ids, RERANK_OCR_SNIPPET_CHARS)
-            .map_err(|error| error.to_string())?;
+            .get_ocr_text_prefixes_by_screenshot_ids_silent(&ids, RERANK_OCR_SNIPPET_CHARS)?;
         Ok(summaries
             .into_iter()
             .map(|summary| {
@@ -1544,9 +1527,9 @@ async fn load_documents(
 async fn load_prefilter_vectors(
     storage: Arc<StorageState>,
     ids: impl Iterator<Item = i64>,
-) -> Result<HashMap<i64, Vec<f32>>, String> {
+) -> Result<HashMap<i64, Vec<f32>>, TaskError> {
     let subjects: Vec<String> = ids.map(|id| id.to_string()).collect();
-    tokio::task::spawn_blocking(move || -> Result<HashMap<i64, Vec<f32>>, String> {
+    tokio::task::spawn_blocking(move || -> Result<HashMap<i64, Vec<f32>>, TaskError> {
         let raw = storage
             .get_query_visible_embeddings_by_subjects(DerivedIndexKind::SemanticText, &subjects)?;
         Ok(raw
@@ -1607,7 +1590,7 @@ async fn embed_anchors(
     semantic: &Arc<SemanticRuntimeState>,
     storage: Arc<StorageState>,
     targets: &[SmartClusterScoringTarget],
-) -> Result<HashMap<i64, Vec<f32>>, String> {
+) -> Result<HashMap<i64, Vec<f32>>, TaskError> {
     let descriptor = crate::semantic_models::descriptor(MlSemanticModel::MinilmL12);
     let mut anchors: HashMap<i64, Vec<f32>> = HashMap::with_capacity(targets.len());
     let mut cold: Vec<(i64, String, String)> = Vec::new();
@@ -1642,10 +1625,13 @@ async fn embed_anchors(
             )
             .await?;
         if embedded.vectors.len() != chunk.len() {
-            return Err(format!(
-                "model_mismatch: anchor encode returned {} vectors for {} clusters",
-                embedded.vectors.len(),
-                chunk.len()
+            return Err(TaskError::worker(
+                MlErrorKind::ModelMismatch,
+                format!(
+                    "anchor encode returned {} vectors for {} clusters",
+                    embedded.vectors.len(),
+                    chunk.len()
+                ),
             ));
         }
         for ((id, _, hash), vector) in chunk.iter().zip(embedded.vectors) {
@@ -1715,7 +1701,7 @@ fn matching_scores(
     target: &SmartClusterScoringTarget,
     candidates: &[i64],
     scores: &[f32],
-) -> Result<Vec<(i64, f64)>, String> {
+) -> Result<Vec<(i64, f64)>, TaskError> {
     if scores.len() != candidates.len() || scores.iter().any(|score| !score.is_finite()) {
         return Err("rerank_failed: invalid score batch".into());
     }
@@ -1736,7 +1722,7 @@ async fn commit_pending(
     revisions: Vec<(i64, Option<i64>)>,
     configuration: Vec<SmartClusterScoringTarget>,
     forced: bool,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64), TaskError> {
     crate::background_policy::check_current()?;
     let execution = crate::background_policy::current_execution();
     let (deleted, remaining) = tokio::task::spawn_blocking(move || {
@@ -1748,7 +1734,7 @@ async fn commit_pending(
             execution.as_deref(),
         )?;
         let remaining = storage.count_smart_cluster_pending()?.max(0) as u64;
-        Ok::<_, String>((deleted, remaining))
+        Ok::<_, TaskError>((deleted, remaining))
     })
     .await
     .map_err(|error| format!("pending commit task failed: {error}"))??;
@@ -1800,11 +1786,8 @@ pub fn status_value(
     }
     let manual_active = manual_pending || status.is_force_running || progress.phase.is_active();
     let last_error = scheduler_task.and_then(|task| task.last_error.as_deref());
-    let failure_kind = scheduler_task.and_then(|task| {
-        task.last_error
-            .as_deref()
-            .map(|error| scheduled_failure_policy(error, task.failure_count.max(1)).code)
-    });
+    let failure_kind =
+        scheduler_task.and_then(|task| task.last_error.as_deref().map(|_| "scoring_failed"));
     serde_json::json!({
         "status": "success",
         "backend": status.backend,
@@ -1887,7 +1870,7 @@ mod tests {
         let failed_value = status_value(&state, 4, Some(&failed));
         assert_eq!(failed_value["phase"], "failed");
         assert_eq!(failed_value["manual_active"], false);
-        assert_eq!(failed_value["failure_kind"], "inference_failed");
+        assert_eq!(failed_value["failure_kind"], "scoring_failed");
         assert_eq!(failed_value["pending_count"], 4);
     }
 
@@ -2150,7 +2133,7 @@ mod tests {
             resolution.configuration,
             &scorer,
             || None,
-            |_| -> std::future::Ready<Result<Option<f64>, String>> {
+            |_| -> std::future::Ready<Result<Option<f64>, TaskError>> {
                 panic!("unchanged failed scorers must not invoke the model")
             },
             |_, _| std::future::ready(Ok(())),
@@ -2236,7 +2219,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_threshold_resolution_never_consumes_the_pending_batch() {
         for failure in [
-            format!("{}: foreground", crate::rerank::YIELDED_TO_FOREGROUND),
+            TaskError::Paused(crate::rerank::YIELDED_TO_FOREGROUND),
             "inference failed".into(),
         ] {
             let scorer = ScorerIdentity::current();

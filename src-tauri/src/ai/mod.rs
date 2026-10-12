@@ -13,7 +13,6 @@ pub mod provider;
 pub mod recap;
 mod tokenizer;
 pub mod tools;
-pub mod unattended;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

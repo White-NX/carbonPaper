@@ -9,6 +9,7 @@ use rand::RngCore;
 use roaring::RoaringBitmap;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use super::types::{RawRecentCaptureRow, RawScreenshotRow};
 use super::{
@@ -124,6 +125,15 @@ fn open_cng_session(
     })
 }
 
+fn check_read_deadline(deadline: Option<Instant>) -> Result<(), BackgroundReadError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(BackgroundReadError::Other(
+            "query_deadline_exceeded_during_hydrate".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Decode row batches in parallel, borrowing the authenticated credential
 /// context in each worker. Only the NCrypt calls are serialized; workers can
 /// decrypt and decode payloads concurrently without opening unauthenticated
@@ -233,14 +243,16 @@ fn ocr_text_prefix_query(placeholder_count: usize) -> String {
 /// arrive contiguously in insertion order; the produced string is then a join
 /// prefix of the full join, so its first `min_chars` characters match the
 /// full text exactly (the MiniLM source contract only consumes that prefix).
-fn assemble_ocr_text_prefixes<E>(
+fn assemble_ocr_text_prefixes(
     rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>,
     min_chars: usize,
-    mut decrypt: impl FnMut(&[u8], &[u8]) -> Result<String, E>,
-) -> Result<std::collections::HashMap<i64, String>, E> {
+    deadline: Option<Instant>,
+    mut decrypt: impl FnMut(&[u8], &[u8]) -> Result<String, BackgroundReadError>,
+) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
     let mut texts: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
     let mut joined_chars: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
     for (screenshot_id, text_enc, key_enc) in rows {
+        check_read_deadline(deadline)?;
         if joined_chars
             .get(&screenshot_id)
             .is_some_and(|&count| count >= min_chars)
@@ -1357,7 +1369,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence";
@@ -1708,6 +1720,49 @@ impl StorageState {
         })
     }
 
+    /// Resolve ranking/filter fields without private-key work. Process-filtered
+    /// CLIP queries still use decrypted summaries; their encrypted process name
+    /// remains authoritative even for legacy rows with inconsistent plaintext.
+    pub(crate) fn clip_candidate_metadata(
+        &self,
+        hashes: &[String],
+        deadline: Instant,
+    ) -> Result<std::collections::HashMap<String, BackgroundScreenshotSummary>, String> {
+        check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let result = self.with_vector_scan_connection("clip_candidate_metadata", |conn| {
+            let _deadline = super::connection::QueryDeadline::install(conn, Some(deadline))
+                .map_err(|error| error.to_string())?;
+            let mut result = std::collections::HashMap::new();
+            for chunk in hashes.chunks(500) {
+                check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), process_name, category
+                     FROM screenshots WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+                     ORDER BY created_at DESC, id DESC"
+                );
+                let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+                let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, BackgroundScreenshotSummary {
+                        id: row.get(1)?, timestamp: row.get(2)?, process_name: row.get(3)?,
+                        category: row.get(4)?, window_title: None,
+                    }))
+                }).map_err(|error| error.to_string())?;
+                for row in rows {
+                    let (hash, metadata) = row.map_err(|error| error.to_string())?;
+                    result.entry(hash).or_insert(metadata);
+                }
+            }
+            check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+            Ok(result)
+        });
+        check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
+        result
+    }
+
     pub fn get_index_storage_stats(&self) -> Result<IndexStorageStats, String> {
         Ok(IndexStorageStats {
             screenshots_count: self.count_active_screenshots()?,
@@ -1810,7 +1865,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -1878,7 +1933,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -1997,14 +2052,17 @@ impl StorageState {
     fn decrypt_summaries_parallel(
         &self,
         raw_rows: Vec<EncryptedScreenshotSummaryRow>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
+        check_read_deadline(deadline)?;
         unwrap_batch_parallel(&self.credential_state, raw_rows, |session, row| {
             if !self.is_silent_read_authorized() {
                 return Err(BackgroundReadError::AuthRequired);
             }
+            check_read_deadline(deadline)?;
             Self::decrypt_screenshot_summary_with_unwrap(
                 row,
                 &|ciphertext| session.unwrap_row_key(ciphertext),
@@ -2020,12 +2078,21 @@ impl StorageState {
         &self,
         ids: &[i64],
     ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
+        self.get_screenshot_summaries_by_ids_silent_with_deadline(ids, None)
+    }
+
+    pub(crate) fn get_screenshot_summaries_by_ids_silent_with_deadline(
+        &self,
+        ids: &[i64],
+        deadline: Option<Instant>,
+    ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
+        check_read_deadline(deadline)?;
 
         let raw_rows = {
             let conn = self
@@ -2072,7 +2139,7 @@ impl StorageState {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
-        self.decrypt_summaries_parallel(raw_rows)
+        self.decrypt_summaries_parallel(raw_rows, deadline)
     }
 
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
@@ -2089,7 +2156,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -2161,7 +2228,7 @@ impl StorageState {
                         s.window_title_enc, s.process_name_enc, s.metadata_enc,
                         s.content_key_encrypted,
                         strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        s.source, s.page_url_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
                         ls.links_enc, ls.links_key_encrypted,
                         s.category, s.category_confidence
@@ -2392,12 +2459,29 @@ impl StorageState {
         screenshot_ids: &[i64],
         min_chars: usize,
     ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
+        self.get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(
+            screenshot_ids,
+            min_chars,
+            None,
+        )
+    }
+
+    /// Query reads stop between OCR boxes when their caller's budget expires.
+    /// Dropping a spawn_blocking JoinHandle alone cannot stop CNG work; without
+    /// this check an expired search continues contending with the next search.
+    pub(crate) fn get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(
+        &self,
+        screenshot_ids: &[i64],
+        min_chars: usize,
+        deadline: Option<Instant>,
+    ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
         if screenshot_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
+        check_read_deadline(deadline)?;
 
         // Phase 1: fetch the raw encrypted rows with a read-only connection.
         let raw_rows = {
@@ -2409,6 +2493,7 @@ impl StorageState {
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
             for chunk in screenshot_ids.chunks(500) {
+                check_read_deadline(deadline)?;
                 let sql = ocr_text_prefix_query(chunk.len());
                 let params: Vec<&dyn rusqlite::ToSql> =
                     chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
@@ -2432,6 +2517,7 @@ impl StorageState {
                     })?;
 
                 for row in rows.filter_map(|r| r.ok()) {
+                    check_read_deadline(deadline)?;
                     raw_rows.push(row);
                 }
             }
@@ -2441,6 +2527,7 @@ impl StorageState {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
+        check_read_deadline(deadline)?;
 
         // Phase 2: group boxes per screenshot. Each id lives in exactly one
         // IN chunk and every chunk is ordered by screenshot_id, so the rows
@@ -2457,7 +2544,7 @@ impl StorageState {
 
         // Phase 3: decrypt each screenshot's prefix in parallel.
         let maps = unwrap_batch_parallel(&self.credential_state, groups, |session, group| {
-            assemble_ocr_text_prefixes(group, min_chars, |data, key| {
+            assemble_ocr_text_prefixes(group, min_chars, deadline, |data, key| {
                 if !self.is_silent_read_authorized() {
                     return Err(BackgroundReadError::AuthRequired);
                 }
@@ -2470,6 +2557,7 @@ impl StorageState {
             })
         })?;
 
+        check_read_deadline(deadline)?;
         let mut result: std::collections::HashMap<i64, String> = screenshot_ids
             .iter()
             .map(|&id| (id, String::new()))
@@ -4271,6 +4359,38 @@ mod ocr_lifecycle_tests {
     }
 
     #[test]
+    fn clip_candidates_preserve_live_ids_and_optional_utc_timestamps_without_decryption() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = super::super::test_storage_with_schema(temp.path().to_path_buf());
+        {
+            let guard = storage
+                .get_connection_named("clip_metadata_fixture")
+                .unwrap();
+            guard.as_ref().unwrap().execute_batch(
+                "INSERT INTO screenshots(id,image_path,image_hash,created_at,process_name,is_deleted,window_title_enc)
+                 VALUES(1,'1.enc','live','1970-01-01 00:00:01','editor.exe',0,X'ff'),
+                       (2,'2.enc','deleted','2026-10-01 00:00:00','editor.exe',1,X'ff'),
+                       (3,'3.enc','invalid','invalid timestamp',NULL,0,X'ff');"
+            ).unwrap();
+        }
+        let keys = ["live", "deleted", "invalid", "missing"].map(str::to_string);
+        let metadata = storage
+            .clip_candidate_metadata(&keys, Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata["live"].id, 1);
+        assert_eq!(metadata["live"].timestamp, Some(1));
+        assert_eq!(metadata["live"].process_name.as_deref(), Some("editor.exe"));
+        assert!(metadata["live"].window_title.is_none());
+        assert_eq!(metadata["invalid"].id, 3);
+        assert!(metadata["invalid"].timestamp.is_none());
+        assert!(storage
+            .clip_candidate_metadata(&keys, Instant::now())
+            .unwrap_err()
+            .starts_with("query_deadline_exceeded"));
+    }
+
+    #[test]
     fn silent_metadata_reads_fail_fast_while_session_is_locked() {
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
@@ -4284,6 +4404,59 @@ mod ocr_lifecycle_tests {
             storage.get_screenshot_summaries_by_ids_silent(&[1]),
             Err(BackgroundReadError::AuthRequired)
         ));
+        assert!(matches!(
+            storage.get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(
+                &[1],
+                200,
+                Some(Instant::now())
+            ),
+            Err(BackgroundReadError::AuthRequired)
+        ));
+        assert!(matches!(
+            storage
+                .get_screenshot_summaries_by_ids_silent_with_deadline(&[1], Some(Instant::now())),
+            Err(BackgroundReadError::AuthRequired)
+        ));
+    }
+
+    #[test]
+    fn expired_private_reads_stop_before_opening_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        credentials.cache_master_key_for_tests(vec![7; 32]);
+        credentials.update_auth_time();
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        assert!(storage.is_silent_read_authorized());
+        let deadline = Some(Instant::now());
+        for error in [
+            storage
+                .get_screenshot_summaries_by_ids_silent_with_deadline(&[1], deadline)
+                .unwrap_err(),
+            storage
+                .get_ocr_text_prefixes_by_screenshot_ids_silent_with_deadline(&[1], 1000, deadline)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "query_deadline_exceeded_during_hydrate");
+        }
+    }
+
+    #[test]
+    fn ocr_deadline_stops_the_remaining_boxes_after_a_slow_unwrap() {
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let rows = (0..100)
+            .map(|_| (1, Some(vec![1]), Some(vec![2])))
+            .collect();
+        let mut calls = 0;
+        let error = assemble_ocr_text_prefixes(rows, 1000, Some(deadline), |_, _| {
+            calls += 1;
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Ok("one box".to_string())
+        })
+        .unwrap_err();
+        // The first CNG operation cannot be preempted; the other 99 must not
+        // keep the detached blocking task busy after its caller times out.
+        assert_eq!(calls, 1);
+        assert_eq!(error.to_string(), "query_deadline_exceeded_during_hydrate");
     }
 
     #[test]
@@ -4357,7 +4530,7 @@ mod ocr_lifecycle_tests {
         };
 
         let mut decrypts = 0usize;
-        let result = assemble_ocr_text_prefixes(rows.clone(), 20, |data, _key| {
+        let result = assemble_ocr_text_prefixes(rows.clone(), 20, None, |data, _key| {
             decrypts += 1;
             Ok::<String, BackgroundReadError>(String::from_utf8(data.to_vec()).unwrap())
         })

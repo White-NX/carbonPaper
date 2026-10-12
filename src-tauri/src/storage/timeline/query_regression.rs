@@ -8,7 +8,7 @@ use std::sync::Arc;
 const REGRESSED_SQL: &str = "SELECT s.id, s.image_path, s.created_at,
         CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
         s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
-        s.content_key_encrypted, s.page_icon_enc, s.page_icon_id,
+        s.content_key_encrypted, s.page_icon_id,
         pi.icon_enc, pi.icon_key_encrypted, s.category FROM screenshots s
     JOIN (SELECT MIN(id) AS picked_id FROM screenshots
           WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2

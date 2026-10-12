@@ -7,8 +7,10 @@ import { useSettingsActivity } from './SettingsActivityContext';
 import { notifySettingsChanged } from '../../lib/settings_api';
 import { useBackgroundIndexProgress } from '../../hooks/useBackgroundIndexProgress';
 import { useIndexTaskController } from './hooks/useIndexTaskController';
+import { usePolling } from '../../hooks/usePolling';
+import { getThumbnailWarmupStatus, warmupThumbnails, cancelThumbnailWarmup } from '../../lib/monitor_api';
 
-export function useAdvancedSectionController({ monitorStatus, t, active = true, diagnosticsActive = active }) {
+export function useAdvancedSectionController({ monitorStatus, t, active = true, diagnosticsActive = active, maintenanceActive = active }) {
   const preferences = useAdvancedPreferences({ monitorStatus, t, active, devicesActive: diagnosticsActive });
   const [vacuumRunning, setVacuumRunning] = useState(false);
   const [vacuumMessage, setVacuumMessage] = useState('');
@@ -33,7 +35,41 @@ export function useAdvancedSectionController({ monitorStatus, t, active = true, 
   const [backgroundProcessingSaving, setBackgroundProcessingSaving] = useState(false);
   const mlOcrStatusRequestRef = useRef(null);
   const [runtimeError, setRuntimeError] = useState('');
+  const [thumbnailWarmup, setThumbnailWarmup] = useState(null);
+  const [thumbnailWarmupBusy, setThumbnailWarmupBusy] = useState(false);
+  const [thumbnailWarmupError, setThumbnailWarmupError] = useState('');
+  const [thumbnailWarmupReadError, setThumbnailWarmupReadError] = useState(false);
+  const thumbnailWarmupRequest = useRef(0);
   useSettingsActivity('runtime-operation', { busy: rustOcrModelDownloading || backgroundProcessingSaving });
+
+  usePolling(async () => {
+    const request = ++thumbnailWarmupRequest.current;
+    try {
+      const status = await getThumbnailWarmupStatus();
+      if (request !== thumbnailWarmupRequest.current) return;
+      setThumbnailWarmup(status);
+      setThumbnailWarmupReadError(false);
+    } catch {
+      if (request === thumbnailWarmupRequest.current) setThumbnailWarmupReadError(true);
+    }
+  }, { intervalMs: 1000, enabled: maintenanceActive && !thumbnailWarmupBusy });
+
+  const handleThumbnailWarmup = async () => {
+    if (thumbnailWarmupBusy) return;
+    ++thumbnailWarmupRequest.current;
+    setThumbnailWarmupBusy(true);
+    setThumbnailWarmupError('');
+    try {
+      const status = thumbnailWarmup?.running
+        ? await cancelThumbnailWarmup()
+        : (await warmupThumbnails({ autoPrompt: true })).progress;
+      setThumbnailWarmup(status);
+    } catch (error) {
+      setThumbnailWarmupError(t('settings.feedback.operationFailed', { error: String(error) }));
+    } finally {
+      setThumbnailWarmupBusy(false);
+    }
+  };
 
   const refreshVacuumRunningStatus = async () => {
     try {
@@ -237,13 +273,13 @@ export function useAdvancedSectionController({ monitorStatus, t, active = true, 
     try {
       const result = await withAuth(() => invoke('storage_run_manual_vacuum'), { autoPrompt: true });
       if (result?.already_running) {
-        setVacuumMessage(t('settings.advanced.vacuum.already_running', '已有数据库优化任务正在执行，请稍候。'));
+        setVacuumMessage(t('settings.advanced.vacuum.already_running'));
       } else {
-        setVacuumMessage(t('settings.advanced.vacuum.success', '数据库优化已完成。'));
+        setVacuumMessage(t('settings.advanced.vacuum.success'));
       }
     } catch (err) {
-      const msg = err?.message || err?.toString() || t('settings.advanced.vacuum.error', '数据库优化失败');
-      setVacuumMessage(t('settings.advanced.vacuum.error_with_detail', '数据库优化失败：{{error}}', { error: msg }));
+      const msg = err?.message || err?.toString() || t('settings.advanced.vacuum.error');
+      setVacuumMessage(t('settings.advanced.vacuum.error_with_detail', { error: msg }));
     } finally {
       await refreshVacuumRunningStatus();
     }
@@ -251,6 +287,10 @@ export function useAdvancedSectionController({ monitorStatus, t, active = true, 
 
   return {
     ...preferences,
+    thumbnailWarmup,
+    thumbnailWarmupBusy,
+    thumbnailWarmupError: thumbnailWarmupError || (thumbnailWarmupReadError ? t('settings.feedback.readFailed') : ''),
+    handleThumbnailWarmup,
     runtimeError,
     refreshRustOcrModelStatus,
     vacuumRunning,

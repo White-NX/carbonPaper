@@ -1,4 +1,5 @@
 //! Request IDs fence cancellation, including requests waiting to start loading.
+use crate::ml_protocol::{MlError, MlErrorKind};
 use ort::session::RunOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,9 +11,12 @@ pub struct RequestControl {
 }
 
 impl RequestControl {
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), MlError> {
         if self.cancelled.load(Ordering::SeqCst) {
-            Err("cancelled: semantic request was revoked".into())
+            Err(MlError::new(
+                MlErrorKind::Cancelled,
+                "semantic request was revoked",
+            ))
         } else {
             Ok(())
         }
@@ -28,14 +32,17 @@ impl RequestControl {
             let _ = options.terminate();
         }
     }
-    pub fn run_options(&self) -> Result<Arc<RunOptions>, String> {
+    pub fn run_options(&self) -> Result<Arc<RunOptions>, MlError> {
         self.check()?;
         let mut options = self.options.lock().unwrap_or_else(|e| e.into_inner());
         self.check()?;
         if let Some(options) = options.as_ref() {
             return Ok(options.clone());
         }
-        let new = Arc::new(RunOptions::new().map_err(|e| format!("inference: run options: {e}"))?);
+        let new = Arc::new(
+            RunOptions::new()
+                .map_err(|e| MlError::new(MlErrorKind::Inference, format!("run options: {e}")))?,
+        );
         *options = Some(new.clone());
         Ok(new)
     }

@@ -100,14 +100,8 @@ pub fn start_power_monitor(app: AppHandle) {
                 tracing::info!("Power: AC disconnected, activating power saving mode");
 
                 // Stop monitor if running
-                let monitor_state = app_clone.state::<crate::monitor::MonitorState>();
-                let capture_state = app_clone.state::<Arc<crate::capture::CaptureState>>();
-                let _ = crate::monitor::stop_monitor_impl(
-                    monitor_state,
-                    capture_state,
-                    app_clone.clone(),
-                )
-                .await;
+                let _ =
+                    crate::monitor::control(&app_clone, crate::monitor::MonitorAction::Stop).await;
 
                 power_state.active.store(true, Ordering::SeqCst);
                 let _ = app_clone.emit(
@@ -133,10 +127,11 @@ pub fn start_power_monitor(app: AppHandle) {
                 let auto_start = registry_config::get_bool("autoStartMonitor").unwrap_or(true);
                 if auto_start {
                     tauri::async_runtime::spawn(async move {
-                        let monitor_state = app_for_spawn.state::<crate::monitor::MonitorState>();
-                        if let Err(e) =
-                            crate::monitor::start_monitor_impl(monitor_state, app_for_spawn.clone())
-                                .await
+                        if let Err(e) = crate::monitor::control(
+                            &app_for_spawn,
+                            crate::monitor::MonitorAction::Start,
+                        )
+                        .await
                         {
                             tracing::error!("Failed to start monitor after power restored: {}", e);
                         }

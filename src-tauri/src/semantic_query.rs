@@ -34,6 +34,7 @@
 use crate::ml_protocol::MlSemanticModel;
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, StorageState};
+use crate::task_error::TaskError;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -287,7 +288,7 @@ async fn try_rust_nl_query_inner(
             tracing::info!("[SEMANTIC] reranked query stopped by the user: {error}");
             RustQueryOutcome::Cancelled
         }
-        Err(error) => unavailable(&error),
+        Err(error) => unavailable(&error.to_string()),
     }
 }
 
@@ -332,7 +333,7 @@ async fn run_rust_reranked_nl_query(
     app: &AppHandle,
     query: &str,
     n_results: u32,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, TaskError> {
     let watcher = app
         .state::<Arc<crate::rerank::RerankQueryState>>()
         .inner()
@@ -406,16 +407,7 @@ async fn run_rust_reranked_nl_query(
         crate::rerank::RerankPriority::Foreground,
         Some(&watcher),
     )
-    .await
-    // A stop keeps its own marker: the caller distinguishes it from a failure
-    // and must not answer it by re-running the query on Python.
-    .map_err(|error| {
-        if crate::rerank::is_cancelled(&error) {
-            error
-        } else {
-            format!("rerank_failed: {error}")
-        }
-    })?;
+    .await?;
     tracing::debug!(
         "[SEMANTIC] rust rerank scored {} document(s) in {:.1}ms",
         documents.len(),
@@ -451,7 +443,7 @@ async fn run_rust_nl_query(
     app: &AppHandle,
     query: &str,
     n_results: u32,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<serde_json::Value>, TaskError> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
 
@@ -464,8 +456,7 @@ async fn run_rust_nl_query(
             QUERY_EMBED_TIMEOUT,
             false,
         )
-        .await
-        .map_err(|error| format!("embed_failed: {error}"))?;
+        .await?;
     let embed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let query_vec = embedding
         .vectors

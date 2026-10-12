@@ -3,10 +3,8 @@
 //! Header and image-size limits are enforced before allocation to keep the local pipe
 //! boundary predictable even when a peer is malformed or compromised.
 //!
-//! Every error carries a stable kind prefix (`invalid_request:`, `limit_exceeded:`,
-//! `protocol:`, `transport:`) so supervisors can classify failures without parsing
-//! free-form text: request-validation failures never restart a worker, while
-//! `transport` means the pipe itself broke.
+//! Errors retain their kind independently of their diagnostic message. Worker
+//! responses keep the same kind/message wire fields for protocol compatibility.
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -19,6 +17,118 @@ pub const MAX_RERANK_DOCUMENTS: usize = 64;
 pub const MAX_SEMANTIC_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_SEMANTIC_TEXT_ITEM_BYTES: usize = 64 * 1024;
 pub const MAX_ML_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlErrorKind {
+    InvalidRequest,
+    LimitExceeded,
+    Timeout,
+    Cancelled,
+    ModelMissing,
+    ModelMismatch,
+    ProviderUnavailable,
+    Inference,
+    Protocol,
+    Transport,
+    WorkerStopped,
+    WorkerMissing,
+}
+
+impl MlErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::ModelMissing => "model_missing",
+            Self::ModelMismatch => "model_mismatch",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::Inference => "inference",
+            Self::Protocol => "protocol",
+            Self::Transport => "transport",
+            Self::WorkerStopped => "worker_stopped",
+            Self::WorkerMissing => "worker_missing",
+        }
+    }
+
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Transport
+                | Self::WorkerStopped
+                | Self::ProviderUnavailable
+                | Self::Inference
+        )
+    }
+
+    pub fn is_deterministic(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidRequest
+                | Self::LimitExceeded
+                | Self::ModelMissing
+                | Self::ModelMismatch
+                | Self::Protocol
+                | Self::WorkerMissing
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlError {
+    pub kind: MlErrorKind,
+    pub message: String,
+}
+
+impl MlError {
+    pub fn new(kind: MlErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Decode only the machine-readable wire field, never the message text.
+    pub fn from_response(code: &str, message: String) -> Self {
+        let kind = match code {
+            "invalid_request" => MlErrorKind::InvalidRequest,
+            "limit_exceeded" => MlErrorKind::LimitExceeded,
+            "timeout" => MlErrorKind::Timeout,
+            "cancelled" => MlErrorKind::Cancelled,
+            "model_missing" => MlErrorKind::ModelMissing,
+            "model_mismatch" => MlErrorKind::ModelMismatch,
+            "provider_unavailable" => MlErrorKind::ProviderUnavailable,
+            "inference" => MlErrorKind::Inference,
+            "protocol" => MlErrorKind::Protocol,
+            "transport" => MlErrorKind::Transport,
+            "worker_stopped" => MlErrorKind::WorkerStopped,
+            "worker_missing" => MlErrorKind::WorkerMissing,
+            _ => {
+                return Self::new(
+                    MlErrorKind::Protocol,
+                    format!("Unknown worker error kind {code}: {message}"),
+                )
+            }
+        };
+        Self::new(kind, message)
+    }
+}
+
+impl std::fmt::Display for MlError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.kind.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for MlError {}
+
+impl From<MlError> for String {
+    fn from(error: MlError) -> Self {
+        error.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,10 +322,14 @@ pub enum MlResponse {
     },
 }
 
-pub fn read_request<R: Read>(reader: &mut R) -> Result<(MlRequest, Vec<u8>), String> {
+pub fn read_request<R: Read>(reader: &mut R) -> Result<(MlRequest, Vec<u8>), MlError> {
     let header = read_frame(reader, MAX_ML_HEADER_BYTES)?;
-    let request: MlRequest = serde_json::from_slice(&header)
-        .map_err(|error| format!("protocol: invalid ML request JSON: {error}"))?;
+    let request: MlRequest = serde_json::from_slice(&header).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Protocol,
+            format!("invalid ML request JSON: {error}"),
+        )
+    })?;
     let body_len = match &request {
         MlRequest::Ocr {
             timeout_ms,
@@ -265,9 +379,12 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<(MlRequest, Vec<u8>), Str
         _ => 0,
     };
     let mut body = vec![0u8; body_len];
-    reader
-        .read_exact(&mut body)
-        .map_err(|error| format!("transport: failed to read ML request body: {error}"))?;
+    reader.read_exact(&mut body).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Transport,
+            format!("failed to read ML request body: {error}"),
+        )
+    })?;
     Ok((request, body))
 }
 
@@ -275,7 +392,7 @@ pub fn write_request<W: Write>(
     writer: &mut W,
     request: &MlRequest,
     body: &[u8],
-) -> Result<(), String> {
+) -> Result<(), MlError> {
     let expected_body_len = match request {
         MlRequest::Ocr {
             timeout_ms,
@@ -325,53 +442,70 @@ pub fn write_request<W: Write>(
         _ => 0,
     };
     if body.len() != expected_body_len {
-        return Err(format!(
-            "invalid_request: ML request body length mismatch: header={}, actual={}",
-            expected_body_len,
-            body.len()
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            format!(
+                "ML request body length mismatch: header={}, actual={}",
+                expected_body_len,
+                body.len()
+            ),
         ));
     }
-    let header = serde_json::to_vec(request)
-        .map_err(|error| format!("protocol: failed to encode ML request: {error}"))?;
+    let header = serde_json::to_vec(request).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Protocol,
+            format!("failed to encode ML request: {error}"),
+        )
+    })?;
     write_frame(writer, &header)?;
     writer
         .write_all(body)
         .and_then(|_| writer.flush())
-        .map_err(|error| format!("transport: failed to write ML request body: {error}"))
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Transport,
+                format!("failed to write ML request body: {error}"),
+            )
+        })
 }
 
-fn validate_timeout(timeout_ms: u64) -> Result<(), String> {
+fn validate_timeout(timeout_ms: u64) -> Result<(), MlError> {
     if timeout_ms == 0 || timeout_ms > MAX_ML_TIMEOUT_MS {
-        return Err(format!(
-            "invalid_request: ML timeout must be within 1..={MAX_ML_TIMEOUT_MS} ms: {timeout_ms}"
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            format!("ML timeout must be within 1..={MAX_ML_TIMEOUT_MS} ms: {timeout_ms}"),
         ));
     }
     Ok(())
 }
 
-fn validate_text_batch(texts: &[String]) -> Result<(), String> {
+fn validate_text_batch(texts: &[String]) -> Result<(), MlError> {
     if texts.is_empty() {
-        return Err(
-            "invalid_request: semantic text batch must contain at least one item".to_string(),
-        );
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            "semantic text batch must contain at least one item",
+        ));
     }
     if texts.len() > MAX_SEMANTIC_BATCH {
-        return Err(format!(
-            "limit_exceeded: semantic text batch must contain 1..={MAX_SEMANTIC_BATCH} items"
+        return Err(MlError::new(
+            MlErrorKind::LimitExceeded,
+            format!("semantic text batch must contain 1..={MAX_SEMANTIC_BATCH} items"),
         ));
     }
     validate_text_limits(texts.iter().map(String::as_str))
 }
 
-fn validate_rerank(query: &str, documents: &[String]) -> Result<(), String> {
+fn validate_rerank(query: &str, documents: &[String]) -> Result<(), MlError> {
     if documents.is_empty() {
-        return Err(
-            "invalid_request: rerank request must contain at least one document".to_string(),
-        );
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            "rerank request must contain at least one document",
+        ));
     }
     if documents.len() > MAX_RERANK_DOCUMENTS {
-        return Err(format!(
-            "limit_exceeded: rerank request must contain 1..={MAX_RERANK_DOCUMENTS} documents"
+        return Err(MlError::new(
+            MlErrorKind::LimitExceeded,
+            format!("rerank request must contain 1..={MAX_RERANK_DOCUMENTS} documents"),
         ));
     }
     validate_text_limits(std::iter::once(query).chain(documents.iter().map(String::as_str)))
@@ -380,72 +514,90 @@ fn validate_rerank(query: &str, documents: &[String]) -> Result<(), String> {
 fn validate_tokenization_request(
     texts: &[String],
     text_pairs: Option<&[String]>,
-) -> Result<(), String> {
+) -> Result<(), MlError> {
     validate_text_batch(texts)?;
     if let Some(pairs) = text_pairs {
         if pairs.len() != texts.len() {
-            return Err(
-                "invalid_request: tokenization text_pairs length must match texts".to_string(),
-            );
+            return Err(MlError::new(
+                MlErrorKind::InvalidRequest,
+                "tokenization text_pairs length must match texts",
+            ));
         }
         validate_text_limits(pairs.iter().map(String::as_str))?;
     }
     Ok(())
 }
 
-fn validate_text_limits<'a>(texts: impl Iterator<Item = &'a str>) -> Result<(), String> {
+fn validate_text_limits<'a>(texts: impl Iterator<Item = &'a str>) -> Result<(), MlError> {
     let mut total = 0usize;
     for text in texts {
         let len = text.len();
         if len > MAX_SEMANTIC_TEXT_ITEM_BYTES {
-            return Err(format!(
-                "limit_exceeded: semantic text item exceeds limit: {len} > {MAX_SEMANTIC_TEXT_ITEM_BYTES}"
+            return Err(MlError::new(
+                MlErrorKind::LimitExceeded,
+                format!("semantic text item exceeds limit: {len} > {MAX_SEMANTIC_TEXT_ITEM_BYTES}"),
             ));
         }
-        total = total
-            .checked_add(len)
-            .ok_or_else(|| "invalid_request: semantic text byte count overflow".to_string())?;
+        total = total.checked_add(len).ok_or_else(|| {
+            MlError::new(
+                MlErrorKind::InvalidRequest,
+                "semantic text byte count overflow",
+            )
+        })?;
     }
     if total > MAX_SEMANTIC_TEXT_BYTES {
-        return Err(format!(
-            "limit_exceeded: semantic text request exceeds limit: {total} > {MAX_SEMANTIC_TEXT_BYTES}"
+        return Err(MlError::new(
+            MlErrorKind::LimitExceeded,
+            format!("semantic text request exceeds limit: {total} > {MAX_SEMANTIC_TEXT_BYTES}"),
         ));
     }
     Ok(())
 }
 
-fn validate_image_batch(images: &[MlImageInput], body_len: usize) -> Result<(), String> {
+fn validate_image_batch(images: &[MlImageInput], body_len: usize) -> Result<(), MlError> {
     if images.is_empty() {
-        return Err(
-            "invalid_request: semantic image batch must contain at least one item".to_string(),
-        );
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            "semantic image batch must contain at least one item",
+        ));
     }
     if images.len() > MAX_SEMANTIC_BATCH {
-        return Err(format!(
-            "limit_exceeded: semantic image batch must contain 1..={MAX_SEMANTIC_BATCH} items"
+        return Err(MlError::new(
+            MlErrorKind::LimitExceeded,
+            format!("semantic image batch must contain 1..={MAX_SEMANTIC_BATCH} items"),
         ));
     }
     if body_len > MAX_ML_IMAGE_BYTES {
-        return Err(format!(
-            "limit_exceeded: ML image body exceeds limit: {body_len}"
+        return Err(MlError::new(
+            MlErrorKind::LimitExceeded,
+            format!("ML image body exceeds limit: {body_len}"),
         ));
     }
     let mut expected_offset = 0usize;
     for image in images {
         if image.offset != expected_offset {
-            return Err(format!(
-                "invalid_request: ML image batch offsets must be contiguous: expected={}, actual={}",
-                expected_offset, image.offset
+            return Err(MlError::new(
+                MlErrorKind::InvalidRequest,
+                format!(
+                    "ML image batch offsets must be contiguous: expected={}, actual={}",
+                    expected_offset, image.offset
+                ),
             ));
         }
         validate_rgb8_body(image.width, image.height, image.stride, image.body_len)?;
-        expected_offset = expected_offset
-            .checked_add(image.body_len)
-            .ok_or_else(|| "invalid_request: ML image batch length overflow".to_string())?;
+        expected_offset = expected_offset.checked_add(image.body_len).ok_or_else(|| {
+            MlError::new(
+                MlErrorKind::InvalidRequest,
+                "ML image batch length overflow",
+            )
+        })?;
     }
     if expected_offset != body_len {
-        return Err(format!(
-            "invalid_request: ML image batch body length mismatch: expected={expected_offset}, actual={body_len}"
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            format!(
+            "ML image batch body length mismatch: expected={expected_offset}, actual={body_len}"
+        ),
         ));
     }
     Ok(())
@@ -456,76 +608,111 @@ fn validate_rgb8_body(
     height: u32,
     stride: usize,
     body_len: usize,
-) -> Result<(), String> {
+) -> Result<(), MlError> {
     if width == 0 || height == 0 {
-        return Err(format!(
-            "invalid_request: invalid ML RGB dimensions: {width}x{height}"
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            format!("invalid ML RGB dimensions: {width}x{height}"),
         ));
     }
     let expected_stride = usize::try_from(width)
-        .map_err(|_| "invalid_request: ML RGB width does not fit usize".to_string())?
+        .map_err(|_| {
+            MlError::new(
+                MlErrorKind::InvalidRequest,
+                "ML RGB width does not fit usize",
+            )
+        })?
         .checked_mul(3)
-        .ok_or_else(|| "invalid_request: ML RGB stride overflow".to_string())?;
+        .ok_or_else(|| MlError::new(MlErrorKind::InvalidRequest, "ML RGB stride overflow"))?;
     if stride != expected_stride {
-        return Err(format!(
-            "invalid_request: ML RGB stride must be tightly packed: expected={expected_stride}, actual={stride}"
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            format!(
+                "ML RGB stride must be tightly packed: expected={expected_stride}, actual={stride}"
+            ),
         ));
     }
     let expected_len = stride
-        .checked_mul(
-            usize::try_from(height)
-                .map_err(|_| "invalid_request: ML RGB height does not fit usize".to_string())?,
-        )
-        .ok_or_else(|| "invalid_request: ML RGB body length overflow".to_string())?;
+        .checked_mul(usize::try_from(height).map_err(|_| {
+            MlError::new(
+                MlErrorKind::InvalidRequest,
+                "ML RGB height does not fit usize",
+            )
+        })?)
+        .ok_or_else(|| MlError::new(MlErrorKind::InvalidRequest, "ML RGB body length overflow"))?;
     if body_len != expected_len {
-        return Err(format!(
-            "invalid_request: ML RGB body length mismatch: expected={expected_len}, actual={body_len}"
+        return Err(MlError::new(
+            MlErrorKind::InvalidRequest,
+            format!("ML RGB body length mismatch: expected={expected_len}, actual={body_len}"),
         ));
     }
     if body_len > MAX_ML_IMAGE_BYTES {
-        return Err(format!(
-            "limit_exceeded: ML image body exceeds limit: {body_len}"
+        return Err(MlError::new(
+            MlErrorKind::LimitExceeded,
+            format!("ML image body exceeds limit: {body_len}"),
         ));
     }
     Ok(())
 }
 
-pub fn read_response<R: Read>(reader: &mut R) -> Result<MlResponse, String> {
+pub fn read_response<R: Read>(reader: &mut R) -> Result<MlResponse, MlError> {
     let frame = read_frame(reader, MAX_ML_HEADER_BYTES)?;
-    serde_json::from_slice(&frame)
-        .map_err(|error| format!("protocol: invalid ML response JSON: {error}"))
+    serde_json::from_slice(&frame).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Protocol,
+            format!("invalid ML response JSON: {error}"),
+        )
+    })
 }
 
-pub fn write_response<W: Write>(writer: &mut W, response: &MlResponse) -> Result<(), String> {
-    let frame = serde_json::to_vec(response)
-        .map_err(|error| format!("protocol: failed to encode ML response: {error}"))?;
+pub fn write_response<W: Write>(writer: &mut W, response: &MlResponse) -> Result<(), MlError> {
+    let frame = serde_json::to_vec(response).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Protocol,
+            format!("failed to encode ML response: {error}"),
+        )
+    })?;
     write_frame(writer, &frame)
 }
 
-fn read_frame<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, String> {
+fn read_frame<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, MlError> {
     let mut len_bytes = [0u8; 4];
-    reader
-        .read_exact(&mut len_bytes)
-        .map_err(|error| format!("transport: failed to read ML frame length: {error}"))?;
+    reader.read_exact(&mut len_bytes).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Transport,
+            format!("failed to read ML frame length: {error}"),
+        )
+    })?;
     let len = u32::from_le_bytes(len_bytes) as usize;
     if len == 0 || len > limit {
-        return Err(format!("protocol: invalid ML frame length: {len}"));
+        return Err(MlError::new(
+            MlErrorKind::Protocol,
+            format!("invalid ML frame length: {len}"),
+        ));
     }
     let mut frame = vec![0u8; len];
-    reader
-        .read_exact(&mut frame)
-        .map_err(|error| format!("transport: failed to read ML frame: {error}"))?;
+    reader.read_exact(&mut frame).map_err(|error| {
+        MlError::new(
+            MlErrorKind::Transport,
+            format!("failed to read ML frame: {error}"),
+        )
+    })?;
     Ok(frame)
 }
 
-fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> Result<(), String> {
+fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> Result<(), MlError> {
     let len = u32::try_from(frame.len())
-        .map_err(|_| "limit_exceeded: ML frame is too large".to_string())?;
+        .map_err(|_| MlError::new(MlErrorKind::LimitExceeded, "ML frame is too large"))?;
     writer
         .write_all(&len.to_le_bytes())
         .and_then(|_| writer.write_all(frame))
         .and_then(|_| writer.flush())
-        .map_err(|error| format!("transport: failed to write ML frame: {error}"))
+        .map_err(|error| {
+            MlError::new(
+                MlErrorKind::Transport,
+                format!("failed to write ML frame: {error}"),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -553,14 +740,12 @@ mod tests {
     fn rejects_zero_and_oversized_frames_before_allocating_payload() {
         let zero_bytes = 0u32.to_le_bytes();
         let mut zero = zero_bytes.as_slice();
-        assert!(read_response(&mut zero)
-            .unwrap_err()
-            .contains("frame length: 0"));
+        assert!(read_response(&mut zero).unwrap_err().kind == MlErrorKind::Protocol);
 
         let oversized = (MAX_ML_HEADER_BYTES as u32 + 1).to_le_bytes();
-        assert!(read_response(&mut oversized.as_slice())
-            .unwrap_err()
-            .contains("invalid ML frame length"));
+        assert!(
+            read_response(&mut oversized.as_slice()).unwrap_err().kind == MlErrorKind::Protocol
+        );
     }
 
     #[test]
@@ -576,9 +761,9 @@ mod tests {
         let header = serde_json::to_vec(&request).unwrap();
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &header).unwrap();
-        assert!(read_request(&mut bytes.as_slice())
-            .unwrap_err()
-            .contains("image body exceeds limit"));
+        assert!(
+            read_request(&mut bytes.as_slice()).unwrap_err().kind == MlErrorKind::LimitExceeded
+        );
     }
 
     #[test]
@@ -593,7 +778,7 @@ mod tests {
         };
         let mut bytes = Vec::new();
         let error = write_request(&mut bytes, &request, &[]).unwrap_err();
-        assert!(error.contains("image body exceeds limit"));
+        assert!(error.kind == MlErrorKind::LimitExceeded);
         assert!(bytes.is_empty());
     }
 
@@ -610,9 +795,9 @@ mod tests {
         let header = serde_json::to_vec(&request).unwrap();
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &header).unwrap();
-        assert!(read_request(&mut bytes.as_slice())
-            .unwrap_err()
-            .contains("stride must be tightly packed"));
+        assert!(
+            read_request(&mut bytes.as_slice()).unwrap_err().kind == MlErrorKind::InvalidRequest
+        );
     }
 
     #[test]
@@ -628,9 +813,9 @@ mod tests {
         let header = serde_json::to_vec(&request).unwrap();
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &header).unwrap();
-        assert!(read_request(&mut bytes.as_slice())
-            .unwrap_err()
-            .contains("body length mismatch"));
+        assert!(
+            read_request(&mut bytes.as_slice()).unwrap_err().kind == MlErrorKind::InvalidRequest
+        );
     }
 
     #[test]
@@ -695,9 +880,12 @@ mod tests {
             }],
             body_len: 3,
         };
-        assert!(write_request(&mut Vec::new(), &bad_image, &[0; 3])
-            .unwrap_err()
-            .contains("offsets must be contiguous"));
+        assert!(
+            write_request(&mut Vec::new(), &bad_image, &[0; 3])
+                .unwrap_err()
+                .kind
+                == MlErrorKind::InvalidRequest
+        );
 
         let bad_text = MlRequest::EmbedText {
             request_id: 24,
@@ -705,9 +893,12 @@ mod tests {
             model: MlSemanticModel::MinilmL12,
             texts: vec!["x".to_string(); MAX_SEMANTIC_BATCH + 1],
         };
-        assert!(write_request(&mut Vec::new(), &bad_text, &[])
-            .unwrap_err()
-            .contains("text batch"));
+        assert!(
+            write_request(&mut Vec::new(), &bad_text, &[])
+                .unwrap_err()
+                .kind
+                == MlErrorKind::LimitExceeded
+        );
     }
 
     #[test]
@@ -719,8 +910,11 @@ mod tests {
             query: "query".to_string(),
             documents: vec!["document".to_string()],
         };
-        assert!(write_request(&mut Vec::new(), &request, &[])
-            .unwrap_err()
-            .contains("timeout"));
+        assert!(
+            write_request(&mut Vec::new(), &request, &[])
+                .unwrap_err()
+                .kind
+                == MlErrorKind::InvalidRequest
+        );
     }
 }

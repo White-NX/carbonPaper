@@ -107,6 +107,15 @@ describe('monitor_api command wrappers', () => {
     expectWithAuth(1);
   });
 
+  it('lets visual grids omit OCR without changing the default text contract', async () => {
+    invoke.mockResolvedValue({ results: [{ id: 1, ocr_text: '' }] });
+    await searchScreenshots('game', 'nl', { includeOcr: false });
+    expect(invoke).toHaveBeenCalledWith('monitor_search_nl', expect.objectContaining({
+      query: 'game', includeOcr: false,
+    }));
+    expectWithAuth(1);
+  });
+
   it('calls ocr search with normalized filters', async () => {
     invoke.mockResolvedValue([{ screenshot_id: 1 }]);
 

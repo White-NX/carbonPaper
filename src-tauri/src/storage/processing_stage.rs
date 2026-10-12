@@ -1,6 +1,7 @@
 //! Archive-side generation fences and durable broker completion receipts.
 use super::StorageState;
 use crate::processing_stage::TaskReceipt;
+use crate::task_error::TaskError;
 use rusqlite::{params, Connection, OptionalExtension};
 
 const DATASET_KEY: &str = "app_bound_dataset_id";
@@ -191,7 +192,7 @@ impl StorageState {
         &self,
         receipt: &TaskReceipt,
         expected: &super::DerivedIndexJobSpec,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         self.processing_stage.check_receipt(receipt)?;
         use carbonpaper_app_bound::protocol::Consumer;
         if !matches!(
@@ -206,7 +207,7 @@ impl StorageState {
         let mut guard = self.get_connection_named("record_staged_receipt")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
         if !self.staged_source_current_on_conn(conn, receipt)? {
-            return Err("staged source changed".into());
+            return Err(TaskError::Paused("staged_source_changed"));
         }
         if receipt.consumer == Consumer::Clip {
             let matches: bool = conn
@@ -239,12 +240,12 @@ impl StorageState {
             )
             .map_err(|e| e.to_string())?;
         if !current {
-            return Err("deferred: staged embedding changed".into());
+            return Err(TaskError::Paused("staged_embedding_changed"));
         }
         if Self::record_staged_receipt_on_conn(&tx, receipt)? {
             Self::enqueue_staged_semantic_completion_on_conn(&tx, receipt)?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| TaskError::from(e.to_string()))
     }
 
     pub(super) fn enqueue_staged_semantic_completion_on_conn(
@@ -352,7 +353,7 @@ impl StorageState {
         targets: &[super::smart_cluster::SmartClusterScoringTarget],
         assignments: &[(i64, f64)],
         needs_archive: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, TaskError> {
         if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::SmartCluster
             || assignments.iter().any(|(id, score)| {
                 !score.is_finite() || !targets.iter().any(|t| t.id == *id && *score >= t.threshold)
@@ -380,7 +381,7 @@ impl StorageState {
         }
         let conn = guard.as_mut().ok_or("Database not initialized")?;
         if !self.staged_source_current_on_conn(conn, receipt)? {
-            return Err("deferred: staged source changed".into());
+            return Err(TaskError::Paused("staged_source_changed"));
         }
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let already: bool = tx
@@ -400,7 +401,7 @@ impl StorageState {
                 .zip(targets)
                 .all(|(a, b)| a.same_scoring_configuration(b))
         {
-            return Err("deferred: smart cluster configuration changed".into());
+            return Err(TaskError::Paused("scoring_configuration_changed"));
         }
         for (cluster, score) in assignments {
             tx.execute(

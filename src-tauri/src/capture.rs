@@ -20,9 +20,6 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId,
@@ -624,28 +621,7 @@ pub fn check_foreground_fullscreen() -> Option<(String, String, bool)> {
     }
 }
 
-/// Retrieves the full executable path of a process given its PID, using Windows `QueryFullProcessImageNameW`.
-pub fn get_process_path_from_pid(pid: u32) -> Option<String> {
-    // SAFETY: `OpenProcess` returns an owned live handle; the UTF-16 output buffer and
-    // length pointer are valid for the synchronous query, and the handle is closed once.
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_FORMAT(0),
-            windows::core::PWSTR(buf.as_mut_ptr()),
-            &mut size,
-        );
-        let _ = windows::Win32::Foundation::CloseHandle(handle);
-        if ok.is_ok() && size > 0 {
-            Some(String::from_utf16_lossy(&buf[..size as usize]))
-        } else {
-            None
-        }
-    }
-}
+pub(crate) use crate::windows_platform::process_image_path as get_process_path_from_pid;
 
 /// Extracts the lowercase file name (e.g., "chrome.exe") from a full executable path.
 pub fn get_process_name_from_path(path: &str) -> String {
