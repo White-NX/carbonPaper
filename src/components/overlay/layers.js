@@ -20,3 +20,6 @@ export const OVERLAY_LAYERS = {
   maintenance: 'z-[70]',
   fatal: 'z-[100]',
 };
+
+// Match the visual bands when surfaces mount or unmount in a different order.
+export const OVERLAY_FOCUS_ORDER = ['dialog', 'prompt', 'confirmation', 'gate', 'lockedAction', 'maintenance', 'fatal'];

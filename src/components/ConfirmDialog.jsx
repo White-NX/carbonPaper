@@ -21,7 +21,7 @@ export function ConfirmDialog({
   const titleId = useId();
   const messageId = useId();
   const visible = useDialogVisibility(isOpen, allowWhenLocked);
-  const dialogRef = useDialogFocus(visible, onCancel, loading);
+  const dialogRef = useDialogFocus(visible, onCancel, loading, { layer: allowWhenLocked ? 'lockedAction' : 'confirmation' });
 
   if (!visible) return null;
 

@@ -65,7 +65,7 @@ export function OverlayShell({
   children,
 }) {
   const titleId = useId();
-  const dialogRef = useDialogFocus(open, onDismiss, !onDismiss);
+  const dialogRef = useDialogFocus(open, onDismiss, !onDismiss, { layer });
   if (!open) return null;
 
   return (

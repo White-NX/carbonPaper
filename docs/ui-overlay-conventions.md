@@ -67,6 +67,15 @@ An overlay that passes `onDismiss` can be closed with Escape. One that does not
 pass it cannot be closed at all; that is how a blocking overlay is expressed.
 Focus is trapped inside the card while it is open (`useDialogFocus`).
 
+The focus stack uses the same priority as the visual layers, including when a
+lower surface mounts later. Only the top surface handles Escape and Tab.
+Background branches inside its covered area are `inert` and hidden from
+assistive technology; previous attributes are restored when it leaves.
+Autofocused form controls retain focus. Closing a child restores its trigger
+inside the remaining dialog, and removing a covered parent never moves focus
+away from the active child. Body scrolling stays locked until the last
+dialog releases it.
+
 ## One overlay at a time
 
 `App` owns an overlay coordinator (`src/components/overlay/coordinator.js`).
