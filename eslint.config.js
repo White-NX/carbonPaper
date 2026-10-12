@@ -4,6 +4,11 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
 const frontendFiles = ['src/**/*.{js,jsx}', 'browser-extension/**/*.{js,jsx}'];
+const frontendTests = ['src/**/*.test.{js,jsx}', 'src/tests/**'];
+const translationRestrictions = [{
+  selector: 'CallExpression:matches([callee.name="t"], [callee.property.name="t"])[arguments.1.type="Literal"][arguments.1.value=type(string)]',
+  message: 'Keep translation defaults in src/i18n/locales instead of inline strings.',
+}];
 
 export default [
   {
@@ -46,10 +51,7 @@ export default [
       'react/jsx-no-duplicate-props': 'error',
       'react/jsx-no-undef': 'error',
       'react/no-unknown-property': 'error',
-      'no-restricted-syntax': ['error', {
-        selector: 'CallExpression:matches([callee.name="t"], [callee.property.name="t"])[arguments.1.type="Literal"][arguments.1.value=type(string)]',
-        message: 'Keep translation defaults in src/i18n/locales instead of inline strings.',
-      }],
+      'no-restricted-syntax': ['error', ...translationRestrictions],
 
       // Existing components intentionally accept flexible data-shaped props.
       'react/prop-types': 'off',
@@ -64,6 +66,31 @@ export default [
       'no-useless-escape': 'off',
       'no-extra-boolean-cast': 'off',
       'no-useless-catch': 'off',
+    },
+  },
+  {
+    files: ['src/**/*.{js,jsx}'],
+    ignores: [...frontendTests, 'src/lib/native_dialogs.js'],
+    rules: {
+      'no-restricted-syntax': ['error', ...translationRestrictions, {
+        selector: ':matches(ImportDeclaration, ExportNamedDeclaration, ExportAllDeclaration, ImportExpression)[source.value="@tauri-apps/plugin-dialog"]',
+        message: 'Use the named file-selection helpers in src/lib/native_dialogs.js.',
+      }, {
+        selector: 'CallExpression[callee.name="require"][arguments.0.value="@tauri-apps/plugin-dialog"]',
+        message: 'Use the named file-selection helpers in src/lib/native_dialogs.js.',
+      }],
+    },
+  },
+  {
+    files: ['src/**/*.{js,jsx}'],
+    ignores: [...frontendTests, 'src/components/Dialog.jsx', 'src/components/ConfirmDialog.jsx',
+      'src/components/overlay/OverlayShell.jsx', 'src/components/ErrorWindow.jsx'],
+    rules: {
+      'no-restricted-imports': ['error', { patterns: [{
+        group: ['**/useDialogFocus', '**/useDialogFocus.js'],
+        importNames: ['useDialogFocus'],
+        message: 'Use Dialog, ConfirmDialog or OverlayShell to inherit visibility, layers and focus behavior.',
+      }] }],
     },
   },
   {

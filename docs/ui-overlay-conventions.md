@@ -186,3 +186,16 @@ prompt while native verification is running. Native verification runs on a
 blocking worker rather than holding the async executor. Once the job settles,
 a later explicit request starts fresh verification even with a valid session;
 the retained-key and fresh-consent rules remain in `credential_manager.rs`.
+
+## Enforcement
+
+`npm run lint:ci` uses AST rules to reject production dialog-plugin imports,
+re-exports, dynamic imports, and `require()` outside `native_dialogs.js`. Tests
+may mock the plugin directly. Direct imports of `useDialogFocus` belong only
+to `Dialog`, `ConfirmDialog`, `OverlayShell`, and `ErrorWindow`; ordinary views
+use those components and may read `useDialogVisibility` or its context.
+
+`npm run test:security` retains the browser-confirmation and backend guards
+and exercises these ESLint boundaries. The checks preserve the translation
+rules and allow normal popover positioning; they do not ban every `fixed` or
+`z-*` class in the frontend.
