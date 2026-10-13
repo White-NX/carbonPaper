@@ -133,6 +133,40 @@ describe('AdvancedSearch', () => {
     });
   });
 
+  it('starts one OCR request per query, filter, or explicit refresh', async () => {
+    searchScreenshots.mockResolvedValue([]);
+    const props = {
+      active: true,
+      searchParams: { query: 'hello', mode: 'ocr', refreshKey: 1 },
+      onSelectResult: vi.fn(),
+    };
+    const { rerender } = render(<AdvancedSearch {...props} />);
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalledTimes(1));
+
+    const next = { ...props, searchParams: { ...props.searchParams, query: 'world' } };
+    rerender(<AdvancedSearch {...next} />);
+    await waitFor(() => expect(searchScreenshots).toHaveBeenLastCalledWith(
+      'world', 'ocr', expect.objectContaining({ offset: 0 })
+    ));
+    expect(searchScreenshots).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByText('advancedSearch.processes.all'));
+    const checkbox = within(screen.getByTestId('filter-panel'))
+      .getByText('code.exe').closest('label').querySelector('input[type="checkbox"]');
+    fireEvent.click(checkbox);
+    fireEvent.mouseDown(document.body);
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalledTimes(3));
+    expect(searchScreenshots).toHaveBeenLastCalledWith(
+      'world', 'ocr', expect.objectContaining({ processNames: ['code.exe'] })
+    );
+
+    rerender(<AdvancedSearch {...next} searchParams={{ ...next.searchParams, refreshKey: 2 }} />);
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalledTimes(4));
+    expect(searchScreenshots).toHaveBeenLastCalledWith(
+      'world', 'ocr', expect.objectContaining({ offset: 0, processNames: ['code.exe'] })
+    );
+  });
+
   it('keeps visual mode available when the monitor is offline', async () => {
     const onSearchModeChange = vi.fn();
 

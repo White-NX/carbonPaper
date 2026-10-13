@@ -246,15 +246,11 @@ export function useAdvancedSearchController({
   }, [active, debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters]);
 
   useEffect(() => {
+    // Query/filter changes and explicit refresh share one trigger. A separate
+    // refresh effect also reruns when resetAndFetch changes, doubling searches
+    // whenever the parent supplies a refreshKey.
     resetAndFetch();
-  }, [resetAndFetch]);
-
-  useEffect(() => {
-    if (!searchParams) return;
-    if (!active) return;
-    if (searchParams.refreshKey === undefined) return;
-    resetAndFetch();
-  }, [searchParams?.refreshKey, active, resetAndFetch]);
+  }, [resetAndFetch, reloadToken]);
 
   /**
    * 着陆区的最近截图。
