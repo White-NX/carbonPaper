@@ -37,6 +37,7 @@ export function useRerankerDownload({ ready, notify, t }) {
   const [percent, setPercent] = useState(null);
   const [error, setError] = useState('');
   const startedRef = useRef(false);
+  const waitingForUnlockRef = useRef(false);
 
   useTauriEventListener('install-log', (event) => {
     const payload = event?.payload || {};
@@ -52,14 +53,19 @@ export function useRerankerDownload({ ready, notify, t }) {
     setPercent(null);
     setError('');
     try {
-      await withAuth(() => invoke('download_model', { modelId: RERANKER_MODEL_ID }), { autoPrompt: true });
-      await saveAdvancedConfig({ smart_cluster_enabled: true });
+      await withAuth(() => invoke('download_model', { modelId: RERANKER_MODEL_ID }), { promptMode: 'defer' });
+      await saveAdvancedConfig({ smart_cluster_enabled: true }, { promptMode: 'defer' });
       writePending(false);
       setStatus('done');
       notifySettingsChanged(['models', 'advanced']);
       notify?.({ type: 'success', title: t('onboarding.smartClusterReady.title'), message: t('onboarding.smartClusterReady.message') });
     } catch (failure) {
       const message = formatError(failure);
+      if (message.includes('AUTH_REQUIRED')) {
+        waitingForUnlockRef.current = true;
+        setStatus('queued');
+        return;
+      }
       setError(message);
       setStatus('failed');
       notify?.({ type: 'error', title: t('onboarding.smartClusterFailed.title'), message: t('onboarding.smartClusterFailed.message', { error: message }) });
@@ -69,7 +75,8 @@ export function useRerankerDownload({ ready, notify, t }) {
   }, [notify, t]);
 
   useEffect(() => {
-    if (status === 'queued' && ready) run();
+    if (!ready) { waitingForUnlockRef.current = false; return; }
+    if (status === 'queued' && !waitingForUnlockRef.current) run();
   }, [status, ready, run]);
 
   /** Remember the request and start as soon as the required models are in. */

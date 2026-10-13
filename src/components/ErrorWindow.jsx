@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useId, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import xibaoImg from '../assets/images/xibao.jpg';
 import { OVERLAY_LAYERS } from './overlay/layers';
 import { useOverlaySlot } from './overlay/coordinator';
+import { useDialogFocus } from '../hooks/useDialogFocus';
 import musicFile from '../assets/music/La Marcha Radetzky - Johann Strauss (1848).mp3';
 
 /**
@@ -12,6 +13,8 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
   const { t } = useTranslation();
   const [mode, setMode] = useState('xibao');
   const audioRef = useRef(null);
+  const titleId = useId();
+  const dialogRef = useDialogFocus(isVisible, undefined, true, { layer: 'fatal', scope: 'window' });
 
   // Control audio based on mode and visibility
   useEffect(() => {
@@ -39,6 +42,11 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
   if (mode === 'xibao') {
     return (
       <div
+        ref={dialogRef}
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         className={`fixed inset-0 ${OVERLAY_LAYERS.fatal} overflow-auto flex flex-col`}
         style={{
           backgroundImage: `url(${xibaoImg})`,
@@ -54,6 +62,7 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
           style={{ paddingTop: '120px' }}
         >
           <h1
+            id={titleId}
             className="text-4xl font-black text-black mb-6 text-center"
             style={{ textShadow: '0 0 10px rgba(255,255,255,0.8)' }}
           >
@@ -116,11 +125,12 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
 
   // Normal mode
   return (
-    <div className={`fixed inset-0 ${OVERLAY_LAYERS.fatal} bg-ide-bg text-ide-text overflow-auto flex flex-col`}>
+    <div ref={dialogRef} role="alertdialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
+      className={`fixed inset-0 ${OVERLAY_LAYERS.fatal} bg-ide-bg text-ide-text overflow-auto flex flex-col`}>
       <audio ref={audioRef} />
 
       <div className="flex-1 flex flex-col items-center justify-center px-10 py-8">
-        <h1 className="text-2xl font-bold text-ide-error mb-4 text-center">
+        <h1 id={titleId} className="text-2xl font-bold text-ide-error mb-4 text-center">
           {t('errorWindow.title')}
         </h1>
 

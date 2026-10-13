@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Shield, ShieldCheck, KeyRound } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { requestAuth } from '../lib/auth_api';
 import { formatError } from '../lib/errors';
 import { OverlayShell, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
@@ -25,11 +25,7 @@ export default function AuthMask({
     setAuthError(null);
 
     try {
-      // 首先确保凭据已初始化
-      await invoke('credential_initialize');
-
-      // 请求 Windows Hello 验证
-      const result = await invoke('credential_verify_user');
+      const result = await requestAuth({ mode: 'unlock' });
 
       if (result) {
         onAuthSuccess?.();
@@ -40,23 +36,10 @@ export default function AuthMask({
       console.error('Authentication error:', err);
       const message = formatError(err);
 
-      if (message.includes('UserCancelled') || message.includes('User cancelled')) {
+      if (message.includes('AUTH_CANCELLED')) {
         setAuthError(t('authMask.errors.cancelled'));
-      } else if (message.includes('WindowsHelloNotAvailable')) {
+      } else if (message.includes('AUTH_NOT_AVAILABLE')) {
         setAuthError(t('authMask.errors.not_available'));
-      } else if (message.includes('KeyNotFound')) {
-        // 首次使用，需要创建凭据
-        setAuthError(t('authMask.errors.initializing'));
-        try {
-          await invoke('credential_initialize');
-          const retryResult = await invoke('credential_verify_user');
-          if (retryResult) {
-            onAuthSuccess?.();
-            return;
-          }
-        } catch (retryErr) {
-          setAuthError(t('authMask.errors.init_failed', { error: formatError(retryErr) }));
-        }
       } else {
         setAuthError(t('authMask.errors.generic_failed', { error: message }));
       }

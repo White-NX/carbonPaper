@@ -137,7 +137,7 @@ export default function VectorMigrationOverlay() {
   const handleReauthenticate = async () => {
     setReauthenticating(true);
     try {
-      await requestAuth();
+      await requestAuth({ mode: 'gate' });
     } catch {
       // Cancelled or failed: the button simply becomes usable again.
     } finally {

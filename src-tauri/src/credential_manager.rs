@@ -17,9 +17,12 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use zeroize::Zeroize;
+
+mod verification;
+use verification::VerificationCoordinator;
 
 /// Errors produced by credential and key-management operations.
 #[derive(Debug, Error)]
@@ -98,6 +101,8 @@ fn verify_with_retained_key<K>(
 
 /// Shared credential-manager state.
 pub struct CredentialManagerState {
+    /// One in-flight explicit verification shared by all application windows.
+    pub(crate) verification: Arc<VerificationCoordinator>,
     /// Cached SQLCipher database key, available only to an authenticated UI session.
     cached_db_key: Mutex<Option<Vec<u8>>>,
     /// Cached public key used to encrypt new data without user interaction.
@@ -184,6 +189,7 @@ impl CredentialManagerState {
             crate::registry_config::get_bool(BACKGROUND_PROCESSING_ENABLED_KEY).unwrap_or(true);
 
         Self {
+            verification: Arc::new(VerificationCoordinator::default()),
             cached_db_key: Mutex::new(None),
             cached_public_key: Mutex::new(None),
             cached_master_key: Mutex::new(None),

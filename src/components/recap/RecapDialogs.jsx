@@ -1,6 +1,5 @@
 import React, { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { OverlayShell } from '../overlay/OverlayShell';
 import { Dialog } from '../Dialog';
 import { Button } from '../ui/Button';
 import { correctRecap, recapErrorKey } from '../../lib/recap_api';
@@ -34,9 +33,8 @@ export function CorrectionDialog({ date, editing, threads, onSaved, onClose }) {
     catch (cause) { setError(String(cause)); }
     finally { setBusy(false); }
   };
-  return <OverlayShell title={t(`recap.correction.${kind}`)} subtitle={editing.task_title} onDismiss={busy ? undefined : onClose}
-    footer={<><Button variant="ghost" disabled={busy} onClick={onClose}>{t('common.cancel')}</Button><Button type="submit" form={id} variant="primary" loading={busy}
-      disabled={(needsTitle && !title.trim()) || (kind === 'merge' && !target)}>{t('recap.save')}</Button></>}>
+  return <Dialog isOpen title={t(`recap.correction.${kind}`)} onClose={onClose} disableClose={busy} contentClassName="p-6">
+    <p className="mb-4 text-xs text-ide-muted">{editing.task_title}</p>
     <form id={id} aria-label={t('recap.correct')} onSubmit={submit} className="space-y-4 text-sm">
       {kind !== 'rename' && <label className="block space-y-2"><span>{t('recap.correction.target')}</span>
         <select className="recap-input" value={target} disabled={busy} required={kind === 'merge'} onChange={(event) => setTarget(event.target.value)}>
@@ -47,15 +45,23 @@ export function CorrectionDialog({ date, editing, threads, onSaved, onClose }) {
       {needsTitle && <label className="block space-y-2"><span>{t('recap.correction.title')}</span><input className="recap-input" value={title} disabled={busy} required maxLength={120} onChange={(event) => setTitle(event.target.value)} /></label>}
       {error && <RecapError error={error} />}
     </form>
-  </OverlayShell>;
+    <div className="mt-5 flex justify-end gap-2">
+      <Button variant="ghost" disabled={busy} onClick={onClose}>{t('common.cancel')}</Button>
+      <Button type="submit" form={id} variant="primary" loading={busy}
+        disabled={(needsTitle && !title.trim()) || (kind === 'merge' && !target)}>{t('recap.save')}</Button>
+    </div>
+  </Dialog>;
 }
 
 export function SourcesDialog({ sources, action, time, onClose }) {
   const { t } = useTranslation();
-  return <OverlayShell title={t('recap.sources')} subtitle={t('recap.recordCount', { count: sources.length })} size="xl" onDismiss={onClose}
-    bodyClassName="flex h-[min(55vh,520px)] flex-none flex-col overflow-hidden" footer={<Button onClick={onClose}>{t('recap.close')}</Button>}>
-    <RecordList items={sources} action={action} time={time} label={t('recap.sources')} />
-  </OverlayShell>;
+  return <Dialog isOpen title={t('recap.sources')} onClose={onClose} maxWidth="max-w-2xl" contentClassName="flex flex-col overflow-hidden p-6">
+    <p className="mb-4 text-xs text-ide-muted">{t('recap.recordCount', { count: sources.length })}</p>
+    <div className="flex h-[min(55vh,520px)] min-h-0 flex-col">
+      <RecordList items={sources} action={action} time={time} label={t('recap.sources')} />
+    </div>
+    <div className="mt-5 flex shrink-0 justify-end"><Button onClick={onClose}>{t('recap.close')}</Button></div>
+  </Dialog>;
 }
 
 export function DiagnosticsDialog({ date, onClose }) {

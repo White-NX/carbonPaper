@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { useDialogFocus, useDialogVisibility } from '../hooks/useDialogFocus';
 import PropTypes from 'prop-types';
 import { cn } from '../lib/utils';
+import { OVERLAY_LAYERS } from './overlay/layers';
 
 export function ConfirmDialog({
   isOpen = false,
@@ -20,13 +21,14 @@ export function ConfirmDialog({
   const titleId = useId();
   const messageId = useId();
   const visible = useDialogVisibility(isOpen, allowWhenLocked);
-  const dialogRef = useDialogFocus(visible, onCancel, loading);
+  const dialogRef = useDialogFocus(visible, onCancel, loading, { layer: allowWhenLocked ? 'lockedAction' : 'confirmation' });
 
   if (!visible) return null;
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 py-6"
+      className={cn('fixed inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 py-6',
+        allowWhenLocked ? OVERLAY_LAYERS.lockedAction : OVERLAY_LAYERS.confirmation)}
       onClick={(event) => {
         event.stopPropagation();
         if (!loading && onCancel) onCancel();

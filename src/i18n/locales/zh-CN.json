@@ -651,7 +651,10 @@
       },
       "migration": {
         "dialog_title": "数据库安全升级",
+        "storage_dialog_title": "正在迁移存储位置",
         "error_default": "迁移出错",
+        "cancelling": "正在取消…",
+        "cancel_failed": "未能取消，请重试。{{error}}",
         "copying": "正在拷贝文件: {{copied}}/{{total}}",
         "current_file": "当前文件: {{file}}",
         "completed": "完成",

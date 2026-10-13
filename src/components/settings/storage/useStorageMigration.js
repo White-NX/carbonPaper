@@ -1,19 +1,24 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { selectStorageDirectory } from '../../../lib/native_dialogs';
 import { withAuth } from '../../../lib/auth_api';
 import { runMonitorAction, notifySettingsChanged } from '../../../lib/settings_api';
 import { useSettingsActivity } from '../SettingsActivityContext';
+
+const CANCELLED = 'Migration cancelled by user';
+const idleCancellation = () => ({ pending: false, requested: false, error: '' });
 
 export function useStorageMigration({ storage, onRefresh, t }) {
   const [isMigrating, setIsMigrating] = useState(false);
   const [migrationProgress, setMigrationProgress] = useState({ total_files: 0, copied_files: 0, current_file: '' });
   const [migrationError, setMigrationError] = useState('');
+  const [migrationCancellation, setMigrationCancellation] = useState(idleCancellation);
   const [isUpdatingStoragePath, setIsUpdatingStoragePath] = useState(false);
   const [isMigrationChoiceDialogOpen, setIsMigrationChoiceDialogOpen] = useState(false);
   const [pendingTargetPath, setPendingTargetPath] = useState('');
   const mountedRef = useRef(true);
+  const migrationRunRef = useRef(null);
   useSettingsActivity('storage-migration', { busy: isMigrating || isUpdatingStoragePath });
   const migrationUnlistenersRef = useRef([]);
   const currentStoragePath = storage?.root_path || 'LocalAppData/CarbonPaper';
@@ -30,6 +35,9 @@ export function useStorageMigration({ storage, onRefresh, t }) {
   }, []);
 
   const executeStoragePathChange = async (targetPath, shouldMigrateData) => {
+    if (!targetPath || migrationRunRef.current) return;
+    const run = { started: false, finished: false, cancelPending: false, cancelRequested: false };
+    migrationRunRef.current = run;
     let unlistenProgress = null;
     let unlistenError = null;
     let shouldRestartMonitor = true;
@@ -53,9 +61,8 @@ export function useStorageMigration({ storage, onRefresh, t }) {
     };
 
     try {
-      if (!targetPath) return;
-
       setMigrationError('');
+      setMigrationCancellation(idleCancellation());
       setIsUpdatingStoragePath(true);
       try {
         const monitorStatusRaw = await invoke('get_monitor_status');
@@ -78,14 +85,23 @@ export function useStorageMigration({ storage, onRefresh, t }) {
         });
 
         unlistenError = await registerMigrationListener('storage-migration-error', (evt) => {
-          setMigrationError(evt.payload?.message || t('settings.storageManagement.migration.error_default'));
+          if (!evt.payload?.cancelled) setMigrationError(evt.payload?.message || t('settings.storageManagement.migration.error_default'));
         });
       }
 
-      await withAuth(() => invoke('storage_migrate_data_dir', {
-        target: targetPath,
-        migrateDataFiles: shouldMigrateData,
-      }), { autoPrompt: true });
+      await withAuth(async () => {
+        if (run.cancelRequested) throw new Error(CANCELLED);
+        run.started = true;
+        try {
+          return await invoke('storage_migrate_data_dir', { target: targetPath, migrateDataFiles: shouldMigrateData });
+        } catch (error) {
+          // A rejected admission can still be cancelled while Hello is open;
+          // the retry must not begin work after that cancellation.
+          if (String(error).includes('AUTH_REQUIRED')) run.started = false;
+          throw error;
+        }
+      }, { autoPrompt: true });
+      run.finished = true;
 
       if (shouldMigrateData) {
         if (mountedRef.current) {
@@ -97,11 +113,12 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       onRefresh?.();
       await notifySettingsChanged(['storage', 'records']);
     } catch (e) {
-      console.error('change storage path failed', e);
-      if (mountedRef.current) {
+      if (String(e?.message || e) !== CANCELLED && mountedRef.current) {
+        console.error('change storage path failed', e);
         setMigrationError(String(e));
       }
     } finally {
+      run.finished = true;
       await removeMigrationListener(unlistenProgress);
       await removeMigrationListener(unlistenError);
 
@@ -112,15 +129,42 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       if (shouldRestartMonitor) {
         try { await runMonitorAction('maintenance-start'); } catch { }
       }
+      if (migrationRunRef.current === run) migrationRunRef.current = null;
+    }
+  };
+
+  const handleCancelMigration = async () => {
+    const run = migrationRunRef.current;
+    if (!run || run.finished || run.cancelPending || run.cancelRequested) return;
+    run.cancelPending = true;
+    run.cancelRequested = true;
+    setMigrationCancellation({ pending: true, requested: false, error: '' });
+    try {
+      let accepted = !run.started;
+      if (run.started) {
+        const result = await withAuth(() => {
+          if (migrationRunRef.current !== run || run.finished) return { status: 'idle' };
+          return invoke('storage_migration_cancel');
+        }, { autoPrompt: true });
+        accepted = result?.status === 'cancel_requested' || !run.started || run.finished;
+      }
+      run.cancelRequested = accepted;
+      if (mountedRef.current && migrationRunRef.current === run) {
+        setMigrationCancellation({ pending: false, requested: accepted, error: '' });
+      }
+    } catch (error) {
+      run.cancelRequested = false;
+      if (mountedRef.current && migrationRunRef.current === run) {
+        setMigrationCancellation({ pending: false, requested: false, error: String(error?.message || error) });
+      }
+    } finally {
+      run.cancelPending = false;
     }
   };
 
   const handleChangeStoragePath = async () => {
     try {
-      const selected = await open({ directory: true });
-      if (!selected) return;
-
-      const targetPath = Array.isArray(selected) ? selected[0] : selected;
+      const targetPath = await selectStorageDirectory();
       if (!targetPath) return;
 
       const normalizedCurrent = currentStoragePath.replace(/[\\/]+$/, '');
@@ -153,6 +197,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
     isMigrating,
     migrationProgress,
     migrationError,
+    migrationCancellation,
     isUpdatingStoragePath,
     isMigrationChoiceDialogOpen,
     pendingTargetPath,
@@ -160,5 +205,6 @@ export function useStorageMigration({ storage, onRefresh, t }) {
     handleChangeStoragePath,
     handleCancelMigrationChoice,
     handleApplyStoragePath,
+    handleCancelMigration,
   };
 }

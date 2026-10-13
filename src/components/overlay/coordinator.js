@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 /**
  * Which startup overlay wins when several want the screen, highest first.
@@ -33,6 +33,11 @@ export function pickOverlay(requests) {
 const OverlayCoordinatorContext = createContext(null);
 export const OverlayCoordinatorProvider = OverlayCoordinatorContext.Provider;
 
+/** Ordinary dialogs yield to the active startup surface in this WebView. */
+export function useActiveOverlay() {
+  return useContext(OverlayCoordinatorContext)?.active ?? null;
+}
+
 /**
  * State for the coordinator. The owner (App) renders
  * `<OverlayCoordinatorProvider value={coordinator.value}>` and can read
@@ -60,11 +65,11 @@ export function useOverlaySlot(id, wants) {
   const request = coordinator?.request;
   const wanted = Boolean(wants);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     request?.(id, wanted);
   }, [request, id, wanted]);
 
-  useEffect(() => () => request?.(id, false), [request, id]);
+  useLayoutEffect(() => () => request?.(id, false), [request, id]);
 
   if (!coordinator) return wanted;
   return wanted && coordinator.active === id;

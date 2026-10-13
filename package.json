@@ -17,7 +17,7 @@
     "test:mcp-contract": "node scripts/mcp-contract.mjs",
     "test:mcp-skill-contract": "node scripts/mcp-contract.mjs --skill-root ../carbonPaperSkill",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
-    "test:security": "node scripts/security-guards.cjs",
+    "test:security": "node scripts/security-guards.cjs && node --test scripts/overlay-boundaries.test.mjs",
     "verify:wal-foundation": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-wal-foundation.ps1",
     "test:backend:fast": "npm run test:security && npm run test:rust",
     "tauri": "tauri",

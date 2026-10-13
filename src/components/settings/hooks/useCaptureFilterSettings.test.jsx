@@ -25,7 +25,7 @@ describe('capture rule drafts', () => {
     expect(JSON.parse(localStorage.getItem('monitorFilters'))).toEqual(saved);
     expect(updateMonitorFilters).not.toHaveBeenCalled();
     renderHook(() => useSavedCaptureFilters({ monitorStatus: 'running' }));
-    expect(updateMonitorFilters).toHaveBeenCalledWith({ processes: saved.processes, titles: [], ignore_protected: true });
+    expect(updateMonitorFilters).toHaveBeenCalledWith({ processes: saved.processes, titles: [], ignore_protected: true }, { promptMode: 'defer' });
     expect(editor.result.current.filtersDirty).toBe(true);
   });
 

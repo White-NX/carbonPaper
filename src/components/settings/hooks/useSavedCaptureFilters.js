@@ -8,7 +8,7 @@ export function useSavedCaptureFilters({ monitorStatus, enabled = true }) {
   useEffect(() => {
     if (!enabled || monitorStatus !== 'running') return;
     const saved = readSavedCaptureFilters();
-    updateMonitorFilters({ processes: saved.processes, titles: saved.titles, ignore_protected: saved.ignoreProtected })
+    updateMonitorFilters({ processes: saved.processes, titles: saved.titles, ignore_protected: saved.ignoreProtected }, { promptMode: 'defer' })
       .catch((error) => console.warn('Failed to apply saved capture filters:', error));
   }, [monitorStatus, enabled]);
 }

@@ -21,8 +21,8 @@ export function notifySettingsChanged(keys) {
   });
 }
 
-export async function saveAdvancedConfig(patch) {
-  await withAuth(() => invoke('set_advanced_config', { config: patch }), { autoPrompt: true });
+export async function saveAdvancedConfig(patch, authOptions = { autoPrompt: true }) {
+  await withAuth(() => invoke('set_advanced_config', { config: patch }), authOptions);
   await notifySettingsChanged(['advanced']);
 }
 

@@ -651,7 +651,10 @@
       },
       "migration": {
         "dialog_title": "Security Update",
+        "storage_dialog_title": "Moving your data",
         "error_default": "Migration error",
+        "cancelling": "Cancelling…",
+        "cancel_failed": "Could not cancel. You can try again. {{error}}",
         "copying": "Copying files: {{copied}}/{{total}}",
         "current_file": "Current: {{file}}",
         "completed": "Completed",
