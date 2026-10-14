@@ -89,7 +89,9 @@ fn record_rust_failure(error: &str, elapsed_ms: f64) {
 }
 
 pub(crate) fn record_pipeline_error(error: &str) {
-    record_rust_failure(error, 0.0);
+    if error != "waiting_for_ac_power" {
+        record_rust_failure(error, 0.0);
+    }
 }
 
 fn truncate_error(error: &str) -> String {
@@ -215,7 +217,9 @@ async fn embed_bge_chunks(
             )
             .await
             .map_err(|error| {
-                if state.foreground_waiting() {
+                if let crate::task_error::TaskError::Paused(reason) = &error {
+                    reason.to_string()
+                } else if state.foreground_waiting() {
                     format!(
                         "foreground_busy: BGE classification yielded after a foreground query arrived: {error}"
                     )
@@ -315,7 +319,9 @@ pub async fn embed_bge_texts(
             })
         }
         Err(error) => {
-            record_rust_failure(&error, elapsed_ms);
+            if error != "waiting_for_ac_power" {
+                record_rust_failure(&error, elapsed_ms);
+            }
             Err(error)
         }
     }

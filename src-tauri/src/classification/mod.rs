@@ -74,6 +74,7 @@ struct NativeEncoder {
     app: AppHandle,
     generation: u64,
     deadline: tokio::time::Instant,
+    capture_work: bool,
 }
 impl TextEncoder for NativeEncoder {
     async fn encode(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
@@ -81,11 +82,26 @@ impl TextEncoder for NativeEncoder {
         if self.app.state::<Arc<StorageState>>().db_generation() != self.generation {
             return Err("classification database changed".into());
         }
-        let result = tokio::time::timeout_at(
+        if self.capture_work {
+            postprocess_gate(&self.app)?;
+        }
+        let inference = tokio::time::timeout_at(
             self.deadline,
             crate::classification_runtime::embed_bge_texts(self.app.clone(), texts),
-        )
-        .await
+        );
+        let result = if self.capture_work {
+            crate::power::CAPTURE_WORK
+                .scope(
+                    self.app
+                        .state::<Arc<crate::power::PowerState>>()
+                        .inner()
+                        .clone(),
+                    inference,
+                )
+                .await
+        } else {
+            inference.await
+        }
         .map_err(|_| "classification inference timed out".to_string())??;
         Ok(result.vectors)
     }
@@ -129,6 +145,7 @@ async fn classify(
         app: app.clone(),
         generation,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        capture_work: !debug,
     };
     let result = current
         .classifier
@@ -180,6 +197,7 @@ fn scheduling_deferred(error: &str) -> bool {
         "foreground_busy",
         "background_busy",
         "foreground_request",
+        "waiting_for_ac_power",
         "MAINTENANCE_IN_PROGRESS",
         "maintenance",
         "classification source changed",
@@ -190,10 +208,10 @@ fn scheduling_deferred(error: &str) -> bool {
     .any(|prefix| error.starts_with(prefix))
 }
 
-fn immediate_gate(app: &AppHandle) -> Result<(), String> {
+fn postprocess_gate(app: &AppHandle) -> Result<(), String> {
     if let Some(reason) = crate::background_scheduler::environment_gate_reason(
         app,
-        crate::background_scheduler::EnvironmentPolicy::Immediate,
+        crate::background_scheduler::EnvironmentPolicy::CapturePostprocess,
     ) {
         return Err(reason.into());
     }
@@ -201,6 +219,10 @@ fn immediate_gate(app: &AppHandle) -> Result<(), String> {
 }
 
 pub(crate) fn enqueue_capture(app: &AppHandle, id: i64, input: Input) -> Result<bool, String> {
+    if postprocess_gate(app).is_err() {
+        // Leave the durable pending row for retry without claiming/spending it.
+        return Ok(false);
+    }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let state = app.state::<Arc<ClassificationState>>().inner().clone();
     let generation = storage.db_generation();
@@ -246,7 +268,7 @@ async fn run_capture(
         storage.defer_native_classification(lease, "classification source changed", true)?;
         return Ok(());
     }
-    immediate_gate(app)?;
+    postprocess_gate(app)?;
     let result = if lease.user_revision == 0
         && crate::registry_config::get_bool("classification_enabled").unwrap_or(true)
     {
@@ -281,7 +303,7 @@ pub(crate) fn enqueue_staged(app: &AppHandle, work: StagedWork) -> Result<bool, 
             process_name: work.input.process_name.clone(),
         };
         let result = async {
-            immediate_gate(&app)?;
+            postprocess_gate(&app)?;
             storage.processing_stage.check_receipt(&work.receipt)?;
             let result = if user_revision == 0
                 && crate::registry_config::get_bool("classification_enabled").unwrap_or(true)
@@ -332,14 +354,17 @@ impl Drop for FeedbackGuard {
 pub(crate) fn start_feedback(app: &AppHandle) {
     let state = app.state::<Arc<ClassificationState>>().inner().clone();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    if !storage.is_silent_read_authorized() || state.feedback_running.swap(true, Ordering::AcqRel) {
+    if postprocess_gate(app).is_err()
+        || !storage.is_silent_read_authorized()
+        || state.feedback_running.swap(true, Ordering::AcqRel)
+    {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _guard = FeedbackGuard(state.clone());
         for _ in 0..8 {
-            if !storage.is_silent_read_authorized() || immediate_gate(&app).is_err() {
+            if !storage.is_silent_read_authorized() || postprocess_gate(&app).is_err() {
                 break;
             }
             let generation = storage.db_generation();
@@ -417,6 +442,7 @@ async fn learn_feedback(
         app: app.clone(),
         generation,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        capture_work: true,
     };
     current
         .classifier
@@ -479,6 +505,7 @@ mod tests {
     fn scheduling_yields_preserve_retry_budgets_but_inference_failures_do_not() {
         for error in [
             "foreground_busy: search",
+            "waiting_for_ac_power",
             "background_busy: indexing",
             "foreground_request",
             "MAINTENANCE_IN_PROGRESS",

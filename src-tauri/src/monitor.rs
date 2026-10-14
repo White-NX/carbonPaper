@@ -517,15 +517,15 @@ async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String,
             stop_capture(app).await?;
             start_capture(app).await
         }
-        MonitorAction::Pause => Ok(set_capture_paused(app, true)),
-        MonitorAction::Resume => Ok(set_capture_paused(app, false)),
+        MonitorAction::Pause => set_capture_paused(app, true),
+        MonitorAction::Resume => set_capture_paused(app, false),
         MonitorAction::TogglePause => {
             if state.is_running() {
                 let paused = app
                     .state::<Arc<CaptureState>>()
                     .paused
                     .load(Ordering::SeqCst);
-                Ok(set_capture_paused(app, !paused))
+                set_capture_paused(app, !paused)
             } else {
                 Ok("Monitor stopped".into())
             }
@@ -534,6 +534,7 @@ async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String,
 }
 
 async fn start_capture(app: &AppHandle) -> Result<String, String> {
+    crate::power::check_capture_allowed(app)?;
     let state = app.state::<MonitorState>();
     // Check if required model files are complete
     if let Ok(model_status) = crate::model_management::check_model_files().await {
@@ -551,6 +552,8 @@ async fn start_capture(app: &AppHandle) -> Result<String, String> {
         }
     }
 
+    // Power may have changed while the model check was awaiting I/O.
+    crate::power::check_capture_allowed(app)?;
     let Some(session) = state.claim_session() else {
         return Ok("Monitor is already running".into());
     };
@@ -784,12 +787,15 @@ pub async fn stop_monitor(window: tauri::Window, app: AppHandle) -> Result<Strin
     control(&app, MonitorAction::Stop).await
 }
 
-fn set_capture_paused(app: &AppHandle, paused: bool) -> String {
+fn set_capture_paused(app: &AppHandle, paused: bool) -> Result<String, String> {
+    if !paused {
+        crate::power::check_capture_allowed(app)?;
+    }
     app.state::<Arc<CaptureState>>()
         .paused
         .store(paused, Ordering::SeqCst);
     crate::refresh_tray_menu(app);
-    serde_json::json!({ "status": if paused { "paused" } else { "resumed" } }).to_string()
+    Ok(serde_json::json!({ "status": if paused { "paused" } else { "resumed" } }).to_string())
 }
 
 #[tauri::command]
@@ -970,6 +976,12 @@ pub fn start_game_mode_monitor(app: AppHandle) {
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+            // Capture and automatic inference are suspended; querying GPU
+            // counters cannot change admission until power saving ends.
+            if crate::power::is_saving_power(&app_clone) {
+                continue;
+            }
 
             // ── Fullscreen non-browser detection ──
             {

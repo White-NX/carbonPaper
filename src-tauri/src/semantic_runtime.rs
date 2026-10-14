@@ -248,9 +248,25 @@ impl Drop for InFlightSemanticRequest {
 struct RequestWatch {
     deadline: Instant,
     lease: Option<Arc<ExecutionLease>>,
+    capture_power: Option<Arc<crate::power::PowerState>>,
 }
 impl RequestWatch {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            lease: background_policy::current_execution(),
+            capture_power: crate::power::current_capture_power(),
+        }
+    }
+
     fn check(&self, runtime: &SemanticRuntimeState) -> Result<(), TaskError> {
+        if self
+            .capture_power
+            .as_ref()
+            .is_some_and(|power| power.is_active())
+        {
+            return Err(TaskError::Paused("waiting_for_ac_power"));
+        }
         if let Some(lease) = &self.lease {
             if runtime.foreground_waiting() {
                 lease.revoke("foreground_request");
@@ -557,6 +573,8 @@ impl SemanticRuntimeState {
         // materially longer than its own timeout. It is computed before the gate
         // is taken because the wait for the gate is the longest of those steps.
         let deadline = Instant::now() + timeout;
+        let watch = RequestWatch::new(deadline);
+        watch.check(self)?;
         background_policy::check_current()?;
         let _request_guard =
             acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
@@ -565,11 +583,16 @@ impl SemanticRuntimeState {
         // begin during that wait. Using the earlier value here could start a
         // fresh DirectML worker after game mode had already taken the GPU back.
         background_policy::check_current()?;
+        watch.check(self)?;
         let prefer_directml = background_policy::current_execution().is_none()
             && directml_allowed_for_request(&app, prefer_directml);
         let model = request_model(&request);
-        let mut provider = match self.select_provider(&app, prefer_directml, model).await {
+        let mut provider = match self
+            .select_provider(&app, prefer_directml, model, &watch)
+            .await
+        {
             Ok(provider) => provider,
+            Err(error) if error.is_pause() => return Err(error),
             Err(error) => {
                 if directml_allowed_for_request(&app, true) {
                     self.disable_directml_for_session(&error);
@@ -616,6 +639,7 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         prefer_directml: bool,
         model: Option<MlSemanticModel>,
+        watch: &RequestWatch,
     ) -> Result<MlProvider, TaskError> {
         if let Some(provider) = self.cached_provider_for_request(prefer_directml, model) {
             return Ok(provider);
@@ -623,8 +647,13 @@ impl SemanticRuntimeState {
 
         let state_for_start = self.clone();
         let app_for_start = app.clone();
+        let startup_watch = watch.clone();
         tokio::task::spawn_blocking(move || {
-            state_for_start.ensure_process(&app_for_start, MlProvider::DirectMl)
+            state_for_start.ensure_process_watched(
+                &app_for_start,
+                MlProvider::DirectMl,
+                Some(&startup_watch),
+            )
         })
         .await
         .map_err(|error| {
@@ -666,10 +695,7 @@ impl SemanticRuntimeState {
         deadline: Instant,
     ) -> Result<MlResponse, TaskError> {
         let request_id = request.request_id();
-        let watch = RequestWatch {
-            deadline,
-            lease: background_policy::current_execution(),
-        };
+        let watch = RequestWatch::new(deadline);
         watch.check(self)?;
         let scheduler = app.try_state::<Arc<BackgroundSchedulerState>>();
         let cost_key = scheduler.as_ref().and_then(|scheduler| {
@@ -963,14 +989,6 @@ impl SemanticRuntimeState {
             .state = "stopped".to_string();
     }
 
-    fn ensure_process(
-        &self,
-        app: &AppHandle,
-        requested_provider: MlProvider,
-    ) -> Result<Arc<SemanticMlChild>, TaskError> {
-        self.ensure_process_watched(app, requested_provider, None)
-    }
-
     fn ensure_process_watched(
         &self,
         app: &AppHandle,
@@ -987,6 +1005,9 @@ impl SemanticRuntimeState {
         // This is the last provider decision before a process can be reused or
         // spawned. Keeping it inside the lifecycle lock closes the remaining
         // gap between the async request-level check and worker startup.
+        if let Some(watch) = watch {
+            watch.check(self)?;
+        }
         let provider = if requested_provider == MlProvider::DirectMl
             && !directml_allowed_for_request(app, true)
         {
@@ -1907,6 +1928,28 @@ pub async fn get_background_index_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capture_power_policy_reaches_startup_watches_without_leaking_to_manual_requests() {
+        let power = Arc::new(crate::power::PowerState::new());
+        let expected = power.clone();
+        let watch = crate::power::CAPTURE_WORK
+            .scope(power, async {
+                RequestWatch::new(Instant::now() + Duration::from_secs(5))
+            })
+            .await;
+        tokio::task::spawn_blocking(move || {
+            assert!(Arc::ptr_eq(
+                watch.capture_power.as_ref().unwrap(),
+                &expected
+            ));
+        })
+        .await
+        .unwrap();
+        let manual_watch = RequestWatch::new(Instant::now() + Duration::from_secs(5));
+        assert!(manual_watch.capture_power.is_none());
+        assert!(manual_watch.check(&SemanticRuntimeState::new()).is_ok());
+    }
 
     #[test]
     fn index_status_covers_scheduler_waits_and_ignores_automatic_work() {

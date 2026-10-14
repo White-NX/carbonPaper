@@ -77,3 +77,41 @@ describe('first-run wizard', () => {
     await waitFor(() => expect(starts()).toBe(1));
   });
 });
+
+describe('power-saving admission', () => {
+  it('waits for the startup power probe and stays stopped on battery', async () => {
+    stopped = true;
+    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
+    const { result, rerender } = renderHook((props) => useMonitorLifecycle({ ...options, ...props }), {
+      initialProps: { powerStatusReady: false, powerSavingSuppressed: false },
+    });
+    await waitFor(() => expect(result.current.backendStatus).toBe('offline'));
+    expect(starts()).toBe(0);
+    rerender({ powerStatusReady: true, powerSavingSuppressed: true });
+    await act(async () => {});
+    expect(starts()).toBe(0);
+    rerender({ powerStatusReady: true, powerSavingSuppressed: false });
+    await waitFor(() => expect(starts()).toBe(1));
+  });
+
+  it('treats a native power rejection as temporary and resumes when AC returns', async () => {
+    const reportBackendError = vi.fn();
+    const { result, rerender } = renderHook((props) => useMonitorLifecycle({ ...options, reportBackendError, ...props }), {
+      initialProps: { powerSavingSuppressed: false },
+    });
+    await waitFor(() => expect(result.current.backendStatus).toBe('online'));
+    const originalInvoke = invoke.getMockImplementation();
+    invoke.mockImplementation(async (command, ...args) => {
+      if (command === 'start_monitor') throw 'POWER_SAVING_ACTIVE';
+      return originalInvoke(command, ...args);
+    });
+    await act(() => result.current.handleStartBackend());
+    expect(reportBackendError).not.toHaveBeenCalled();
+    expect(result.current.backendError).toBe('');
+    expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(1);
+    rerender({ powerSavingSuppressed: true });
+    invoke.mockImplementation(originalInvoke);
+    rerender({ powerSavingSuppressed: false });
+    await waitFor(() => expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(2));
+  });
+});

@@ -220,10 +220,12 @@ impl MlRuntimeState {
         timeout: Duration,
         use_directml: bool,
     ) -> Result<MlOcrResult, String> {
+        crate::power::check_capture_allowed(&app)?;
         // The worker protocol is single-request. Holding this gate across
         // provider selection, startup and the response prevents a concurrent
         // provider switch from killing an in-flight request.
         let _request_guard = self.request_gate.lock().await;
+        crate::power::check_capture_allowed(&app)?;
         // A capture task may outlive the game-mode transition that created it.
         // Clamp the route again here so a stale task cannot start or retain a
         // DirectML worker after suppression becomes active.
@@ -247,12 +249,18 @@ impl MlRuntimeState {
             );
         }
         let state_for_start = self.clone();
-        let process_result =
-            tokio::task::spawn_blocking(move || state_for_start.ensure_process(&app, provider))
-                .await
-                .map_err(|error| format!("ML worker startup task failed: {error}"))?;
+        let app_for_start = app.clone();
+        let process_result = tokio::task::spawn_blocking(move || {
+            state_for_start.ensure_process(&app_for_start, provider)
+        })
+        .await
+        .map_err(|error| format!("ML worker startup task failed: {error}"))?;
         let process = match process_result {
             Ok(process) => process,
+            Err(error) if error == crate::power::POWER_SAVING_ACTIVE => {
+                self.stop();
+                return Err(error);
+            }
             Err(error) => {
                 self.record_failure(&error, 0.0);
                 if provider == MlProvider::DirectMl {
@@ -261,6 +269,10 @@ impl MlRuntimeState {
                 return Err(error);
             }
         };
+        if crate::power::is_saving_power(&app) {
+            self.stop();
+            return Err(crate::power::POWER_SAVING_ACTIVE.into());
+        }
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let width = image.width();
         let height = image.height();
@@ -287,7 +299,23 @@ impl MlRuntimeState {
         let process_for_request = process.clone();
         let request_task =
             tokio::task::spawn_blocking(move || process_for_request.request_rgb(&request, image));
-        let response = match tokio::time::timeout(timeout + CANCEL_GRACE, request_task).await {
+        let response_wait = tokio::time::timeout(timeout + CANCEL_GRACE, request_task);
+        tokio::pin!(response_wait);
+        let response_result = loop {
+            tokio::select! {
+                result = &mut response_wait => break result,
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    if crate::power::is_saving_power(&app) {
+                        // OCR owns this worker exclusively. Killing it also
+                        // releases the blocking pipe reader; the saved frame
+                        // is preserved by the capture completion handler.
+                        self.stop();
+                        return Err(crate::power::POWER_SAVING_ACTIVE.into());
+                    }
+                }
+            }
+        };
+        let response = match response_result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(format!("ML request task failed: {error}")),
             Err(_) => {
@@ -303,6 +331,10 @@ impl MlRuntimeState {
                 ))
             }
         };
+        // A policy stop can close the pipe before the polling branch runs.
+        if response.is_err() && crate::power::is_saving_power(&app) {
+            return Err(crate::power::POWER_SAVING_ACTIVE.into());
+        }
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         match response {
             Ok(MlResponse::OcrComplete {
@@ -402,6 +434,18 @@ impl MlRuntimeState {
         self.stop_locked();
     }
 
+    pub(crate) fn stop_for_power_saving(&self, power: &crate::power::PowerState) {
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Power may have returned while the capture session was draining.
+        // Do not kill an OCR worker started by the resumed session.
+        if power.is_active() {
+            self.stop_locked();
+        }
+    }
+
     fn stop_locked(&self) {
         let process = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -426,6 +470,7 @@ impl MlRuntimeState {
             .lifecycle_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        crate::power::check_capture_allowed(app)?;
         {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(process) = &inner.process {
@@ -506,10 +551,16 @@ impl MlRuntimeState {
                 let _ = ready_sender.send((ready, reader));
             })
             .map_err(|error| format!("failed to start ML handshake reader: {error}"))?;
-        let (ready, stdout) = match ready_receiver.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(value) => value,
-            Err(_) => {
+        let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
+        let (ready, stdout) = loop {
+            crate::power::check_capture_allowed(app)?;
+            if Instant::now() >= startup_deadline {
                 return Err("Rust ML worker startup timed out".to_string());
+            }
+            match ready_receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(value) => break value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => return Err("Rust ML worker handshake disconnected".to_string()),
             }
         };
         let child = pending_child.take();
@@ -1278,6 +1329,9 @@ async fn run_postprocess_tasks<M, MF, D, DF>(
 }
 
 async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
+    if crate::power::is_saving_power(app) {
+        return Ok(());
+    }
     let storage = app
         .state::<Arc<crate::storage::StorageState>>()
         .inner()
@@ -1287,6 +1341,9 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
     }
     let ids = storage.list_pending_ocr_postprocess_ids(10)?;
     for screenshot_id in ids {
+        if crate::power::is_saving_power(app) {
+            break;
+        }
         if storage.processing_stage.owns_screenshot(
             screenshot_id,
             carbonpaper_app_bound::protocol::Consumer::Classification,

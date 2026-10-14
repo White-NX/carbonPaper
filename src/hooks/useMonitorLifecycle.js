@@ -14,6 +14,7 @@ export function useMonitorLifecycle({
   modelsNeedDownload,
   captureHeld = false,
   powerSavingSuppressed,
+  powerStatusReady = true,
   formatErrorDetails,
   reportBackendError,
   resetBackendErrorDedupe,
@@ -34,6 +35,11 @@ export function useMonitorLifecycle({
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
   const unexpectedStopsRef = useRef([]);
+  const powerBlockedRef = useRef(false);
+
+  useEffect(() => {
+    if (!powerSavingSuppressed) powerBlockedRef.current = false;
+  }, [powerSavingSuppressed]);
 
   useEffect(() => {
     backendStatusRef.current = backendStatus;
@@ -92,6 +98,14 @@ export function useMonitorLifecycle({
     } catch (err) {
       setBackendStatus('offline');
       backendStatusRef.current = 'offline';
+      // Native admission can observe unplugging before the power event reaches
+      // this window. Wait for the policy transition without a failure dialog or
+      // permanently disabling auto-start when AC returns.
+      if ((typeof err === 'string' ? err : err?.message) === 'POWER_SAVING_ACTIVE') {
+        powerBlockedRef.current = true;
+        backendStartAtRef.current = null;
+        return;
+      }
       const message = err?.message || t('settings.general.monitor.errors.startFailedFallback');
       const details = formatErrorDetails(err);
       setBackendError(message);
@@ -237,6 +251,7 @@ export function useMonitorLifecycle({
 
   useEffect(() => {
     if (!autoStartMonitor) return;
+    if (!powerStatusReady || powerBlockedRef.current) return;
     if (autoStartSuppressed || autoStartSuppressedRef.current || runtimeActionRef.current) return;
     if (powerSavingSuppressed) return;
     if (!modelsCheckDone) return;
@@ -255,6 +270,7 @@ export function useMonitorLifecycle({
     modelsCheckDone,
     modelsNeedDownload,
     powerSavingSuppressed,
+    powerStatusReady,
   ]);
 
   return {
