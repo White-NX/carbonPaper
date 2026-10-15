@@ -24,7 +24,7 @@ use roaring::RoaringBitmap;
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, ToSql};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
@@ -213,10 +213,14 @@ struct SearchStages {
     combining: Duration,
     /// Mapping candidate blocks onto screenshots.
     resolving: Duration,
-    /// Decrypting candidates and scoring them.
+    /// Fetching candidates, decrypting them and scoring them.
     verifying: Duration,
+    /// The SQL part of `verifying`, before any key unwrap or plaintext work.
+    candidate_sql: Duration,
     /// Fetching the page and decrypting the rest of its columns.
     materializing: Duration,
+    /// The SQL part of `materializing`.
+    page_sql: Duration,
 }
 
 /// Per-query timing report for [`StorageState::search_text`], emitted on drop.
@@ -260,7 +264,7 @@ impl Drop for SearchTelemetry {
              probe={}/{} load={} ({:.1}KiB) candidates={} tolerated={} stmts={} verified={} \
              kept={} near={} rows={} | \
              setup={:.1} filters={:.1} plan={:.1} probe={:.1} bitmaps={:.1} combine={:.1} \
-             resolve={:.1} verify={:.1} page={:.1}",
+             resolve={:.1} verify={:.1} page={:.1} candidate_sql={:.1} page_sql={:.1}",
             self.tier,
             self.cached,
             self.complete,
@@ -287,6 +291,8 @@ impl Drop for SearchTelemetry {
             millis(self.stages.resolving),
             millis(self.stages.verifying),
             millis(self.stages.materializing),
+            millis(self.stages.candidate_sql),
+            millis(self.stages.page_sql),
         );
 
         if total >= SLOW_SEARCH_REPORT {
@@ -666,21 +672,20 @@ fn fuzzy_candidates(
 
 /// The `cap` highest ids of a bitmap, largest first.
 ///
-/// Roaring iterates ascending and row ids grow with capture time, so this is
-/// "the most recent `cap` candidates" — the right ones to keep when a set is
-/// too large to check in full.
+/// Seek from the end instead of visiting the entire posting list to retain
+/// its tail. Work stays bounded by `cap` even for a very common short query.
 fn newest_ids(bitmap: &RoaringBitmap, cap: usize) -> Vec<i64> {
-    if cap == 0 {
-        return Vec::new();
-    }
-    let mut window: VecDeque<u32> = VecDeque::with_capacity(cap + 1);
-    for id in bitmap.iter() {
-        if window.len() == cap {
-            window.pop_front();
-        }
-        window.push_back(id);
-    }
-    window.into_iter().rev().map(|id| id as i64).collect()
+    bitmap.iter().rev().take(cap).map(i64::from).collect()
+}
+
+fn screenshot_ids_for_ocr_sql(count: usize) -> String {
+    let requested = requested_ocr_ids_sql(count);
+    format!(
+        "{requested}
+         SELECT DISTINCT r.screenshot_id FROM requested
+         CROSS JOIN ocr_results r NOT INDEXED ON r.id = requested.id
+         WHERE r.is_deleted = 0"
+    )
 }
 
 fn distinct_screenshots_of(
@@ -690,11 +695,7 @@ fn distinct_screenshots_of(
 ) -> Result<Vec<i64>, String> {
     let mut screenshots: HashSet<i64> = HashSet::new();
     for chunk in ocr_ids.chunks(SQL_CHUNK) {
-        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT DISTINCT screenshot_id FROM ocr_results
-              WHERE id IN ({placeholders}) AND is_deleted = 0"
-        );
+        let sql = screenshot_ids_for_ocr_sql(chunk.len());
         let params: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
         let mut stmt = conn
             .prepare(&sql)
@@ -967,6 +968,35 @@ const SEARCH_RESULT_COLUMNS: &str =
          CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
          s.category";
 
+const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted,
+     CAST(strftime('%s', s.created_at) AS INTEGER)";
+
+/// Recall already chose a bounded set of OCR ids. Without statistics SQLite
+/// can prefer idx_ocr_deleted_screenshot(is_deleted=?) and scan every live
+/// block for each candidate batch and each result page. Materialize only the
+/// requested ids, then drive primary-key lookups with CROSS JOIN. DISTINCT
+/// preserves IN's handling of repeated ids. NOT INDEXED still permits rowid
+/// lookups and keeps deletion indexes out of these bounded reads.
+fn requested_ocr_ids_sql(count: usize) -> String {
+    let values = vec!["(?)"; count].join(",");
+    format!(
+        "WITH requested(id) AS MATERIALIZED (
+             SELECT DISTINCT column1 FROM (VALUES {values})
+         )"
+    )
+}
+
+fn search_rows_by_id_sql(columns: &str, count: usize) -> String {
+    let requested = requested_ocr_ids_sql(count);
+    format!(
+        "{requested}
+         SELECT {columns} FROM requested
+         CROSS JOIN ocr_results r NOT INDEXED ON r.id = requested.id
+         CROSS JOIN screenshots s NOT INDEXED ON r.screenshot_id = s.id
+         WHERE r.is_deleted = 0 AND s.is_deleted = 0"
+    )
+}
+
 /// One projected row, still encrypted.
 ///
 /// Decoding is kept separate from decryption so the `rusqlite` statement is
@@ -1157,7 +1187,9 @@ impl StorageState {
         sql: &str,
         param_refs: &[&dyn ToSql],
         known_text: &HashMap<i64, String>,
+        stages: &mut SearchStages,
     ) -> Result<Vec<SearchResult>, String> {
+        let sql_started = Instant::now();
         let raw_rows: Vec<RawSearchRow> = {
             let mut stmt = conn
                 .prepare(sql)
@@ -1169,6 +1201,7 @@ impl StorageState {
                 .collect();
             rows
         };
+        stages.page_sql += sql_started.elapsed();
 
         // One batch per screenshot: the content key that decrypts the window
         // title is shared by every text block of a capture, so unwrapping it
@@ -1257,23 +1290,18 @@ impl StorageState {
         conn: &Connection,
         ids: &[i64],
         known_text: &HashMap<i64, String>,
+        stages: &mut SearchStages,
     ) -> Result<Vec<SearchResult>, String> {
         let mut results: Vec<SearchResult> = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(SQL_CHUNK) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT {SEARCH_RESULT_COLUMNS}
-                   FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id
-                  WHERE r.id IN ({placeholders})
-                    AND r.is_deleted = 0
-                    AND s.is_deleted = 0"
-            );
+            let sql = search_rows_by_id_sql(SEARCH_RESULT_COLUMNS, chunk.len());
             let param_refs: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
             results.extend(self.materialize_search_rows(
                 conn,
                 &sql,
                 param_refs.as_slice(),
                 known_text,
+                stages,
             )?);
         }
 
@@ -1296,15 +1324,7 @@ impl StorageState {
     ) -> Result<Vec<CandidateRow>, String> {
         let mut rows: Vec<CandidateRow> = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(SQL_CHUNK) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted,
-                        CAST(strftime('%s', s.created_at) AS INTEGER)
-                   FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id
-                  WHERE r.id IN ({placeholders})
-                    AND r.is_deleted = 0
-                    AND s.is_deleted = 0"
-            );
+            let sql = search_rows_by_id_sql(CANDIDATE_COLUMNS, chunk.len());
             let params: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
             let mut stmt = conn
                 .prepare(&sql)
@@ -1481,8 +1501,13 @@ impl StorageState {
                 offset,
             );
             let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
-            let results =
-                self.materialize_search_rows(&conn, &sql, param_refs.as_slice(), &HashMap::new())?;
+            let results = self.materialize_search_rows(
+                &conn,
+                &sql,
+                param_refs.as_slice(),
+                &HashMap::new(),
+                &mut telemetry.stages,
+            )?;
             telemetry.stages.materializing += watch.lap();
             telemetry.counts.rows_returned = results.len();
             return Ok(results);
@@ -1505,7 +1530,8 @@ impl StorageState {
             telemetry.complete = complete;
             telemetry.counts.candidates = ordered.len() as u64;
             let page = page_of(&ordered, offset as usize, limit as usize);
-            let results = self.materialize_ordered(&conn, &page, &HashMap::new())?;
+            let results =
+                self.materialize_ordered(&conn, &page, &HashMap::new(), &mut telemetry.stages)?;
             telemetry.stages.materializing += watch.lap();
             telemetry.counts.rows_returned = results.len();
             return Ok(results);
@@ -1640,7 +1666,9 @@ impl StorageState {
             .iter()
             .map(|candidate| candidate.ocr_id)
             .collect();
+        let sql_started = Instant::now();
         let rows = self.load_candidate_rows(&conn, &ids, &mut telemetry.counts)?;
+        telemetry.stages.candidate_sql += sql_started.elapsed();
         let verified = self.decrypt_candidates(rows)?;
         telemetry.counts.verified += verified.len();
 
@@ -1702,7 +1730,7 @@ impl StorageState {
         let ordered: Vec<i64> = scored.iter().map(|row| row.ocr_id).collect();
         let page = page_of(&ordered, offset, limit);
         texts.retain(|id, _| page.contains(id));
-        let results = self.materialize_ordered(&conn, &page, &texts)?;
+        let results = self.materialize_ordered(&conn, &page, &texts, &mut telemetry.stages)?;
         telemetry.stages.materializing += watch.lap();
         telemetry.counts.rows_returned = results.len();
         self.store_order(
@@ -2005,6 +2033,17 @@ fn bounded_fuzzy_hits(mut hits: Vec<GroupHit>, allowed: Option<&RoaringBitmap>) 
 /// ids are its newest rows; without one, SQLite walks the primary key
 /// backwards. Either way the caller gets a bounded window it can afford to
 /// decrypt.
+///
+/// Keep the screenshot deletion check as a scalar lookup. SQLite can turn
+/// EXISTS into a join and build a bloom filter over all screenshots after
+/// ANALYZE, defeating the early LIMIT even when only a few rows are needed.
+const RECENT_CANDIDATE_SQL: &str = "SELECT r.id
+       FROM ocr_results r NOT INDEXED
+      WHERE r.is_deleted = 0
+        AND (SELECT s.is_deleted FROM screenshots s
+             WHERE s.id = r.screenshot_id) = 0
+      ORDER BY r.id DESC LIMIT ?";
+
 fn recent_candidate_ids(
     conn: &Connection,
     allowed: Option<&RoaringBitmap>,
@@ -2016,12 +2055,7 @@ fn recent_candidate_ids(
     }
 
     let mut stmt = conn
-        .prepare(
-            "SELECT r.id
-               FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id
-              WHERE r.is_deleted = 0 AND s.is_deleted = 0
-              ORDER BY r.id DESC LIMIT ?",
-        )
+        .prepare(RECENT_CANDIDATE_SQL)
         .map_err(|e| format!("Failed to prepare recent scan: {}", e))?;
     let ids = stmt
         .query_map(params![window as i64], |row| row.get::<_, i64>(0))
@@ -2046,6 +2080,9 @@ fn describe_read_error(error: BackgroundReadError) -> String {
         BackgroundReadError::Other(message) => message,
     }
 }
+
+#[cfg(test)]
+mod query_regression;
 
 #[cfg(test)]
 mod tests {
