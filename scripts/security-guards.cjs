@@ -3,6 +3,10 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMMAND_TIERS = {
+  'commands::recap::recap_search': 'session_required',
+  'commands::recap::recap_search_status': 'session_required',
+  'commands::recap::recap_prepare_search': 'session_required',
+  'commands::recap::recap_cancel_search_index': 'runtime_public',
   'commands::recap::recap_get_settings': 'session_required',
   'commands::recap::recap_save_settings': 'session_required',
   'commands::recap::recap_list_days': 'session_required',
@@ -389,7 +393,7 @@ function checkBrowserDialogs() {
 
 function checkRecapToolGuards() {
   const source = read('src-tauri/src/mcp_server/recap.rs');
-  for (const name of ['tool_get_recap_days', 'tool_get_recap_day']) {
+  for (const name of ['tool_get_recap_days', 'tool_get_recap_day', 'tool_search_recaps']) {
     const start = source.indexOf(`async fn ${name}(`);
     const end = source.indexOf('\n}', start);
     const body = source.slice(start, end);

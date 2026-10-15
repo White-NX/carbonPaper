@@ -252,6 +252,61 @@
       "name": "get_recap_day"
     },
     {
+      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Returns concise activities, key details and citable screenshots; verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index. Timestamps are Unix milliseconds.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "end_date": {
+            "description": "Inclusive local date YYYY-MM-DD",
+            "type": "string"
+          },
+          "include_details": {
+            "default": true,
+            "description": "Include saved key facts in retrieval",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "default": "hybrid",
+            "enum": [
+              "keyword",
+              "semantic",
+              "hybrid"
+            ],
+            "type": "string"
+          },
+          "offset": {
+            "maximum": 100000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "ranking_revision": {
+            "description": "When paging, pass ranking_revision from the previous result. If results changed, restart at offset 0 without this field.",
+            "type": "string"
+          },
+          "start_date": {
+            "description": "Inclusive local date YYYY-MM-DD",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_recaps"
+    },
+    {
       "description": "Create or replace the stored AI-generated title, cluster overview, OCR summary, key points, evidence, and model metadata for a smart cluster.",
       "inputSchema": {
         "properties": {

@@ -107,6 +107,35 @@ pub(super) async fn tool_get_recap_days(
     .map_err(|e| format!("Task join error: {e}"))?
 }
 
+pub(super) async fn tool_search_recaps(
+    app_handle: &tauri::AppHandle,
+    args: Value,
+) -> Result<Value, String> {
+    require_authenticated_session(app_handle)?;
+    let query: recap::RecapSearchQuery = serde_json::from_value(args).map_err(|e| e.to_string())?;
+    let result = recap::search_activities(app_handle.clone(), query).await?;
+    require_authenticated_session(app_handle)?;
+    let mut result = serde_json::to_value(result).map_err(|_| "RECAP_INVALID_CACHE")?;
+    // Keep the established MCP screenshot citation and Unix-millisecond contract.
+    if let Some(items) = result["items"].as_array_mut() {
+        for item in items {
+            if let Some(sources) = item["sources"].as_array_mut() {
+                for source in sources {
+                    if let Some(source) = source.as_object_mut() {
+                        if let Some(id) = source.remove("id") {
+                            source.insert("screenshot_id".into(), id);
+                        }
+                        if let Some(time) = source.remove("timestamp_ms") {
+                            source.insert("timestamp".into(), time);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Explicit projection prevents prompts, reasoning, record directories and
 /// provider diagnostics from becoming model inputs. Refilter generated text
 /// and user corrections as well as source identities before returning them.
@@ -142,6 +171,23 @@ fn day_result(
                 (|| {
                     let title = filter_identity(filter, mode, &activity.task_title)?;
                     let text = filter_joined_text(filter, mode, &activity.text)?;
+                    let details = activity
+                        .details
+                        .iter()
+                        .filter_map(|detail| {
+                            if detail.evidence_ids.is_empty()
+                                || !detail
+                                    .evidence_ids
+                                    .iter()
+                                    .all(|id| activity.sources.iter().any(|s| s.id == *id))
+                            {
+                                return None;
+                            }
+                            filter_joined_text(filter, mode, &detail.text)
+                                .ok()
+                                .map(|text| json!({"text":text,"evidence_ids":detail.evidence_ids}))
+                        })
+                        .collect::<Vec<_>>();
                     let sources = activity.sources.iter().map(|source| {
                     Ok(json!({
                         "screenshot_id": source.id,
@@ -152,7 +198,7 @@ fn day_result(
                 }).collect::<Result<Vec<_>, super::Rejected>>()?;
                     Ok::<_, super::Rejected>(json!({
                         "activity_id": activity.id, "task_id": activity.task_id,
-                        "task_title": title, "text": text,
+                        "task_title": title, "text": text, "details": details,
                         "start_ms": activity.start_ms, "end_ms": activity.end_ms,
                         "batch_start_ms": batch.start_ms, "sources": sources,
                     }))
@@ -225,6 +271,7 @@ mod tests {
                     topics: vec![],
                 }),
                 activities: vec![RecapActivity {
+                    details: vec![],
                     id: "activity-1".into(),
                     task_id: "task-1".into(),
                     task_title: "Corrected title".into(),

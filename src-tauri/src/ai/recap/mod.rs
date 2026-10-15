@@ -3,6 +3,7 @@ mod privacy;
 mod progress;
 mod runner;
 mod screening;
+mod search;
 mod selection;
 mod summary;
 pub mod types;
@@ -10,6 +11,10 @@ mod views;
 
 pub(crate) use privacy::PrivacyFingerprint;
 pub use runner::{generate, read_day, read_progress, start_scheduler, RecapRuntime};
+pub use search::{
+    prepare as prepare_search, search as search_activities, status as search_status,
+    RecapSearchQuery, RecapSearchResult, RecapSearchRuntime, RecapSearchStatus,
+};
 pub use types::*;
 pub(crate) use views::with_current_day;
 pub use views::{read_day_view, read_records, RecapRecordPage};

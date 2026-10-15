@@ -423,7 +423,8 @@ Factual grounding (apply silently):
 Grouping and output:
 - Group by concrete task, not application. Different apps may serve the same task, and one app may host different tasks. Reuse an existing task_id only when evidence supports the same task; otherwise assign a new identifier and reuse it for that task's occurrences. Each activity describes one natural occurrence; keep interruptions separate.
 - Request at most three targeted gaps and twelve additional record IDs total; no broad exploration.
-- Return only JSON: {"activities":[{"task_id":"new:1","task_title":"short specific task name","text":"concise activity description","evidence_ids":[123]}],"gaps":[{"question":"specific unresolved fact or task relationship","evidence_ids":[456]}]}. Maximum 80 activities; no prose outside JSON."#;
+- When include_key_details is true, select at most three activities with useful discoveries, comparisons, decisions, explicit outcomes or unresolved questions. Preserve one to three concrete details for each selected activity. Brief important events can qualify; duration and repetition alone do not establish importance. Keep the activity sentence concise. Each detail must cite a subset of that activity's evidence_ids, use at most 300 characters and preserve attribution and whether the source describes reading, a proposal or completed work. Do not restate the activity sentence or fill in missing facts. If a specific detail needs more evidence, use a targeted gap. When include_key_details is false, omit details.
+- Return only JSON: {"activities":[{"task_id":"new:1","task_title":"short specific task name","text":"concise activity description","evidence_ids":[123],"details":[{"text":"specific supported fact","evidence_ids":[123]}]}],"gaps":[{"question":"specific unresolved fact or task relationship","evidence_ids":[456]}]}. Maximum 80 activities; no prose outside JSON."#;
 
 fn request(payload: &Value, max_output: u32) -> ChatRequest {
     let rules=" For a new task use task_id new:1, new:2, etc.; reuse that identifier for its other occurrences within this response. Distinct tasks must have distinct identifiers even when titles coincide. Each activity's evidence_ids MUST belong to exactly one segment from the supplied evidence. For a task spanning segments, create one activity per segment and reuse its task_id. Existing task IDs are preserved exactly.";
@@ -501,7 +502,7 @@ fn initial_request(
         .collect::<Vec<_>>();
     let mut segments = HashSet::new();
     let mut directory=order.iter().filter_map(|i| {let e=&records[*i];segments.insert(&e.segment).then(||json!({"id":e.id,"segment":e.segment,"time_ms":e.timestamp_ms,"title":limited(&e.window_title,80)}))}).take(128).collect::<Vec<_>>();
-    let mut payload = json!({"language":settings.language,"answer_tokens":settings.answer_tokens,"existing_tasks":tasks,"directory":directory,"directory_omitted":records.len().saturating_sub(directory.len()),"evidence":[]});
+    let mut payload = json!({"language":settings.language,"include_key_details":settings.include_key_details,"answer_tokens":settings.answer_tokens,"existing_tasks":tasks,"directory":directory,"directory_omitted":records.len().saturating_sub(directory.len()),"evidence":[]});
     while context::estimated_input_tokens(provider.kind, &request(&payload, output)) > allowance / 2
         && !directory.is_empty()
     {
@@ -900,7 +901,7 @@ async fn generate_batch(
             } else {
                 "Return ONLY additional facts or activities supported by the new evidence. The valid first activities will be retained locally: do not repeat or rewrite them. For a fact extending an existing occurrence, reuse its task_id and cite its evidence ID alongside any new supporting IDs; your text will be appended locally. Reuse existing task_id (including new:N) for the same task; use unused new:N identifiers for new tasks. Return an empty activities array if there is nothing useful to add."
             };
-            let payload = json!({"language":ctx.settings.language,"answer_tokens":ctx.settings.answer_tokens,"existing_tasks":model_prior.threads.iter().take(64).map(|t|json!({"id":t.id,"title":t.title})).collect::<Vec<_>>(),"validated_draft":draft,"repair_required":needs_repair,"validation_error":repair_error,"instruction":format!("{instruction} No more gaps. Describe only occurrences in the requested batch; earlier evidence may establish task identity only."),"batch_start_ms":start,"batch_end_ms":end});
+            let payload = json!({"language":ctx.settings.language,"include_key_details":ctx.settings.include_key_details,"answer_tokens":ctx.settings.answer_tokens,"existing_tasks":model_prior.threads.iter().take(64).map(|t|json!({"id":t.id,"title":t.title})).collect::<Vec<_>>(),"validated_draft":draft,"repair_required":needs_repair,"validation_error":repair_error,"instruction":format!("{instruction} No more gaps. Describe only occurrences in the requested batch; earlier evidence may establish task identity only."),"batch_start_ms":start,"batch_end_ms":end});
             let repaired = async {
                 let (second, second_evidence) = followup_request(
                     &first,
@@ -986,6 +987,17 @@ async fn generate_batch(
         .iter()
         .filter(|e| e.timestamp_ms >= start && e.timestamp_ms < end)
         .count();
+    // Keep the experiment's added content bounded, even if a provider ignores
+    // the selection instruction. Disabling details is authoritative locally.
+    let mut detailed = 0;
+    for activity in &mut activities {
+        if !activity.details.is_empty() {
+            detailed += 1;
+            if !ctx.settings.include_key_details || detailed > 3 {
+                activity.details.clear();
+            }
+        }
+    }
     batch.activities = activities;
     batch.status = if !draft.gaps.is_empty() || batch.error.is_some() {
         "partial"
@@ -1036,6 +1048,16 @@ fn merge_supplement(first: &Draft, supplement: Draft) -> Result<Draft, String> {
             for id in addition.evidence_ids {
                 if !old.evidence_ids.contains(&id) {
                     old.evidence_ids.push(id);
+                }
+            }
+            for detail in addition.details {
+                if old.details.len() < 3
+                    && !old
+                        .details
+                        .iter()
+                        .any(|d| d.text.trim() == detail.text.trim())
+                {
+                    old.details.push(detail);
                 }
             }
         } else {

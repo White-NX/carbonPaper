@@ -15,6 +15,8 @@ import { RecapTabs } from './RecapTabs';
 import RecapRecords from './RecapRecords';
 import RecapRunStatus from './RecapRunStatus';
 import RecapApps from './RecapApps';
+import RecapSearch from './RecapSearch';
+import RecapKeyDetails from './RecapKeyDetails';
 
 function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
   const [open, setOpen] = useState(false);
@@ -118,6 +120,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   const selected = day?.threads.find((thread) => thread.id === task);
   const loaded = Boolean(day);
   const hasContent = batches.some((batch) => batch.activities.length || batch.error || batch.summary || batch.summary_error);
+  const showTabs = Boolean(settings?.enabled || hasContent || days.length);
   const running = operation === 'generate' || liveRunning || Boolean(day?.running);
   const issue = error || loadError || day?.error;
   const consentNeeded = String(issue).includes('AI_REMOTE_CONSENT_REQUIRED') || batches.some((batch) => [batch.error, batch.summary_error].some((value) => value?.includes('AI_REMOTE_CONSENT_REQUIRED')));
@@ -191,11 +194,11 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     <PageHeader
       as="header"
       bordered
-      flushBottom={Boolean(!task && settings?.enabled)}
-      secondaryRow={!task && settings?.enabled ? (
+      flushBottom={Boolean(!task && showTabs)}
+      secondaryRow={!task && showTabs ? (
         <>
           <RecapTabs tab={tab} onChange={setTab} />
-          {latest > 0 && (
+          {latest > 0 && tab !== 'search' && (
             <span className="ml-auto hidden text-[11px] text-ide-muted sm:block">
               {t('recap.updated', { time: time(latest) })}
             </span>
@@ -208,7 +211,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
           {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
             : <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 shrink-0 text-ide-accent" /><span className="truncate">{t('recap.title')}</span></h1>}
         </div>
-        <div className="recap-header-actions flex min-h-10 items-center justify-end gap-1.5">
+        <div className={tab === 'search' && !task ? 'hidden' : 'recap-header-actions flex min-h-10 items-center justify-end gap-1.5'}>
           {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
           {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
             { label: t('recap.correction.rename'), icon: Pencil, onClick: () => editTask('rename'), disabled: !selected },
@@ -224,7 +227,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
             ]} />
           </>}
         </div>
-        <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-10 shrink-0 items-center gap-1.5">
+        <div role="group" aria-label={t('recap.date')} className={tab === 'search' && !task ? 'hidden' : 'recap-date-navigation flex h-10 shrink-0 items-center gap-1.5'}>
           <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
           <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
             className="recap-focus h-[30px] w-36 min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
@@ -237,9 +240,13 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
     {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
     {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}
-    {!task && tab === 'records' && settings?.enabled ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
+    <div id="recap-panel-search" role="tabpanel" aria-labelledby="recap-tab-search" hidden={Boolean(task) || tab !== 'search'} className={tab === 'search' && !task ? 'min-h-0 flex-1' : 'hidden'}>
+      <RecapSearch active={active && !task && tab === 'search'} authenticated={isAuthenticated} action={action} time={time}
+        onOpenDay={(value) => { setDate(value); setTab('recap'); }} />
+    </div>
+    {!task && tab === 'search' ? null : !task && tab === 'records' && showTabs ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
       <RecapRecords date={date} batches={batches} active={active} action={action} time={time} period={period} onPeriod={setPeriod} position={recordsPosition} />
-    </div> : <div ref={scroll} id="recap-panel-recap" role={!task ? 'tabpanel' : undefined} aria-labelledby={!task && settings?.enabled ? 'recap-tab-recap' : undefined}
+    </div> : <div ref={scroll} id="recap-panel-recap" role={!task ? 'tabpanel' : undefined} aria-labelledby={!task && showTabs ? 'recap-tab-recap' : undefined}
       className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-7" onScroll={(event) => { positions.current[route] = event.currentTarget.scrollTop; }}>
       <div className="mx-auto max-w-[1120px]">
         {task ? <div className="mx-auto max-w-[880px]">
@@ -249,6 +256,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
             <div className="mb-3 flex items-center justify-between gap-3"><time className="text-xs font-medium tabular-nums text-ide-muted">{time(activity.start_ms)}{activity.start_ms !== activity.end_ms && `–${time(activity.end_ms)}`}</time>
               <Button variant="ghost" icon={Pencil} onClick={() => setEditing({ ...activity, kind: 'move', epoch: epoch.current })}>{t('recap.adjust')}</Button></div>
             <p className="whitespace-pre-wrap break-words text-sm leading-7">{activity.text}</p>
+            <RecapKeyDetails details={activity.details} sources={activity.sources} onSources={setSources} />
             {activity.sources.length > 0 && <div className="mt-4"><div className="grid max-w-lg grid-cols-3 gap-3">{activity.sources.slice(0, 3).map((source) => <SourceThumbnail key={source.id} source={source} action={action} time={time} />)}</div>
               <button className="recap-focus mt-3 rounded text-xs text-ide-muted hover:text-ide-accent" onClick={() => setSources(activity.sources)}>{t('recap.viewSources', { count: activity.sources.length })}</button>
             </div>}

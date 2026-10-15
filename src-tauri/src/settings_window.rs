@@ -350,6 +350,11 @@ pub fn broadcast_auth_state(app: &tauri::AppHandle) {
         return;
     };
     let valid = credentials.is_session_valid();
+    if !valid {
+        if let Some(search) = app.try_state::<crate::ai::recap::RecapSearchRuntime>() {
+            search.clear();
+        }
+    }
     let mut previous = state.auth_state.lock().unwrap_or_else(|e| e.into_inner());
     if *previous != Some(valid) {
         *previous = Some(valid);

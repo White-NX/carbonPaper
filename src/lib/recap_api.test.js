@@ -1,11 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { correctRecap, deleteRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, groupRecapActivities, sourceResult } from './recap_api';
+import { correctRecap, deleteRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, groupRecapActivities, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex } from './recap_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((action) => action()) }));
 
 describe('recap API and occurrence display', () => {
+  it('keeps search read-only and index preparation explicitly authenticated', async () => {
+    const request = { query: 'a discussion', mode: 'hybrid', include_details: true };
+    await searchRecaps(request);
+    expect(invoke).toHaveBeenLastCalledWith('recap_search', { request });
+    expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: false });
+    await prepareRecapSearch();
+    expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: true });
+    const count = withAuth.mock.calls.length;
+    await cancelRecapSearchIndex();
+    expect(withAuth.mock.calls).toHaveLength(count);
+    expect(invoke).toHaveBeenLastCalledWith('recap_cancel_search_index');
+  });
   it('protects deletion and addresses only the selected date', async () => {
     await deleteRecap('2026-09-01');
     expect(invoke).toHaveBeenLastCalledWith('recap_delete', { date: '2026-09-01' });

@@ -28,6 +28,14 @@
 .recap-period-time { position: relative; padding-top: 6px; }
 .recap-time-dot { position: absolute; top: 11px; right: -13px; width: 5px; height: 5px; border-radius: 50%; background: var(--ide-border); }
 .recap-diagnostics { container: recap-diagnostics / inline-size; }
+.recap-search { container: recap-search / inline-size; }
+.recap-search-date { width: 146px; min-width: 0; }
+.recap-search-input input::-webkit-search-cancel-button { cursor: pointer; }
+@container recap-search (max-width: 620px) {
+  .recap-search-result { flex-wrap: wrap; gap: 8px; }
+  .recap-search-result-date { display: flex; align-items: center; gap: 10px; width: 100%; }
+  .recap-search-result-date time { margin-top: 0; }
+}
 .recap-request-fields { grid-template-columns: minmax(0, auto) minmax(0, 1fr); }
 @container recap-diagnostics (max-width: 420px) {
   .recap-request-fields { grid-template-columns: minmax(0, 1fr); }

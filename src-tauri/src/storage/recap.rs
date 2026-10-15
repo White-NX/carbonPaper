@@ -68,7 +68,7 @@ impl StorageState {
                 }).collect::<Vec<_>>().join(" OR ");
                 let purge = if event=="DELETE" || (table=="screenshots" && event=="UPDATE") {
                     let guard = if event=="UPDATE" {"AND OLD.is_deleted=0 AND NEW.is_deleted<>0"}else{""};
-                    format!("DELETE FROM recap_payloads WHERE kind IN ('batch','index','screen','summary') AND day IN (SELECT day FROM recap_days WHERE {conditions}) {guard};")
+                    format!("DELETE FROM recap_payloads WHERE kind IN ('batch','index','screen','summary','search') AND day IN (SELECT day FROM recap_days WHERE {conditions}) {guard};")
                 }else{String::new()};
                 let when = if event == "UPDATE" { format!("WHEN {}", changes.join(" OR ")) } else { String::new() };
                 triggers.push_str(&format!(
@@ -83,7 +83,67 @@ impl StorageState {
             let _ = conn.execute_batch("ROLLBACK TO recap_triggers; RELEASE recap_triggers;");
             return Err(error.to_string());
         }
+        Self::init_recap_search_epoch(conn)?;
         Ok(())
+    }
+
+    fn init_recap_search_epoch(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS recap_search_state (
+                id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
+             INSERT OR IGNORE INTO recap_search_state VALUES(1,0);
+             CREATE TRIGGER IF NOT EXISTS recap_search_day_update AFTER UPDATE ON recap_days
+                WHEN OLD.revision IS NOT NEW.revision OR OLD.privacy_hash IS NOT NEW.privacy_hash BEGIN
+                UPDATE recap_search_state SET version=version+1 WHERE id=1; END;"
+        ).map_err(|e| e.to_string())?;
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            let row = if event == "DELETE" { "OLD" } else { "NEW" };
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS recap_search_payload_{event} AFTER {event} ON recap_payloads
+                 WHEN {row}.kind IN ('batch','corrections') BEGIN
+                 UPDATE recap_search_state SET version=version+1 WHERE id=1; END;"
+            )).map_err(|e| e.to_string())?;
+        }
+        for table in ["recap_days", "recap_deleted_days"] {
+            for event in ["INSERT", "DELETE"] {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS recap_search_{table}_{event} AFTER {event} ON {table} BEGIN
+                     UPDATE recap_search_state SET version=version+1 WHERE id=1; END;"
+                )).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recap_search_epoch(&self) -> Result<i64, String> {
+        let guard = self.get_connection_named("recap_search_epoch")?;
+        guard
+            .as_ref()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .query_row(
+                "SELECT version FROM recap_search_state WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Search covers all saved dates, independently of the calendar's 730-date
+    /// discovery limit and the screenshot MiniLM index's 30-day retention.
+    pub(crate) fn recap_search_days(&self) -> Result<Vec<(String, i64)>, String> {
+        let guard = self.get_connection_named("recap_search_days")?;
+        let mut statement = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?.prepare(
+            "SELECT d.day,d.revision FROM recap_days d
+             WHERE d.day NOT IN (SELECT day FROM recap_deleted_days)
+             AND EXISTS(SELECT 1 FROM recap_payloads p WHERE p.kind='batch' AND p.day=d.day AND p.revision=d.revision)
+             ORDER BY d.day DESC"
+        ).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string());
+        rows
     }
 
     pub(crate) fn recap_day_revision(
@@ -595,7 +655,14 @@ mod tests {
                 INSERT INTO recap_payloads VALUES('batch','other','2026-01-02',0,x'00',x'00');",
             )
             .unwrap();
-            for kind in ["batch", "summary", "index", "screen", "corrections"] {
+            for kind in [
+                "batch",
+                "summary",
+                "index",
+                "screen",
+                "corrections",
+                "search",
+            ] {
                 conn.execute(
                     "INSERT INTO recap_payloads VALUES(?1,?1,'2026-01-01',7,x'00',x'00')",
                     [kind],
@@ -694,6 +761,54 @@ mod tests {
                 .unwrap_err(),
             "RECAP_SOURCE_CHANGED"
         );
+    }
+
+    #[test]
+    fn search_epoch_tracks_sources_and_corrections_but_not_embedding_writes() {
+        let (_temp, s) = storage();
+        let write = |sql: &str| {
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap()
+        };
+        write(
+            "INSERT INTO recap_days VALUES('2026-01-01',0,9999999999999,0,'privacy',9999999999999);
+               INSERT INTO recap_payloads VALUES('batch','batch','2026-01-01',0,x'00',x'00');",
+        );
+        let original = s.recap_search_epoch().unwrap();
+        assert_eq!(
+            s.recap_search_days().unwrap(),
+            vec![("2026-01-01".into(), 0)]
+        );
+        write(
+            "INSERT INTO recap_payloads VALUES('search','2026-01-01','2026-01-01',0,x'00',x'00');",
+        );
+        assert_eq!(s.recap_search_epoch().unwrap(), original);
+        write("INSERT INTO recap_payloads VALUES('corrections','2026-01-01','2026-01-01',-1,x'00',x'00');");
+        let corrected = s.recap_search_epoch().unwrap();
+        assert!(corrected > original);
+        write("INSERT INTO screenshots(id,created_at) VALUES(1,'2026-01-01 01:00:00');");
+        assert!(s.recap_search_epoch().unwrap() > corrected);
+        assert!(
+            s.recap_search_days().unwrap().is_empty(),
+            "stale batches must leave the corpus"
+        );
+        write("UPDATE screenshots SET is_deleted=1 WHERE id=1;");
+        let count: i64 =
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM recap_payloads WHERE kind='search'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(count, 0, "deletion purges saved vectors as well as text");
     }
 
     #[test]

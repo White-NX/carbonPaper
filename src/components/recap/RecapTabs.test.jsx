@@ -39,6 +39,6 @@ describe('RecapTabs', () => {
     expect(onChange).toHaveBeenCalledWith('recap');
 
     fireEvent.keyDown(recapTab, { key: 'End' });
-    expect(onChange).toHaveBeenCalledWith('records');
+    expect(onChange).toHaveBeenLastCalledWith('search');
   });
 });

@@ -11,6 +11,7 @@ pub struct RecapSettings {
     pub enabled_since: Option<String>,
     pub provider_id: Option<String>,
     pub language: String,
+    pub include_key_details: bool,
     pub batch_input_tokens: u64,
     pub batch_output_tokens: u64,
     pub request_output_tokens: u32,
@@ -30,6 +31,7 @@ impl Default for RecapSettings {
             enabled_since: None,
             provider_id: None,
             language: "zh-CN".into(),
+            include_key_details: true,
             batch_input_tokens: 36_000,
             batch_output_tokens: 64_000,
             request_output_tokens: 32_000,
@@ -190,11 +192,19 @@ impl From<&Evidence> for SourceRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecapDetail {
+    pub text: String,
+    pub evidence_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecapActivity {
     pub id: String,
     pub task_id: String,
     pub task_title: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<RecapDetail>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub segments: Vec<String>,
@@ -345,6 +355,8 @@ pub struct DraftActivity {
     pub task_title: String,
     pub text: String,
     pub evidence_ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<RecapDetail>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -450,6 +462,15 @@ pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) 
                     .max()
                     .unwrap_or(a.end_ms);
                 a.sources = sources;
+                // A fact requiring evidence from both corrected tasks cannot
+                // be attributed to either task on its own.
+                a.details.retain(|detail| {
+                    !detail.evidence_ids.is_empty()
+                        && detail
+                            .evidence_ids
+                            .iter()
+                            .all(|id| a.sources.iter().any(|s| s.id == *id))
+                });
                 if split {
                     a.member_ids.retain(|id| {
                         resolve(
@@ -493,6 +514,7 @@ mod tests {
             summary: None,
             summary_error: None,
             activities: vec![RecapActivity {
+                details: vec![],
                 id: "regenerated".into(),
                 task_id: "new-model-id".into(),
                 task_title: "Generated name".into(),
@@ -545,6 +567,42 @@ mod tests {
         assert!(!serde_json::to_string(&view)
             .unwrap()
             .contains("private-test-key"));
+    }
+    #[test]
+    fn corrected_splits_only_keep_facts_with_all_their_sources() {
+        let mut batch = batch();
+        batch.activities[0].details = vec![
+            RecapDetail {
+                text: "First source fact".into(),
+                evidence_ids: vec![1],
+            },
+            RecapDetail {
+                text: "Combined conclusion".into(),
+                evidence_ids: vec![1, 2],
+            },
+        ];
+        let mut corrections = Corrections::default();
+        corrections.assignments.insert(1, "first".into());
+        corrections.assignments.insert(2, "second".into());
+        let mut batches = vec![batch];
+        apply_corrections(&mut batches, &corrections);
+        assert_eq!(batches[0].activities[0].details.len(), 1);
+        assert_eq!(
+            batches[0].activities[0].details[0].text,
+            "First source fact"
+        );
+        assert!(batches[0].activities[1].details.is_empty());
+    }
+
+    #[test]
+    fn old_activities_and_settings_load_without_rewriting_history() {
+        let mut value = serde_json::to_value(&batch().activities[0]).unwrap();
+        value.as_object_mut().unwrap().remove("details");
+        let old: RecapActivity = serde_json::from_value(value).unwrap();
+        assert!(old.details.is_empty());
+        let settings: RecapSettings = serde_json::from_str("{\"enabled\":true}").unwrap();
+        assert!(settings.include_key_details);
+        assert_eq!(old.text, "Observed activity");
     }
     #[test]
     fn app_language_overrides_legacy_recap_language_without_changing_other_settings() {

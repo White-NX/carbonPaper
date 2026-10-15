@@ -8,6 +8,45 @@ use crate::{
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
+/// Authentication: required. Searches saved, corrected activities across dates.
+#[tauri::command]
+pub async fn recap_search(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    request: RecapSearchQuery,
+) -> Result<RecapSearchResult, String> {
+    check_auth_required(&credential_state)?;
+    recap::search_activities(app, request).await
+}
+
+/// Authentication: required. Reports local search coverage without loading a model.
+#[tauri::command]
+pub async fn recap_search_status(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<RecapSearchStatus, String> {
+    check_auth_required(&credential_state)?;
+    tokio::task::spawn_blocking(move || recap::search_status(&app))
+        .await
+        .map_err(|_| "RECAP_WORKER_FAILED")?
+}
+
+/// Authentication: required. Builds resumable local embeddings for saved recaps.
+#[tauri::command]
+pub async fn recap_prepare_search(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+    recap::prepare_search(app).await
+}
+
+/// Authentication: not required. Stops local preparation without returning data.
+#[tauri::command]
+pub fn recap_cancel_search_index(runtime: tauri::State<'_, RecapSearchRuntime>) -> bool {
+    runtime.cancel()
+}
+
 /// Authentication: required. API keys are omitted from the returned settings.
 #[tauri::command]
 pub async fn recap_get_settings(

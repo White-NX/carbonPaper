@@ -14,6 +14,10 @@ export const generateRecap = (date, force = false) => write('recap_generate', { 
 export const cancelRecap = () => invoke('recap_cancel');
 export const deleteRecap = (date) => write('recap_delete', { date });
 export const correctRecap = (date, correction) => write('recap_correct', { date, correction });
+export const searchRecaps = (request) => read('recap_search', { request });
+export const getRecapSearchStatus = () => read('recap_search_status');
+export const prepareRecapSearch = () => write('recap_prepare_search');
+export const cancelRecapSearchIndex = () => invoke('recap_cancel_search_index');
 
 export function localDate(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;

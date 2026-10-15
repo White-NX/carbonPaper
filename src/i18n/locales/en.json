@@ -170,7 +170,9 @@
       "model": "Screening model",
       "apiKey": "API key",
       "keySaved": "Saved; leave unchanged to keep the key",
-      "keyPlaceholder": "Enter an API key"
+      "keyPlaceholder": "Enter an API key",
+      "keyDetails": "Keep important details",
+      "keyDetailsHint": "New recaps preserve cited discoveries, decisions and questions for a few important activities. Regenerate a day to add details to existing records."
     },
     "errors": {
       "RECAP_INVALID_SUMMARY": "The period summary could not be generated. View activity details or try again.",
@@ -216,7 +218,70 @@
       "AI_BAD_REQUEST": "The model service rejected the generation request. Check the selected model and usage settings.",
       "AI_SERVER_ERROR": "The model service encountered an error. Please try again later.",
       "AI_INVALID_RESPONSE": "The model service returned an unreadable response. Retry or check its configuration.",
-      "AI_RATE_LIMITED": "The model service is busy. Please try again later."
+      "AI_RATE_LIMITED": "The model service is busy. Please try again later.",
+      "RECAP_INVALID_DETAIL": "Some key details have invalid sources. Try generating the recap again.",
+      "RECAP_INVALID_SEARCH": "Enter a query and check the search options.",
+      "RECAP_SEARCH_NOT_READY": "Prepare recap search before searching by meaning.",
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search.",
+      "RECAP_SEARCH_RESULTS_CHANGED": "Search results have changed. Search again before continuing."
+    },
+    "keyDetails": "Key details",
+    "detailSources": "{{count}} sources",
+    "search": {
+      "tab": "Search recaps",
+      "title": "Find what you remember",
+      "subtitle": "Find activities, discussions and discoveries across days",
+      "form": "Search daily recaps",
+      "query": "Search recap content",
+      "placeholder": "Describe something you remember, or enter keywords…",
+      "submit": "Search",
+      "mode": "Search method",
+      "modes": {
+        "hybrid": "Combined",
+        "keyword": "Keywords",
+        "semantic": "By meaning"
+      },
+      "range": "Date range",
+      "ranges": {
+        "all": "All dates",
+        "week": "Last 7 days",
+        "month": "Last 30 days",
+        "custom": "Choose dates"
+      },
+      "options": "Options",
+      "includeDetails": "Search key details",
+      "includeDetailsHint": "Include specific discoveries, decisions and questions saved with activities. Turn off to search titles and short descriptions only.",
+      "startDate": "From",
+      "endDate": "To",
+      "invalidRange": "The start date must be on or before the end date.",
+      "preparing": "Preparing search by meaning",
+      "preparingHint": "Keyword search remains available. You can stop and continue later.",
+      "indexOffer": "Find activities in your own words",
+      "indexPartial": "More recaps are ready to prepare",
+      "indexHint": "Saved recaps are searchable by keyword. Prepare them to also find activities by the meaning of your description.",
+      "prepare": "Prepare search",
+      "updateIndex": "Continue preparation",
+      "keywordFallback": "Showing keyword matches. Search by meaning is not ready for this query.",
+      "partialResults": "These results combine keyword matches and available meaning matches. Some recaps are still being prepared.",
+      "changed": "Recap content has changed. Search again to see current results.",
+      "searching": "Searching recaps",
+      "resultCount": "{{count}} activities found",
+      "sorted": "Most relevant first",
+      "sources": "{{count}} sources",
+      "more": "Show more activities",
+      "activity": "Activity details",
+      "openDay": "Open daily recap",
+      "emptyTitle": "No matching activities yet",
+      "emptyHint": "Try more specific words or a wider date range. Recaps cover saved activities; the main search can help find further details.",
+      "noRecapsTitle": "Start with your first recap",
+      "noRecapsHint": "Generate a daily recap to start finding activities across days. Existing recaps are included automatically.",
+      "landingTitle": "Start with a memory",
+      "landingHint": "Describe a discussion, a topic you explored or a decision you recorded. You do not need to remember the original wording.",
+      "exampleOne": "Performance improvements we discussed",
+      "exampleTwo": "Ways to organize research we compared",
+      "diagnostics": "Search information",
+      "timing": "Query time: {{ms}} ms",
+      "coverage": "Semantic index: {{indexed}} / {{total}} passages"
     }
   },
   "appBound": {
@@ -1951,7 +2016,8 @@
       "screenshots": "Read {{count}} screenshots",
       "records": "Checked history {{count}} times",
       "archives": "Checked archives {{count}} times",
-      "separator": ", "
+      "separator": ", ",
+      "search_recaps": "Search recaps for “{{query}}”"
     },
     "setup": {
       "title": "Connect a model service first",

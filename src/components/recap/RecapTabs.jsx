@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Sparkles, Clock } from 'lucide-react';
+import { Sparkles, Clock, Search } from 'lucide-react';
 import { focusStyle } from '../ui/Button';
 
 /**
@@ -19,6 +19,7 @@ export function RecapTabs({ tab, onChange }) {
   const tabs = [
     { value: 'recap', label: t('recap.overview'), Icon: Sparkles },
     { value: 'records', label: t('recap.records'), Icon: Clock },
+    { value: 'search', label: t('recap.search.tab'), Icon: Search },
   ];
 
   return (
@@ -38,7 +39,9 @@ export function RecapTabs({ tab, onChange }) {
             onKeyDown={(event) => {
               if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
                 event.preventDefault();
-                const next = event.key === 'Home' ? 'recap' : event.key === 'End' ? 'records' : value === 'recap' ? 'records' : 'recap';
+                const index = tabs.findIndex((item) => item.value === value);
+                const next = tabs[event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+                  : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length].value;
                 onChange(next);
                 document.getElementById(`recap-tab-${next}`)?.focus();
               }

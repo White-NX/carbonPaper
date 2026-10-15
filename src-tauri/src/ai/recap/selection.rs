@@ -213,6 +213,20 @@ pub fn validate_draft(
         {
             return Err("RECAP_INVALID_ACTIVITY".into());
         }
+        if item.details.len() > 3
+            || item.details.iter().any(|detail| {
+                detail.text.trim().is_empty()
+                    || detail.text.chars().count() > 300
+                    || detail.evidence_ids.is_empty()
+                    || detail.evidence_ids.len() > 12
+                    || detail
+                        .evidence_ids
+                        .iter()
+                        .any(|id| !item.evidence_ids.contains(id))
+            })
+        {
+            return Err("RECAP_INVALID_DETAIL".into());
+        }
         let mut selected = item
             .evidence_ids
             .iter()
@@ -251,6 +265,7 @@ pub fn validate_draft(
         }
         for (segment, group) in groups {
             out.push(RecapActivity {
+                details: item.details.clone(),
                 id: format!("activity-{}-{}", group[0].id, &digest(&task_id)[..8]),
                 task_id: task_id.clone(),
                 task_title: item.task_title.trim().into(),
@@ -312,6 +327,7 @@ mod tests {
         assert_ne!(rs[2].segment, rs[3].segment);
         let d = Draft {
             activities: vec![DraftActivity {
+                details: vec![],
                 task_id: None,
                 task_title: "A".into(),
                 text: "Observed A".into(),
@@ -330,6 +346,7 @@ mod tests {
         prepare(&mut rs);
         let mut d = Draft {
             activities: vec![DraftActivity {
+                details: vec![],
                 task_id: None,
                 task_title: "A".into(),
                 text: "x".into(),
@@ -341,6 +358,28 @@ mod tests {
         d.activities[0].evidence_ids = vec![1];
         d.activities[0].task_id = Some("invented".into());
         assert!(validate_draft(&d, &rs, &HashSet::new(), "day").is_err());
+    }
+    #[test]
+    fn key_details_require_received_evidence_from_the_same_activity() {
+        let mut records = vec![e(1, 0, "A", "cache comparison"), e(2, 1, "B", "unrelated")];
+        prepare(&mut records);
+        let mut draft: Draft = serde_json::from_value(serde_json::json!({
+            "activities":[{"task_id":"new:1","task_title":"Compare caching","text":"Read a comparison.",
+                "evidence_ids":[1],"details":[{"text":"The document proposes an in-memory cache.","evidence_ids":[1]}]}]
+        })).unwrap();
+        let result = validate_draft(&draft, &records, &HashSet::new(), "day").unwrap();
+        assert_eq!(result[0].details[0].evidence_ids, vec![1]);
+        draft.activities[0].details[0].evidence_ids = vec![2];
+        assert_eq!(
+            validate_draft(&draft, &records, &HashSet::new(), "day").unwrap_err(),
+            "RECAP_INVALID_DETAIL"
+        );
+        draft.activities[0].details[0].evidence_ids = vec![1];
+        draft.activities[0].details[0].text = "x".repeat(301);
+        assert_eq!(
+            validate_draft(&draft, &records, &HashSet::new(), "day").unwrap_err(),
+            "RECAP_INVALID_DETAIL"
+        );
     }
     #[test]
     fn coverage_does_not_let_repetition_hide_a_short_activity() {

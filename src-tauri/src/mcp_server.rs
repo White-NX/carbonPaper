@@ -31,7 +31,7 @@ use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
 mod recap;
-use recap::{tool_get_recap_day, tool_get_recap_days};
+use recap::{tool_get_recap_day, tool_get_recap_days, tool_search_recaps};
 
 // ==================== Default config ====================
 
@@ -363,6 +363,7 @@ define_mcp_tool_dispatch!(
     "get_smart_cluster_summary" => tool_get_smart_cluster_summary,
     "get_recap_days" => tool_get_recap_days,
     "get_recap_day" => tool_get_recap_day,
+    "search_recaps" => tool_search_recaps,
     "upsert_smart_cluster_summary" => tool_upsert_smart_cluster_summary,
     "delete_smart_cluster_summary" => tool_delete_smart_cluster_summary,
 );
@@ -475,7 +476,7 @@ fn filter_segment(
 /// segments can no longer be told apart, so the default mode replaces the
 /// whole text and keeps the hit; the snapshot details still return the
 /// clean segments.
-fn filter_joined_text(
+pub(crate) fn filter_joined_text(
     filter: &SensitiveFilterState,
     mode: FilterMode,
     text: &str,

@@ -27,7 +27,7 @@ pub struct TurnContext {
 fn is_time_search(name: &str) -> bool {
     matches!(
         name,
-        "search_ocr_text" | "search_nl" | "get_snapshots_by_time_range"
+        "search_ocr_text" | "search_nl" | "get_snapshots_by_time_range" | "search_recaps"
     )
 }
 
@@ -55,10 +55,24 @@ impl TurnContext {
                 .filter(|n| n.is_finite() && *n >= 0.0 && *n < i64::MAX as f64)
                 .map(|n| n as i64)
         };
+        let recap_date = |key: &str, end: bool| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .and_then(|date| super::recap::day_bounds(date).ok())
+                .map(|(start, next_day)| if end { next_day - 1 } else { start })
+        };
         let range = SearchTimeRange {
             tool: call.name.clone(),
-            start_time: timestamp("start_time"),
-            end_time: timestamp("end_time"),
+            start_time: if call.name == "search_recaps" {
+                recap_date("start_date", false)
+            } else {
+                timestamp("start_time")
+            },
+            end_time: if call.name == "search_recaps" {
+                recap_date("end_date", true)
+            } else {
+                timestamp("end_time")
+            },
         };
         if range.valid() && !self.searched_ranges.contains(&range) {
             self.searched_ranges.push(range);
@@ -390,5 +404,27 @@ mod tests {
         assert!(
             question.contains("+08:00") && question.contains(&now.timestamp_millis().to_string())
         );
+    }
+
+    #[test]
+    fn recap_search_preserves_inclusive_local_dates_for_later_followups() {
+        let now: DateTime<FixedOffset> = "2026-10-15T12:00:00+08:00".parse().unwrap();
+        let mut context = TurnContext::new(now);
+        context.record_search(&ToolCall {
+            id: "recap".into(),
+            name: "search_recaps".into(),
+            arguments: json!({"query":"cache","start_date":"2026-10-01","end_date":"2026-10-03"})
+                .to_string(),
+        });
+        assert_eq!(context.searched_ranges.len(), 1);
+        assert_eq!(
+            context.searched_ranges[0].start_time,
+            Some(super::super::recap::day_bounds("2026-10-01").unwrap().0)
+        );
+        assert_eq!(
+            context.searched_ranges[0].end_time,
+            Some(super::super::recap::day_bounds("2026-10-03").unwrap().1 - 1)
+        );
+        assert!(context.range_note().contains("search_recaps"));
     }
 }

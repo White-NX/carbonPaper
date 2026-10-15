@@ -188,6 +188,7 @@ fn request(
                 json!({
                     "id": a.id, "task_id": a.task_id, "task_title": a.task_title,
                     "text": a.text, "first_observed_ms": a.start_ms, "last_observed_ms": a.end_ms,
+                    "key_details": a.details.iter().map(|d| &d.text).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();
@@ -221,7 +222,11 @@ fn single_activity_summary(batch: &RecapBatch) -> Option<RecapSummary> {
         return None;
     };
     let text = activity.text.trim();
-    if text.is_empty() || text.chars().count() > 600 || activity.sources.is_empty() {
+    if text.is_empty()
+        || text.chars().count() > 600
+        || activity.sources.is_empty()
+        || !activity.details.is_empty()
+    {
         return None;
     }
     Some(RecapSummary {
@@ -368,6 +373,7 @@ mod tests {
     }
     fn batch() -> RecapBatch {
         let activity = |id: &str, task: &str, time| RecapActivity {
+            details: vec![],
             id: id.into(),
             task_id: task.into(),
             task_title: format!("Task {task}"),

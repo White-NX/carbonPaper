@@ -170,7 +170,9 @@
       "model": "筛查模型",
       "apiKey": "API key",
       "keySaved": "已保存，留空保持原值",
-      "keyPlaceholder": "输入 API key"
+      "keyPlaceholder": "输入 API key",
+      "keyDetails": "保留重要细节",
+      "keyDetailsHint": "新生成的回顾会为少数重要活动补充有来源的发现、决定和问题。可重新生成某一天的回顾，补充已有记录。"
     },
     "errors": {
       "RECAP_INVALID_SUMMARY": "时段概述未能生成，可查看具体经过或重试。",
@@ -216,7 +218,70 @@
       "AI_BAD_REQUEST": "模型服务拒绝了生成请求，请检查所选模型和用量设置。",
       "AI_SERVER_ERROR": "模型服务发生错误，请稍后重试。",
       "AI_INVALID_RESPONSE": "模型服务返回了无法读取的响应，请重试或检查服务配置。",
-      "AI_RATE_LIMITED": "模型服务繁忙，请稍后重试。"
+      "AI_RATE_LIMITED": "模型服务繁忙，请稍后重试。",
+      "RECAP_INVALID_DETAIL": "部分关键细节缺少有效来源，请重试生成。",
+      "RECAP_INVALID_SEARCH": "请输入搜索内容，并检查搜索选项。",
+      "RECAP_SEARCH_NOT_READY": "请先准备回顾搜索，再按含义查找。",
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "暂时无法按含义查找，请稍后重试。关键词搜索仍可使用。",
+      "RECAP_SEARCH_RESULTS_CHANGED": "搜索结果已更新，请重新搜索后继续查看。"
+    },
+    "keyDetails": "关键细节",
+    "detailSources": "{{count}} 条来源",
+    "search": {
+      "tab": "搜索回顾",
+      "title": "找回你记得的事情",
+      "subtitle": "跨日期查找活动、讨论与重要发现",
+      "form": "搜索每日回顾",
+      "query": "搜索回顾内容",
+      "placeholder": "描述一件事，或输入关键词…",
+      "submit": "搜索",
+      "mode": "查找方式",
+      "modes": {
+        "hybrid": "综合",
+        "keyword": "关键词",
+        "semantic": "按含义"
+      },
+      "range": "日期范围",
+      "ranges": {
+        "all": "全部日期",
+        "week": "近 7 天",
+        "month": "近 30 天",
+        "custom": "选择日期"
+      },
+      "options": "搜索选项",
+      "includeDetails": "搜索关键细节",
+      "includeDetailsHint": "同时查找活动中保留的具体发现、决定和问题。关闭后，仅查找活动标题与简介。",
+      "startDate": "开始日期",
+      "endDate": "结束日期",
+      "invalidRange": "开始日期不能晚于结束日期。",
+      "preparing": "正在准备按含义查找",
+      "preparingHint": "准备期间仍可按关键词搜索。停止后，下次可以继续。",
+      "indexOffer": "用不同说法找回相关活动",
+      "indexPartial": "有新的回顾等待准备",
+      "indexHint": "已保存的回顾可以按关键词查找。完成准备后，也能根据描述的含义寻找相关活动。",
+      "prepare": "准备搜索",
+      "updateIndex": "继续准备",
+      "keywordFallback": "本次显示关键词匹配结果。按含义查找暂未就绪。",
+      "partialResults": "本次结合了关键词匹配和已就绪的含义匹配，部分回顾仍在准备。",
+      "changed": "回顾内容已更新，请重新搜索以查看最新结果。",
+      "searching": "正在搜索回顾",
+      "resultCount": "找到 {{count}} 条活动",
+      "sorted": "按相关程度排列",
+      "sources": "{{count}} 条来源",
+      "more": "查看更多活动",
+      "activity": "活动详情",
+      "openDay": "查看当天回顾",
+      "emptyTitle": "暂未找到相关活动",
+      "emptyHint": "试试更具体的词，或扩大日期范围。回顾涵盖已整理的活动，更多细节也可以通过主搜索查找。",
+      "noRecapsTitle": "从第一份回顾开始",
+      "noRecapsHint": "为一天生成回顾后，就可以在这里跨日期查找活动。已有回顾会自动出现在搜索范围内。",
+      "landingTitle": "从一段记忆开始",
+      "landingHint": "忘记原来的用词也没关系。描述当时讨论的事、查阅的主题，或记下的一个决定。",
+      "exampleOne": "讨论过的性能优化方案",
+      "exampleTwo": "比较过哪些资料整理方法",
+      "diagnostics": "搜索信息",
+      "timing": "查询耗时 {{ms}} 毫秒",
+      "coverage": "语义索引：{{indexed}} / {{total}} 个片段"
     }
   },
   "appBound": {
@@ -1951,7 +2016,8 @@
       "screenshots": "阅读了 {{count}} 张截图",
       "records": "浏览了 {{count}} 次记录",
       "archives": "查看了 {{count}} 次归档",
-      "separator": "，"
+      "separator": "，",
+      "search_recaps": "查找回顾「{{query}}」"
     },
     "setup": {
       "title": "先连接一个模型服务",

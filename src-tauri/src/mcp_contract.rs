@@ -27,6 +27,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_smart_cluster_summary",
     "get_recap_days",
     "get_recap_day",
+    "search_recaps",
     "upsert_smart_cluster_summary",
     "delete_smart_cluster_summary",
 ];
@@ -176,6 +177,25 @@ pub fn tool_definitions() -> Value {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Max activities (default 10)" }
                 },
                 "required": ["date"]
+            }
+        },
+        {
+            "name": "search_recaps",
+            "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Returns concise activities, key details and citable screenshots; verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index. Timestamps are Unix milliseconds.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "mode": { "type": "string", "enum": ["keyword", "semantic", "hybrid"], "default": "hybrid" },
+                    "start_date": { "type": "string", "description": "Inclusive local date YYYY-MM-DD" },
+                    "end_date": { "type": "string", "description": "Inclusive local date YYYY-MM-DD" },
+                    "include_details": { "type": "boolean", "default": true, "description": "Include saved key facts in retrieval" },
+                    "ranking_revision": { "type": "string", "description": "When paging, pass ranking_revision from the previous result. If results changed, restart at offset 0 without this field." },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
+                },
+                "required": ["query"]
             }
         },
         {

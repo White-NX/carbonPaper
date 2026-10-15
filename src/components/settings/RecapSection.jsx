@@ -138,6 +138,8 @@ export default function RecapSection() {
         </div>
         <SettingsDivider />
         <SettingsDisclosure title={t('recap.settings.advanced')}>
+          <SettingsRow label={t('recap.settings.keyDetails')} description={t('recap.settings.keyDetailsHint')}
+            control={<SettingsSwitch checked={draft.include_key_details ?? true} onChange={(value) => update('include_key_details', value)} />} />
           <p className="text-xs leading-relaxed text-ide-muted">{t('recap.settings.budgetHint')}</p>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {Object.entries(limits).map(([key, [min, max]]) => <label key={key} className="block space-y-2 text-xs"><span>{t(`recap.settings.${key}`)}</span><input className={inputClass} type="number" min={min} max={max} step={1} required value={draft[key]} {...commitInput}

@@ -864,6 +864,7 @@ pub fn run() {
         .manage(MonitorState::new())
         .manage(ai::AiRuntimeState::default())
         .manage(ai::recap::RecapRuntime::default())
+        .manage(ai::recap::RecapSearchRuntime::default())
         .manage(settings_window::SettingsWindowState::default())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
@@ -1296,6 +1297,10 @@ pub fn run() {
             commands::ai::ai_search,
             commands::ai::ai_search_cancel,
             commands::recap::recap_get_settings,
+            commands::recap::recap_search,
+            commands::recap::recap_search_status,
+            commands::recap::recap_prepare_search,
+            commands::recap::recap_cancel_search_index,
             commands::recap::recap_save_settings,
             commands::recap::recap_list_days,
             commands::recap::recap_get_day,

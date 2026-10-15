@@ -364,6 +364,15 @@ impl CredentialManagerState {
             .store(false, Ordering::SeqCst);
     }
 
+    /// Identity for request-local and resident recap reads. A later unlock
+    /// cannot authorize work admitted under an earlier session.
+    pub(crate) fn session_marker(&self) -> Option<std::time::Instant> {
+        *self
+            .last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn silent_read_auth_required(&self) -> bool {
         self.silent_read_auth_required.load(Ordering::SeqCst)
     }
