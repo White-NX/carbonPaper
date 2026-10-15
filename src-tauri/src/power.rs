@@ -184,8 +184,8 @@ pub fn start_power_monitor(app: AppHandle) {
                 }
             }
             if status.active {
-                // The capture drain preserves already saved frames. Release
-                // the resident OCR worker too, including a long-running OCR.
+                // Already admitted OCR keeps its timeout and finishes even if
+                // the capture drain ends first. Release the worker once idle.
                 let ml = app
                     .state::<Arc<crate::ml_runtime::MlRuntimeState>>()
                     .inner()
