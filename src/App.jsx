@@ -131,6 +131,7 @@ function App() {
     handleManualStartMonitor,
     handleManualStopMonitor,
     backendStatus,
+    monitorPowerSavingSuppressed,
     monitorPaused,
     handleStartBackend,
     handlePauseMonitor,
@@ -265,6 +266,7 @@ function App() {
         searchMode={searchMode}
         onSearchModeChange={setSearchMode}
         backendStatus={backendStatus}
+        powerSavingSuppressed={monitorPowerSavingSuppressed}
         monitorPaused={monitorPaused}
         handleStartBackend={handleStartBackend}
         handlePauseMonitor={handlePauseMonitor}

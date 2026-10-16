@@ -5,7 +5,7 @@ import { SearchBox } from './SearchBox';
 import { APP_VERSION } from '../lib/version';
 import BrandMark from './BrandMark';
 
-function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, handlePauseMonitor, handleResumeMonitor, locked }) {
+function ServiceStatusBadge({ backendStatus, powerSavingSuppressed, monitorPaused, handleStartBackend, handlePauseMonitor, handleResumeMonitor, locked }) {
   const { t } = useTranslation();
 
   let dotColor, label, onClick, disabled = false, showSpinner = false;
@@ -24,6 +24,10 @@ function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, 
     disabled = true;
     showSpinner = true;
     onClick = undefined;
+  } else if (powerSavingSuppressed) {
+    dotColor = 'bg-ide-warning';
+    label = t('topbar.service.powerSavingOffline');
+    disabled = true;
   } else {
     dotColor = 'bg-red-500';
     label = t('topbar.service.offline');
@@ -38,7 +42,7 @@ function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, 
       title={label}
     >
       <span className={`w-2 h-2 rounded-full ${dotColor} shrink-0`} />
-      <span className={`overflow-hidden transition-all duration-200 whitespace-nowrap ${backendStatus === 'online' ? 'max-w-0 opacity-0 group-hover:max-w-[6rem] group-hover:opacity-100' : 'max-w-[6rem] opacity-100'}`}>
+      <span className={`overflow-hidden transition-all duration-200 whitespace-nowrap ${backendStatus === 'online' ? 'max-w-0 opacity-0 group-hover:max-w-[6rem] group-hover:opacity-100' : powerSavingSuppressed ? 'max-w-[20rem] opacity-100' : 'max-w-[6rem] opacity-100'}`}>
         {showSpinner && <Loader2 className="w-3 h-3 animate-spin inline mr-1" />}
         {label}
       </span>
@@ -61,6 +65,7 @@ export default function TopBar({
   searchMode,
   onSearchModeChange,
   backendStatus,
+  powerSavingSuppressed = false,
   monitorPaused,
   handleStartBackend,
   handlePauseMonitor,
@@ -98,6 +103,7 @@ export default function TopBar({
       <div className="flex items-center gap-1">
         <ServiceStatusBadge
           backendStatus={backendStatus}
+          powerSavingSuppressed={powerSavingSuppressed}
           monitorPaused={monitorPaused}
           handleStartBackend={handleStartBackend}
           handlePauseMonitor={handlePauseMonitor}

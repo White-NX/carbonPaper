@@ -36,9 +36,13 @@ export function useMonitorLifecycle({
   const backendStartAtRef = useRef(null);
   const unexpectedStopsRef = useRef([]);
   const powerBlockedRef = useRef(false);
+  const [powerBlocked, setPowerBlocked] = useState(false);
 
   useEffect(() => {
-    if (!powerSavingSuppressed) powerBlockedRef.current = false;
+    if (!powerSavingSuppressed) {
+      powerBlockedRef.current = false;
+      setPowerBlocked(false);
+    }
   }, [powerSavingSuppressed]);
 
   useEffect(() => {
@@ -103,6 +107,7 @@ export function useMonitorLifecycle({
       // permanently disabling auto-start when AC returns.
       if ((typeof err === 'string' ? err : err?.message) === 'POWER_SAVING_ACTIVE') {
         powerBlockedRef.current = true;
+        setPowerBlocked(true);
         backendStartAtRef.current = null;
         return;
       }
@@ -279,6 +284,7 @@ export function useMonitorLifecycle({
     handleManualStartMonitor,
     handleManualStopMonitor,
     backendStatus,
+    monitorPowerSavingSuppressed: powerSavingSuppressed || powerBlocked,
     monitorPaused,
     backendError,
     handleStartBackend,

@@ -108,10 +108,12 @@ describe('power-saving admission', () => {
     await act(() => result.current.handleStartBackend());
     expect(reportBackendError).not.toHaveBeenCalled();
     expect(result.current.backendError).toBe('');
+    expect(result.current.monitorPowerSavingSuppressed).toBe(true);
     expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(1);
     rerender({ powerSavingSuppressed: true });
     invoke.mockImplementation(originalInvoke);
     rerender({ powerSavingSuppressed: false });
     await waitFor(() => expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(2));
+    expect(result.current.monitorPowerSavingSuppressed).toBe(false);
   });
 });
