@@ -28,8 +28,12 @@ proposed 2 GiB / physical-memory percentage rule. Disk thresholds are explicit
 initial parameters. Changes to them or the CPU budgets require new measurements.
 
 Activity is sampled every 250 ms when work is pending, with resource counters
-sampled each second. An input transition revokes A directly from the activity
-monitor. B continues through ordinary keyboard and mouse activity. A revoked
+sampled each second while on AC. On battery the activity probe slows to five
+seconds, resource sampling pauses, and fallback backlog reconciliation slows
+to 30 seconds; power transitions and manual requests still wake the scheduler.
+Admission and revocation check AC directly. An input transition revokes A
+directly from the activity monitor. B continues through ordinary keyboard and
+mouse activity. A revoked
 lease cannot turn into B: the old slice must finish and receive a new admission.
 
 ## Local qualification and bounded work

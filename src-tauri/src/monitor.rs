@@ -22,6 +22,8 @@ const LIFECYCLE_DRAINING: u64 = u64::MAX;
 
 pub struct MonitorState {
     control: tokio::sync::Mutex<()>,
+    /// A maintenance pause whose restore was rejected by the power gate.
+    maintenance_resume_pending: AtomicBool,
     /// Which capture session owns the monitor: `LIFECYCLE_IDLE`,
     /// `LIFECYCLE_DRAINING`, or the id of the running session.
     ///
@@ -47,6 +49,7 @@ impl MonitorState {
     pub fn new() -> Self {
         Self {
             control: tokio::sync::Mutex::new(()),
+            maintenance_resume_pending: AtomicBool::new(false),
             lifecycle: AtomicU64::new(LIFECYCLE_IDLE),
             next_session: AtomicU64::new(1),
             game_mode_dml_suppressed: AtomicBool::new(false),
@@ -60,6 +63,15 @@ impl MonitorState {
     /// still being drained counts until the drain ends.
     pub fn is_running(&self) -> bool {
         self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_IDLE
+    }
+
+    pub(crate) fn defer_maintenance_resume(&self) {
+        self.maintenance_resume_pending
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn maintenance_resume_pending(&self) -> bool {
+        self.maintenance_resume_pending.load(Ordering::SeqCst)
     }
 
     /// Claims the monitor for a new capture session and returns its id, or
@@ -488,6 +500,7 @@ pub(crate) enum MonitorAction {
     Stop,
     Pause,
     Resume,
+    ResumeAfterPowerSaving,
     Restart,
     TogglePause,
 }
@@ -510,30 +523,57 @@ pub(crate) async fn control_in_maintenance(
 async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String, String> {
     let state = app.state::<MonitorState>();
     let _control = state.control.lock().await;
-    match action {
+    // The power loop can select Start before maintenance records its rejected
+    // restore. Reconcile under the lock instead of accepting "already running"
+    // and clearing a pause that still needs to be restored.
+    let action = match action {
+        MonitorAction::Start if state.maintenance_resume_pending() && state.is_running() => {
+            MonitorAction::ResumeAfterPowerSaving
+        }
+        action => action,
+    };
+    let result = match action {
         MonitorAction::Start => start_capture(app).await,
         MonitorAction::Stop => stop_capture(app).await,
         MonitorAction::Restart => {
             stop_capture(app).await?;
             start_capture(app).await
         }
-        MonitorAction::Pause => Ok(set_capture_paused(app, true)),
-        MonitorAction::Resume => Ok(set_capture_paused(app, false)),
+        MonitorAction::Pause => set_capture_paused(app, true),
+        MonitorAction::Resume => set_capture_paused(app, false),
+        MonitorAction::ResumeAfterPowerSaving => {
+            // Re-check under the control lock: a user pause/stop may have
+            // superseded this restore after the power loop chose its action.
+            if state.maintenance_resume_pending() && state.is_running() {
+                set_capture_paused(app, false)
+            } else {
+                Ok("No deferred monitor resume".into())
+            }
+        }
         MonitorAction::TogglePause => {
             if state.is_running() {
                 let paused = app
                     .state::<Arc<CaptureState>>()
                     .paused
                     .load(Ordering::SeqCst);
-                Ok(set_capture_paused(app, !paused))
+                set_capture_paused(app, !paused)
             } else {
                 Ok("Monitor stopped".into())
             }
         }
+    };
+    if result.is_ok() {
+        // Any successful explicit action supersedes the old maintenance state;
+        // a failed policy restore remains pending for the next power probe.
+        state
+            .maintenance_resume_pending
+            .store(false, Ordering::SeqCst);
     }
+    result
 }
 
 async fn start_capture(app: &AppHandle) -> Result<String, String> {
+    crate::power::check_capture_allowed(app)?;
     let state = app.state::<MonitorState>();
     // Check if required model files are complete
     if let Ok(model_status) = crate::model_management::check_model_files().await {
@@ -551,6 +591,8 @@ async fn start_capture(app: &AppHandle) -> Result<String, String> {
         }
     }
 
+    // Power may have changed while the model check was awaiting I/O.
+    crate::power::check_capture_allowed(app)?;
     let Some(session) = state.claim_session() else {
         return Ok("Monitor is already running".into());
     };
@@ -784,12 +826,15 @@ pub async fn stop_monitor(window: tauri::Window, app: AppHandle) -> Result<Strin
     control(&app, MonitorAction::Stop).await
 }
 
-fn set_capture_paused(app: &AppHandle, paused: bool) -> String {
+fn set_capture_paused(app: &AppHandle, paused: bool) -> Result<String, String> {
+    if !paused {
+        crate::power::check_capture_allowed(app)?;
+    }
     app.state::<Arc<CaptureState>>()
         .paused
         .store(paused, Ordering::SeqCst);
     crate::refresh_tray_menu(app);
-    serde_json::json!({ "status": if paused { "paused" } else { "resumed" } }).to_string()
+    Ok(serde_json::json!({ "status": if paused { "paused" } else { "resumed" } }).to_string())
 }
 
 #[tauri::command]
@@ -806,10 +851,13 @@ pub async fn resume_monitor(window: tauri::Window, app: AppHandle) -> Result<Str
 
 #[tauri::command]
 pub async fn get_monitor_status(
+    app: AppHandle,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
 ) -> Result<String, String> {
-    Ok(monitor_status_value(&state, &capture_state).to_string())
+    let mut status = monitor_status_value(&state, &capture_state);
+    status["power_saving_active"] = serde_json::json!(crate::power::is_saving_power(&app));
+    Ok(status.to_string())
 }
 
 // GPU enumeration and game-mode resource suppression.

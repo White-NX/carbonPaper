@@ -220,6 +220,8 @@ impl MlRuntimeState {
         timeout: Duration,
         use_directml: bool,
     ) -> Result<MlOcrResult, String> {
+        // Callers have already accepted and saved this screenshot under the
+        // capture power gate. Finish its OCR even if power changes afterward.
         // The worker protocol is single-request. Holding this gate across
         // provider selection, startup and the response prevents a concurrent
         // provider switch from killing an in-flight request.
@@ -247,10 +249,12 @@ impl MlRuntimeState {
             );
         }
         let state_for_start = self.clone();
-        let process_result =
-            tokio::task::spawn_blocking(move || state_for_start.ensure_process(&app, provider))
-                .await
-                .map_err(|error| format!("ML worker startup task failed: {error}"))?;
+        let app_for_start = app.clone();
+        let process_result = tokio::task::spawn_blocking(move || {
+            state_for_start.ensure_process(&app_for_start, provider)
+        })
+        .await
+        .map_err(|error| format!("ML worker startup task failed: {error}"))?;
         let process = match process_result {
             Ok(process) => process,
             Err(error) => {
@@ -287,7 +291,8 @@ impl MlRuntimeState {
         let process_for_request = process.clone();
         let request_task =
             tokio::task::spawn_blocking(move || process_for_request.request_rgb(&request, image));
-        let response = match tokio::time::timeout(timeout + CANCEL_GRACE, request_task).await {
+        let response_result = tokio::time::timeout(timeout + CANCEL_GRACE, request_task).await;
+        let response = match response_result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(format!("ML request task failed: {error}")),
             Err(_) => {
@@ -402,6 +407,27 @@ impl MlRuntimeState {
         self.stop_locked();
     }
 
+    pub(crate) fn stop_for_power_saving(&self, power: &crate::power::PowerState) {
+        self.stop_if_idle(|| power.is_active());
+    }
+
+    fn stop_if_idle(&self, should_stop: impl FnOnce() -> bool) {
+        // Startup and inference both own this gate. Power saving releases only
+        // an idle worker; the next power probe retries after admitted OCR ends.
+        let Ok(_request_guard) = self.request_gate.try_lock() else {
+            return;
+        };
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Power may have returned while the capture session was draining.
+        // Do not kill an OCR worker started by the resumed session.
+        if should_stop() {
+            self.stop_locked();
+        }
+    }
+
     fn stop_locked(&self) {
         let process = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -506,10 +532,15 @@ impl MlRuntimeState {
                 let _ = ready_sender.send((ready, reader));
             })
             .map_err(|error| format!("failed to start ML handshake reader: {error}"))?;
-        let (ready, stdout) = match ready_receiver.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(value) => value,
-            Err(_) => {
+        let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
+        let (ready, stdout) = loop {
+            if Instant::now() >= startup_deadline {
                 return Err("Rust ML worker startup timed out".to_string());
+            }
+            match ready_receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(value) => break value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => return Err("Rust ML worker handshake disconnected".to_string()),
             }
         };
         let child = pending_child.take();
@@ -1278,6 +1309,9 @@ async fn run_postprocess_tasks<M, MF, D, DF>(
 }
 
 async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
+    if crate::power::is_saving_power(app) {
+        return Ok(());
+    }
     let storage = app
         .state::<Arc<crate::storage::StorageState>>()
         .inner()
@@ -1287,6 +1321,9 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
     }
     let ids = storage.list_pending_ocr_postprocess_ids(10)?;
     for screenshot_id in ids {
+        if crate::power::is_saving_power(app) {
+            break;
+        }
         if storage.processing_stage.owns_screenshot(
             screenshot_id,
             carbonpaper_app_bound::protocol::Consumer::Classification,
@@ -1349,6 +1386,22 @@ mod tests {
     use super::*;
     use rapidocr_core::config::PipelineConfig;
     use rapidocr_core::model::model_set_by_name;
+
+    #[tokio::test]
+    async fn power_saving_finishes_admitted_ocr_before_releasing_the_worker() {
+        let runtime = MlRuntimeState::new();
+        runtime.inner.lock().unwrap().state = "running".into();
+        let request = runtime.request_gate.lock().await;
+
+        runtime.stop_if_idle(|| true);
+        assert_eq!(runtime.inner.lock().unwrap().state, "running");
+
+        drop(request);
+        runtime.stop_if_idle(|| false);
+        assert_eq!(runtime.inner.lock().unwrap().state, "running");
+        runtime.stop_if_idle(|| true);
+        assert_eq!(runtime.inner.lock().unwrap().state, "stopped");
+    }
 
     #[tokio::test]
     async fn periodic_summary_keeps_ticking_while_other_work_is_pending() {

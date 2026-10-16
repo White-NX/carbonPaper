@@ -35,6 +35,7 @@ pub const AUTO_AGING_LIMIT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const CLIP_AUTO_QUANTUM: Duration = Duration::from_secs(60);
 pub(crate) const MINILM_AUTO_QUANTUM: Duration = Duration::from_secs(30);
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
+const BATTERY_TICK_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -671,8 +672,11 @@ pub(crate) enum EnvironmentPolicy {
     IdleOnly,
     /// Resumable work admitted through a profile-specific scheduler lease.
     Automatic,
-    /// Capture postprocessing and explicit requests may run during user activity,
-    /// while still yielding to maintenance and foreground semantic queries.
+    /// Captured screenshots may be classified during activity, but follow the
+    /// user's power-saving preference even when a durable backlog remains.
+    CapturePostprocess,
+    /// Explicit requests may run on battery and during user activity, while
+    /// still yielding to maintenance and foreground semantic queries.
     Immediate,
 }
 
@@ -682,11 +686,15 @@ impl EnvironmentPolicy {
         maintenance_active: bool,
         idle: &IdleState,
         semantic: &SemanticRuntimeState,
+        power_saving: bool,
     ) -> Option<&'static str> {
         if maintenance_active {
             return Some("maintenance");
         }
-        if self != Self::Immediate {
+        if self == Self::CapturePostprocess && power_saving {
+            return Some("waiting_for_ac_power");
+        }
+        if matches!(self, Self::IdleOnly | Self::Automatic) {
             if !idle.ac_connected.load(Ordering::Relaxed) {
                 return Some("waiting_for_ac_power");
             }
@@ -718,6 +726,7 @@ pub(crate) fn environment_gate_reason(
                     crate::maintenance::is_active(),
                     &app.state::<Arc<IdleState>>(),
                     &app.state::<Arc<SemanticRuntimeState>>(),
+                    crate::power::is_saving_power(app),
                 )
             });
         }
@@ -726,6 +735,7 @@ pub(crate) fn environment_gate_reason(
         crate::maintenance::is_active(),
         &app.state::<Arc<IdleState>>(),
         &app.state::<Arc<SemanticRuntimeState>>(),
+        crate::power::is_saving_power(app),
     )
 }
 
@@ -875,6 +885,7 @@ fn should_refresh_backlog(reason: SchedulerWake) -> bool {
 }
 
 async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
+    let mut tick_interval = TICK_INTERVAL;
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Consume Tokio's immediate first tick, then run one startup pass without
@@ -883,6 +894,21 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
     ticker.tick().await;
     let mut first_pass = true;
     loop {
+        let next_interval = if crate::power::is_ac_power_connected() {
+            TICK_INTERVAL
+        } else {
+            BATTERY_TICK_INTERVAL
+        };
+        if tick_interval != next_interval {
+            tick_interval = next_interval;
+            ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + tick_interval,
+                tick_interval,
+            );
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
+        // Manual requests and power transitions still notify immediately;
+        // battery-blocked queues need only infrequent fallback reconciliation.
         let wake_reason =
             wait_for_scheduler_wake(&mut first_pass, &mut ticker, &runtime.wake).await;
         if runtime.stop.load(Ordering::SeqCst) {
@@ -1347,11 +1373,11 @@ mod tests {
             idle.fullscreen_exclusive
                 .store(fullscreen, Ordering::Relaxed);
             assert_eq!(
-                EnvironmentPolicy::Immediate.gate_reason(false, &idle, &semantic),
+                EnvironmentPolicy::CapturePostprocess.gate_reason(false, &idle, &semantic, false),
                 None,
             );
             assert_eq!(
-                EnvironmentPolicy::IdleOnly.gate_reason(false, &idle, &semantic),
+                EnvironmentPolicy::IdleOnly.gate_reason(false, &idle, &semantic, false),
                 Some(bulk_reason),
             );
         }
@@ -1362,19 +1388,42 @@ mod tests {
         let idle = IdleState::new();
         idle.is_idle.store(true, Ordering::Relaxed);
         let semantic = Arc::new(SemanticRuntimeState::new());
-        for policy in [EnvironmentPolicy::Immediate, EnvironmentPolicy::IdleOnly] {
+        for policy in [
+            EnvironmentPolicy::Immediate,
+            EnvironmentPolicy::CapturePostprocess,
+            EnvironmentPolicy::IdleOnly,
+        ] {
             assert_eq!(
-                policy.gate_reason(true, &idle, &semantic),
+                policy.gate_reason(true, &idle, &semantic, false),
                 Some("maintenance")
             );
             let foreground = semantic.foreground_lease();
             assert_eq!(
-                policy.gate_reason(false, &idle, &semantic),
+                policy.gate_reason(false, &idle, &semantic, false),
                 Some("foreground_request"),
             );
             drop(foreground);
-            assert_eq!(policy.gate_reason(false, &idle, &semantic), None);
+            assert_eq!(policy.gate_reason(false, &idle, &semantic, false), None);
         }
+    }
+
+    #[test]
+    fn power_saving_defers_capture_backlog_but_preserves_explicit_manual_work() {
+        let idle = IdleState::new();
+        idle.ac_connected.store(false, Ordering::Relaxed);
+        let semantic = SemanticRuntimeState::new();
+        assert_eq!(
+            EnvironmentPolicy::CapturePostprocess.gate_reason(false, &idle, &semantic, true),
+            Some("waiting_for_ac_power"),
+        );
+        assert_eq!(
+            EnvironmentPolicy::Immediate.gate_reason(false, &idle, &semantic, true),
+            None,
+        );
+        assert_eq!(
+            EnvironmentPolicy::CapturePostprocess.gate_reason(false, &idle, &semantic, false),
+            None,
+        );
     }
 
     fn task(kind: &str, ready: i64, manual: bool, seq: u64) -> BackgroundTaskState {

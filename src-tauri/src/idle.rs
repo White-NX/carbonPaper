@@ -40,6 +40,16 @@ pub const IDLE_THRESHOLD_SECS: u64 = 1800;
 /// Polling cadence for the idle monitor loop.
 const POLL_INTERVAL_SECS: u64 = 2;
 
+fn probe_interval(pending: bool, ac_connected: bool) -> std::time::Duration {
+    if !ac_connected {
+        crate::power::POLL_INTERVAL
+    } else if pending {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_secs(POLL_INTERVAL_SECS)
+    }
+}
+
 pub struct IdleState {
     /// Last computed idle time in seconds (best-effort, updated every POLL_INTERVAL_SECS).
     pub idle_secs: AtomicU64,
@@ -158,12 +168,7 @@ pub fn start_idle_monitor(app: AppHandle) {
             let pending = app_clone
                 .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
                 .is_some_and(|scheduler| scheduler.has_pending_work());
-            tokio::time::sleep(if pending {
-                std::time::Duration::from_millis(250)
-            } else {
-                std::time::Duration::from_secs(POLL_INTERVAL_SECS)
-            })
-            .await;
+            tokio::time::sleep(probe_interval(pending, is_ac_power_connected())).await;
 
             if composite_shutdown.load(Ordering::SeqCst) {
                 tracing::info!("Idle monitor exiting on shutdown flag");
@@ -278,6 +283,19 @@ pub fn stop_idle_monitor(idle_state: &Arc<IdleState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_backlog_does_not_enable_fast_activity_polling() {
+        assert_eq!(
+            probe_interval(true, false),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(probe_interval(false, false), probe_interval(true, false));
+        assert_eq!(
+            probe_interval(true, true),
+            std::time::Duration::from_millis(250)
+        );
+    }
 
     /// The composite rule, extracted so the three signals can be asserted
     /// without a desktop session. The monitor loop calls the same function.

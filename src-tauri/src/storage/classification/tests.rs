@@ -135,6 +135,21 @@ fn scheduling_deferral_preserves_budget_and_old_lease_cannot_touch_new_work() {
 }
 
 #[test]
+fn repeated_power_deferrals_keep_classification_retryable() {
+    let (_dir, storage) = fixture();
+    for _ in 0..8 {
+        let lease = storage.claim_native_classification(0, 1).unwrap().unwrap();
+        storage
+            .defer_native_classification(&lease, "waiting_for_ac_power", true)
+            .unwrap();
+        assert_eq!(status(&storage), ("pending".into(), 0, None));
+        assert_eq!(category(&storage), "old");
+        permit_retry(&storage);
+    }
+    assert!(storage.claim_native_classification(0, 1).unwrap().is_some());
+}
+
+#[test]
 fn user_correction_and_learning_intent_survive_in_flight_classification() {
     let (_dir, storage) = fixture();
     let lease = storage.claim_native_classification(0, 1).unwrap().unwrap();

@@ -248,9 +248,25 @@ impl Drop for InFlightSemanticRequest {
 struct RequestWatch {
     deadline: Instant,
     lease: Option<Arc<ExecutionLease>>,
+    capture_power: Option<Arc<crate::power::PowerState>>,
 }
 impl RequestWatch {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            lease: background_policy::current_execution(),
+            capture_power: crate::power::current_capture_power(),
+        }
+    }
+
     fn check(&self, runtime: &SemanticRuntimeState) -> Result<(), TaskError> {
+        if self
+            .capture_power
+            .as_ref()
+            .is_some_and(|power| power.is_active())
+        {
+            return Err(TaskError::Paused("waiting_for_ac_power"));
+        }
         if let Some(lease) = &self.lease {
             if runtime.foreground_waiting() {
                 lease.revoke("foreground_request");
@@ -557,6 +573,8 @@ impl SemanticRuntimeState {
         // materially longer than its own timeout. It is computed before the gate
         // is taken because the wait for the gate is the longest of those steps.
         let deadline = Instant::now() + timeout;
+        let watch = RequestWatch::new(deadline);
+        watch.check(self)?;
         background_policy::check_current()?;
         let _request_guard =
             acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
@@ -565,11 +583,16 @@ impl SemanticRuntimeState {
         // begin during that wait. Using the earlier value here could start a
         // fresh DirectML worker after game mode had already taken the GPU back.
         background_policy::check_current()?;
+        watch.check(self)?;
         let prefer_directml = background_policy::current_execution().is_none()
             && directml_allowed_for_request(&app, prefer_directml);
         let model = request_model(&request);
-        let mut provider = match self.select_provider(&app, prefer_directml, model).await {
+        let mut provider = match self
+            .select_provider(&app, prefer_directml, model, &watch)
+            .await
+        {
             Ok(provider) => provider,
+            Err(error) if error.is_pause() => return Err(error),
             Err(error) => {
                 if directml_allowed_for_request(&app, true) {
                     self.disable_directml_for_session(&error);
@@ -616,6 +639,7 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         prefer_directml: bool,
         model: Option<MlSemanticModel>,
+        watch: &RequestWatch,
     ) -> Result<MlProvider, TaskError> {
         if let Some(provider) = self.cached_provider_for_request(prefer_directml, model) {
             return Ok(provider);
@@ -623,8 +647,13 @@ impl SemanticRuntimeState {
 
         let state_for_start = self.clone();
         let app_for_start = app.clone();
+        let startup_watch = watch.clone();
         tokio::task::spawn_blocking(move || {
-            state_for_start.ensure_process(&app_for_start, MlProvider::DirectMl)
+            state_for_start.ensure_process_watched(
+                &app_for_start,
+                MlProvider::DirectMl,
+                Some(&startup_watch),
+            )
         })
         .await
         .map_err(|error| {
@@ -666,10 +695,7 @@ impl SemanticRuntimeState {
         deadline: Instant,
     ) -> Result<MlResponse, TaskError> {
         let request_id = request.request_id();
-        let watch = RequestWatch {
-            deadline,
-            lease: background_policy::current_execution(),
-        };
+        let watch = RequestWatch::new(deadline);
         watch.check(self)?;
         let scheduler = app.try_state::<Arc<BackgroundSchedulerState>>();
         let cost_key = scheduler.as_ref().and_then(|scheduler| {
@@ -963,14 +989,6 @@ impl SemanticRuntimeState {
             .state = "stopped".to_string();
     }
 
-    fn ensure_process(
-        &self,
-        app: &AppHandle,
-        requested_provider: MlProvider,
-    ) -> Result<Arc<SemanticMlChild>, TaskError> {
-        self.ensure_process_watched(app, requested_provider, None)
-    }
-
     fn ensure_process_watched(
         &self,
         app: &AppHandle,
@@ -987,6 +1005,9 @@ impl SemanticRuntimeState {
         // This is the last provider decision before a process can be reused or
         // spawned. Keeping it inside the lifecycle lock closes the remaining
         // gap between the async request-level check and worker startup.
+        if let Some(watch) = watch {
+            watch.check(self)?;
+        }
         let provider = if requested_provider == MlProvider::DirectMl
             && !directml_allowed_for_request(app, true)
         {
@@ -1409,13 +1430,39 @@ async fn acquire_request_slot(
     deadline: Instant,
     request_id: u64,
 ) -> Result<tokio::sync::MutexGuard<'_, ()>, TaskError> {
+    let capture_power = crate::power::current_capture_power();
+    let poll_policy = capture_power.is_some() || background_policy::current_execution().is_some();
+    acquire_request_slot_checked(gate, deadline, request_id, poll_policy, || {
+        if capture_power
+            .as_ref()
+            .is_some_and(|power| power.is_active())
+        {
+            return Err(TaskError::Paused("waiting_for_ac_power"));
+        }
+        background_policy::check_current()
+    })
+    .await
+}
+
+async fn acquire_request_slot_checked(
+    gate: &tokio::sync::Mutex<()>,
+    deadline: Instant,
+    request_id: u64,
+    poll_policy: bool,
+    check_policy: impl Fn() -> Result<(), TaskError>,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, TaskError> {
     let wait = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.lock());
     tokio::pin!(wait);
     let result = loop {
-        background_policy::check_current()?;
+        check_policy()?;
         tokio::select! {
-            result = &mut wait => break result,
-            _ = tokio::time::sleep(Duration::from_millis(25)), if background_policy::current_execution().is_some() => {}
+            result = &mut wait => {
+                // A power change at the deadline is a deferral, not a worker
+                // failure. It must not spend the classification retry budget.
+                check_policy()?;
+                break result;
+            },
+            _ = tokio::time::sleep(Duration::from_millis(25)), if poll_policy => {}
         }
     };
     result.map_err(|_| {
@@ -1907,6 +1954,28 @@ pub async fn get_background_index_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capture_power_policy_reaches_startup_watches_without_leaking_to_manual_requests() {
+        let power = Arc::new(crate::power::PowerState::new());
+        let expected = power.clone();
+        let watch = crate::power::CAPTURE_WORK
+            .scope(power, async {
+                RequestWatch::new(Instant::now() + Duration::from_secs(5))
+            })
+            .await;
+        tokio::task::spawn_blocking(move || {
+            assert!(Arc::ptr_eq(
+                watch.capture_power.as_ref().unwrap(),
+                &expected
+            ));
+        })
+        .await
+        .unwrap();
+        let manual_watch = RequestWatch::new(Instant::now() + Duration::from_secs(5));
+        assert!(manual_watch.capture_power.is_none());
+        assert!(manual_watch.check(&SemanticRuntimeState::new()).is_ok());
+    }
 
     #[test]
     fn index_status_covers_scheduler_waits_and_ignores_automatic_work() {
@@ -2406,6 +2475,65 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn queued_capture_defers_on_power_change_without_interrupting_the_slot_owner() {
+        let gate = tokio::sync::Mutex::new(());
+        let held = gate.lock().await;
+        let saving_power = std::sync::atomic::AtomicBool::new(false);
+        let queued = acquire_request_slot_checked(
+            &gate,
+            Instant::now() + Duration::from_secs(30),
+            125,
+            true,
+            || {
+                if saving_power.load(Ordering::SeqCst) {
+                    Err(TaskError::Paused("waiting_for_ac_power"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(queued, async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                saving_power.store(true, Ordering::SeqCst);
+            })
+        })
+        .await
+        .expect("power deferral must not wait for the worker deadline");
+        let error = result.unwrap_err();
+        assert!(matches!(error, TaskError::Paused("waiting_for_ac_power")));
+        assert!(error.worker_kind().is_none());
+        assert!(
+            gate.try_lock().is_err(),
+            "the running request still owns its slot"
+        );
+        drop(held);
+        // Foreground requests have no capture power policy and remain usable.
+        assert!(
+            acquire_request_slot(&gate, Instant::now() + Duration::from_secs(1), 126)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn power_deferral_takes_precedence_over_a_queued_request_timeout() {
+        let gate = tokio::sync::Mutex::new(());
+        let _held = gate.lock().await;
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let error = acquire_request_slot_checked(&gate, Instant::now(), 127, true, || {
+            if checks.fetch_add(1, Ordering::SeqCst) > 0 {
+                Err(TaskError::Paused("waiting_for_ac_power"))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, TaskError::Paused("waiting_for_ac_power")));
     }
 
     #[tokio::test]

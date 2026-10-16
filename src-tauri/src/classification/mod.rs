@@ -74,6 +74,7 @@ struct NativeEncoder {
     app: AppHandle,
     generation: u64,
     deadline: tokio::time::Instant,
+    capture_work: bool,
 }
 impl TextEncoder for NativeEncoder {
     async fn encode(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
@@ -81,13 +82,38 @@ impl TextEncoder for NativeEncoder {
         if self.app.state::<Arc<StorageState>>().db_generation() != self.generation {
             return Err("classification database changed".into());
         }
-        let result = tokio::time::timeout_at(
+        if self.capture_work {
+            // The BGE runtime waits for foreground queries between batches.
+            // Keep completed anchor batches while it waits; all other policy
+            // gates still defer capture work immediately.
+            inference_gate(postprocess_gate(&self.app))?;
+        }
+        let inference = tokio::time::timeout_at(
             self.deadline,
             crate::classification_runtime::embed_bge_texts(self.app.clone(), texts),
-        )
-        .await
+        );
+        let result = if self.capture_work {
+            crate::power::CAPTURE_WORK
+                .scope(
+                    self.app
+                        .state::<Arc<crate::power::PowerState>>()
+                        .inner()
+                        .clone(),
+                    inference,
+                )
+                .await
+        } else {
+            inference.await
+        }
         .map_err(|_| "classification inference timed out".to_string())??;
         Ok(result.vectors)
+    }
+}
+
+fn inference_gate(result: Result<(), String>) -> Result<(), String> {
+    match result {
+        Err(reason) if reason == "foreground_request" => Ok(()),
+        result => result,
     }
 }
 
@@ -129,6 +155,7 @@ async fn classify(
         app: app.clone(),
         generation,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        capture_work: !debug,
     };
     let result = current
         .classifier
@@ -180,6 +207,7 @@ fn scheduling_deferred(error: &str) -> bool {
         "foreground_busy",
         "background_busy",
         "foreground_request",
+        "waiting_for_ac_power",
         "MAINTENANCE_IN_PROGRESS",
         "maintenance",
         "classification source changed",
@@ -190,10 +218,10 @@ fn scheduling_deferred(error: &str) -> bool {
     .any(|prefix| error.starts_with(prefix))
 }
 
-fn immediate_gate(app: &AppHandle) -> Result<(), String> {
+fn postprocess_gate(app: &AppHandle) -> Result<(), String> {
     if let Some(reason) = crate::background_scheduler::environment_gate_reason(
         app,
-        crate::background_scheduler::EnvironmentPolicy::Immediate,
+        crate::background_scheduler::EnvironmentPolicy::CapturePostprocess,
     ) {
         return Err(reason.into());
     }
@@ -201,6 +229,10 @@ fn immediate_gate(app: &AppHandle) -> Result<(), String> {
 }
 
 pub(crate) fn enqueue_capture(app: &AppHandle, id: i64, input: Input) -> Result<bool, String> {
+    if postprocess_gate(app).is_err() {
+        // Leave the durable pending row for retry without claiming/spending it.
+        return Ok(false);
+    }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let state = app.state::<Arc<ClassificationState>>().inner().clone();
     let generation = storage.db_generation();
@@ -246,7 +278,7 @@ async fn run_capture(
         storage.defer_native_classification(lease, "classification source changed", true)?;
         return Ok(());
     }
-    immediate_gate(app)?;
+    postprocess_gate(app)?;
     let result = if lease.user_revision == 0
         && crate::registry_config::get_bool("classification_enabled").unwrap_or(true)
     {
@@ -281,7 +313,7 @@ pub(crate) fn enqueue_staged(app: &AppHandle, work: StagedWork) -> Result<bool, 
             process_name: work.input.process_name.clone(),
         };
         let result = async {
-            immediate_gate(&app)?;
+            postprocess_gate(&app)?;
             storage.processing_stage.check_receipt(&work.receipt)?;
             let result = if user_revision == 0
                 && crate::registry_config::get_bool("classification_enabled").unwrap_or(true)
@@ -332,14 +364,17 @@ impl Drop for FeedbackGuard {
 pub(crate) fn start_feedback(app: &AppHandle) {
     let state = app.state::<Arc<ClassificationState>>().inner().clone();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    if !storage.is_silent_read_authorized() || state.feedback_running.swap(true, Ordering::AcqRel) {
+    if postprocess_gate(app).is_err()
+        || !storage.is_silent_read_authorized()
+        || state.feedback_running.swap(true, Ordering::AcqRel)
+    {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _guard = FeedbackGuard(state.clone());
         for _ in 0..8 {
-            if !storage.is_silent_read_authorized() || immediate_gate(&app).is_err() {
+            if !storage.is_silent_read_authorized() || postprocess_gate(&app).is_err() {
                 break;
             }
             let generation = storage.db_generation();
@@ -417,6 +452,7 @@ async fn learn_feedback(
         app: app.clone(),
         generation,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        capture_work: true,
     };
     current
         .classifier
@@ -479,6 +515,7 @@ mod tests {
     fn scheduling_yields_preserve_retry_budgets_but_inference_failures_do_not() {
         for error in [
             "foreground_busy: search",
+            "waiting_for_ac_power",
             "background_busy: indexing",
             "foreground_request",
             "MAINTENANCE_IN_PROGRESS",
@@ -492,6 +529,78 @@ mod tests {
             "classification inference timed out",
         ] {
             assert!(!scheduling_deferred(error), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn anchor_batches_wait_for_search_without_restarting_completed_inference() {
+        struct SearchAwareEncoder {
+            runtime: Arc<crate::semantic_runtime::SemanticRuntimeState>,
+            batches: Vec<usize>,
+        }
+        impl TextEncoder for SearchAwareEncoder {
+            async fn encode(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+                let foreground = (self.batches.len() == 1).then(|| self.runtime.foreground_lease());
+                inference_gate(if self.runtime.foreground_waiting() {
+                    Err("foreground_request".into())
+                } else {
+                    Ok(())
+                })?;
+                let (result, ()) = tokio::join!(
+                    crate::classification_runtime::wait_for_foreground(
+                        &self.runtime,
+                        std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    ),
+                    async move {
+                        tokio::task::yield_now().await;
+                        drop(foreground);
+                    }
+                );
+                result?;
+                self.batches.push(texts.len());
+                Ok(vec![vec![1.0, 0.0]; texts.len()])
+            }
+        }
+        let batch_size = crate::ml_protocol::MAX_SEMANTIC_BATCH;
+        let mut anchors = scoring::Anchors::new();
+        anchors.insert(
+            "category".into(),
+            (0..batch_size * 2 + 1)
+                .map(|i| {
+                    scoring::Anchor::new(format!("anchor {i}"), "default", 1.0, "global", None)
+                })
+                .collect(),
+        );
+        let mut classifier = Classifier::new(anchors).unwrap();
+        let mut encoder = SearchAwareEncoder {
+            runtime: Arc::new(crate::semantic_runtime::SemanticRuntimeState::new()),
+            batches: Vec::new(),
+        };
+        let input = Input {
+            title: "query".into(),
+            process_name: "app.exe".into(),
+            ocr_text: String::new(),
+        };
+        assert_eq!(
+            classifier
+                .classify(&mut encoder, &input, false)
+                .await
+                .unwrap()
+                .category,
+            "category"
+        );
+        assert_eq!(encoder.batches, [batch_size, batch_size, 1, 1]);
+    }
+
+    #[test]
+    fn waiting_for_search_keeps_power_and_maintenance_gates() {
+        assert!(inference_gate(Err("foreground_request".into())).is_ok());
+        for reason in [
+            "waiting_for_ac_power",
+            "maintenance",
+            "MAINTENANCE_IN_PROGRESS",
+        ] {
+            assert_eq!(inference_gate(Err(reason.into())), Err(reason.into()));
         }
     }
 }

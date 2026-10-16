@@ -252,6 +252,15 @@ impl CaptureState {
             })
     }
 
+    /// Both WGC and native-messaging ingestion obey the same capture gates.
+    pub(crate) fn accepts_frames(&self, monitor_running: bool, power_saving: bool) -> bool {
+        monitor_running
+            && !power_saving
+            && !self.stopped.load(Ordering::SeqCst)
+            && !self.paused.load(Ordering::SeqCst)
+            && !self.game_mode_capture_paused.load(Ordering::SeqCst)
+    }
+
     /// Explicitly drops the current WGC session and releases capture resources.
     pub fn clear_wgc_session(&self, reason: &str) {
         let mut guard = self.wgc_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1411,16 +1420,14 @@ pub async fn run_capture_loop(
             break;
         }
 
-        // Check pause
-        if capture_state.paused.load(Ordering::SeqCst) {
-            continue;
-        }
-
-        // Check game mode fullscreen pause
-        if capture_state
-            .game_mode_capture_paused
-            .load(Ordering::SeqCst)
-        {
+        let power_saving = crate::power::is_saving_power(&app);
+        if !capture_state.accepts_frames(true, power_saving) {
+            if power_saving {
+                capture_state.clear_wgc_session("power_saving");
+                // The policy monitor normally stops this loop. If maintenance
+                // owns control, stay suspended without hot polling or WGC.
+                tokio::time::sleep(crate::power::POLL_INTERVAL).await;
+            }
             continue;
         }
 
@@ -1499,13 +1506,7 @@ pub async fn run_capture_loop(
             if capture_state.stopped.load(Ordering::SeqCst) {
                 break;
             }
-            if capture_state.paused.load(Ordering::SeqCst) {
-                continue;
-            }
-            if capture_state
-                .game_mode_capture_paused
-                .load(Ordering::SeqCst)
-            {
+            if !capture_state.accepts_frames(true, crate::power::is_saving_power(&app)) {
                 continue;
             }
 
@@ -1553,6 +1554,9 @@ pub async fn run_capture_loop(
             current_window_fingerprint = stabilized_window_fingerprint;
         }
 
+        if !capture_state.accepts_frames(true, crate::power::is_saving_power(&app)) {
+            continue;
+        }
         // Capture screenshot
         let captured = match capture_foreground_window(
             window_info.hwnd_raw,
@@ -1669,6 +1673,11 @@ pub async fn run_capture_loop(
             "timestamp": ts_str,
         });
 
+        // Native capture and extension round trips can span a power change.
+        // Do not persist a frame after its capture policy has been revoked.
+        if !capture_state.accepts_frames(true, crate::power::is_saving_power(&app)) {
+            continue;
+        }
         let Some(ocr_slot) = capture_state.try_reserve_ocr_slot() else {
             tracing::debug!(
                 "OCR slot was claimed while capture was being prepared; dropping frame"
@@ -1841,12 +1850,16 @@ async fn process_ocr_async(
     .await;
 
     if let Err(e) = result {
-        crate::ml_runtime::schedule_ocr_model_health_notification(app.clone());
-        tracing::error!(
-            "OCR processing failed for screenshot {}: {}",
-            screenshot_id,
-            e
-        );
+        if e == crate::power::POWER_SAVING_ACTIVE {
+            tracing::info!("OCR interrupted by power saving for screenshot {screenshot_id}");
+        } else {
+            crate::ml_runtime::schedule_ocr_model_health_notification(app.clone());
+            tracing::error!(
+                "OCR processing failed for screenshot {}: {}",
+                screenshot_id,
+                e
+            );
+        }
         // OCR failure must never delete an already captured screenshot. Commit
         // it without OCR rows; the persistent OCR status is updated separately.
         if let Err(commit_err) = storage.commit_screenshot(screenshot_id, None, None, None) {
@@ -2204,6 +2217,24 @@ pub(crate) fn md5_hash(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_and_extension_frames_obey_all_pause_reasons() {
+        let state = CaptureState::new();
+        assert!(!state.accepts_frames(false, false));
+        assert!(!state.accepts_frames(true, true));
+        assert!(state.accepts_frames(true, false));
+        for flag in [
+            &state.stopped,
+            &state.paused,
+            &state.game_mode_capture_paused,
+        ] {
+            flag.store(true, Ordering::SeqCst);
+            assert!(!state.accepts_frames(true, false));
+            flag.store(false, Ordering::SeqCst);
+        }
+        assert!(state.accepts_frames(true, false));
+    }
 
     #[test]
     fn office_document_hwnd_participates_in_focus_fingerprint() {

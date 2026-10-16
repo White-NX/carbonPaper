@@ -266,8 +266,9 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
 
         let storage = app_handle.state::<Arc<StorageState>>().inner().clone();
 
-        let policy_pruned = if last_policy_check.elapsed()
-            >= std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS)
+        let policy_pruned = if !power::is_saving_power(&app_handle)
+            && last_policy_check.elapsed()
+                >= std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS)
         {
             last_policy_check = std::time::Instant::now();
             match tokio::task::spawn_blocking({
@@ -404,7 +405,8 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             };
         }
 
-        let vacuum = if ocr_batch.queue_rows == 0
+        let vacuum = if !power::is_saving_power(&app_handle)
+            && ocr_batch.queue_rows == 0
             && finalized_screenshots == 0
             && !ocr_failed
             && !ocr_batch.waiting_for_unlock
@@ -474,7 +476,11 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
 
         let active = (ocr_batch.queue_rows > 0 || finalized_screenshots > 0)
             && !ocr_batch.waiting_for_unlock;
-        let delay = if active && !ocr_failed {
+        let delay = if power::is_saving_power(&app_handle) {
+            // Keep explicit deletions progressing, without a 25 ms drain loop
+            // or five-second empty-queue queries while recording is suspended.
+            std::time::Duration::from_secs(if active { 1 } else { 30 })
+        } else if active && !ocr_failed {
             std::time::Duration::from_millis(ACTIVE_YIELD_MILLIS)
         } else {
             std::time::Duration::from_secs(IDLE_SLEEP_SECS)

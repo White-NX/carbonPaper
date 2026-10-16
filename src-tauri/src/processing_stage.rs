@@ -1284,9 +1284,10 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
     // Classification finishes a captured screenshot and should follow OCR within
     // the dispatch cadence, even while the user is active. Durable staging must
     // not give it the idle-only policy used by bulk indexing and clustering.
-    if let Some(reason) =
-        crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::Immediate)
-    {
+    if let Some(reason) = crate::background_scheduler::environment_gate_reason(
+        app,
+        EnvironmentPolicy::CapturePostprocess,
+    ) {
         if storage.processing_stage.has_ready(Consumer::Classification) {
             crate::background_activity::blocked("classification", reason);
         }
