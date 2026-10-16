@@ -93,12 +93,15 @@ pub async fn restore_monitor_after_maintenance(
     owner: &crate::maintenance::MaintenanceGuard,
 ) {
     if !restore.was_paused && restore.was_running {
-        let _ = crate::monitor::control_in_maintenance(
+        let result = crate::monitor::control_in_maintenance(
             app,
             crate::monitor::MonitorAction::Resume,
             owner,
         )
         .await;
+        if matches!(result, Err(ref error) if error == crate::power::POWER_SAVING_ACTIVE) {
+            app.state::<MonitorState>().defer_maintenance_resume();
+        }
     }
 }
 

@@ -45,10 +45,13 @@ impl PowerStatus {
         previous: Option<Self>,
         running: bool,
         auto_start: bool,
+        maintenance_resume_pending: bool,
     ) -> Option<MonitorAction> {
         if self.active && running {
             // Reconcile every pass: a failed stop must not consume the only AC edge.
             Some(MonitorAction::Stop)
+        } else if !self.active && running && maintenance_resume_pending {
+            Some(MonitorAction::ResumeAfterPowerSaving)
         } else if !self.active && previous.is_some_and(|status| status.active) && auto_start {
             Some(MonitorAction::Start)
         } else {
@@ -166,14 +169,20 @@ pub fn start_power_monitor(app: AppHandle) {
                 }
             }
 
-            let running = app.state::<crate::monitor::MonitorState>().is_running();
+            let monitor = app.state::<crate::monitor::MonitorState>();
+            let running = monitor.is_running();
             let auto_start = registry_config::get_bool("autoStartMonitor").unwrap_or(true)
                 && !crate::onboarding::capture_held();
             if status.active || !auto_start || running {
                 resume_pending = false;
             }
             let action = status
-                .monitor_action(previous, running, auto_start)
+                .monitor_action(
+                    previous,
+                    running,
+                    auto_start,
+                    monitor.maintenance_resume_pending(),
+                )
                 .or_else(|| resume_pending.then_some(MonitorAction::Start));
             resume_pending = false;
             if let Some(action) = action {
@@ -254,10 +263,10 @@ mod tests {
         let state = PowerState::with_status(status);
         assert!(state.active.load(Ordering::SeqCst));
         assert!(matches!(
-            status.monitor_action(None, true, true),
+            status.monitor_action(None, true, true, false),
             Some(MonitorAction::Stop)
         ));
-        assert!(status.monitor_action(None, false, true).is_none());
+        assert!(status.monitor_action(None, false, true, false).is_none());
     }
 
     #[test]
@@ -265,11 +274,11 @@ mod tests {
         let disabled = PowerStatus::new(false, false);
         let enabled = PowerStatus::new(true, false);
         assert!(matches!(
-            enabled.monitor_action(Some(disabled), true, true),
+            enabled.monitor_action(Some(disabled), true, true, false),
             Some(MonitorAction::Stop)
         ));
         assert!(matches!(
-            enabled.monitor_action(Some(enabled), true, true),
+            enabled.monitor_action(Some(enabled), true, true, false),
             Some(MonitorAction::Stop)
         ));
     }
@@ -279,17 +288,42 @@ mod tests {
         let battery = PowerStatus::new(true, false);
         for released in [PowerStatus::new(true, true), PowerStatus::new(false, false)] {
             assert!(matches!(
-                released.monitor_action(Some(battery), false, true),
+                released.monitor_action(Some(battery), false, true, false),
                 Some(MonitorAction::Start)
             ));
             assert!(released
-                .monitor_action(Some(battery), false, false)
+                .monitor_action(Some(battery), false, false, false)
                 .is_none());
             assert!(released
-                .monitor_action(Some(released), false, true)
+                .monitor_action(Some(released), false, true, false)
                 .is_none());
-            assert!(released.monitor_action(None, false, true).is_none());
+            assert!(released.monitor_action(None, false, true, false).is_none());
         }
+    }
+
+    #[test]
+    fn deferred_maintenance_restore_resumes_the_running_session_after_ac_returns() {
+        let battery = PowerStatus::new(true, false);
+        let ac = PowerStatus::new(true, true);
+        for auto_start in [false, true] {
+            for previous in [Some(battery), Some(ac)] {
+                assert!(matches!(
+                    ac.monitor_action(previous, true, auto_start, true),
+                    Some(MonitorAction::ResumeAfterPowerSaving)
+                ));
+            }
+        }
+        assert!(matches!(
+            battery.monitor_action(Some(ac), true, true, true),
+            Some(MonitorAction::Stop)
+        ));
+    }
+
+    #[test]
+    fn a_user_pause_or_stop_does_not_gain_a_deferred_power_resume() {
+        let ac = PowerStatus::new(true, true);
+        assert!(ac.monitor_action(Some(ac), true, true, false).is_none());
+        assert!(ac.monitor_action(Some(ac), false, false, true).is_none());
     }
 
     #[test]
