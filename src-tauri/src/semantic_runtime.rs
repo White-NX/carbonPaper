@@ -1430,13 +1430,39 @@ async fn acquire_request_slot(
     deadline: Instant,
     request_id: u64,
 ) -> Result<tokio::sync::MutexGuard<'_, ()>, TaskError> {
+    let capture_power = crate::power::current_capture_power();
+    let poll_policy = capture_power.is_some() || background_policy::current_execution().is_some();
+    acquire_request_slot_checked(gate, deadline, request_id, poll_policy, || {
+        if capture_power
+            .as_ref()
+            .is_some_and(|power| power.is_active())
+        {
+            return Err(TaskError::Paused("waiting_for_ac_power"));
+        }
+        background_policy::check_current()
+    })
+    .await
+}
+
+async fn acquire_request_slot_checked(
+    gate: &tokio::sync::Mutex<()>,
+    deadline: Instant,
+    request_id: u64,
+    poll_policy: bool,
+    check_policy: impl Fn() -> Result<(), TaskError>,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, TaskError> {
     let wait = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.lock());
     tokio::pin!(wait);
     let result = loop {
-        background_policy::check_current()?;
+        check_policy()?;
         tokio::select! {
-            result = &mut wait => break result,
-            _ = tokio::time::sleep(Duration::from_millis(25)), if background_policy::current_execution().is_some() => {}
+            result = &mut wait => {
+                // A power change at the deadline is a deferral, not a worker
+                // failure. It must not spend the classification retry budget.
+                check_policy()?;
+                break result;
+            },
+            _ = tokio::time::sleep(Duration::from_millis(25)), if poll_policy => {}
         }
     };
     result.map_err(|_| {
@@ -2449,6 +2475,65 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn queued_capture_defers_on_power_change_without_interrupting_the_slot_owner() {
+        let gate = tokio::sync::Mutex::new(());
+        let held = gate.lock().await;
+        let saving_power = std::sync::atomic::AtomicBool::new(false);
+        let queued = acquire_request_slot_checked(
+            &gate,
+            Instant::now() + Duration::from_secs(30),
+            125,
+            true,
+            || {
+                if saving_power.load(Ordering::SeqCst) {
+                    Err(TaskError::Paused("waiting_for_ac_power"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(queued, async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                saving_power.store(true, Ordering::SeqCst);
+            })
+        })
+        .await
+        .expect("power deferral must not wait for the worker deadline");
+        let error = result.unwrap_err();
+        assert!(matches!(error, TaskError::Paused("waiting_for_ac_power")));
+        assert!(error.worker_kind().is_none());
+        assert!(
+            gate.try_lock().is_err(),
+            "the running request still owns its slot"
+        );
+        drop(held);
+        // Foreground requests have no capture power policy and remain usable.
+        assert!(
+            acquire_request_slot(&gate, Instant::now() + Duration::from_secs(1), 126)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn power_deferral_takes_precedence_over_a_queued_request_timeout() {
+        let gate = tokio::sync::Mutex::new(());
+        let _held = gate.lock().await;
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let error = acquire_request_slot_checked(&gate, Instant::now(), 127, true, || {
+            if checks.fetch_add(1, Ordering::SeqCst) > 0 {
+                Err(TaskError::Paused("waiting_for_ac_power"))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, TaskError::Paused("waiting_for_ac_power")));
     }
 
     #[tokio::test]
