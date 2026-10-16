@@ -257,10 +257,6 @@ impl MlRuntimeState {
         .map_err(|error| format!("ML worker startup task failed: {error}"))?;
         let process = match process_result {
             Ok(process) => process,
-            Err(error) if error == crate::power::POWER_SAVING_ACTIVE => {
-                self.stop();
-                return Err(error);
-            }
             Err(error) => {
                 self.record_failure(&error, 0.0);
                 if provider == MlProvider::DirectMl {
@@ -312,10 +308,6 @@ impl MlRuntimeState {
                 ))
             }
         };
-        // A policy stop can close the pipe before the polling branch runs.
-        if response.is_err() && crate::power::is_saving_power(&app) {
-            return Err(crate::power::POWER_SAVING_ACTIVE.into());
-        }
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         match response {
             Ok(MlResponse::OcrComplete {
