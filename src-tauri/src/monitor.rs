@@ -977,12 +977,6 @@ pub fn start_game_mode_monitor(app: AppHandle) {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-            // Capture and automatic inference are suspended; querying GPU
-            // counters cannot change admission until power saving ends.
-            if crate::power::is_saving_power(&app_clone) {
-                continue;
-            }
-
             // ── Fullscreen non-browser detection ──
             {
                 let capture_state = app_clone.state::<Arc<CaptureState>>();
