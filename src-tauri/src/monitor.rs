@@ -812,10 +812,13 @@ pub async fn resume_monitor(window: tauri::Window, app: AppHandle) -> Result<Str
 
 #[tauri::command]
 pub async fn get_monitor_status(
+    app: AppHandle,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
 ) -> Result<String, String> {
-    Ok(monitor_status_value(&state, &capture_state).to_string())
+    let mut status = monitor_status_value(&state, &capture_state);
+    status["power_saving_active"] = serde_json::json!(crate::power::is_saving_power(&app));
+    Ok(status.to_string())
 }
 
 // GPU enumeration and game-mode resource suppression.
