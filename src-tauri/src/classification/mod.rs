@@ -83,7 +83,10 @@ impl TextEncoder for NativeEncoder {
             return Err("classification database changed".into());
         }
         if self.capture_work {
-            postprocess_gate(&self.app)?;
+            // The BGE runtime waits for foreground queries between batches.
+            // Keep completed anchor batches while it waits; all other policy
+            // gates still defer capture work immediately.
+            inference_gate(postprocess_gate(&self.app))?;
         }
         let inference = tokio::time::timeout_at(
             self.deadline,
@@ -104,6 +107,13 @@ impl TextEncoder for NativeEncoder {
         }
         .map_err(|_| "classification inference timed out".to_string())??;
         Ok(result.vectors)
+    }
+}
+
+fn inference_gate(result: Result<(), String>) -> Result<(), String> {
+    match result {
+        Err(reason) if reason == "foreground_request" => Ok(()),
+        result => result,
     }
 }
 
@@ -519,6 +529,78 @@ mod tests {
             "classification inference timed out",
         ] {
             assert!(!scheduling_deferred(error), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn anchor_batches_wait_for_search_without_restarting_completed_inference() {
+        struct SearchAwareEncoder {
+            runtime: Arc<crate::semantic_runtime::SemanticRuntimeState>,
+            batches: Vec<usize>,
+        }
+        impl TextEncoder for SearchAwareEncoder {
+            async fn encode(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+                let foreground = (self.batches.len() == 1).then(|| self.runtime.foreground_lease());
+                inference_gate(if self.runtime.foreground_waiting() {
+                    Err("foreground_request".into())
+                } else {
+                    Ok(())
+                })?;
+                let (result, ()) = tokio::join!(
+                    crate::classification_runtime::wait_for_foreground(
+                        &self.runtime,
+                        std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    ),
+                    async move {
+                        tokio::task::yield_now().await;
+                        drop(foreground);
+                    }
+                );
+                result?;
+                self.batches.push(texts.len());
+                Ok(vec![vec![1.0, 0.0]; texts.len()])
+            }
+        }
+        let batch_size = crate::ml_protocol::MAX_SEMANTIC_BATCH;
+        let mut anchors = scoring::Anchors::new();
+        anchors.insert(
+            "category".into(),
+            (0..batch_size * 2 + 1)
+                .map(|i| {
+                    scoring::Anchor::new(format!("anchor {i}"), "default", 1.0, "global", None)
+                })
+                .collect(),
+        );
+        let mut classifier = Classifier::new(anchors).unwrap();
+        let mut encoder = SearchAwareEncoder {
+            runtime: Arc::new(crate::semantic_runtime::SemanticRuntimeState::new()),
+            batches: Vec::new(),
+        };
+        let input = Input {
+            title: "query".into(),
+            process_name: "app.exe".into(),
+            ocr_text: String::new(),
+        };
+        assert_eq!(
+            classifier
+                .classify(&mut encoder, &input, false)
+                .await
+                .unwrap()
+                .category,
+            "category"
+        );
+        assert_eq!(encoder.batches, [batch_size, batch_size, 1, 1]);
+    }
+
+    #[test]
+    fn waiting_for_search_keeps_power_and_maintenance_gates() {
+        assert!(inference_gate(Err("foreground_request".into())).is_ok());
+        for reason in [
+            "waiting_for_ac_power",
+            "maintenance",
+            "MAINTENANCE_IN_PROGRESS",
+        ] {
+            assert_eq!(inference_gate(Err(reason.into())), Err(reason.into()));
         }
     }
 }

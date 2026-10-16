@@ -144,7 +144,7 @@ fn validate_texts(texts: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn wait_for_foreground(
+pub(crate) async fn wait_for_foreground(
     state: &Arc<SemanticRuntimeState>,
     deadline: Instant,
 ) -> Result<(), String> {
