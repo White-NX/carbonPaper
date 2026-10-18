@@ -10,6 +10,15 @@ top search bar. Disabling recap semantic search parks `recap_index` without
 deleting vectors; enabling it resumes unfinished work. Keyword search remains
 available in either state.
 
+Recap reconciliation publishes saved-vector counts before the first inference
+slice. `recap-search-progress` and `get_background_index_progress.recap` share
+one revisioned snapshot with `total_known`, `phase`, a task-specific
+`wait_reason`, and `last_progress_at_ms` (the last committed checkpoint in this
+application session). Polling only reads counters and scheduling state; the
+existing authorized corpus scan restores counts after restart. Waiting retains
+the saved percentage, and an unknown total has no numeric percentage or fixed
+fill. Empty and fully indexed corpora clear the task indicator.
+
 ## Admission
 
 `background_scheduling_mode` is a partial preference in `get_advanced_config`

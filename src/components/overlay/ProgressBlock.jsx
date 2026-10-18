@@ -1,6 +1,31 @@
 import React from 'react';
 import { cn } from '../../lib/utils';
 
+/** Shared counted/indeterminate bar, including the search field background. */
+export function ProgressBar({ label, percent, active = true, variant = 'default', className }) {
+  const value = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : null;
+  const background = variant === 'background';
+  return (
+    <div
+      role="progressbar"
+      aria-label={typeof label === 'string' ? label : undefined}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={value ?? undefined}
+      className={cn(background
+        ? 'pointer-events-none absolute inset-0 overflow-hidden'
+        : 'h-2 w-full overflow-hidden rounded-full border border-ide-border bg-ide-bg', className)}
+    >
+      <div
+        className={cn('h-full bg-ide-accent transition-all duration-300 ease-out',
+          background ? (active ? 'opacity-20' : 'opacity-10') : 'rounded-full',
+          value === null && active && 'w-1/3 animate-pulse')}
+        style={value !== null || !active ? { width: `${value ?? 0}%` } : undefined}
+      />
+    </div>
+  );
+}
+
 /**
  * Label, counts and a bar. Pass `current`/`total` for a counted run, `percent`
  * when only a ratio is known, or neither for an indeterminate bar.
@@ -23,19 +48,7 @@ export function ProgressBlock({ label, current, total, percent, showCount = true
           )}
         </div>
       )}
-      <div
-        role="progressbar"
-        aria-label={typeof label === 'string' ? label : undefined}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={value ?? undefined}
-        className="h-2 w-full overflow-hidden rounded-full border border-ide-border bg-ide-bg"
-      >
-        <div
-          className={cn('h-full rounded-full bg-ide-accent transition-all duration-300 ease-out', value === null && 'w-1/3 animate-pulse')}
-          style={value !== null ? { width: `${value}%` } : undefined}
-        />
-      </div>
+      <ProgressBar label={label} percent={value} />
       {detail && <p className="text-xs text-ide-muted">{detail}</p>}
     </div>
   );

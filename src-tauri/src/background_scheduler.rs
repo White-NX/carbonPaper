@@ -684,6 +684,35 @@ pub(crate) fn gate_reason_for_kind(
     gate_reason(app, manual)
 }
 
+/// Explain this automatic task's admission, independently of whichever task
+/// most recently updated the scheduler-wide diagnostic reason.
+pub(crate) fn task_wait_reason(app: &AppHandle, kind: BackgroundTaskKind) -> Option<&'static str> {
+    if let Some(reason) = gate_reason_for_kind(app, false, kind) {
+        return Some(reason);
+    }
+    if app
+        .state::<Arc<SemanticRuntimeState>>()
+        .external_background_waiting()
+    {
+        return Some("external_background_request");
+    }
+    if app
+        .try_state::<Arc<BackgroundSchedulerState>>()
+        .is_some_and(|scheduler| {
+            scheduler
+                .runtime
+                .running_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+                .is_some_and(|task| task != kind.as_str())
+        })
+    {
+        return Some("other_task");
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnvironmentPolicy {
     IdleOnly,
@@ -966,6 +995,11 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             continue;
         };
         let storage = storage_state.inner().clone();
+        let recap_revision = app
+            .state::<crate::ai::recap::RecapSearchRuntime>()
+            .progress()
+            .run
+            .revision;
         let tasks = match tokio::task::spawn_blocking({
             let storage = storage.clone();
             move || storage.background_scheduler_tasks()
@@ -982,6 +1016,12 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 continue;
             }
         };
+        app.state::<crate::ai::recap::RecapSearchRuntime>()
+            .sync_scheduler_progress(
+                &app,
+                tasks.iter().find(|task| task.task_kind == TASK_RECAP_INDEX),
+                recap_revision,
+            );
         let now = now_ms();
         runtime.adaptive.pending.store(
             tasks

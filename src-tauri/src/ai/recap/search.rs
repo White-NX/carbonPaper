@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use zeroize::Zeroize;
 
-use super::{runner::privacy_hash, types::*, with_current_day};
+use super::{runner::privacy_hash, types::*, with_current_day, RecapIndexProgress};
 use crate::ai::provider::Cancellation;
 use crate::credential_manager::CredentialManagerState;
 use crate::minilm_contract::{
@@ -173,9 +173,11 @@ pub struct RecapSearchStatus {
 
 #[derive(Default)]
 struct IndexRun {
-    progress: crate::index_progress::IndexRunProgress,
+    progress: RecapIndexProgress,
+    counts_identity: Option<Identity>,
     cancel: Option<Arc<Cancellation>>,
     error: Option<String>,
+    stop_reason: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -187,17 +189,91 @@ pub struct RecapSearchRuntime {
 }
 
 impl RecapSearchRuntime {
-    pub fn progress(&self) -> crate::index_progress::IndexRunProgress {
+    pub fn progress(&self) -> RecapIndexProgress {
         self.index
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .progress
     }
 
+    fn update_progress(&self, update: impl FnOnce(&mut IndexRun)) -> Option<RecapIndexProgress> {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = index.progress;
+        update(&mut index);
+        if index.progress == previous {
+            return None;
+        }
+        index.progress.run.revision = previous.run.revision + 1;
+        Some(index.progress)
+    }
+
+    pub(crate) fn sync_scheduler_progress(
+        &self,
+        app: &tauri::AppHandle,
+        task: Option<&crate::storage::BackgroundTaskState>,
+        expected_revision: u64,
+    ) -> RecapIndexProgress {
+        let wait_reason = task
+            .filter(|task| matches!(task.status.as_str(), "queued" | "running" | "retry_wait"))
+            .and_then(|_| {
+                crate::background_scheduler::task_wait_reason(
+                    app,
+                    crate::background_scheduler::BackgroundTaskKind::RecapIndex,
+                )
+            });
+        let progress = self.update_progress(|index| {
+            // A ledger read queued behind storage must not overwrite a newer
+            // count, checkpoint or run transition with its old task state.
+            if index.progress.run.revision != expected_revision || index.cancel.is_some() {
+                return;
+            }
+            index
+                .progress
+                .sync_task(task, wait_reason, chrono::Utc::now().timestamp_millis());
+        });
+        emit_index_progress(app, progress);
+        self.progress()
+    }
+
+    fn publish_counts(&self, app: &tauri::AppHandle, corpus: &Arc<Corpus>, committed: bool) {
+        let progress = {
+            let current = self.corpus.lock().unwrap_or_else(|e| e.into_inner());
+            if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, corpus)) {
+                return;
+            }
+            // Read and publish under the same locks so a concurrent status
+            // scan cannot restore the count from before a committed batch.
+            let vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
+            self.update_progress(|index| {
+                if index.counts_identity.as_ref() != Some(&corpus.identity) {
+                    index.counts_identity = Some(corpus.identity.clone());
+                    index.progress.run.run_id += 1;
+                }
+                index.progress.total_known = true;
+                index.progress.run.total = corpus.total_chunks as u64;
+                index.progress.run.processed = vectors.len() as u64;
+                index.progress.run.indexed = vectors.len() as u64;
+                if committed {
+                    index.progress.last_progress_at_ms =
+                        Some(chrono::Utc::now().timestamp_millis());
+                }
+                if index.cancel.is_none() && index.progress.complete() {
+                    index.progress.set_phase("idle");
+                }
+            })
+        };
+        emit_index_progress(app, progress);
+    }
+
     pub fn cancel(&self) -> bool {
-        let index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cancel) = &index.cancel {
             cancel.cancel();
+            if !index.progress.run.stopping {
+                index.progress.run.stopping = true;
+                index.progress.set_phase("stopping");
+                index.progress.run.revision += 1;
+            }
             true
         } else {
             false
@@ -209,6 +285,12 @@ impl RecapSearchRuntime {
         self.cancel();
         *self.corpus.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.index.lock().unwrap_or_else(|e| e.into_inner()).error = None;
+    }
+}
+
+fn emit_index_progress(app: &tauri::AppHandle, progress: Option<RecapIndexProgress>) {
+    if let Some(progress) = progress {
+        let _ = app.emit("recap-search-progress", progress);
     }
 }
 
@@ -728,6 +810,7 @@ pub fn status(app: &tauri::AppHandle) -> Result<RecapSearchStatus, String> {
     };
     drop(index);
     corpus.identity.check(app)?;
+    runtime.publish_counts(app, &corpus, false);
     Ok(result)
 }
 
@@ -746,12 +829,19 @@ impl Drop for IndexGuard {
                 .is_some_and(|c| Arc::ptr_eq(c, &self.cancel))
             {
                 index.cancel = None;
-                index.progress.running = false;
-                index.progress.revision += 1;
+                index.progress.run.running = false;
+                index.progress.run.stopping = false;
+                if index.progress.complete() {
+                    index.progress.set_phase("idle");
+                } else {
+                    let reason = index.stop_reason.take();
+                    index.progress.wait(reason);
+                }
+                index.progress.run.revision += 1;
             }
             index.progress
         };
-        let _ = self.app.emit("recap-search-progress", progress);
+        emit_index_progress(&self.app, Some(progress));
     }
 }
 
@@ -825,23 +915,35 @@ async fn prepare_run(app: tauri::AppHandle, automatic: bool) -> Result<bool, Tas
         let cancel = Cancellation::new();
         index.cancel = Some(cancel.clone());
         index.error = None;
-        index.progress.running = true;
-        index.progress.revision += 1;
+        index.stop_reason = None;
+        index.progress.run.running = true;
+        index.progress.run.stopping = false;
+        index.progress.set_phase("preparing");
+        index.progress.run.revision += 1;
         (cancel, index.progress)
     };
     let _guard = IndexGuard {
         app: app.clone(),
         cancel: cancel.clone(),
     };
-    let _ = app.emit("recap-search-progress", progress);
+    emit_index_progress(&app, Some(progress));
     let result = prepare_inner(&app, &cancel, automatic).await;
     if let Err(error) = &result {
-        app.state::<RecapSearchRuntime>()
-            .index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .error = (!error.is_pause() && !matches!(error, TaskError::AuthenticationRequired))
+        let runtime = app.state::<RecapSearchRuntime>();
+        let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
+        index.error = (!error.is_pause() && !matches!(error, TaskError::AuthenticationRequired))
             .then(|| error.to_string());
+        index.stop_reason = crate::background_policy::current_execution()
+            .and_then(|lease| lease.reason())
+            .or(Some(match error {
+                TaskError::Paused(reason) => *reason,
+                TaskError::AuthenticationRequired => "waiting_for_unlock",
+                TaskError::Failed(message) if message == "AUTH_REQUIRED" => "waiting_for_unlock",
+                TaskError::Failed(message) if message == "RECAP_SOURCE_CHANGED" => "source_changed",
+                _ if error.is_pause() => "cancelled",
+                _ if crate::semantic_runtime::is_deterministic_worker_failure(error) => "failed",
+                _ => "retry_wait",
+            }));
     }
     result
 }
@@ -856,16 +958,20 @@ async fn prepare_inner(
         .await
         .map_err(|error| worker_failure("index_load", error))??;
     let (mut indexed_chunks, total_chunks) = counts(&corpus);
-    let progress = {
-        let runtime = app.state::<RecapSearchRuntime>();
-        let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
-        index.progress.total = total_chunks as u64;
-        index.progress.processed = indexed_chunks as u64;
-        index.progress.indexed = indexed_chunks as u64;
-        index.progress.revision += 1;
-        index.progress
-    };
-    let _ = app.emit("recap-search-progress", progress);
+    let runtime = app.state::<RecapSearchRuntime>();
+    runtime.publish_counts(app, &corpus, false);
+    if indexed_chunks == total_chunks {
+        corpus.identity.check(app)?;
+        return Ok(false);
+    }
+    emit_index_progress(
+        app,
+        runtime.update_progress(|index| {
+            if !index.progress.run.stopping {
+                index.progress.set_phase("running");
+            }
+        }),
+    );
     // Explicit preparation shares the worker fairly with interactive queries
     // and asks automatic model passes to yield until preparation ends.
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
@@ -966,16 +1072,8 @@ async fn prepare_inner(
                     .unwrap_or_else(|e| e.into_inner())
                     .extend(std::mem::take(&mut additions.vectors));
                 indexed_chunks += batch.len();
-                let progress = {
-                    let runtime = app.state::<RecapSearchRuntime>();
-                    let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
-                    index.progress.processed = indexed_chunks as u64;
-                    index.progress.indexed = indexed_chunks as u64;
-                    index.progress.revision += 1;
-                    index.progress
-                };
+                runtime.publish_counts(app, &corpus, true);
                 crate::background_activity::index_progress(batch.len() as u64);
-                let _ = app.emit("recap-search-progress", progress);
                 if automatic {
                     return Ok(indexed_chunks < total_chunks);
                 }

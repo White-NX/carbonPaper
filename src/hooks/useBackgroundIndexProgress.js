@@ -13,7 +13,7 @@ function mergeRun(previous, incoming) {
 }
 
 export function isIndexTaskPending(run) {
-  return ['queued', 'running', 'stopping', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait'].includes(run?.phase)
+  return ['queued', 'preparing', 'running', 'stopping', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait'].includes(run?.phase)
     || Boolean(run?.running);
 }
 
@@ -77,11 +77,13 @@ export function useBackgroundIndexProgress(active = true) {
         ...previous,
         recap: mergeRun(previous.recap, {
           ...payload,
-          phase: payload.running ? 'running' : payload.processed < payload.total ? 'queued' : 'idle',
+          phase: payload.phase || (payload.running ? 'running' : payload.processed < payload.total ? 'queued' : 'idle'),
         }),
       }));
     }
-    refresh();
+    // Current events carry the same complete, ordered snapshot as polling.
+    // Only legacy notifications need another storage-backed status request.
+    if (!payload?.phase) refresh();
   }, [refresh], active);
 
   return { progress, refresh };

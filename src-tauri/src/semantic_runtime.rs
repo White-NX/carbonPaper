@@ -1926,13 +1926,12 @@ impl IndexTaskProgress {
 pub struct BackgroundIndexProgress {
     pub semantic: IndexTaskProgress,
     pub clip: IndexTaskProgress,
-    pub recap: IndexTaskProgress,
+    pub recap: crate::ai::recap::RecapIndexProgress,
 }
 
-/// Read both manual index runs at once.
-///
-/// One command rather than two because the caller is a four-second poll loop and
-/// one IPC round trip is cheaper than two for data this small.
+/// Read manual screenshot indexing and automatic recap indexing together.
+/// Recap counts come from the existing authorized corpus scan; this poll only
+/// reconciles scheduling state and never decrypts or loads the recap corpus.
 ///
 /// Deliberately *not* session-guarded, for the same reason
 /// [`crate::clip_index::clip_index_stop_now`] is not: a CLIP backfill of a full
@@ -1941,11 +1940,13 @@ pub struct BackgroundIndexProgress {
 /// thing it exists to explain. It returns counters and no user data.
 #[tauri::command]
 pub async fn get_background_index_progress(
+    app: AppHandle,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
     recap_run: tauri::State<'_, crate::ai::recap::RecapSearchRuntime>,
 ) -> Result<BackgroundIndexProgress, String> {
+    let recap_revision = recap_run.progress().run.revision;
     let read_storage = storage.inner().clone();
     let tasks = tokio::task::spawn_blocking(move || read_storage.background_scheduler_tasks())
         .await
@@ -1954,17 +1955,7 @@ pub async fn get_background_index_progress(
     let recap_task = tasks
         .iter()
         .find(|row| row.task_kind == crate::background_scheduler::TASK_RECAP_INDEX);
-    let mut recap = IndexTaskProgress::resolve(recap_run.progress(), recap_task, read_wait_reason);
-    // Recap indexing is automatic; unlike screenshot backfills its progress
-    // remains visible between the scheduler's small resumable slices.
-    if recap.phase == "idle" {
-        recap.phase = match recap_task.map(|row| row.status.as_str()) {
-            Some("running") => "running",
-            Some("queued") => read_wait_reason.unwrap_or("queued"),
-            Some("retry_wait") => "retry_wait",
-            _ => "idle",
-        };
-    }
+    let recap = recap_run.sync_scheduler_progress(&app, recap_task, recap_revision);
     Ok(BackgroundIndexProgress {
         recap,
         semantic: IndexTaskProgress::resolve(

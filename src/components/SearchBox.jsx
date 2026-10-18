@@ -1,8 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
+import { Image as ImageIcon, Type, Loader2, Clock3, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
+import { ProgressBar } from './overlay/ProgressBlock';
+import { Banner } from './ui/Banner';
+
+function ActiveIndexIcon({ className, ...props }) {
+    return <Loader2 {...props} className={`${className || ''} animate-spin`} />;
+}
 
 export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
     const { t } = useTranslation();
@@ -35,9 +41,12 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         hasClipIndexTask,
         clipIndexTaskLabel,
         hasRecapIndexTask,
-        recapIndexPercent,
+        recapIndexActive,
+        recapIndexFailed,
+        recapIndexTaskLabel,
         showProgressBar,
         progressFillPercent,
+        progressActive,
         taskSummaryPlaceholder,
         isDownloadingModels,
         toggleMode,
@@ -66,11 +75,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             data-keep-selection="true"
         >
             <div className="relative flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm overflow-hidden">
-                {showProgressBar && (
-                    <div
-                        className="pointer-events-none absolute inset-y-0 left-0 bg-sky-500/35 dark:bg-sky-400/20 transition-all duration-500"
-                        style={{ width: `${progressFillPercent}%` }}
-                    />
+                {showProgressBar && (progressFillPercent !== null || progressActive) && (
+                    <ProgressBar variant="background" label={taskSummaryPlaceholder}
+                        percent={progressFillPercent} active={progressActive} />
                 )}
                 <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
                 <button
@@ -226,17 +233,12 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         </div>
                     )}
                     {hasRecapIndexTask && (
-                        <div className="shrink-0 border-b border-ide-border bg-violet-500/10 p-3">
-                            <div className="flex items-center gap-2 text-violet-500 text-sm font-bold">
-                                <Loader2 size={14} className="animate-spin" />
-                                {t('search.task.recapIndexRunningTitle')}
-                            </div>
-                            <div className="mt-1 text-xs leading-relaxed text-ide-muted">
-                                {t('search.task.recapIndexRunningDesc', {
-                                    progress: recapIndexPercent === null ? '…' : Math.round(recapIndexPercent),
-                                })}
-                            </div>
-                        </div>
+                        <Banner tone={recapIndexFailed ? 'error' : 'info'}
+                            title={t('search.task.recapIndexTitle')}
+                            icon={recapIndexActive ? ActiveIndexIcon : recapIndexFailed ? undefined : Clock3}
+                            className="shrink-0 rounded-none border-x-0 border-t-0 p-3">
+                            {recapIndexTaskLabel}
+                        </Banner>
                     )}
                     {isMigrating && (
                         <div className="p-3 bg-yellow-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">

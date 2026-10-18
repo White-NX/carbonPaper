@@ -4,6 +4,7 @@ mod progress;
 mod runner;
 mod screening;
 pub(crate) mod search;
+mod search_progress;
 mod selection;
 mod summary;
 pub mod types;
@@ -16,6 +17,7 @@ pub use search::{
     prepare as prepare_search, search as search_activities, status as search_status,
     RecapSearchQuery, RecapSearchResult, RecapSearchRuntime, RecapSearchStatus,
 };
+pub use search_progress::RecapIndexProgress;
 pub use types::*;
 pub use unified::{search as search_unified, UnifiedSearchQuery, UnifiedSearchResult};
 pub(crate) use views::with_current_day;
