@@ -15,14 +15,28 @@ use zeroize::Zeroize;
 use super::{runner::privacy_hash, types::*, with_current_day};
 use crate::ai::provider::Cancellation;
 use crate::credential_manager::CredentialManagerState;
-use crate::minilm_contract::{validate_minilm_vector, MINILM_VECTOR_SPACE_REVISION};
-use crate::ml_protocol::MlSemanticModel;
-use crate::semantic_runtime::SemanticRuntimeState;
+use crate::minilm_contract::{
+    validate_minilm_vector, MINILM_DIMENSIONS, MINILM_MODEL_ID, MINILM_VECTOR_SPACE_REVISION,
+};
+use crate::ml_protocol::{MlErrorKind, MlSemanticModel};
+use crate::semantic_runtime::{
+    SemanticEmbeddingResult, SemanticRuntimeState, SemanticRuntimeStatus, SemanticTimeouts,
+};
 use crate::sensitive_filter::SensitiveFilterState;
 use crate::storage::StorageState;
+use crate::task_error::TaskError;
 
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 const ENCODE_BATCH: usize = 4;
+const SAVE_SHARD: usize = 64;
+const QUERY_EMBED_TIMEOUT: SemanticTimeouts = SemanticTimeouts {
+    warm: Duration::from_secs(5),
+    // Debug worker measurements took 5.3-5.7 seconds for model verification,
+    // tokenizer setup and ONNX session construction. Allow that one-time cost
+    // to complete while keeping warm requests on their original deadline.
+    cold: Duration::from_secs(20),
+};
+const INDEX_EMBED_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +58,9 @@ pub struct RecapSearchQuery {
     pub offset: usize,
     pub limit: usize,
     pub ranking_revision: Option<String>,
+    pub process_names: Vec<String>,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
 }
 
 impl Default for RecapSearchQuery {
@@ -57,6 +74,9 @@ impl Default for RecapSearchQuery {
             offset: 0,
             limit: 20,
             ranking_revision: None,
+            process_names: Vec::new(),
+            start_ms: None,
+            end_ms: None,
         }
     }
 }
@@ -83,12 +103,26 @@ impl RecapSearchQuery {
         if matches!((&self.start_date, &self.end_date), (Some(a), Some(b)) if a > b) {
             return Err("RECAP_INVALID_DATE".into());
         }
+        if matches!((self.start_ms, self.end_ms), (Some(a), Some(b)) if a > b) {
+            return Err("RECAP_INVALID_DATE".into());
+        }
         Ok(())
     }
 
     fn includes(&self, date: &str) -> bool {
         self.start_date.as_deref().is_none_or(|start| date >= start)
             && self.end_date.as_deref().is_none_or(|end| date <= end)
+    }
+
+    fn includes_activity(&self, activity: &RecapActivity) -> bool {
+        self.start_ms.is_none_or(|start| activity.end_ms >= start)
+            && self.end_ms.is_none_or(|end| activity.start_ms <= end)
+            && (self.process_names.is_empty()
+                || activity.sources.iter().any(|source| {
+                    self.process_names
+                        .iter()
+                        .any(|name| source.process_name.eq_ignore_ascii_case(name))
+                }))
     }
 }
 
@@ -119,6 +153,8 @@ pub struct RecapSearchResult {
     pub next_offset: Option<usize>,
     pub mode: SearchMode,
     pub semantic_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_error: Option<String>,
     pub indexed_chunks: usize,
     pub total_chunks: usize,
     pub elapsed_ms: u64,
@@ -137,6 +173,7 @@ pub struct RecapSearchStatus {
 
 #[derive(Default)]
 struct IndexRun {
+    progress: crate::index_progress::IndexRunProgress,
     cancel: Option<Arc<Cancellation>>,
     error: Option<String>,
 }
@@ -144,11 +181,19 @@ struct IndexRun {
 #[derive(Default)]
 pub struct RecapSearchRuntime {
     serial: AtomicU64,
+    loading: Mutex<()>,
     corpus: Mutex<Option<Arc<Corpus>>>,
     index: Mutex<IndexRun>,
 }
 
 impl RecapSearchRuntime {
+    pub fn progress(&self) -> crate::index_progress::IndexRunProgress {
+        self.index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .progress
+    }
+
     pub fn cancel(&self) -> bool {
         let index = self.index.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cancel) = &index.cancel {
@@ -168,7 +213,7 @@ impl RecapSearchRuntime {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct Identity {
+pub(super) struct Identity {
     generation: u64,
     epoch: i64,
     privacy: String,
@@ -176,7 +221,7 @@ struct Identity {
     session: Option<Instant>,
 }
 
-fn identity(app: &tauri::AppHandle) -> Result<Identity, String> {
+pub(super) fn identity(app: &tauri::AppHandle) -> Result<Identity, String> {
     if !app
         .state::<Arc<CredentialManagerState>>()
         .is_session_valid()
@@ -200,14 +245,40 @@ fn identity(app: &tauri::AppHandle) -> Result<Identity, String> {
     })
 }
 
+pub(crate) fn semantic_enabled(app: &tauri::AppHandle) -> Result<bool, String> {
+    let storage = app.state::<Arc<StorageState>>();
+    Ok(storage
+        .recap_read::<RecapSettings>("settings", "settings", None)?
+        .unwrap_or_default()
+        .semantic_search_enabled)
+}
+
+/// Changes enqueue automatic work; scheduler reconciliation also catches source
+/// and privacy changes that arrive without a recap UI event.
+pub(crate) fn schedule_index(app: &tauri::AppHandle) {
+    if semantic_enabled(app).is_ok_and(|enabled| enabled) {
+        if let Some(scheduler) =
+            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        {
+            if let Err(error) = scheduler.enqueue(
+                app,
+                crate::background_scheduler::BackgroundTaskKind::RecapIndex,
+                false,
+            ) {
+                tracing::debug!("[RECAP:SEARCH] Failed to queue index: {error}");
+            }
+        }
+    }
+}
+
 impl Identity {
-    fn token(&self) -> String {
+    pub(super) fn token(&self) -> String {
         digest(&format!(
             "{}:{}:{}:{}:{:?}",
             self.generation, self.epoch, self.privacy, self.serial, self.session
         ))
     }
-    fn check(&self, app: &tauri::AppHandle) -> Result<(), String> {
+    pub(super) fn check(&self, app: &tauri::AppHandle) -> Result<(), String> {
         if self != &identity(app)? {
             return Err("RECAP_SOURCE_CHANGED".into());
         }
@@ -226,17 +297,35 @@ struct Document {
     batch_start_ms: i64,
     activity: RecapActivity,
     chunks: Vec<Chunk>,
+    keywords: KeywordText,
+}
+
+impl Document {
+    fn new(date: String, revision: i64, batch_start_ms: i64, activity: RecapActivity) -> Self {
+        Self {
+            date,
+            revision,
+            batch_start_ms,
+            chunks: chunks(&activity),
+            keywords: KeywordText::new(&activity),
+            activity,
+        }
+    }
 }
 struct Corpus {
     identity: Identity,
     documents: Vec<Document>,
-    vectors: Mutex<BTreeMap<String, Vec<f32>>>,
+    total_chunks: usize,
+    dates: usize,
+    vectors: Mutex<HashMap<String, Vec<f32>>>,
 }
 
 impl Drop for Corpus {
     fn drop(&mut self) {
         for document in &mut self.documents {
             document.date.zeroize();
+            document.keywords.title.zeroize();
+            document.keywords.text.zeroize();
             let activity = &mut document.activity;
             activity.task_title.zeroize();
             activity.text.zeroize();
@@ -267,6 +356,183 @@ struct SavedVectors {
     version: u32,
     model_revision: String,
     vectors: BTreeMap<String, Vec<f32>>,
+}
+
+impl Drop for SavedVectors {
+    fn drop(&mut self) {
+        for vector in self.vectors.values_mut() {
+            vector.zeroize();
+        }
+    }
+}
+
+impl SavedVectors {
+    fn checkpoint(
+        shard: &[(&str, &str)],
+        vectors: &HashMap<String, Vec<f32>>,
+        additions: &BTreeMap<String, Vec<f32>>,
+    ) -> Self {
+        Self {
+            version: INDEX_VERSION,
+            model_revision: MINILM_VECTOR_SPACE_REVISION.into(),
+            vectors: shard
+                .iter()
+                .filter_map(|(key, _)| {
+                    additions
+                        .get(*key)
+                        .or_else(|| vectors.get(*key))
+                        .map(|v| (key.to_string(), v.clone()))
+                })
+                .collect(),
+        }
+    }
+}
+
+struct EmbeddingAttempt {
+    request_id: String,
+    stage: &'static str,
+    timeout: SemanticTimeouts,
+    batch_size: usize,
+    input_bytes: usize,
+    indexed_chunks: usize,
+    total_chunks: usize,
+    started: Instant,
+}
+
+impl EmbeddingAttempt {
+    fn failure(&self, error: &TaskError, status: &SemanticRuntimeStatus) -> String {
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let warm_timeout_ms = self.timeout.warm.as_millis() as u64;
+        let cold_timeout_ms = self.timeout.cold.as_millis() as u64;
+        // Record runtime metadata without serializing unrelated backend state,
+        // search text, recap content or the returned vectors.
+        let runtime = serde_json::json!({
+            "state": status.state,
+            "provider": status.provider,
+            "worker_version": status.worker_version,
+            "ort_version": status.ort_version,
+            "runtime_path": status.runtime_path,
+            "loaded_model": status.loaded_model,
+            "model_revision": status.model_revision,
+            "restart_count": status.restart_count,
+            "last_error_kind": status.last_error_kind,
+            "last_error": status.last_error,
+            "directml_disabled_for_session": status.directml_disabled_for_session,
+        });
+        tracing::warn!(target: "recap", request_id = %self.request_id, stage = self.stage,
+            model = MINILM_MODEL_ID, batch_size = self.batch_size, input_bytes = self.input_bytes,
+            indexed_chunks = self.indexed_chunks, total_chunks = self.total_chunks,
+            warm_timeout_ms, cold_timeout_ms, elapsed_ms, error_kind = error.code(), detail = error.message(),
+            runtime = %runtime, "[RECAP:SEARCH] Embedding failed");
+        format!(
+            "RECAP_SEARCH_MODEL_UNAVAILABLE: {error}\n\
+             stage={} request_id={} model={MINILM_MODEL_ID} batch_size={} input_bytes={} \
+             indexed_chunks={} total_chunks={} warm_timeout_ms={warm_timeout_ms} \
+             cold_timeout_ms={cold_timeout_ms} elapsed_ms={elapsed_ms}\n\
+             runtime={runtime}",
+            self.stage,
+            self.request_id,
+            self.batch_size,
+            self.input_bytes,
+            self.indexed_chunks,
+            self.total_chunks,
+        )
+    }
+}
+
+fn validate_embeddings(result: &SemanticEmbeddingResult, expected: usize) -> Result<(), TaskError> {
+    if result.model != MlSemanticModel::MinilmL12 {
+        return Err(TaskError::worker(
+            MlErrorKind::Protocol,
+            format!("Expected MiniLM embeddings, got {:?}", result.model),
+        ));
+    }
+    if result.vectors.len() != expected {
+        return Err(TaskError::worker(
+            MlErrorKind::Protocol,
+            format!(
+                "Expected {expected} MiniLM embeddings, got {} (reported dimensions: {})",
+                result.vectors.len(),
+                result.dimensions,
+            ),
+        ));
+    }
+    if result.dimensions != MINILM_DIMENSIONS {
+        return Err(TaskError::worker(
+            MlErrorKind::Protocol,
+            format!(
+                "Expected {MINILM_DIMENSIONS} MiniLM dimensions, worker reported {}",
+                result.dimensions,
+            ),
+        ));
+    }
+    for (index, vector) in result.vectors.iter().enumerate() {
+        validate_minilm_vector(vector).map_err(|detail| {
+            TaskError::worker(
+                MlErrorKind::Inference,
+                format!("Invalid MiniLM embedding at batch index {index}: {detail}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn embed_minilm(
+    app: &tauri::AppHandle,
+    texts: Vec<String>,
+    stage: &'static str,
+    timeout: SemanticTimeouts,
+    indexed_chunks: usize,
+    total_chunks: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    let attempt = EmbeddingAttempt {
+        request_id: crate::maintenance_support::new_run_id("recap-search"),
+        stage,
+        timeout,
+        batch_size: texts.len(),
+        input_bytes: texts.iter().map(String::len).sum(),
+        indexed_chunks,
+        total_chunks,
+        started: Instant::now(),
+    };
+    tracing::info!(target: "recap", request_id = %attempt.request_id, stage,
+        model = MINILM_MODEL_ID, batch_size = attempt.batch_size, input_bytes = attempt.input_bytes,
+        indexed_chunks, total_chunks,
+        warm_timeout_ms = timeout.warm.as_millis() as u64,
+        cold_timeout_ms = timeout.cold.as_millis() as u64,
+        "[RECAP:SEARCH] Embedding started");
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let result = semantic
+        .embed_text(
+            app.clone(),
+            MlSemanticModel::MinilmL12,
+            texts,
+            timeout,
+            false,
+        )
+        .await
+        .and_then(|result| {
+            validate_embeddings(&result, attempt.batch_size)?;
+            Ok(result)
+        });
+    match result {
+        Ok(result) => {
+            tracing::info!(target: "recap", request_id = %attempt.request_id, stage,
+                elapsed_ms = attempt.started.elapsed().as_millis() as u64,
+                model_load_ms = result.timings.model_load_ms,
+                preprocess_ms = result.timings.preprocess_ms,
+                inference_ms = result.timings.inference_ms,
+                request_total_ms = result.timings.request_total_ms,
+                "[RECAP:SEARCH] Embedding finished");
+            Ok(result.vectors)
+        }
+        Err(error) => Err(attempt.failure(&error, &semantic.status())),
+    }
+}
+
+fn worker_failure(stage: &str, error: tokio::task::JoinError) -> String {
+    tracing::error!(target: "recap", stage, detail = %error, "[RECAP:SEARCH] Task failed");
+    format!("RECAP_WORKER_FAILED: stage={stage}: {error}")
 }
 
 /// Byte-bounded windows are conservative for this multilingual tokenizer's
@@ -360,8 +626,9 @@ fn filtered_activity(
 }
 
 fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
-    let current = identity(app)?;
     let runtime = app.state::<RecapSearchRuntime>();
+    let _loading = runtime.loading.lock().unwrap_or_else(|e| e.into_inner());
+    let current = identity(app)?;
     if let Some(corpus) = runtime
         .corpus
         .lock()
@@ -374,40 +641,41 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
     let storage = app.state::<Arc<StorageState>>();
     let filter = app.state::<Arc<SensitiveFilterState>>();
     let mut documents = Vec::new();
-    let mut vectors = BTreeMap::new();
+    let mut vectors = HashMap::new();
     for (date, revision) in storage.recap_search_days()? {
         current.check(app)?;
         with_current_day(app, &date, |day| {
             for batch in day.batches {
                 for activity in batch.activities {
                     if let Some(activity) = filtered_activity(activity, &filter) {
-                        documents.push(Document {
-                            date: date.clone(),
+                        documents.push(Document::new(
+                            date.clone(),
                             revision,
-                            batch_start_ms: batch.start_ms,
-                            chunks: chunks(&activity),
+                            batch.start_ms,
                             activity,
-                        });
+                        ));
                     }
                 }
             }
             Ok(())
         })?;
-        match storage.recap_read::<SavedVectors>("search", &date, Some(revision)) {
-            Ok(Some(saved))
-                if saved.version == INDEX_VERSION
-                    && saved.model_revision == MINILM_VECTOR_SPACE_REVISION =>
-            {
-                vectors.extend(
-                    saved
-                        .vectors
-                        .into_iter()
-                        .filter(|(_, v)| validate_minilm_vector(v).is_ok()),
-                );
+        for key in storage.recap_payload_keys("search", &date, revision)? {
+            current.check(app)?;
+            match storage.recap_read::<SavedVectors>("search", &key, Some(revision)) {
+                Ok(Some(mut saved))
+                    if saved.version == INDEX_VERSION
+                        && saved.model_revision == MINILM_VECTOR_SPACE_REVISION =>
+                {
+                    vectors.extend(
+                        std::mem::take(&mut saved.vectors)
+                            .into_iter()
+                            .filter(|(_, v)| validate_minilm_vector(v).is_ok()),
+                    );
+                }
+                Ok(_) => (),
+                Err(error) if error == "RECAP_INVALID_CACHE" => (),
+                Err(error) => return Err(error),
             }
-            Ok(_) => (),
-            Err(error) if error == "RECAP_INVALID_CACHE" => (),
-            Err(error) => return Err(error),
         }
     }
     let keys: HashSet<&str> = documents
@@ -417,9 +685,17 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
         .collect();
     vectors.retain(|key, _| keys.contains(key.as_str()));
     current.check(app)?;
+    let total_chunks = keys.len();
+    let dates = documents
+        .iter()
+        .map(|d| &d.date)
+        .collect::<HashSet<_>>()
+        .len();
     let corpus = Arc::new(Corpus {
         identity: current,
         documents,
+        total_chunks,
+        dates,
         vectors: Mutex::new(vectors),
     });
     *runtime.corpus.lock().unwrap_or_else(|e| e.into_inner()) = Some(corpus.clone());
@@ -432,19 +708,8 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
 }
 
 fn counts(corpus: &Corpus) -> (usize, usize) {
-    let keys: HashSet<&str> = corpus
-        .documents
-        .iter()
-        .flat_map(|d| &d.chunks)
-        .map(|c| c.key.as_str())
-        .collect();
     let vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
-    (
-        keys.iter()
-            .filter(|key| vectors.contains_key(**key))
-            .count(),
-        keys.len(),
-    )
+    (vectors.len(), corpus.total_chunks)
 }
 
 pub fn status(app: &tauri::AppHandle) -> Result<RecapSearchStatus, String> {
@@ -458,12 +723,7 @@ pub fn status(app: &tauri::AppHandle) -> Result<RecapSearchStatus, String> {
         indexed_chunks,
         total_chunks,
         activities: corpus.documents.len(),
-        dates: corpus
-            .documents
-            .iter()
-            .map(|d| &d.date)
-            .collect::<HashSet<_>>()
-            .len(),
+        dates: corpus.dates,
         error: index.error.clone(),
     };
     drop(index);
@@ -478,144 +738,252 @@ struct IndexGuard {
 impl Drop for IndexGuard {
     fn drop(&mut self) {
         let runtime = self.app.state::<RecapSearchRuntime>();
-        let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
-        if index
-            .cancel
-            .as_ref()
-            .is_some_and(|c| Arc::ptr_eq(c, &self.cancel))
-        {
-            index.cancel = None;
-        }
-        let _ = self.app.emit("recap-search-progress", ());
+        let progress = {
+            let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
+            if index
+                .cancel
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(c, &self.cancel))
+            {
+                index.cancel = None;
+                index.progress.running = false;
+                index.progress.revision += 1;
+            }
+            index.progress
+        };
+        let _ = self.app.emit("recap-search-progress", progress);
     }
 }
 
 pub async fn prepare(app: tauri::AppHandle) -> Result<(), String> {
+    prepare_run(app, false)
+        .await
+        .map(|_| ())
+        .map_err(String::from)
+}
+
+pub(crate) async fn run_scheduled_slice(
+    app: &tauri::AppHandle,
+) -> Result<crate::background_scheduler::ScheduledSliceResult, TaskError> {
+    if !semantic_enabled(app)? {
+        return Ok(crate::background_scheduler::ScheduledSliceResult::skipped(
+            "disabled",
+        ));
+    }
+    let Ok(_worker) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
+        return Ok(crate::background_scheduler::ScheduledSliceResult::skipped(
+            "semantic_worker_busy",
+        ));
+    };
+    prepare_run(app.clone(), true)
+        .await
+        .map(crate::background_scheduler::ScheduledSliceResult::complete)
+        .map_err(|error| match error {
+            TaskError::Failed(message) if message == "AUTH_REQUIRED" => {
+                TaskError::AuthenticationRequired
+            }
+            TaskError::Failed(message) if message == "RECAP_SOURCE_CHANGED" => {
+                TaskError::Paused("source_changed")
+            }
+            other => other,
+        })
+}
+
+fn index_check(
+    app: &tauri::AppHandle,
+    cancel: &Cancellation,
+    automatic: bool,
+) -> Result<(), TaskError> {
+    if cancel.is_cancelled() {
+        return Err(TaskError::Paused("cancelled"));
+    }
+    if !semantic_enabled(app)? {
+        return Err(TaskError::Paused("disabled"));
+    }
+    if automatic {
+        if let Some(lease) = crate::background_policy::current_execution() {
+            lease.check()?;
+        }
+        if app
+            .state::<Arc<SemanticRuntimeState>>()
+            .foreground_waiting()
+        {
+            return Err(TaskError::Paused("foreground_request"));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_run(app: tauri::AppHandle, automatic: bool) -> Result<bool, TaskError> {
     identity(&app)?;
-    let cancel = {
+    let (cancel, progress) = {
         let runtime = app.state::<RecapSearchRuntime>();
         let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
         if index.cancel.is_some() {
-            return Err("AI_BUSY".into());
+            return Err(TaskError::Paused("recap_index_busy"));
         }
         let cancel = Cancellation::new();
         index.cancel = Some(cancel.clone());
         index.error = None;
-        cancel
+        index.progress.running = true;
+        index.progress.revision += 1;
+        (cancel, index.progress)
     };
     let _guard = IndexGuard {
         app: app.clone(),
         cancel: cancel.clone(),
     };
-    let _ = app.emit("recap-search-progress", ());
-    let result = prepare_inner(&app, &cancel).await;
+    let _ = app.emit("recap-search-progress", progress);
+    let result = prepare_inner(&app, &cancel, automatic).await;
     if let Err(error) = &result {
         app.state::<RecapSearchRuntime>()
             .index
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .error =
-            (!matches!(error.as_str(), "AI_CANCELLED" | "AUTH_REQUIRED")).then(|| error.clone());
+            .error = (!error.is_pause() && !matches!(error, TaskError::AuthenticationRequired))
+            .then(|| error.to_string());
     }
     result
 }
 
-async fn prepare_inner(app: &tauri::AppHandle, cancel: &Arc<Cancellation>) -> Result<(), String> {
+async fn prepare_inner(
+    app: &tauri::AppHandle,
+    cancel: &Arc<Cancellation>,
+    automatic: bool,
+) -> Result<bool, TaskError> {
     let load_app = app.clone();
     let corpus = tokio::task::spawn_blocking(move || load_corpus(&load_app))
         .await
-        .map_err(|_| "RECAP_WORKER_FAILED")??;
-    let days: BTreeMap<&str, Vec<&Document>> =
+        .map_err(|error| worker_failure("index_load", error))??;
+    let (mut indexed_chunks, total_chunks) = counts(&corpus);
+    let progress = {
+        let runtime = app.state::<RecapSearchRuntime>();
+        let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
+        index.progress.total = total_chunks as u64;
+        index.progress.processed = indexed_chunks as u64;
+        index.progress.indexed = indexed_chunks as u64;
+        index.progress.revision += 1;
+        index.progress
+    };
+    let _ = app.emit("recap-search-progress", progress);
+    // Explicit preparation shares the worker fairly with interactive queries
+    // and asks automatic model passes to yield until preparation ends.
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let _foreground = (!automatic).then(|| semantic.foreground_lease());
+    let days =
         corpus
             .documents
             .iter()
-            .fold(BTreeMap::new(), |mut days, d| {
+            .fold(BTreeMap::<&str, Vec<&Document>>::new(), |mut days, d| {
                 days.entry(&d.date).or_default().push(d);
                 days
             });
     for (date, documents) in days {
-        let all: BTreeMap<&str, &str> = documents
+        let all: Vec<_> = documents
             .iter()
             .flat_map(|d| &d.chunks)
             .map(|c| (c.key.as_str(), c.text.as_str()))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
             .collect();
-        let missing: Vec<_> = {
-            let vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
-            all.iter()
-                .filter(|(key, _)| !vectors.contains_key(**key))
-                .map(|(key, text)| (*key, *text))
-                .collect()
-        };
-        for batch in missing.chunks(ENCODE_BATCH) {
-            corpus.identity.check(app)?;
-            if cancel.is_cancelled() {
-                return Err("AI_CANCELLED".into());
-            }
-            let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
-            let encoding = semantic.embed_text(
-                app.clone(),
-                MlSemanticModel::MinilmL12,
-                batch.iter().map(|(_, text)| text.to_string()).collect(),
-                Duration::from_secs(60),
-                false,
-            );
-            let monitor = async {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    corpus.identity.check(app)?;
-                    if cancel.is_cancelled() {
-                        return Err::<(), String>("AI_CANCELLED".into());
-                    }
-                }
-            };
-            let encoded = tokio::select! {
-                result = encoding => result.map_err(|_| "RECAP_SEARCH_MODEL_UNAVAILABLE".to_string())?,
-                result = monitor => { result?; unreachable!() }
-            };
-            corpus.identity.check(app)?;
-            if cancel.is_cancelled() {
-                return Err("AI_CANCELLED".into());
-            }
-            if encoded.vectors.len() != batch.len()
-                || encoded
-                    .vectors
-                    .iter()
-                    .any(|v| validate_minilm_vector(v).is_err())
-            {
-                return Err("RECAP_SEARCH_MODEL_UNAVAILABLE".into());
-            }
-            let saved = {
-                let mut vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
-                vectors.extend(
-                    batch
+        // Stable, bounded shards cap rewriting at 64 vectors per commit. Saving
+        // every inference batch preserves cancellation/restart progress without
+        // serializing the whole day's accumulated vectors each time.
+        for shard in all.chunks(SAVE_SHARD) {
+            let shard_key = format!(
+                "{date}:{}",
+                digest(
+                    &shard
                         .iter()
-                        .zip(encoded.vectors)
-                        .map(|((key, _), vector)| (key.to_string(), vector)),
+                        .map(|(key, _)| *key)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            );
+            let missing: Vec<_> = {
+                let vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
+                shard
+                    .iter()
+                    .filter(|(key, _)| !vectors.contains_key(*key))
+                    .copied()
+                    .collect()
+            };
+            for batch in missing.chunks(ENCODE_BATCH) {
+                corpus.identity.check(app)?;
+                index_check(app, cancel, automatic)?;
+                let encoding = semantic.embed_text(
+                    app.clone(),
+                    MlSemanticModel::MinilmL12,
+                    batch.iter().map(|(_, text)| text.to_string()).collect(),
+                    INDEX_EMBED_TIMEOUT,
+                    false,
                 );
-                SavedVectors {
+                let monitor = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        corpus.identity.check(app)?;
+                        index_check(app, cancel, automatic)?;
+                        if cancel.is_cancelled() {
+                            return Err::<(), TaskError>(TaskError::Paused("cancelled"));
+                        }
+                    }
+                };
+                let encoded = tokio::select! {
+                    result = encoding => { let result = result?; validate_embeddings(&result, batch.len())?; result.vectors },
+                    result = monitor => { result?; unreachable!() }
+                };
+                corpus.identity.check(app)?;
+                index_check(app, cancel, automatic)?;
+                let mut additions = SavedVectors {
                     version: INDEX_VERSION,
                     model_revision: MINILM_VECTOR_SPACE_REVISION.into(),
-                    vectors: all
-                        .keys()
-                        .filter_map(|key| vectors.get(*key).map(|v| (key.to_string(), v.clone())))
+                    vectors: batch
+                        .iter()
+                        .zip(encoded)
+                        .map(|((key, _), v)| (key.to_string(), v))
                         .collect(),
+                };
+                let saved = {
+                    let vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
+                    SavedVectors::checkpoint(shard, &vectors, &additions.vectors)
+                };
+                let storage = app.state::<Arc<StorageState>>().inner().clone();
+                let (key, day, revision, generation) = (
+                    shard_key.clone(),
+                    date.to_string(),
+                    documents[0].revision,
+                    corpus.identity.generation,
+                );
+                tokio::task::spawn_blocking(move || {
+                    storage.recap_write("search", &key, &day, revision, generation, &saved)
+                })
+                .await
+                .map_err(|error| worker_failure("index_save", error))??;
+                corpus.identity.check(app)?;
+                corpus
+                    .vectors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(std::mem::take(&mut additions.vectors));
+                indexed_chunks += batch.len();
+                let progress = {
+                    let runtime = app.state::<RecapSearchRuntime>();
+                    let mut index = runtime.index.lock().unwrap_or_else(|e| e.into_inner());
+                    index.progress.processed = indexed_chunks as u64;
+                    index.progress.indexed = indexed_chunks as u64;
+                    index.progress.revision += 1;
+                    index.progress
+                };
+                crate::background_activity::index_progress(batch.len() as u64);
+                let _ = app.emit("recap-search-progress", progress);
+                if automatic {
+                    return Ok(indexed_chunks < total_chunks);
                 }
-            };
-            let storage = app.state::<Arc<StorageState>>().inner().clone();
-            let (date, revision, generation) = (
-                date.to_string(),
-                documents[0].revision,
-                corpus.identity.generation,
-            );
-            tokio::task::spawn_blocking(move || {
-                storage.recap_write("search", &date, &date, revision, generation, &saved)
-            })
-            .await
-            .map_err(|_| "RECAP_WORKER_FAILED")??;
-            let _ = app.emit("recap-search-progress", ());
+            }
         }
     }
-    corpus.identity.check(app)
+    corpus.identity.check(app)?;
+    Ok(false)
 }
 
 fn normalize(text: &str) -> String {
@@ -628,6 +996,58 @@ fn normalize(text: &str) -> String {
         .join(" ")
 }
 
+struct KeywordText {
+    title: String,
+    text: String,
+    body_bytes: usize,
+}
+
+impl KeywordText {
+    fn new(activity: &RecapActivity) -> Self {
+        let mut text = normalize(&activity.text);
+        let body_bytes = text.len();
+        for detail in &activity.details {
+            let detail = normalize(&detail.text);
+            if !detail.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&detail);
+            }
+        }
+        Self {
+            title: normalize(&activity.task_title),
+            text,
+            body_bytes,
+        }
+    }
+
+    fn score(&self, query: &str, terms: &[&str], details: bool) -> f64 {
+        if query.is_empty() {
+            return 0.0;
+        }
+        let text = if details {
+            &self.text
+        } else {
+            &self.text[..self.body_bytes]
+        };
+        if !terms
+            .iter()
+            .all(|term| self.title.contains(term) || text.contains(term))
+        {
+            return 0.0;
+        }
+        let title_hits = terms
+            .iter()
+            .filter(|term| self.title.contains(**term))
+            .count();
+        1.0 + title_hits as f64 * 3.0
+            + if self.title.contains(query) { 8.0 } else { 0.0 }
+            + if text.contains(query) { 4.0 } else { 0.0 }
+    }
+}
+
+#[cfg(test)]
 fn keyword_score(activity: &RecapActivity, query: &str, details: bool) -> f64 {
     let query = normalize(query);
     if query.is_empty() {
@@ -669,15 +1089,24 @@ fn rank(
 ) -> (Vec<RecapSearchHit>, usize, usize) {
     let mut keywords = Vec::new();
     let mut semantic = Vec::new();
+    let normalized = normalize(&query.query);
+    let mut terms: Vec<_> = normalized.split_whitespace().collect();
+    terms.sort_unstable();
+    terms.dedup();
+    // Shared titles and repeated excerpts are content-addressed: score each
+    // vector once, after date/detail filtering, for the lifetime of this query.
+    let mut scores = HashMap::<&str, f64>::new();
     let vectors = corpus.vectors.lock().unwrap_or_else(|e| e.into_inner());
     for (i, document) in corpus
         .documents
         .iter()
         .enumerate()
-        .filter(|(_, d)| query.includes(&d.date))
+        .filter(|(_, d)| query.includes(&d.date) && query.includes_activity(&d.activity))
     {
         if query.mode != SearchMode::Semantic {
-            let score = keyword_score(&document.activity, &query.query, query.include_details);
+            let score = document
+                .keywords
+                .score(&normalized, &terms, query.include_details);
             if score > 0.0 {
                 keywords.push((i, score));
             }
@@ -687,12 +1116,18 @@ fn rank(
                 .chunks
                 .iter()
                 .filter(|c| query.include_details || !c.detail)
-                .filter_map(|c| vectors.get(&c.key))
-                .map(|v| {
-                    v.iter()
+                .filter_map(|c| {
+                    if let Some(score) = scores.get(c.key.as_str()) {
+                        return Some(*score);
+                    }
+                    let v = vectors.get(&c.key)?;
+                    let score = v
+                        .iter()
                         .zip(embedding)
                         .map(|(a, b)| f64::from(a * b))
-                        .sum::<f64>()
+                        .sum::<f64>();
+                    scores.insert(&c.key, score);
+                    Some(score)
                 })
                 .filter(|s| s.is_finite() && *s > 0.0)
                 .max_by(f64::total_cmp);
@@ -716,6 +1151,21 @@ fn rank(
         })
     };
     sort(&mut keywords);
+    // Exact activity top-200 needs no full semantic sort. Keep deterministic
+    // ties when selecting the prefix so later pages retain the same ranking.
+    if semantic.len() > 200 {
+        semantic.select_nth_unstable_by(200, |a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| {
+                    corpus.documents[b.0]
+                        .activity
+                        .start_ms
+                        .cmp(&corpus.documents[a.0].activity.start_ms)
+                })
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        semantic.truncate(200);
+    }
     sort(&mut semantic);
     let mut ranks: HashMap<usize, (Option<usize>, Option<usize>)> = HashMap::new();
     for (position, (i, _)) in keywords.iter().enumerate() {
@@ -784,6 +1234,9 @@ fn ranking_revision(
             query.start_date,
             query.end_date,
             query.include_details,
+            query.process_names,
+            query.start_ms,
+            query.end_ms,
             semantic_indexed
         ])
         .to_string(),
@@ -792,16 +1245,30 @@ fn ranking_revision(
 
 pub async fn search(
     app: tauri::AppHandle,
-    query: RecapSearchQuery,
+    mut query: RecapSearchQuery,
 ) -> Result<RecapSearchResult, String> {
     query.validate()?;
+    query.include_details = true;
+    search_inner(app, query).await
+}
+
+pub(super) async fn search_inner(
+    app: tauri::AppHandle,
+    mut query: RecapSearchQuery,
+) -> Result<RecapSearchResult, String> {
+    let enabled = semantic_enabled(&app)?;
+    if !enabled {
+        query.mode = SearchMode::Keyword;
+    }
     let started = Instant::now();
     let load_app = app.clone();
     let corpus = tokio::task::spawn_blocking(move || load_corpus(&load_app))
         .await
-        .map_err(|_| "RECAP_WORKER_FAILED")??;
+        .map_err(|error| worker_failure("query_load", error))??;
     let (indexed_chunks, total_chunks) = counts(&corpus);
-    let mut semantic_status = if total_chunks == 0 {
+    let mut semantic_status = if !enabled {
+        "disabled"
+    } else if total_chunks == 0 {
         "empty"
     } else if indexed_chunks == 0 {
         "not_prepared"
@@ -811,39 +1278,34 @@ pub async fn search(
         "ready"
     };
     let mut embedding = None;
+    let mut semantic_error = None;
+    let semantic = (query.mode != SearchMode::Keyword && indexed_chunks > 0)
+        .then(|| app.state::<Arc<SemanticRuntimeState>>().inner().clone());
+    let _foreground = semantic
+        .as_ref()
+        .map(|semantic| semantic.foreground_lease());
     if query.mode != SearchMode::Keyword && indexed_chunks > 0 {
-        let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
-        match semantic
-            .embed_text(
-                app.clone(),
-                MlSemanticModel::MinilmL12,
-                vec![query.query.trim().into()],
-                Duration::from_secs(5),
-                false,
-            )
-            .await
+        match embed_minilm(
+            &app,
+            vec![query.query.trim().into()],
+            "query_embedding",
+            QUERY_EMBED_TIMEOUT,
+            indexed_chunks,
+            total_chunks,
+        )
+        .await
         {
-            Ok(result) => {
-                embedding = result
-                    .vectors
-                    .into_iter()
-                    .next()
-                    .filter(|v| validate_minilm_vector(v).is_ok())
+            Ok(vectors) => embedding = vectors.into_iter().next(),
+            Err(error) => {
+                semantic_status = "unavailable";
+                semantic_error = Some(error);
             }
-            Err(_) => (),
-        }
-        if embedding.is_none() {
-            semantic_status = "unavailable";
         }
     }
+    drop(_foreground);
     corpus.identity.check(&app)?;
     if query.mode == SearchMode::Semantic && embedding.is_none() && total_chunks > 0 {
-        return Err(if indexed_chunks == 0 {
-            "RECAP_SEARCH_NOT_READY"
-        } else {
-            "RECAP_SEARCH_MODEL_UNAVAILABLE"
-        }
-        .into());
+        return Err(semantic_error.unwrap_or_else(|| "RECAP_SEARCH_NOT_READY".into()));
     }
     let result = tokio::task::spawn_blocking(move || {
         corpus.identity.check(&app)?;
@@ -871,6 +1333,7 @@ pub async fn search(
             next_offset: (end < total).then_some(end),
             mode: query.mode,
             semantic_status: semantic_status.into(),
+            semantic_error,
             indexed_chunks,
             total_chunks,
             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -879,13 +1342,150 @@ pub async fn search(
         Ok(result)
     })
     .await
-    .map_err(|_| "RECAP_WORKER_FAILED")?;
+    .map_err(|error| worker_failure("query_rank", error))?;
     result
 }
 
 #[cfg(test)]
+#[path = "search_benchmark.rs"]
+mod benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embeddings(vectors: Vec<Vec<f32>>) -> SemanticEmbeddingResult {
+        SemanticEmbeddingResult {
+            model: MlSemanticModel::MinilmL12,
+            dimensions: MINILM_DIMENSIONS,
+            vectors,
+            timings: crate::ml_protocol::MlSemanticTimings {
+                model_load_ms: 0.0,
+                preprocess_ms: 0.0,
+                inference_ms: 0.0,
+                request_total_ms: 0.0,
+                cpu_ms: 0.0,
+                model_load_cpu_ms: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn embedding_diagnostics_distinguish_empty_extra_and_malformed_responses() {
+        let vector = vec![0.25; MINILM_DIMENSIONS];
+        assert!(validate_embeddings(&embeddings(vec![vector.clone()]), 1).is_ok());
+        for (vectors, actual) in [(vec![], 0), (vec![vector.clone(), vector.clone()], 2)] {
+            let error = validate_embeddings(&embeddings(vectors), 1).unwrap_err();
+            assert_eq!(error.worker_kind(), Some(MlErrorKind::Protocol));
+            assert!(error
+                .message()
+                .contains(&format!("Expected 1 MiniLM embeddings, got {actual}")));
+        }
+        let error = validate_embeddings(&embeddings(vec![vector.clone()]), 4).unwrap_err();
+        assert!(error
+            .message()
+            .contains("Expected 4 MiniLM embeddings, got 1"));
+        let mut wrong_dimensions = embeddings(vec![vector.clone()]);
+        wrong_dimensions.dimensions = 512;
+        assert!(validate_embeddings(&wrong_dimensions, 1)
+            .unwrap_err()
+            .message()
+            .contains("worker reported 512"));
+        let mut wrong_model = embeddings(vec![vector.clone()]);
+        wrong_model.model = MlSemanticModel::BgeSmallZh;
+        assert!(validate_embeddings(&wrong_model, 1)
+            .unwrap_err()
+            .message()
+            .contains("Expected MiniLM embeddings"));
+
+        for (invalid, reason) in [
+            (vec![0.25; 512], "Expected 384 dimensions, got 512"),
+            (vec![0.0; MINILM_DIMENSIONS], "zero vector"),
+            (vec![f32::NAN; MINILM_DIMENSIONS], "non-finite"),
+        ] {
+            let error =
+                validate_embeddings(&embeddings(vec![vector.clone(), invalid]), 2).unwrap_err();
+            assert_eq!(error.worker_kind(), Some(MlErrorKind::Inference));
+            assert!(error.message().contains("batch index 1"));
+            assert!(error.message().contains(reason));
+        }
+    }
+
+    #[test]
+    fn embedding_failure_logs_and_reports_the_cause_and_request_context() {
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let attempt = EmbeddingAttempt {
+            request_id: "recap-search-test".into(),
+            stage: "query_embedding",
+            timeout: QUERY_EMBED_TIMEOUT,
+            batch_size: 1,
+            input_bytes: 12,
+            indexed_chunks: 4,
+            total_chunks: 8,
+            started: Instant::now(),
+        };
+        let mut status = SemanticRuntimeState::new().status();
+        status.state = "degraded".into();
+        status.provider = "cpu".into();
+        status.loaded_model = Some("bge-small-zh-v1.5".into());
+        status.worker_version = Some("0.9.0".into());
+        // Unrelated index diagnostics must not be serialized into this report.
+        status.backend.last_error = Some("private unrelated index detail".into());
+        let error = TaskError::worker(
+            MlErrorKind::Timeout,
+            "semantic request 7 gave up waiting for the semantic worker",
+        );
+        let report = attempt.failure(&error, &status);
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(report.starts_with("RECAP_SEARCH_MODEL_UNAVAILABLE: timeout:"));
+        for value in [
+            "recap-search-test",
+            "query_embedding",
+            "warm_timeout_ms=5000",
+            "cold_timeout_ms=20000",
+            "indexed_chunks=4",
+            "total_chunks=8",
+            error.message(),
+            "bge-small-zh-v1.5",
+            "cpu",
+            "degraded",
+        ] {
+            assert!(report.contains(value), "missing report context: {value}");
+            assert!(output.contains(value), "missing log context: {value}");
+        }
+        assert!(output.contains("[RECAP:SEARCH] Embedding failed"));
+        assert!(output.contains("error_kind=\"timeout\""));
+        assert!(!report.contains("private unrelated"));
+        assert!(!output.contains("private unrelated"));
+    }
+
+    #[tokio::test]
+    async fn worker_panics_keep_the_stage_and_original_failure() {
+        let error = tokio::task::spawn_blocking(|| panic!("test search task panic"))
+            .await
+            .unwrap_err();
+        let report = worker_failure("query_load", error);
+        assert!(report.starts_with("RECAP_WORKER_FAILED: stage=query_load:"));
+        assert!(report.contains("test search task panic"));
+    }
 
     fn activity(title: &str, text: &str) -> RecapActivity {
         RecapActivity {
@@ -921,6 +1521,71 @@ mod tests {
     }
 
     #[test]
+    fn cached_keywords_match_the_original_scores_in_both_detail_modes() {
+        for a in [
+            activity("回顾 SEARCH", "比较 project"),
+            activity("", ""),
+            activity("Unicode：界", "多余  空格、与标点，mixed-CASE"),
+        ] {
+            let cached = KeywordText::new(&a);
+            for query in [
+                "回顾 检索",
+                "SEARCH SEARCH",
+                "project 采用内存缓存降低查询延迟",
+                "mixed CASE",
+                "火星",
+                "!!!",
+                "界",
+            ] {
+                let normalized = normalize(query);
+                let terms = normalized
+                    .split_whitespace()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                for details in [true, false] {
+                    assert_eq!(
+                        cached.score(&normalized, &terms, details),
+                        keyword_score(&a, query, details),
+                        "{query}, details={details}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoints_bound_rewrites_and_resume_a_partly_saved_shard() {
+        let keys = (0..SAVE_SHARD * 2 + 1)
+            .map(|i| format!("key-{i:04}"))
+            .collect::<Vec<_>>();
+        let all = keys
+            .iter()
+            .map(|key| (key.as_str(), "synthetic"))
+            .collect::<Vec<_>>();
+        let mut vectors = HashMap::new();
+        let mut rewritten = 0;
+        for shard in all.chunks(SAVE_SHARD) {
+            for batch in shard.chunks(ENCODE_BATCH) {
+                let additions = batch
+                    .iter()
+                    .map(|(key, _)| (key.to_string(), vec![0.25; MINILM_DIMENSIONS]))
+                    .collect();
+                let saved = SavedVectors::checkpoint(shard, &vectors, &additions);
+                assert!(saved.vectors.len() <= SAVE_SHARD);
+                // A restart materializes exactly the committed prefix, not the
+                // entire day's vectors and not the next uncommitted batch.
+                let mut restored: SavedVectors =
+                    serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+                rewritten += restored.vectors.len();
+                vectors.extend(std::mem::take(&mut restored.vectors));
+            }
+        }
+        assert_eq!(vectors.len(), all.len());
+        assert!(rewritten <= all.len() * (SAVE_SHARD / ENCODE_BATCH + 1) / 2);
+    }
+
+    #[test]
     fn chunks_keep_late_content_and_separate_fact_windows() {
         let a = activity("标题", &format!("{}独特结尾", "内容".repeat(300)));
         let parts = chunks(&a);
@@ -941,15 +1606,9 @@ mod tests {
         let c = activity("回顾搜索", "很早以前的记录");
         let documents = vec![("2026-10-10", a), ("2026-10-11", b), ("2025-01-01", c)]
             .into_iter()
-            .map(|(date, activity)| Document {
-                date: date.into(),
-                revision: 0,
-                batch_start_ms: 0,
-                chunks: chunks(&activity),
-                activity,
-            })
+            .map(|(date, activity)| Document::new(date.into(), 0, 0, activity))
             .collect::<Vec<_>>();
-        let vectors = BTreeMap::from([
+        let vectors = HashMap::from([
             // Distinct descriptions have distinct vectors; repeated title-only
             // windows deliberately share the same content-addressed key.
             (documents[0].chunks[1].key.clone(), vec![0.7, 0.3]),
@@ -965,6 +1624,8 @@ mod tests {
                 session: None,
             },
             documents,
+            total_chunks: 3,
+            dates: 3,
             vectors: Mutex::new(vectors),
         };
         let query = RecapSearchQuery {
@@ -1003,6 +1664,39 @@ mod tests {
         q.start_date = Some("2026-10-12".into());
         q.end_date = Some("2026-10-01".into());
         assert!(q.validate().is_err());
+    }
+
+    #[test]
+    fn activity_filters_match_source_processes_and_inclusive_time_overlap() {
+        let mut activity = activity("搜索", "回顾活动");
+        activity.start_ms = 1000;
+        activity.end_ms = 2000;
+        activity.sources = vec![SourceRef {
+            id: 1,
+            timestamp_ms: 1500,
+            process_name: "Code.exe".into(),
+            window_title: "Design".into(),
+        }];
+        let mut query = RecapSearchQuery {
+            query: "搜索".into(),
+            process_names: vec!["code.EXE".into()],
+            start_ms: Some(2000),
+            end_ms: Some(3000),
+            ..Default::default()
+        };
+        assert!(query.includes_activity(&activity));
+        query.start_ms = Some(2001);
+        assert!(!query.includes_activity(&activity));
+        query.start_ms = Some(0);
+        query.end_ms = Some(1000);
+        assert!(query.includes_activity(&activity));
+        query.end_ms = Some(999);
+        assert!(!query.includes_activity(&activity));
+        query.end_ms = Some(3000);
+        query.process_names = vec!["msedge.exe".into()];
+        assert!(!query.includes_activity(&activity));
+        query.process_names.clear();
+        assert!(query.includes_activity(&activity));
     }
 
     #[test]

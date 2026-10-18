@@ -17,6 +17,17 @@ mod timeline_requests;
 static TIMELINE_REQUESTS: Lazy<timeline_requests::TimelineRequests> =
     Lazy::new(timeline_requests::TimelineRequests::default);
 
+/// Authentication: required. Fuses screenshot keywords and recap retrieval.
+#[tauri::command]
+pub async fn storage_search_unified(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    request: crate::ai::recap::UnifiedSearchQuery,
+) -> Result<crate::ai::recap::UnifiedSearchResult, String> {
+    check_auth_required(&credential_state)?;
+    crate::ai::recap::search_unified(app, request).await
+}
+
 #[derive(Default, Clone)]
 struct ThumbnailWarmupProgress {
     running: bool,

@@ -57,6 +57,7 @@ pub async fn recap_get_settings(
     Ok(storage_state
         .recap_read::<RecapSettings>("settings", "settings", None)?
         .unwrap_or_default()
+        .current_defaults()
         .with_app_language()
         .view())
 }
@@ -96,7 +97,26 @@ pub async fn recap_save_settings(
     });
     settings.validate()?;
     app.state::<RecapRuntime>().cancel();
+    if !settings.semantic_search_enabled {
+        app.state::<RecapSearchRuntime>().cancel();
+        storage_state.park_background_task(
+            crate::background_scheduler::TASK_RECAP_INDEX,
+            "feature_disabled",
+        )?;
+    }
     storage_state.recap_write("settings", "settings", "", -1, generation, &settings)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        if settings.semantic_search_enabled {
+            scheduler.enqueue(
+                &app,
+                crate::background_scheduler::BackgroundTaskKind::RecapIndex,
+                false,
+            )?;
+        }
+        scheduler.wake();
+    }
     let _ = app.emit("recap-changed", ());
     Ok(settings.view())
 }
@@ -195,6 +215,7 @@ pub async fn recap_delete(
     }
     app.state::<RecapRuntime>()
         .delete_day(&storage_state, &date)?;
+    recap::search::schedule_index(&app);
     let _ = app.emit("recap-changed", ());
     let _ = app.emit("recap-progress", ());
     Ok(())
@@ -323,6 +344,7 @@ pub async fn recap_correct(
     }
     // The storage trigger queues summary updates in the same transaction.
     storage_state.recap_write("corrections", &date, &date, -1, generation, &history)?;
+    recap::search::schedule_index(&app);
     let _ = app.emit("recap-changed", &date);
     recap::read_day(&app, &date)
 }

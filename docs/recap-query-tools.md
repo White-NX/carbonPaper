@@ -18,12 +18,14 @@ the existing MCP bearer token and unlocked application session.
   Use `get_snapshot_details` to examine the underlying screenshot text.
 - `search_recaps`: required `query`, optional `mode` (`keyword`, `semantic`,
   or the default `hybrid`), inclusive `start_date` / `end_date`, `include_details`
-  (default true), `offset` and `limit` (default 20, maximum 50). Searches corrected
+  (accepted for compatibility; always treated as true), `offset` and `limit`
+  (default 20, maximum 50). Searches corrected
   activities across all saved dates, including independently cited key details.
   `semantic_status` reports index coverage or keyword fallback. Pass the returned
   `ranking_revision` when requesting another page; restart at offset zero if
-  results change. Search does not generate recaps or prepare embeddings. See the
-  [experiment guide](recap-search-experiment.md) for preparation and comparisons.
+  results change. Search does not generate recaps or prepare embeddings; the
+  shared scheduler maintains the index. See the
+  [recap search guide](recap-search-experiment.md) for the UI and ranking behavior.
 
 Example MCP call:
 

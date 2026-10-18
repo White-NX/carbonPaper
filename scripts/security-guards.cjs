@@ -61,6 +61,7 @@ const COMMAND_TIERS = {
   'commands::storage::storage_list_recent_screenshots': 'session_required',
   'commands::storage::storage_get_timeline_density': 'session_required',
   'commands::storage::storage_search': 'session_required',
+  'commands::storage::storage_search_unified': 'session_required',
   'commands::storage::storage_get_image': 'session_required',
   'commands::storage::storage_get_thumbnail': 'session_required',
   'commands::storage::storage_batch_get_thumbnails': 'session_required',

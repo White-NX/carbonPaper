@@ -1,6 +1,6 @@
 //! Read-only recap tools shared by MCP clients and interactive AI search.
 use super::{filter_identity, filter_joined_text, require_authenticated_session};
-use crate::ai::recap::{self, RecapDay};
+use crate::ai::recap::{self, RecapDay, RecapSearchResult};
 use crate::sensitive_filter::SensitiveFilterState;
 use crate::storage::StorageState;
 use serde::Deserialize;
@@ -113,8 +113,31 @@ pub(super) async fn tool_search_recaps(
 ) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
     let query: recap::RecapSearchQuery = serde_json::from_value(args).map_err(|e| e.to_string())?;
-    let result = recap::search_activities(app_handle.clone(), query).await?;
+    let result = recap::search_activities(app_handle.clone(), query)
+        .await
+        .map_err(search_error)?;
     require_authenticated_session(app_handle)?;
+    search_result(result)
+}
+
+fn search_error(error: String) -> String {
+    match error.split_once(':') {
+        Some((code, _))
+            if matches!(
+                code,
+                "RECAP_SEARCH_MODEL_UNAVAILABLE" | "RECAP_WORKER_FAILED"
+            ) =>
+        {
+            code.into()
+        }
+        _ => error,
+    }
+}
+
+fn search_result(mut result: RecapSearchResult) -> Result<Value, String> {
+    // Runtime paths and raw worker diagnostics stay in the local UI and logs,
+    // rather than becoming model inputs through MCP or interactive AI search.
+    result.semantic_error = None;
     let mut result = serde_json::to_value(result).map_err(|_| "RECAP_INVALID_CACHE")?;
     // Keep the established MCP screenshot citation and Unix-millisecond contract.
     if let Some(items) = result["items"].as_array_mut() {
@@ -317,6 +340,39 @@ mod tests {
         ] {
             assert!(!result.to_string().contains(field));
         }
+    }
+
+    #[test]
+    fn search_projection_omits_local_diagnostics_and_preserves_fallback_status() {
+        let diagnostic = "RECAP_SEARCH_MODEL_UNAVAILABLE: model_missing: private runtime path";
+        let result = search_result(RecapSearchResult {
+            revision: "source".into(),
+            ranking_revision: "ranking".into(),
+            items: vec![],
+            total: 0,
+            offset: 0,
+            limit: 20,
+            next_offset: None,
+            mode: recap::RecapSearchQuery::default().mode,
+            semantic_status: "unavailable".into(),
+            semantic_error: Some(diagnostic.into()),
+            indexed_chunks: 1,
+            total_chunks: 1,
+            elapsed_ms: 5000,
+        })
+        .unwrap();
+        assert_eq!(result["semantic_status"], "unavailable");
+        assert!(result.get("semantic_error").is_none());
+        assert!(!result.to_string().contains("private runtime path"));
+        assert_eq!(
+            search_error(diagnostic.into()),
+            "RECAP_SEARCH_MODEL_UNAVAILABLE"
+        );
+        assert_eq!(
+            search_error("RECAP_WORKER_FAILED: stage=query_load: private panic detail".into()),
+            "RECAP_WORKER_FAILED"
+        );
+        assert_eq!(search_error("AUTH_REQUIRED".into()), "AUTH_REQUIRED");
     }
 
     #[test]

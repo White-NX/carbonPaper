@@ -12,6 +12,10 @@ pub struct RecapSettings {
     pub provider_id: Option<String>,
     pub language: String,
     pub include_key_details: bool,
+    /// Enables the local MiniLM index used by semantic recap search. Keyword
+    /// search remains available when this is disabled.
+    #[serde(default = "default_semantic_search_enabled")]
+    pub semantic_search_enabled: bool,
     pub batch_input_tokens: u64,
     pub batch_output_tokens: u64,
     pub request_output_tokens: u32,
@@ -32,6 +36,7 @@ impl Default for RecapSettings {
             provider_id: None,
             language: "zh-CN".into(),
             include_key_details: true,
+            semantic_search_enabled: true,
             batch_input_tokens: 36_000,
             batch_output_tokens: 64_000,
             request_output_tokens: 32_000,
@@ -43,6 +48,10 @@ impl Default for RecapSettings {
             screening: ScreeningSettings::default(),
         }
     }
+}
+
+fn default_semantic_search_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -91,6 +100,9 @@ impl RecapSettings {
     /// Upgrade only the complete, untouched legacy budget tuple. Explicitly
     /// customized limits remain authoritative, including small output budgets.
     pub fn current_defaults(mut self) -> Self {
+        // Key details are part of the searchable recap contract now. Older
+        // payloads may contain false, but reads and saves always normalize it.
+        self.include_key_details = true;
         if self.budget_version == 0 {
             if (
                 self.batch_input_tokens,
@@ -568,6 +580,18 @@ mod tests {
             .unwrap()
             .contains("private-test-key"));
     }
+    #[test]
+    fn legacy_detail_opt_out_is_normalized_and_semantic_search_defaults_on() {
+        let settings: RecapSettings =
+            serde_json::from_str(r#"{"include_key_details":false}"#).unwrap();
+        assert!(settings.semantic_search_enabled);
+        assert!(settings.clone().current_defaults().include_key_details);
+        assert!(settings.view().include_key_details);
+        let disabled: RecapSettings =
+            serde_json::from_str(r#"{"semantic_search_enabled":false}"#).unwrap();
+        assert!(!disabled.current_defaults().semantic_search_enabled);
+    }
+
     #[test]
     fn corrected_splits_only_keep_facts_with_all_their_sources() {
         let mut batch = batch();

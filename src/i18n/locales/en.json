@@ -171,8 +171,8 @@
       "apiKey": "API key",
       "keySaved": "Saved; leave unchanged to keep the key",
       "keyPlaceholder": "Enter an API key",
-      "keyDetails": "Keep important details",
-      "keyDetailsHint": "New recaps preserve cited discoveries, decisions and questions for a few important activities. Regenerate a day to add details to existing records."
+      "semanticSearch": "Enable recap semantic search",
+      "semanticSearchHint": "Prepare a local index automatically to find recaps by meaning. Keyword search remains available when disabled."
     },
     "errors": {
       "RECAP_INVALID_SUMMARY": "The period summary could not be generated. View activity details or try again.",
@@ -221,67 +221,15 @@
       "AI_RATE_LIMITED": "The model service is busy. Please try again later.",
       "RECAP_INVALID_DETAIL": "Some key details have invalid sources. Try generating the recap again.",
       "RECAP_INVALID_SEARCH": "Enter a query and check the search options.",
-      "RECAP_SEARCH_NOT_READY": "Prepare recap search before searching by meaning.",
-      "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search.",
-      "RECAP_SEARCH_RESULTS_CHANGED": "Search results have changed. Search again before continuing."
+      "RECAP_SEARCH_NOT_READY": "Semantic search is still being prepared. Keyword search is available.",
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search."
     },
     "keyDetails": "Key details",
     "detailSources": "{{count}} sources",
     "search": {
-      "tab": "Search recaps",
-      "title": "Find what you remember",
-      "subtitle": "Find activities, discussions and discoveries across days",
-      "form": "Search daily recaps",
-      "query": "Search recap content",
-      "placeholder": "Describe something you remember, or enter keywords…",
-      "submit": "Search",
-      "mode": "Search method",
-      "modes": {
-        "hybrid": "Combined",
-        "keyword": "Keywords",
-        "semantic": "By meaning"
-      },
-      "range": "Date range",
-      "ranges": {
-        "all": "All dates",
-        "week": "Last 7 days",
-        "month": "Last 30 days",
-        "custom": "Choose dates"
-      },
-      "options": "Options",
-      "includeDetails": "Search key details",
-      "includeDetailsHint": "Include specific discoveries, decisions and questions saved with activities. Turn off to search titles and short descriptions only.",
-      "startDate": "From",
-      "endDate": "To",
-      "invalidRange": "The start date must be on or before the end date.",
-      "preparing": "Preparing search by meaning",
-      "preparingHint": "Keyword search remains available. You can stop and continue later.",
-      "indexOffer": "Find activities in your own words",
-      "indexPartial": "More recaps are ready to prepare",
-      "indexHint": "Saved recaps are searchable by keyword. Prepare them to also find activities by the meaning of your description.",
-      "prepare": "Prepare search",
-      "updateIndex": "Continue preparation",
-      "keywordFallback": "Showing keyword matches. Search by meaning is not ready for this query.",
-      "partialResults": "These results combine keyword matches and available meaning matches. Some recaps are still being prepared.",
-      "changed": "Recap content has changed. Search again to see current results.",
-      "searching": "Searching recaps",
-      "resultCount": "{{count}} activities found",
-      "sorted": "Most relevant first",
       "sources": "{{count}} sources",
-      "more": "Show more activities",
       "activity": "Activity details",
-      "openDay": "Open daily recap",
-      "emptyTitle": "No matching activities yet",
-      "emptyHint": "Try more specific words or a wider date range. Recaps cover saved activities; the main search can help find further details.",
-      "noRecapsTitle": "Start with your first recap",
-      "noRecapsHint": "Generate a daily recap to start finding activities across days. Existing recaps are included automatically.",
-      "landingTitle": "Start with a memory",
-      "landingHint": "Describe a discussion, a topic you explored or a decision you recorded. You do not need to remember the original wording.",
-      "exampleOne": "Performance improvements we discussed",
-      "exampleTwo": "Ways to organize research we compared",
-      "diagnostics": "Search information",
-      "timing": "Query time: {{ms}} ms",
-      "coverage": "Semantic index: {{indexed}} / {{total}} passages"
+      "openDay": "Open daily recap"
     }
   },
   "appBound": {
@@ -1438,7 +1386,16 @@
       "modelDownloadRunningTitle": "Downloading Model Files",
       "modelDownloadRunningDesc": "Downloading required model files in background, progress: {{progress}}%.",
       "stopTooltip": "Stop smart clustering",
-      "stop": "Stop"
+      "stop": "Stop",
+      "recapIndexPreparing": "Preparing recap search index…",
+      "recapIndexQueued": "Recap search index queued",
+      "recapIndexWaitingForUnlock": "Recap search index waiting for unlock",
+      "recapIndexWaitingForVerification": "Recap search index waiting for verification",
+      "recapIndexRetryWait": "Recap search index waiting to retry",
+      "recapIndexStopping": "Stopping recap search indexing…",
+      "recapIndexSummaryPlaceholder": "Calculating recap vectors ({{progress}}%)",
+      "recapIndexRunningTitle": "Calculating recap vectors",
+      "recapIndexRunningDesc": "Generating semantic vectors for daily recaps, progress {{progress}}%."
     }
   },
   "sidebar": {
@@ -1534,13 +1491,13 @@
     "title": "Advanced search",
     "search": {
       "error": "Search failed: {{message}}",
-      "placeholder_ocr": "Search text that appeared on screen",
+      "placeholder_ocr": "Search snapshots and recaps",
       "placeholder_nl": "Describe the screen you are looking for",
       "go": "Search",
       "searching": "Searching...",
       "did_you_know": "Did you know: {{msg}}",
-      "no_results_for": "No screenshots contain \"{{query}}\"",
-      "no_results_filtered": "No screenshots match the current filters.",
+      "no_results_for": "No results found for \"{{query}}\"",
+      "no_results_filtered": "No results match the current filters.",
       "no_results_hint": "Widening the time range or dropping a filter often helps.",
       "try_visual": "Search by picture instead",
       "clear_filters": "Clear filters"
@@ -1550,7 +1507,7 @@
       "nl": "Picture",
       "ocr_full": "Text search",
       "nl_full": "Picture search",
-      "ocr_hint": "Match keywords in recognized text",
+      "ocr_hint": "Search snapshot text and recap activities",
       "nl_hint": "Match screen content with a description",
       "ai": "AI",
       "ai_hint": "Ask a question and let AI search your history for the answer"
@@ -1589,7 +1546,11 @@
       "elapsed_other": "took {{ms}} ms",
       "has_more": "scroll for more",
       "sort_time": "Newest first",
-      "sort_similarity": "By similarity"
+      "sort_similarity": "By similarity",
+      "sort_relevance": "By relevance",
+      "total": "{{count}} results",
+      "resultTypes": "{{snapshots}} snapshots · {{recaps}} recaps",
+      "categoryScope": "Categories filter snapshots"
     },
     "group": {
       "expand": "{{count}} more from this window",
@@ -1615,7 +1576,13 @@
       "LLM-powered search will be added in the future!",
       "btw, I play arknights",
       "Amiya, hear me out, I really didn't favor Pelica..."
-    ]
+    ],
+    "semanticUpdating": "Finding related recaps…",
+    "semanticFallback": "Showing keyword matches and available meaning matches.",
+    "resultTypes": {
+      "recap": "Recap"
+    },
+    "viewSource": "Open source snapshot"
   },
   "mask": {
     "model_download": {

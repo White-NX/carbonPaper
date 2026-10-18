@@ -18,7 +18,7 @@ export function isIndexTaskPending(run) {
 }
 
 export function useBackgroundIndexProgress(active = true) {
-  const [progress, setProgress] = useState({ semantic: EMPTY_RUN, clip: EMPTY_RUN });
+  const [progress, setProgress] = useState({ semantic: EMPTY_RUN, clip: EMPTY_RUN, recap: EMPTY_RUN });
   const mounted = useRef(false);
   const inFlight = useRef(null);
 
@@ -36,6 +36,7 @@ export function useBackgroundIndexProgress(active = true) {
         setProgress((previous) => ({
           semantic: mergeRun(previous.semantic, next.semantic),
           clip: mergeRun(previous.clip, next.clip),
+          recap: mergeRun(previous.recap, next.recap),
         }));
       }
       return next;
@@ -70,6 +71,18 @@ export function useBackgroundIndexProgress(active = true) {
   };
   useTauriEventListener('semantic-index-progress', ({ payload }) => onChunk('semantic', payload), [], active);
   useTauriEventListener('clip-index-progress', ({ payload }) => onChunk('clip', payload), [], active);
+  useTauriEventListener('recap-search-progress', ({ payload }) => {
+    if (payload) {
+      setProgress((previous) => ({
+        ...previous,
+        recap: mergeRun(previous.recap, {
+          ...payload,
+          phase: payload.running ? 'running' : payload.processed < payload.total ? 'queued' : 'idle',
+        }),
+      }));
+    }
+    refresh();
+  }, [refresh], active);
 
   return { progress, refresh };
 }

@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Sparkles, Clock, Search } from 'lucide-react';
+import { Sparkles, Clock } from 'lucide-react';
 import { focusStyle } from '../ui/Button';
 
 /**
@@ -19,7 +19,6 @@ export function RecapTabs({ tab, onChange }) {
   const tabs = [
     { value: 'recap', label: t('recap.overview'), Icon: Sparkles },
     { value: 'records', label: t('recap.records'), Icon: Clock },
-    { value: 'search', label: t('recap.search.tab'), Icon: Search },
   ];
 
   return (

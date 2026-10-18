@@ -87,6 +87,7 @@ impl Drop for RunningGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         let _ = self.0.emit("recap-changed", ());
+        super::search::schedule_index(&self.0);
     }
 }
 

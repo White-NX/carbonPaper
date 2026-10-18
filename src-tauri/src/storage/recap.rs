@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use super::{BackgroundReadError, StorageState};
 use crate::ai::recap::{PrivacyFingerprint, RecapSettings, RecapUsage};
 
+const PAYLOAD_KEYS_SQL: &str =
+    "SELECT key FROM recap_payloads WHERE kind=?1 AND day=?2 AND revision=?3 ORDER BY key";
+
 impl StorageState {
     pub(super) fn init_recap_tables(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
@@ -18,6 +21,8 @@ impl StorageState {
                 revision INTEGER NOT NULL, data BLOB NOT NULL, row_key BLOB NOT NULL,
                 PRIMARY KEY(kind,key));
              CREATE INDEX IF NOT EXISTS idx_recap_payload_day ON recap_payloads(day);
+             CREATE INDEX IF NOT EXISTS idx_recap_payload_day_kind_revision_key
+                ON recap_payloads(day,kind,revision,key);
              CREATE TABLE IF NOT EXISTS recap_deleted_days (day TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS recap_usage (
                 id INTEGER PRIMARY KEY, day TEXT NOT NULL, role TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -99,10 +104,12 @@ impl StorageState {
         for event in ["INSERT", "UPDATE", "DELETE"] {
             let row = if event == "DELETE" { "OLD" } else { "NEW" };
             conn.execute_batch(&format!(
-                "CREATE TRIGGER IF NOT EXISTS recap_search_payload_{event} AFTER {event} ON recap_payloads
-                 WHEN {row}.kind IN ('batch','corrections') BEGIN
+                "DROP TRIGGER IF EXISTS recap_search_payload_{event};
+                 CREATE TRIGGER recap_search_payload_{event} AFTER {event} ON recap_payloads
+                 WHEN {row}.kind IN ('batch','corrections','settings') BEGIN
                  UPDATE recap_search_state SET version=version+1 WHERE id=1; END;"
-            )).map_err(|e| e.to_string())?;
+            ))
+            .map_err(|e| e.to_string())?;
         }
         for table in ["recap_days", "recap_deleted_days"] {
             for event in ["INSERT", "DELETE"] {
@@ -140,6 +147,31 @@ impl StorageState {
         ).map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string());
+        rows
+    }
+
+    /// Covering lookup avoids decrypting or sorting unrelated history when
+    /// opening the search shards for one day.
+    pub(crate) fn recap_payload_keys(
+        &self,
+        kind: &str,
+        day: &str,
+        revision: i64,
+    ) -> Result<Vec<String>, String> {
+        if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        let guard = self.get_connection_named("recap_payload_keys")?;
+        let mut statement = guard
+            .as_ref()
+            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            .prepare(PAYLOAD_KEYS_SQL)
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![kind, day, revision], |r| r.get(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string());
@@ -638,6 +670,33 @@ mod tests {
         StorageState::init_recap_tables(&conn).unwrap();
         *storage.db.lock().unwrap() = Some(conn);
         (temp, storage)
+    }
+
+    #[test]
+    fn search_shard_lookup_uses_a_covering_range_without_walking_other_days() {
+        let (_temp, s) = storage();
+        let guard = s.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+            INSERT INTO recap_payloads SELECT 'search',printf('shard-%05d',x),printf('day-%05d',x),0,x'00',x'00' FROM n;").unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {PAYLOAD_KEYS_SQL}"))
+            .unwrap()
+            .query_map(params!["search", "day-05000", 0], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("SEARCH recap_payloads USING COVERING INDEX idx_recap_payload_day_kind_revision_key"),"{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        let mut statement = conn.prepare(PAYLOAD_KEYS_SQL).unwrap();
+        let keys = statement
+            .query_map(params!["search", "day-05000", 0], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(keys, vec!["shard-05000"]);
+        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 100);
     }
     #[test]
     fn deleting_a_day_purges_private_payloads_and_preserves_sources_and_budget() {

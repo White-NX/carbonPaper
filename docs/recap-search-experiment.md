@@ -1,29 +1,31 @@
-# Searchable recap experiment
+# Searchable recap
 
 This branch combines cross-date activity retrieval with selective, cited key
-details. Existing recaps become searchable immediately by keyword. Local MiniLM
-embeddings add meaning-based retrieval after an explicit preparation step.
+details. Existing recaps are searchable from Advanced Search alongside OCR
+snapshot matches. Local MiniLM embeddings add meaning-based retrieval when the
+recap semantic-search setting is enabled; keyword retrieval remains immediate.
 Newly generated recaps preserve a few concrete details for important activities.
 
 ## Try it
 
-1. Open **Daily recap → Search recaps**. Enter a description or keywords and
-   optionally choose a date range. Results are activities with dates and sources.
-2. Choose **Prepare search** to enable meaning-based retrieval across saved
-   recaps. Preparation is local, reports progress, can be stopped, and resumes
-   from encrypted saved vectors. It does not regenerate summaries or call the
-   configured remote recap provider.
-3. Compare **Keywords**, **By meaning**, and **Combined**. Under **Options**,
-   toggle **Search key details** to compare the same activities with and without
-   their additional facts. Changing filters refreshes an existing search.
+1. Open **Advanced Search**, choose **Text**, and enter a description or
+   keywords. The field is labelled **Search snapshots and recaps**. Date and
+   process filters apply to both result types; category filters apply to
+   snapshots.
+2. Keyword matches appear first. When semantic search is enabled, the local
+   index is queried in the background and the same list is replaced by a hybrid
+   ranking using reciprocal-rank fusion (constant 60). Indexing is automatic,
+   resumable, and runs through the shared background scheduler.
+3. In **Settings → Organize → Daily recap**, use **Enable recap semantic
+   search** to pause or resume vector indexing and semantic queries. Turning it
+   off keeps recap keyword matches available.
 4. Open a result to read its key details and screenshots. Each detail has its
    own source action. Closing a source dialog returns to the activity; closing
    the activity retains the search. **Open daily recap** returns to that date.
-5. In **Settings → Organize → Daily recap → Advanced**, **Keep important details**
-   controls new generation. It defaults on in this experimental branch. To
-   enrich an existing day, use that day's **Regenerate** action. This uses the
-   existing provider, consent and generation budgets; older recaps are not
-   automatically regenerated.
+5. The **Daily recap** page remains the place to read, correct, inspect sources,
+   and delete activities. To enrich an existing day, use that day's
+   **Regenerate** action. This uses the existing provider, consent and
+   generation budgets; older recaps are not automatically regenerated.
 
 The existing `npm run debug` workflow runs the experiment from its worktree.
 It uses the normal local database, registry settings and Windows CNG key, as
@@ -31,21 +33,28 @@ documented in `AGENTS.md`. UI preview screenshots below use synthetic records.
 
 ## Interface
 
-![Search results across dates](images/recap-search-experiment.png)
+![Unified snapshot and recap results](images/unified-search-results.jpg)
 
-![Activity details and individual source references](images/recap-search-details.png)
+![Recap activity details and source references](images/unified-search-recap-details.jpg)
 
-The search tab stays available for saved history when recap generation is
-disabled. Empty history, no matches, pending preparation, partial coverage and
-unavailable inference have distinct messages. Combined search explicitly reports
-keyword fallback; meaning-only search requires an available index. Detailed
-query timing and index counts stay in a disclosure rather than the main flow.
+![English results in a narrow window](images/unified-search-narrow.jpg)
+
+Advanced Search keeps snapshot rows and recap rows in one relevance stream while
+retaining their distinct cards and opening behavior. Recap rows show the date,
+activity interval, title, summary, key-detail excerpt, source count, primary
+process, source-screenshot action, and a link back to that day's recap. The
+statistics bar reports total, snapshot, and recap counts; category filtering is
+called out as snapshot-scoped. Empty history, no matches, partial coverage and
+unavailable inference have distinct messages. The top search bar reports a
+short **Recap vectors** progress message while automatic indexing is active.
 
 ## Generation and evidence
 
 - The extraction request selects up to three important activities per period,
   with up to three details each, at most 300 characters per detail. The local
-  postprocessor enforces the selected-activity bound and the saved setting.
+  postprocessor enforces the selected-activity bound. Legacy detail opt-outs are
+  normalized on read and save; `include_details` remains an accepted search
+  field and is always treated as true for existing clients.
 - Prompts prioritize useful discoveries, comparisons, decisions, explicit
   outcomes and unresolved questions. Brief events can qualify. Existing targeted
   gap requests can obtain additional evidence within the same request budgets.
@@ -77,16 +86,25 @@ fusion with a constant of 60. Only the requested page's source metadata is
 cloned into results. Similarity is a retrieval signal, not proof of an event.
 
 Vectors are stored as encrypted `recap_payloads` of kind `search`, grouped by
-date. Preparation commits small batches so cancellation preserves completed
-work. Search itself never starts preparation. The index covers all saved dates,
-independently of the calendar discovery API's 730-date limit.
+date in deterministic shards of up to 64 vectors. Preparation encodes and saves
+four vectors at a time within each shard; interrupted runs resume from the last
+encrypted batch commit. Shard writes leave the source/correction epoch intact;
+database generation, day revision, privacy and session remain fenced. Search
+itself never starts preparation. The shared scheduler creates a `recap_index`
+task after recap generation, correction, deletion, or source/privacy changes.
+The task uses encrypted shards, checkpointed batches, retries, foreground
+request yielding, and the same progress and failure policy as other background
+indexers. The index covers all saved dates, independently of the calendar
+discovery API's 730-date limit.
 
 A resident activity projection avoids decrypting every recap for every query.
 Its identity includes database generation, a source/correction epoch, privacy
 policy and authenticated session. Lock notifications clear it and cancel
 preparation. Every composed read checks its identity before returning; a later
-unlock cannot authorize a request from the preceding session. Plaintext and
-vectors in the resident projection are zeroized when its last reference drops.
+unlock cannot authorize a request from the preceding session. Normalized
+keyword text and vectors are retained alongside activities and zeroized when
+the projection's last reference drops. Concurrent first reads share one corpus
+materialization.
 
 Source edits, recap regeneration, corrections and deletions invalidate the
 projection. Screenshot deletion also purges persisted search payloads. Search
@@ -119,8 +137,8 @@ Use the same locally selected questions and saved corpus for each comparison:
 
 | Comparison | What it isolates |
 |---|---|
-| Keywords / By meaning / Combined, details excluded | Retrieval over short activity descriptions |
-| Same mode, details included / excluded | Additional retrieval value of preserved facts |
+| Keyword first page / completed hybrid ranking | Latency and additional semantic recall |
+| Snapshot matches / recap activities in the shared stream | Relevance and useful source navigation |
 | Current AI tools / AI with `search_recaps`, same model and call budget | End-to-end time, calls, context usage and citation accuracy |
 
 Include exact names, paraphrases, activities repeated across dates, facts omitted
@@ -131,15 +149,18 @@ The UI's query time includes corpus loading and query encoding, but excludes
 past preparation and recap generation. Do not infer end-to-end improvements
 from the ranking unit tests or synthetic UI screenshots.
 
+See [the timeout investigation and scaling measurements](recap-search-performance.md)
+for cold-start budgets, reproducible synthetic benchmarks and remaining costs
+when searching several years of activities.
+
 Relevant checks are `npm run test:frontend`, `npm run build`, `npm run lint:ci`,
 `npm run i18n:check`, `npm run test:security`, `npm run test:mcp-contract`,
 `cargo check --manifest-path src-tauri/Cargo.toml`, and
 `cargo test --manifest-path src-tauri/Cargo.toml --lib`.
 
-Validation on Windows for this implementation: 558 frontend tests passed;
-851 Rust library tests passed and eight existing opt-in tests were ignored.
-Build, lint, locale parity, security guards, Cargo check and MCP contract checks
-passed. Chrome previews exercised light/dark themes, Chinese/English controls,
-1280-pixel and 560-pixel layouts, empty results, filters, nested source dialogs,
-and preparation/cancellation using synthetic records. Real-provider generation
-quality and retrieval performance on personal history were not benchmarked.
+Validation on Windows: 559 frontend tests passed across 84 files; 867 Rust
+library tests passed and nine opt-in tests were ignored. Build, lint, locale
+parity, security guards, Cargo check, Rust formatting, and MCP contract checks
+passed. Browser checks exercised Chinese/dark and English/light views and a
+560-pixel window using synthetic records. Real-provider generation quality and
+end-to-end retrieval performance on personal history have not been benchmarked.

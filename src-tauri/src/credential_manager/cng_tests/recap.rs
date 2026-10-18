@@ -170,6 +170,81 @@ fn correction_jobs_survive_restart_and_only_acknowledge_the_processed_version() 
 }
 
 #[test]
+fn search_shards_resume_from_encrypted_commits_and_keep_revision_and_auth_fences() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = storage_credentials(temp.path().to_path_buf());
+    let storage = StorageState::new(temp.path().to_path_buf(), credentials.clone());
+    storage.initialize().unwrap();
+    let day = "2026-01-01";
+    let (start, end) = day_bounds(day).unwrap();
+    let privacy = PrivacyFingerprint::new(SensitiveFilterConfig::default()).unwrap();
+    let revision = storage
+        .recap_day_revision(day, start, end, &privacy)
+        .unwrap()
+        .0;
+    let generation = storage.db_generation();
+    let epoch = storage.recap_search_epoch().unwrap();
+    for (key, value) in [
+        ("shard-a", json!({"prefix":[1,2,3,4]})),
+        ("shard-b", json!({"prefix":[5,6]})),
+    ] {
+        storage
+            .recap_write("search", key, day, revision, generation, &value)
+            .unwrap();
+    }
+    assert_eq!(storage.recap_search_epoch().unwrap(), epoch);
+    storage.shutdown().unwrap();
+    storage.initialize().unwrap();
+    assert_eq!(
+        storage.recap_payload_keys("search", day, revision).unwrap(),
+        vec!["shard-a", "shard-b"]
+    );
+    assert_eq!(
+        storage
+            .recap_read::<Value>("search", "shard-a", Some(revision))
+            .unwrap(),
+        Some(json!({"prefix":[1,2,3,4]}))
+    );
+    assert!(storage
+        .recap_payload_keys("search", day, revision + 1)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .recap_payload_keys("batch", day, revision)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .recap_payload_keys("search", "2026-01-02", revision)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .recap_write(
+            "search",
+            "uncommitted",
+            day,
+            revision + 1,
+            storage.db_generation(),
+            &json!({"prefix":[7]})
+        )
+        .is_err());
+    assert_eq!(
+        storage
+            .recap_payload_keys("search", day, revision)
+            .unwrap()
+            .len(),
+        2
+    );
+    credentials.invalidate_session();
+    assert_eq!(
+        storage
+            .recap_payload_keys("search", day, revision)
+            .unwrap_err(),
+        "AUTH_REQUIRED"
+    );
+    storage.shutdown().unwrap();
+}
+
+#[test]
 fn recap_payloads_survive_database_reopen_and_equivalent_policy_reload() {
     let temp = tempfile::tempdir().unwrap();
     let credentials = storage_credentials(temp.path().to_path_buf());

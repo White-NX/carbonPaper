@@ -20,6 +20,33 @@ describe('useBackgroundIndexProgress', () => {
   });
   afterEach(() => { vi.useRealTimers(); });
 
+  it('refreshes automatic recap progress when an index slice commits', async () => {
+    getBackgroundIndexProgress.mockResolvedValueOnce({ semantic: idle, clip: idle, recap: { ...clip, total: 20, processed: 4 } });
+    const hook = renderHook(() => useBackgroundIndexProgress());
+    await act(async () => {});
+    expect(hook.result.current.progress.recap.processed).toBe(4);
+    getBackgroundIndexProgress.mockResolvedValueOnce({ recap: { ...clip, phase: 'queued', running: false, total: 20, processed: 8, revision: 3 } });
+    await act(async () => { events['recap-search-progress']({ payload: null }); });
+    expect(hook.result.current.progress.recap.processed).toBe(8);
+    expect(hook.result.current.progress.recap.phase).toBe('queued');
+  });
+
+  it('applies recap chunk events while a slow status reply is pending', async () => {
+    let reply;
+    getBackgroundIndexProgress.mockReturnValueOnce(new Promise((resolve) => { reply = resolve; }));
+    const hook = renderHook(() => useBackgroundIndexProgress());
+    await act(async () => {});
+    const recap = { running: true, processed: 4, indexed: 4, total: 20, revision: 2 };
+    act(() => events['recap-search-progress']({ payload: recap }));
+    expect(hook.result.current.progress.recap.processed).toBe(4);
+    act(() => events['recap-search-progress']({ payload: { ...recap, processed: 8, indexed: 8, revision: 3 } }));
+    expect(hook.result.current.progress.recap.processed).toBe(8);
+    await act(async () => { reply({ recap: { ...recap, revision: 1 } }); });
+    expect(hook.result.current.progress.recap.processed).toBe(8);
+    act(() => events['recap-search-progress']({ payload: { ...recap, running: false, processed: 8, indexed: 8, revision: 4 } }));
+    expect(hook.result.current.progress.recap.phase).toBe('queued');
+  });
+
   it('retains progress across failed polls and scheduler waits, then clears activity on completion', async () => {
     const hook = renderHook(() => useBackgroundIndexProgress());
     await act(async () => {});

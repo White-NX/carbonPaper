@@ -28,6 +28,7 @@ pub const TASK_SEMANTIC_INDEX: &str = "semantic_index";
 pub const TASK_CLIP_INDEX: &str = "clip_index";
 pub const TASK_SMART_CLUSTER: &str = "smart_cluster";
 pub const TASK_ANN_BUILD: &str = "ann_build";
+pub const TASK_RECAP_INDEX: &str = "recap_index";
 
 /// Automatic work may wait behind a user-requested pass for this long before
 /// becoming eligible to reclaim the head of the queue.
@@ -44,6 +45,7 @@ pub enum BackgroundTaskKind {
     ClipIndex,
     SmartCluster,
     AnnBuild,
+    RecapIndex,
 }
 
 impl BackgroundTaskKind {
@@ -53,6 +55,7 @@ impl BackgroundTaskKind {
             Self::ClipIndex => TASK_CLIP_INDEX,
             Self::SmartCluster => TASK_SMART_CLUSTER,
             Self::AnnBuild => TASK_ANN_BUILD,
+            Self::RecapIndex => TASK_RECAP_INDEX,
         }
     }
 
@@ -62,6 +65,7 @@ impl BackgroundTaskKind {
             TASK_CLIP_INDEX => Some(Self::ClipIndex),
             TASK_SMART_CLUSTER => Some(Self::SmartCluster),
             TASK_ANN_BUILD => Some(Self::AnnBuild),
+            TASK_RECAP_INDEX => Some(Self::RecapIndex),
             _ => None,
         }
     }
@@ -70,7 +74,7 @@ impl BackgroundTaskKind {
         match self {
             Self::ClipIndex => Some(CLIP_AUTO_QUANTUM),
             Self::SemanticIndex => Some(MINILM_AUTO_QUANTUM),
-            Self::SmartCluster | Self::AnnBuild => None,
+            Self::SmartCluster | Self::AnnBuild | Self::RecapIndex => None,
         }
     }
 }
@@ -84,7 +88,9 @@ fn task_feature_enabled_with_config(
         _ if manual => true,
         BackgroundTaskKind::SemanticIndex => smart_cluster_enabled,
         BackgroundTaskKind::SmartCluster => smart_cluster_enabled,
-        BackgroundTaskKind::ClipIndex | BackgroundTaskKind::AnnBuild => true,
+        BackgroundTaskKind::ClipIndex
+        | BackgroundTaskKind::AnnBuild
+        | BackgroundTaskKind::RecapIndex => true,
     }
 }
 
@@ -416,7 +422,12 @@ impl BackgroundSchedulerState {
             // a scheduler row because those workers predate the unified ledger.
             // Seed only missing rows; an existing completed row must retain its
             // durable completion timestamp and interval semantics.
-            for kind in [TASK_SEMANTIC_INDEX, TASK_CLIP_INDEX, TASK_ANN_BUILD] {
+            for kind in [
+                TASK_SEMANTIC_INDEX,
+                TASK_CLIP_INDEX,
+                TASK_ANN_BUILD,
+                TASK_RECAP_INDEX,
+            ] {
                 if storage
                     .background_scheduler_task(kind)
                     .ok()
@@ -621,6 +632,13 @@ pub(crate) fn gate_reason_for_kind(
             return lease.reason();
         }
     }
+    if kind == BackgroundTaskKind::RecapIndex
+        && !app
+            .state::<Arc<CredentialManagerState>>()
+            .is_session_valid()
+    {
+        return Some("waiting_for_unlock");
+    }
     if !manual {
         let storage = app.state::<Arc<StorageState>>();
         let staged = storage.background_processing_enabled()
@@ -754,6 +772,35 @@ async fn refresh_backlog(app: &AppHandle) {
     let Ok((semantic, clip, smart)) = counts else {
         return;
     };
+    // Reconcile recap debt from its committed encrypted projection. Polling
+    // does not load a model and source/privacy epochs invalidate the projection.
+    if app
+        .state::<Arc<CredentialManagerState>>()
+        .is_session_valid()
+    {
+        let recap_app = app.clone();
+        let recap = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            if !crate::ai::recap::search::semantic_enabled(&recap_app)? {
+                return Ok(false);
+            }
+            let status = crate::ai::recap::search_status(&recap_app)?;
+            Ok(status.indexed_chunks < status.total_chunks)
+        })
+        .await;
+        match recap {
+            Ok(Ok(true)) => {
+                let _ =
+                    storage.enqueue_background_task_if_changed(TASK_RECAP_INDEX, false, now_ms());
+            }
+            Ok(Ok(false)) => {
+                if crate::ai::recap::search::semantic_enabled(app).is_ok_and(|enabled| !enabled) {
+                    let _ = storage.park_background_task(TASK_RECAP_INDEX, "feature_disabled");
+                }
+            }
+            _ => (),
+        }
+    }
+
     // This reconciliation already runs inside the scheduler loop. Persist any
     // newly discovered work directly: using the public enqueue path here would
     // notify the same loop while it is running, leave a Notify permit behind,
@@ -812,6 +859,9 @@ async fn execute_slice(
     if kind == BackgroundTaskKind::AnnBuild {
         return crate::clip_ann::run_scheduled_slice(app, manual).await;
     }
+    if kind == BackgroundTaskKind::RecapIndex {
+        return crate::ai::recap::search::run_scheduled_slice(app).await;
+    }
     if !manual
         && matches!(
             kind,
@@ -826,7 +876,9 @@ async fn execute_slice(
             BackgroundTaskKind::ClipIndex => {
                 crate::clip_index::run_scheduled_slice(app, false, Some(context)).await
             }
-            BackgroundTaskKind::SmartCluster | BackgroundTaskKind::AnnBuild => {
+            BackgroundTaskKind::SmartCluster
+            | BackgroundTaskKind::AnnBuild
+            | BackgroundTaskKind::RecapIndex => {
                 unreachable!()
             }
         }
@@ -844,7 +896,7 @@ async fn execute_slice(
             BackgroundTaskKind::SmartCluster => {
                 crate::smart_cluster_scoring::run_scheduled_slice(app, manual).await
             }
-            BackgroundTaskKind::AnnBuild => unreachable!(),
+            BackgroundTaskKind::AnnBuild | BackgroundTaskKind::RecapIndex => unreachable!(),
         }
     }
 }
@@ -1221,7 +1273,9 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 });
                 let deterministic_index_failure = matches!(
                     kind,
-                    BackgroundTaskKind::SemanticIndex | BackgroundTaskKind::ClipIndex
+                    BackgroundTaskKind::SemanticIndex
+                        | BackgroundTaskKind::ClipIndex
+                        | BackgroundTaskKind::RecapIndex
                 )
                     && crate::semantic_runtime::is_deterministic_worker_failure(&error);
                 let terminal_ann_failure = kind == BackgroundTaskKind::AnnBuild

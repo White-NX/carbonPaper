@@ -304,9 +304,12 @@ export function useSearchBoxController({
   const clipIndexPercent = indexRunPercent(backgroundIndex.clip);
   const semanticIndexTaskLabel = indexTaskLabel(backgroundIndex.semantic, semanticIndexPercent, 'semantic', t);
   const clipIndexTaskLabel = indexTaskLabel(backgroundIndex.clip, clipIndexPercent, 'clip', t);
+  const hasRecapIndexTask = isIndexTaskPending(backgroundIndex.recap);
+  const recapIndexPercent = indexRunPercent(backgroundIndex.recap);
+  const recapIndexTaskLabel = indexTaskLabel(backgroundIndex.recap, recapIndexPercent, 'recap', t);
 
   const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels
-    || hasSemanticIndexTask || hasClipIndexTask;
+    || hasSemanticIndexTask || hasClipIndexTask || hasRecapIndexTask;
   const progressFillPercent = (() => {
     if (hasDeleteTask) return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
     if (hasClusterTask) return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
@@ -326,6 +329,7 @@ export function useSearchBoxController({
         ? 8
         : Math.min(100, semanticIndexPercent);
     }
+    if (hasRecapIndexTask) return recapIndexPercent === null || recapIndexPercent <= 0 ? 8 : recapIndexPercent;
     return 0;
   })();
 
@@ -345,6 +349,7 @@ export function useSearchBoxController({
     if (hasSemanticIndexTask) {
       return semanticIndexTaskLabel;
     }
+    if (hasRecapIndexTask) return recapIndexTaskLabel;
     return '';
   })();
 
@@ -479,6 +484,9 @@ export function useSearchBoxController({
     hasClipIndexTask,
     clipIndexPercent,
     clipIndexTaskLabel,
+    hasRecapIndexTask,
+    recapIndexPercent,
+    recapIndexTaskLabel,
     showProgressBar,
     progressFillPercent,
     taskSummaryPlaceholder,

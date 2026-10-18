@@ -27,6 +27,14 @@ function Activity() { const { dirty, busy } = useSettingsWindowActivity(); retur
 function Host({ enabled = true }) { return <SettingsActivityProvider enabled={enabled}><Activity /><RecapSection /></SettingsActivityProvider>; }
 
 describe('daily recap in the settings window', () => {
+  it('defaults semantic search on and saves disabling it without a key detail switch', async () => {
+    render(<Host />);
+    const control = await screen.findByRole('switch', { name: 'recap.settings.semanticSearch' });
+    expect(control).toBeChecked();
+    expect(screen.queryByRole('switch', { name: 'recap.settings.keyDetails' })).not.toBeInTheDocument();
+    fireEvent.click(control);
+    await waitFor(() => expect(saveRecapSettings).toHaveBeenCalledWith(expect.objectContaining({ semantic_search_enabled: false })));
+  });
   it('still allows configuration when the usage summary cannot be read', async () => {
     getRecapDay.mockRejectedValueOnce(new Error('RECAP_INVALID_CACHE'));
     render(<Host />);

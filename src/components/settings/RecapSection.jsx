@@ -123,8 +123,12 @@ export default function RecapSection() {
   return <SettingsSection id="daily-recap" icon={CalendarDays} title={t('recap.title')} description={t('recap.settings.description')}>
     {error && <SettingsErrorBanner>{t(recapErrorKey(error))}<SettingsButton disabled={busy} onClick={() => draft ? save() : load()}>{t('common.retry')}</SettingsButton></SettingsErrorBanner>}
     {!draft ? <SettingsStatus>{t('recap.loading')}</SettingsStatus> : <SettingsGroup aria-label={t('recap.settings.title')}>
-        <SettingsRow label={t('recap.settings.enabled')} description={t('recap.settings.enabledHint')}
-          control={<SettingsSwitch checked={draft.enabled} onChange={(value) => update('enabled', value)} />} />
+        <div className="space-y-4">
+          <SettingsRow label={t('recap.settings.enabled')} description={t('recap.settings.enabledHint')}
+            control={<SettingsSwitch checked={draft.enabled} onChange={(value) => update('enabled', value)} />} />
+          <SettingsRow label={t('recap.settings.semanticSearch')} description={t('recap.settings.semanticSearchHint')}
+            control={<SettingsSwitch checked={draft.semantic_search_enabled ?? true} onChange={(value) => update('semantic_search_enabled', value)} />} />
+        </div>
         <SettingsDivider />
         <div className="space-y-5">
           <SettingsRow label={t('recap.settings.provider')} control={<SettingsSelect value={draft.provider_id || ''}
@@ -138,8 +142,6 @@ export default function RecapSection() {
         </div>
         <SettingsDivider />
         <SettingsDisclosure title={t('recap.settings.advanced')}>
-          <SettingsRow label={t('recap.settings.keyDetails')} description={t('recap.settings.keyDetailsHint')}
-            control={<SettingsSwitch checked={draft.include_key_details ?? true} onChange={(value) => update('include_key_details', value)} />} />
           <p className="text-xs leading-relaxed text-ide-muted">{t('recap.settings.budgetHint')}</p>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {Object.entries(limits).map(([key, [min, max]]) => <label key={key} className="block space-y-2 text-xs"><span>{t(`recap.settings.${key}`)}</span><input className={inputClass} type="number" min={min} max={max} step={1} required value={draft[key]} {...commitInput}

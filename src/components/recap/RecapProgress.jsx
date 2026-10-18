@@ -33,11 +33,11 @@ function duration(ms, t) {
     : t('recap.diagnostics.minutesSeconds', { minutes: Math.floor(seconds / 60), seconds: seconds % 60 });
 }
 
-export function DiagnosticError({ error, tone = 'error', message }) {
+export function DiagnosticError({ error, tone = 'error', message, action, className = '' }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const id = useId();
-  return <Banner tone={tone}>
+  return <Banner tone={tone} action={action} className={className}>
     <p>{message || t(recapErrorKey(error), { defaultValue: t('recap.errors.unknown') })}</p>
     {error && <>
       <Button variant="ghost" size="xs" className="mt-1 -ml-2" aria-expanded={open} aria-controls={id} onClick={() => setOpen(value => !value)}>{t('recap.errorDetails')}</Button>

@@ -1,8 +1,14 @@
 # Adaptive background scheduling
 
-The scheduler owns four durable task kinds: MiniLM indexing, CLIP indexing,
-Smart Cluster scoring, and ANN maintenance. Capture, immediate classification,
-and foreground requests retain their own priority and authorization paths.
+The scheduler owns five durable task kinds: MiniLM indexing, CLIP indexing,
+Smart Cluster scoring, ANN maintenance, and recap vector indexing. Capture,
+immediate classification, and foreground requests retain their own priority and
+authorization paths. Recap indexing uses encrypted checkpoints, retries,
+foreground request yielding, and the same admission gates as other automatic
+tasks. Its progress is exposed through `get_background_index_progress` and the
+top search bar. Disabling recap semantic search parks `recap_index` without
+deleting vectors; enabling it resumes unfinished work. Keyword search remains
+available in either state.
 
 ## Admission
 

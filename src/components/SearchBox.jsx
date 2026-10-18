@@ -34,6 +34,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         semanticIndexTaskLabel,
         hasClipIndexTask,
         clipIndexTaskLabel,
+        hasRecapIndexTask,
+        recapIndexPercent,
         showProgressBar,
         progressFillPercent,
         taskSummaryPlaceholder,
@@ -220,6 +222,19 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                             </div>
                             <div className="text-xs text-ide-muted leading-relaxed">
                                 {clipIndexTaskLabel}
+                            </div>
+                        </div>
+                    )}
+                    {hasRecapIndexTask && (
+                        <div className="shrink-0 border-b border-ide-border bg-violet-500/10 p-3">
+                            <div className="flex items-center gap-2 text-violet-500 text-sm font-bold">
+                                <Loader2 size={14} className="animate-spin" />
+                                {t('search.task.recapIndexRunningTitle')}
+                            </div>
+                            <div className="mt-1 text-xs leading-relaxed text-ide-muted">
+                                {t('search.task.recapIndexRunningDesc', {
+                                    progress: recapIndexPercent === null ? '…' : Math.round(recapIndexPercent),
+                                })}
                             </div>
                         </div>
                     )}

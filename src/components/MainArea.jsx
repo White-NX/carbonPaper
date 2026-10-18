@@ -139,6 +139,7 @@ export default function MainArea({
   const [showOcrPanel, setShowOcrPanel] = useState(false);
   const [snapshotPreviewTabs, setSnapshotPreviewTabs] = useState([]);
   const [activeSnapshotPreviewKey, setActiveSnapshotPreviewKey] = useState(null);
+  const [recapNavigation, setRecapNavigation] = useState(null);
   const snapshotPreviewTabsRef = useRef([]);
   const activeSnapshotPreviewKeyRef = useRef(null);
 
@@ -390,6 +391,11 @@ export default function MainArea({
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
             onTimelineSearchChange={onTimelineSearchChange}
+            isAuthenticated={isAuthenticated}
+            onOpenRecapDay={(date) => {
+              setRecapNavigation({ date, token: Date.now() });
+              setActiveTab('recap');
+            }}
           />
         </div>
 
@@ -410,7 +416,7 @@ export default function MainArea({
           onOpen={() => openStandaloneSnapshotPreview()}
           onClear={clearSnapshotPreviewTabs}
         />
-        <RecapView active={activeTab === 'recap'} isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} />
+        <RecapView active={activeTab === 'recap'} isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} navigation={recapNavigation} />
       </div>
     </section>
   );

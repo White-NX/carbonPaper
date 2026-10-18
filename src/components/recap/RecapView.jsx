@@ -15,7 +15,6 @@ import { RecapTabs } from './RecapTabs';
 import RecapRecords from './RecapRecords';
 import RecapRunStatus from './RecapRunStatus';
 import RecapApps from './RecapApps';
-import RecapSearch from './RecapSearch';
 import RecapKeyDetails from './RecapKeyDetails';
 
 function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
@@ -90,7 +89,7 @@ function Landing({ enabled, hasClosedPeriod, loading, error, onConfigure, onGene
   </div>;
 }
 
-export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview }) {
+export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview, navigation }) {
   const { t, i18n } = useTranslation();
   const [date, setDate] = useState(localDate);
   const [task, setTask] = useState(null);
@@ -134,6 +133,11 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     setTask(null); setEditing(null); setSources(null); setDiagnostics(false); setOperation(''); setError(''); setNotice(''); setLiveRunning(false);
     setTab('recap'); setPeriod(''); positions.current = {}; recordsPosition.current = 0;
   }, [date, isAuthenticated]);
+  useEffect(() => {
+    if (!navigation?.date) return;
+    setDate(navigation.date);
+    setTask(null); setTab('recap'); setPeriod('');
+  }, [navigation]);
   useEffect(() => {
     if (!active) return undefined;
     const escape = (event) => {
@@ -198,7 +202,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
       secondaryRow={!task && showTabs ? (
         <>
           <RecapTabs tab={tab} onChange={setTab} />
-          {latest > 0 && tab !== 'search' && (
+          {latest > 0 && (
             <span className="ml-auto hidden text-[11px] text-ide-muted sm:block">
               {t('recap.updated', { time: time(latest) })}
             </span>
@@ -211,7 +215,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
           {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
             : <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 shrink-0 text-ide-accent" /><span className="truncate">{t('recap.title')}</span></h1>}
         </div>
-        <div className={tab === 'search' && !task ? 'hidden' : 'recap-header-actions flex min-h-10 items-center justify-end gap-1.5'}>
+        <div className="recap-header-actions flex min-h-10 items-center justify-end gap-1.5">
           {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
           {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
             { label: t('recap.correction.rename'), icon: Pencil, onClick: () => editTask('rename'), disabled: !selected },
@@ -227,7 +231,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
             ]} />
           </>}
         </div>
-        <div role="group" aria-label={t('recap.date')} className={tab === 'search' && !task ? 'hidden' : 'recap-date-navigation flex h-10 shrink-0 items-center gap-1.5'}>
+        <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-10 shrink-0 items-center gap-1.5">
           <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
           <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
             className="recap-focus h-[30px] w-36 min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
@@ -240,11 +244,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
     {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
     {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}
-    <div id="recap-panel-search" role="tabpanel" aria-labelledby="recap-tab-search" hidden={Boolean(task) || tab !== 'search'} className={tab === 'search' && !task ? 'min-h-0 flex-1' : 'hidden'}>
-      <RecapSearch active={active && !task && tab === 'search'} authenticated={isAuthenticated} action={action} time={time}
-        onOpenDay={(value) => { setDate(value); setTab('recap'); }} />
-    </div>
-    {!task && tab === 'search' ? null : !task && tab === 'records' && showTabs ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
+    {!task && tab === 'records' && showTabs ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
       <RecapRecords date={date} batches={batches} active={active} action={action} time={time} period={period} onPeriod={setPeriod} position={recordsPosition} />
     </div> : <div ref={scroll} id="recap-panel-recap" role={!task ? 'tabpanel' : undefined} aria-labelledby={!task && showTabs ? 'recap-tab-recap' : undefined}
       className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-7" onScroll={(event) => { positions.current[route] = event.currentTarget.scrollTop; }}>

@@ -3,10 +3,11 @@ mod privacy;
 mod progress;
 mod runner;
 mod screening;
-mod search;
+pub(crate) mod search;
 mod selection;
 mod summary;
 pub mod types;
+mod unified;
 mod views;
 
 pub(crate) use privacy::PrivacyFingerprint;
@@ -16,5 +17,6 @@ pub use search::{
     RecapSearchQuery, RecapSearchResult, RecapSearchRuntime, RecapSearchStatus,
 };
 pub use types::*;
+pub use unified::{search as search_unified, UnifiedSearchQuery, UnifiedSearchResult};
 pub(crate) use views::with_current_day;
 pub use views::{read_day_view, read_records, RecapRecordPage};
