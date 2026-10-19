@@ -281,6 +281,13 @@ mod tests {
             start_ms: time,
             end_ms: time,
             sources: vec![],
+            evidence: super::super::activity_contract::ActivityEvidence {
+                time_semantics: "evidence_observation_span",
+                observation_kind: "instant",
+                observed_span_ms: 0,
+                member_screenshot_ids: vec![],
+                membership_status: "unavailable",
+            },
             keyword_rank: keyword,
             semantic_rank: semantic,
         }

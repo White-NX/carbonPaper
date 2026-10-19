@@ -157,6 +157,33 @@ protocol errors. Codes include `INVALID_ARGUMENT`, `TOOL_NOT_FOUND`,
 `RECAP_SOURCE_CHANGED` remain available. Callers should inspect the code rather
 than treating any empty result as a successful read.
 
+## Activity observations and membership
+
+Both `get_recap_day` and `search_recaps` expose
+`time_semantics: "evidence_observation_span"`. `start_ms` and `end_ms` are the
+earliest and latest direct citation capture instants (both observed endpoints).
+`span_ms` is their nonnegative difference. `observation_kind` is `instant` when
+the endpoints coincide and `span` otherwise. A zero span is a single observed
+instant; neither kind estimates continuous work duration. Membership can cover
+captures beyond the directly cited span. Period boundaries remain half-open.
+
+`sources` is the complete set of direct citations for the activity;
+`details[].evidence_ids` cites the subset supporting that fact. `member_ids` is
+the distinct, ascending screenshot ID list from the saved assignment of records
+to the nearest activity in their segment, after user corrections. Membership is
+an assignment, not factual support for every sentence. Use screenshot details to
+verify individual members. Process filters match cited sources and keep the full
+activity membership; they do not trim it to one process.
+
+`membership_status` is `complete` when all stored members can be exported,
+`filtered` when known members were withheld by privacy filtering, `incomplete`
+when stored IDs cannot be resolved in the period directory or direct citations,
+and `unavailable` when old data has no stored member list. An empty list with
+`unavailable` does not
+establish that the activity has no members. No missing membership is reconstructed
+from citations. Lists are kept whole during Agent compaction. Members alone do not
+become factual screenshot citations.
+
 ## Saved calendars and local months
 
 New recap days persist an IANA `time_zone`, `rule: "system_local_at_creation"`,

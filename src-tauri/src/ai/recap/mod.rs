@@ -1,4 +1,5 @@
 //! Bounded, evidence-backed daily recaps. Classification is optional.
+pub(crate) mod activity_contract;
 mod privacy;
 mod progress;
 mod runner;

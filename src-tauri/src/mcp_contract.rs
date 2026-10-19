@@ -228,7 +228,7 @@ pub fn tool_definitions() -> Value {
     let mut tools = json!([
         {
             "name": "get_snapshots_by_time_range",
-            "description": "Page screenshot metadata in the half-open interval [start_ms, end_ms), ordered by capture time then screenshot_id. Results use screenshot_id and captured_at_ms (Unix milliseconds); null capture time means unknown. Use offset/limit; max_records is a legacy alias for limit.",
+            "description": "List screenshots in [start_ms, end_ms), ordered by captured_at_ms then screenshot_id. Times are Unix milliseconds; null means unknown. max_records aliases limit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -243,7 +243,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "get_snapshot_details",
-            "description": "Read one screenshot using screenshot_id from another tool. Returns status=found, record with captured_at_ms, and paginated ocr_results with ocr_processed_at_ms. Use offset/limit to read all OCR rows. Missing screenshots return SNAPSHOT_NOT_FOUND; privacy rejection returns PRIVACY_REJECTED. Include OCR bounding boxes with include_coords=true.",
+            "description": "Read screenshot_id, returning status=found, record (captured_at_ms) and paged ocr_results (ocr_processed_at_ms). Times are Unix milliseconds. Missing or privacy-rejected reads fail with SNAPSHOT_NOT_FOUND or PRIVACY_REJECTED.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -257,7 +257,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_ocr_text",
-            "description": "Find words visible on screen using lexical OCR search. Extract distinctive keywords from a question, e.g. 保存路径 or save location. Separate keywords with spaces; a Chinese question is otherwise one long phrase. Fuzzy matching tolerates spelling/OCR errors. Results use screenshot_id for evidence, ocr_id for the text row, captured_at_ms for capture time, and ocr_processed_at_ms for recognition completion; all times are Unix milliseconds. Ranked hits include match_evidence with relevance_score, matched_terms, literal_terms, match_type (literal, approximate, or bigram_only), phrase_matched, and optional matched/total_bigram_groups. Scores and terms describe the representative OCR row before privacy filtering, not the whole screenshot. confidence is OCR recognition confidence, not search relevance.",
+            "description": "Search visible words with space-separated keywords, e.g. 保存路径 or save location; a full Chinese question becomes one phrase. fuzzy tolerates spelling/OCR errors. screenshot_id identifies evidence, ocr_id the text row; captured_at_ms is capture time, ocr_processed_at_ms recognition completion (Unix milliseconds). match_evidence explains the representative OCR row before privacy filtering: relevance_score, matched_terms, literal_terms, match_type=literal|approximate|bigram_only, phrase_matched, optional matched/total_bigram_groups. confidence measures OCR confidence, not relevance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -275,7 +275,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_nl",
-            "description": "Natural language visual search over screenshots using Chinese-CLIP image embeddings. Describe what the screen looks like; use search_ocr_text for visible words. Results use screenshot_id and captured_at_ms (Unix milliseconds). A time filter excludes captures whose time is unknown.",
+            "description": "Search screen appearance with Chinese-CLIP image embeddings; use search_ocr_text for visible words. Results use screenshot_id and captured_at_ms (Unix milliseconds). Time filters exclude unknown capture times.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -342,7 +342,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "get_recap_day",
-            "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is YYYY-MM-DD in the returned calendar, whose recorded time zone and day/period boundaries remain fixed. Sources use screenshot_id and captured_at_ms; all instants are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details.",
+            "description": "Read saved, corrected activities, period overviews and sources (screenshot_id, captured_at_ms). YYYY-MM-DD uses the returned saved calendar's fixed zone and day/period boundaries. Times are Unix milliseconds. Activities are chronological; batch_start_ms selects a period. Empty/pending periods do not prove inactivity. Does not generate or edit recaps. Verify facts with get_snapshot_details.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -356,7 +356,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_recaps",
-            "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for recorded zones and boundaries. process_names matches any cited source, case-insensitively. Sources use screenshot_id and captured_at_ms. Verify factual claims with get_snapshot_details. Hybrid searches all filtered activities by keyword and uses available vectors even with a partial index; unavailable semantics leave keyword results. coverage reports unique text chunks and activity coverage globally, in the query scope, and per scoped date; missing_chunks identifies dates with gaps. execution reports requested mode, executed branches, pre-pagination match counts, fallback reason and the semantic top-200 candidate cap. total counts fused candidates, not all possible semantic matches. index_progress reports index construction separately. A null keyword_rank means the activity did not match keywords. Does not generate recaps or build the index.",
+            "description": "Search saved, corrected activities by keyword, semantic meaning, or hybrid. Inclusive YYYY-MM-DD filters use saved calendars[date] zones/bounds. Hybrid runs keywords over all filtered activities plus available vectors; semantic failure preserves keywords. coverage counts unique chunks and activities globally, in query_scope and per scoped date; missing_dates identifies gaps. execution reports requested mode, branches, match counts before paging, fallback_reason and the semantic top-200 cap. total counts fused candidates; keyword_rank=null means no keyword match. index_progress describes index construction. Sources use screenshot_id/captured_at_ms (Unix milliseconds); verify facts with get_snapshot_details. Does not generate recaps or index.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -411,6 +411,13 @@ pub fn tool_definitions() -> Value {
         tool["inputSchema"]["additionalProperties"] = false.into();
         if matches!(
             tool["name"].as_str(),
+            Some("get_recap_day" | "search_recaps")
+        ) {
+            let description = tool["description"].as_str().unwrap().to_owned();
+            tool["description"] = format!("{description} Activity start_ms/end_ms are first/last cited capture times; span_ms is their difference, not work duration (time_semantics=evidence_observation_span; observation_kind=instant|span). sources cites the activity; details[].evidence_ids cites each fact. member_ids lists assigned screenshots, possibly beyond the cited span. membership_status: complete, filtered by privacy, incomplete directory, or unavailable legacy data. Verify members with get_snapshot_details.").into();
+        }
+        if matches!(
+            tool["name"].as_str(),
             Some(
                 "get_snapshots_by_time_range"
                     | "get_snapshot_details"
@@ -424,7 +431,7 @@ pub fn tool_definitions() -> Value {
             )
         ) {
             let description = tool["description"].as_str().unwrap().to_owned();
-            tool["description"] = format!("{description} Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.").into();
+            tool["description"] = format!("{description} Paging: use next_offset with unchanged filters even after short/empty/truncated pages. null ends results except end_reason=offset_limit (narrow filters). result_offset precedes privacy filtering. Restart after data/index changes.").into();
         }
         if tool["name"] == "search_nl" {
             tool["inputSchema"]["properties"]["limit"]["maximum"] = 200.into();

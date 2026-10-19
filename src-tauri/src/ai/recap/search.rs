@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use zeroize::Zeroize;
 
+use super::activity_contract::{member_directory, ActivityEvidence};
 use super::{runner::privacy_hash, types::*, with_current_day, RecapIndexProgress};
 use crate::ai::provider::Cancellation;
 use crate::credential_manager::CredentialManagerState;
@@ -146,6 +147,8 @@ pub struct RecapSearchHit {
     pub start_ms: i64,
     pub end_ms: i64,
     pub sources: Vec<SourceRef>,
+    #[serde(flatten)]
+    pub evidence: ActivityEvidence,
     pub keyword_rank: Option<usize>,
     pub semantic_rank: Option<usize>,
 }
@@ -518,6 +521,7 @@ struct Document {
     activity: RecapActivity,
     chunks: Vec<Chunk>,
     keywords: KeywordText,
+    evidence: ActivityEvidence,
 }
 
 impl Document {
@@ -528,6 +532,10 @@ impl Document {
             batch_start_ms,
             chunks: chunks(&activity),
             keywords: KeywordText::new(&activity),
+            evidence: ActivityEvidence::project(
+                &activity,
+                &super::activity_contract::MemberDirectory::default(),
+            ),
             activity,
         }
     }
@@ -549,6 +557,8 @@ impl Drop for Corpus {
             let activity = &mut document.activity;
             activity.task_title.zeroize();
             activity.text.zeroize();
+            activity.member_ids.zeroize();
+            document.evidence.member_screenshot_ids.zeroize();
             for detail in &mut activity.details {
                 detail.text.zeroize();
             }
@@ -866,14 +876,14 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
         current.check(app)?;
         with_current_day(app, &date, |day| {
             for batch in day.batches {
+                let directory = member_directory(&batch.records, &filter);
                 for activity in batch.activities {
                     if let Some(activity) = filtered_activity(activity, &filter) {
-                        documents.push(Document::new(
-                            date.clone(),
-                            revision,
-                            batch.start_ms,
-                            activity,
-                        ));
+                        let evidence = ActivityEvidence::project(&activity, &directory);
+                        let mut document =
+                            Document::new(date.clone(), revision, batch.start_ms, activity);
+                        document.evidence = evidence;
+                        documents.push(document);
                     }
                 }
             }
@@ -1481,6 +1491,7 @@ fn rank_with_report(
                 start_ms: a.start_ms,
                 end_ms: a.end_ms,
                 sources: a.sources.clone(),
+                evidence: d.evidence.clone(),
                 keyword_rank,
                 semantic_rank,
             }

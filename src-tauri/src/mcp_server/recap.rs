@@ -225,6 +225,8 @@ fn day_result(
             "start_ms": batch.start_ms, "end_ms": batch.end_ms,
             "status": batch.status, "overview": overview,
         }));
+        let member_directory =
+            crate::ai::recap::activity_contract::member_directory(&batch.records, filter);
         for activity in batch.activities {
             let clean = (|| {
                 let title = filter_identity(filter, mode, &activity.task_title)?;
@@ -256,10 +258,19 @@ fn day_result(
                         Ok(super::wire::recap_source(&source))
                     })
                     .collect::<Result<Vec<_>, super::Rejected>>()?;
+                let evidence = crate::ai::recap::activity_contract::ActivityEvidence::project(
+                    &activity,
+                    &member_directory,
+                );
                 Ok::<_, super::Rejected>(json!({
                     "activity_id": activity.id, "task_id": activity.task_id,
                     "task_title": title, "text": text, "details": details,
                     "start_ms": activity.start_ms, "end_ms": activity.end_ms,
+                    "time_semantics": evidence.time_semantics,
+                    "observation_kind": evidence.observation_kind,
+                    "span_ms": evidence.observed_span_ms,
+                    "member_ids": evidence.member_screenshot_ids,
+                    "membership_status": evidence.membership_status,
                     "batch_start_ms": batch.start_ms, "sources": sources,
                 }))
             })();
@@ -385,10 +396,17 @@ mod tests {
             "records",
             "usage",
             "provider diagnostics",
-            "member_ids",
         ] {
             assert!(!result.to_string().contains(field));
         }
+        assert_eq!(result["items"][0]["member_ids"], json!([42]));
+        assert_eq!(result["items"][0]["membership_status"], "complete");
+        assert_eq!(
+            result["items"][0]["time_semantics"],
+            "evidence_observation_span"
+        );
+        assert_eq!(result["items"][0]["span_ms"], 0);
+        assert_eq!(result["items"][0]["observation_kind"], "instant");
     }
 
     #[test]
@@ -417,6 +435,13 @@ mod tests {
                 details: vec![],
                 start_ms: source.timestamp_ms,
                 end_ms: source.timestamp_ms,
+                evidence: crate::ai::recap::activity_contract::ActivityEvidence {
+                    time_semantics: "evidence_observation_span",
+                    observation_kind: "instant",
+                    observed_span_ms: 0,
+                    member_screenshot_ids: vec![source.id, source.id + 1],
+                    membership_status: "complete",
+                },
                 sources: vec![source],
                 keyword_rank: Some(1),
                 semantic_rank: None,
@@ -438,6 +463,13 @@ mod tests {
         .unwrap();
         assert_eq!(result["semantic_status"], "unavailable");
         assert_eq!(result["returned_count"], 1);
+        assert_eq!(
+            result["items"][0]["member_ids"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(result["items"][0]["membership_status"], "complete");
+        assert_eq!(result["items"][0]["span_ms"], 0);
+        assert_eq!(result["items"][0]["observation_kind"], "instant");
         assert!(result.get("semantic_error").is_none());
         assert_eq!(
             result["items"][0]["sources"][0]["screenshot_id"],
@@ -489,6 +521,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn membership_exports_all_assignments_with_explicit_privacy_and_legacy_status() {
+        let mut day = fixture();
+        let batch = &mut day.batches[0];
+        let mut private_member = batch.records[0].clone();
+        private_member.id = 43;
+        private_member.window_title = "private window".into();
+        let mut safe_member = batch.records[0].clone();
+        safe_member.id = 44;
+        batch.records.extend([private_member, safe_member]);
+        batch.activities[0].member_ids = vec![44, 42, 43, 44];
+        for mode in ["mask", "remove_paragraph", "reject"] {
+            let result = day_result(day.clone(), &query(), &filter(mode)).unwrap();
+            let item = &result["items"][0];
+            assert_eq!(item["sources"].as_array().unwrap().len(), 1);
+            if mode == "reject" {
+                assert_eq!(item["member_ids"], json!([42, 44]));
+                assert_eq!(item["membership_status"], "filtered");
+            } else {
+                assert_eq!(item["member_ids"], json!([42, 43, 44]));
+                assert_eq!(item["membership_status"], "complete");
+            }
+            let outcome = crate::ai::tools::summarize("get_recap_day", result);
+            assert_eq!(outcome.snapshots.len(), 1);
+            assert_eq!(outcome.snapshots[0].screenshot_id, 42);
+        }
+        day.batches[0].activities[0].member_ids.push(45);
+        let result = day_result(day.clone(), &query(), &filter("mask")).unwrap();
+        assert_eq!(result["items"][0]["membership_status"], "incomplete");
+        assert_eq!(result["items"][0]["member_ids"], json!([42, 43, 44]));
+        day.batches[0].activities[0].member_ids.clear();
+        let result = day_result(day, &query(), &filter("mask")).unwrap();
+        assert_eq!(result["items"][0]["membership_status"], "unavailable");
+        assert_eq!(result["items"][0]["member_ids"], json!([]));
     }
 
     #[test]

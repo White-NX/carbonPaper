@@ -563,22 +563,26 @@ mod tests {
     #[test]
     fn minimum_context_budget_can_fit_rules_and_the_real_tool_catalog() {
         let budget = super::super::config::MIN_CONTEXT_TOKENS;
-        let mut request = ChatRequest {
-            messages: vec![
-                Message::System(system_prompt()),
-                Message::User("Find an invoice".into()),
-            ],
-            tools: tools::specs(ToolScope::ReadOnly),
-            max_tokens: Some(AgentLimits::default().max_answer_tokens.min(budget / 4)),
-            ..Default::default()
-        };
-        context::fit_request(
-            &mut request,
-            &mut 1,
+        for kind in [
+            super::super::config::ProviderKind::OpenaiCompatible,
             super::super::config::ProviderKind::Anthropic,
-            budget,
-        )
-        .unwrap();
+        ] {
+            let mut request = ChatRequest {
+                messages: vec![
+                    Message::System(system_prompt()),
+                    Message::User("Find an invoice".into()),
+                ],
+                tools: tools::specs(ToolScope::ReadOnly),
+                max_tokens: Some(AgentLimits::default().max_answer_tokens.min(budget / 4)),
+                ..Default::default()
+            };
+            let estimated = context::estimated_input_tokens(kind, &request);
+            let allowance = context::input_allowance(&request, budget);
+            assert!(
+                context::fit_request(&mut request, &mut 1, kind, budget).is_ok(),
+                "{kind:?}: estimated input {estimated} exceeds allowance {allowance}"
+            );
+        }
     }
 
     #[test]

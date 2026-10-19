@@ -266,6 +266,7 @@ fn rank_reference(
                 start_ms: a.start_ms,
                 end_ms: a.end_ms,
                 sources: a.sources.clone(),
+                evidence: d.evidence.clone(),
                 keyword_rank,
                 semantic_rank,
             }
