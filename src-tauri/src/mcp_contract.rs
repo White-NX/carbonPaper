@@ -228,24 +228,28 @@ pub fn tool_definitions() -> Value {
     let mut tools = json!([
         {
             "name": "get_snapshots_by_time_range",
-            "description": "Get screenshot metadata in the half-open interval [start_ms, end_ms). Results use screenshot_id and captured_at_ms (Unix milliseconds); null capture time means unknown. Returns the earliest matching records up to max_records.",
+            "description": "Page screenshot metadata in the half-open interval [start_ms, end_ms), ordered by capture time then screenshot_id. Results use screenshot_id and captured_at_ms (Unix milliseconds); null capture time means unknown. Use offset/limit; max_records is a legacy alias for limit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "start_ms": { "type": "integer", "minimum": 0, "description": "Inclusive start, Unix milliseconds" },
                     "end_ms": { "type": "integer", "minimum": 0, "description": "Exclusive end, Unix milliseconds" },
-                    "max_records": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum number of records to return (default 500)" }
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 100000, "description": "Continuation offset (default 0)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Page size (default 500)" },
+                    "max_records": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Legacy alias for limit; omit when supplying limit" }
                 },
                 "required": ["start_ms", "end_ms"]
             }
         },
         {
             "name": "get_snapshot_details",
-            "description": "Read one screenshot using screenshot_id from another tool. Returns status=found, record with captured_at_ms, and OCR rows with ocr_processed_at_ms. An empty OCR list means no text is currently available for export. Missing screenshots return SNAPSHOT_NOT_FOUND; privacy rejection returns PRIVACY_REJECTED. Include OCR bounding boxes with include_coords=true.",
+            "description": "Read one screenshot using screenshot_id from another tool. Returns status=found, record with captured_at_ms, and paginated ocr_results with ocr_processed_at_ms. Use offset/limit to read all OCR rows. Missing screenshots return SNAPSHOT_NOT_FOUND; privacy rejection returns PRIVACY_REJECTED. Include OCR bounding boxes with include_coords=true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "screenshot_id": { "type": "integer", "minimum": 1, "description": "screenshot_id returned by another tool; OCR row IDs cannot be used here" },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "OCR rows per page (default 100)" },
                     "include_coords": { "type": "boolean", "description": "Include OCR bounding box coordinates (default false)" }
                 },
                 "required": ["screenshot_id"]
@@ -290,16 +294,21 @@ pub fn tool_definitions() -> Value {
             "description": "List smart clusters with cluster_id, assignment counts, stored summaries, and explicit Unix-millisecond created_at_ms, updated_at_ms and last_assigned_at_ms fields. Unknown times are null.",
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Clusters per page (default 50)" }
+                }
             }
         },
         {
             "name": "get_smart_cluster_ocr_corpus",
-            "description": "Get smart-cluster screenshots with joined OCR text, screenshot_id, captured_at_ms and assigned_at_ms (Unix milliseconds). Results are paginated and ordered by rerank score.",
+            "description": "Get smart-cluster screenshots with joined OCR text, screenshot_id, captured_at_ms and assigned_at_ms (Unix milliseconds). Results are ordered by rerank score then screenshot_id. Use offset/limit; page/page_size remain legacy aliases. When continuing with next_offset, omit page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "cluster_id": { "type": "integer", "description": "Smart cluster ID" },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Page size (default 50)" },
                     "page": { "type": "integer", "minimum": 0, "maximum": 100000, "description": "Page number (0-based, default 0)" },
                     "page_size": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Page size (default 50, max 200)" },
                     "include_empty_ocr": { "type": "boolean", "description": "Include snapshots that have no OCR text (default false)" }
@@ -399,6 +408,29 @@ pub fn tool_definitions() -> Value {
     ]);
     for tool in tools.as_array_mut().expect("tool catalog is an array") {
         tool["inputSchema"]["additionalProperties"] = false.into();
+        if matches!(
+            tool["name"].as_str(),
+            Some(
+                "get_snapshots_by_time_range"
+                    | "get_snapshot_details"
+                    | "search_ocr_text"
+                    | "search_nl"
+                    | "get_smart_clusters"
+                    | "get_smart_cluster_ocr_corpus"
+                    | "get_recap_days"
+                    | "get_recap_day"
+                    | "search_recaps"
+            )
+        ) {
+            let description = tool["description"].as_str().unwrap().to_owned();
+            tool["description"] = format!("{description} Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.").into();
+        }
+        if tool["name"] == "search_nl" {
+            tool["inputSchema"]["properties"]["limit"]["maximum"] = 200.into();
+        }
+        if let Some(property) = tool["inputSchema"]["properties"].get_mut("offset") {
+            property["maximum"] = 100_000.into();
+        }
         if let Some(property) = tool["inputSchema"]["properties"].get_mut("cluster_id") {
             property["minimum"] = 1.into();
         }
@@ -431,6 +463,14 @@ pub fn contract_document() -> Value {
             "screenshot": "screenshot_id",
             "ocr_row": "ocr_id",
             "cluster": "cluster_id"
+        },
+        "pagination_contract": {
+            "arguments": "offset and limit; retain filters and recap ranking_revision when continuing",
+            "results": "items (ocr_results for snapshot details), offset, limit, returned_count, next_offset; total only when known",
+            "positions": "result_offset refers to the row before privacy filtering; next_offset is the next unread position, not offset plus returned_count",
+            "compaction": "Result and request compaction defer whole trailing items with truncated=true. JSON records and nested evidence stay whole; if a request cannot fit a single complete item, it fails with AI_CONTEXT_LIMIT.",
+            "completion": "Follow non-null next_offset even on an empty page. A full last page may require one empty probe. null ends the current result set except end_reason=offset_limit, which requires a narrower query.",
+            "consistency": "Offsets require unchanged filters and data. Recap ranking_revision rejects changed rankings; other tools should be restarted after source or index changes."
         },
         "error_contract": {
             "shape": {"error": {"code": "STABLE_ERROR_CODE", "message": "Description"}},

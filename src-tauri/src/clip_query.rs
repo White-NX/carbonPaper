@@ -35,7 +35,7 @@ pub const MAX_CLIP_RESULTS: u32 = 200;
 /// Preserve the existing IPC/MCP deep-pagination contract. Requests whose
 /// exact over-fetch exceeds the ANN envelope explicitly use one full exact
 /// scan rather than being silently clamped to a shallower page.
-pub const MAX_CLIP_OFFSET: u32 = 10_000;
+pub const MAX_CLIP_OFFSET: u32 = 100_000;
 
 /// Read-only CLIP retrieval and ANN diagnostic.
 #[derive(Debug, Clone, Serialize)]
@@ -1481,11 +1481,12 @@ mod tests {
     }
 
     #[test]
-    fn offset_contract_keeps_ten_thousand_and_clamps_above_it() {
-        assert_eq!(MAX_CLIP_OFFSET, 10_000);
+    fn offset_contract_matches_the_tool_catalog_without_silently_repeating_pages() {
+        assert_eq!(MAX_CLIP_OFFSET, 100_000);
         assert_eq!(bounded_clip_offset(9_999), 9_999);
         assert_eq!(bounded_clip_offset(10_000), 10_000);
-        assert_eq!(bounded_clip_offset(10_001), 10_000);
+        assert_eq!(bounded_clip_offset(10_001), 10_001);
+        assert_eq!(bounded_clip_offset(100_001), 100_000);
         let defaults = ClipQueryRequest::new("query", None, None, &[], None, None);
         assert_eq!((defaults.limit, defaults.offset), (20, 0));
         let bounded =

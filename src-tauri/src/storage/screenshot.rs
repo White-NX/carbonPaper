@@ -1873,7 +1873,7 @@ impl StorageState {
                  LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
                  LEFT JOIN link_sets ls ON s.link_set_id = ls.id
                  WHERE s.is_deleted = 0 AND s.created_at BETWEEN '{}' AND '{}'
-                 ORDER BY s.created_at ASC
+                 ORDER BY s.created_at ASC, s.id ASC
                  LIMIT {} OFFSET {}",
                 start_dt, end_dt, limit, offset
             );
@@ -2282,7 +2282,7 @@ impl StorageState {
                         box_x1, box_y1, box_x2, box_y2,
                         box_x3, box_y3, box_x4, box_y4, created_at
                  FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0
-                 ORDER BY box_y1, box_x1",
+                 ORDER BY box_y1, box_x1, id",
                 )
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
             let rows = stmt
@@ -2344,7 +2344,7 @@ impl StorageState {
                         box_x3, box_y3, box_x4, box_y4, created_at
                      FROM ocr_results
                      WHERE is_deleted = 0 AND screenshot_id IN ({placeholders})
-                     ORDER BY screenshot_id, box_y1, box_x1"
+                     ORDER BY screenshot_id, box_y1, box_x1, id"
                 );
                 let params: Vec<&dyn rusqlite::ToSql> =
                     chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();

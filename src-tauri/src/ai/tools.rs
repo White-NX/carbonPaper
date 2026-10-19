@@ -11,10 +11,8 @@ use serde_json::{Map, Value};
 use super::provider::{ToolCall, ToolSpec};
 use crate::mcp_contract;
 
-/// Upper bound on one tool result as sent to the model, in characters.
+/// Target page size. An individual record remains whole even when larger.
 const MAX_RESULT_CHARS: usize = 12_000;
-/// Longest single string kept inside a tool result, in characters.
-const MAX_STRING_CHARS: usize = 1_500;
 /// Fields that cost tokens without helping the model answer.
 const DROPPED_FIELDS: &[&str] = &["image_path", "confidence", "distance", "box_coords"];
 
@@ -152,12 +150,13 @@ fn parse_arguments(raw: &str) -> Result<Value, serde_json::Error> {
 }
 
 pub(crate) fn summarize(_tool_name: &str, mut result: Value) -> ToolOutcome {
+    compact(&mut result);
+    let result = crate::mcp_server::page::fit(result, MAX_RESULT_CHARS);
     let mut snapshots = Vec::new();
     collect_snapshots(&result, &mut snapshots);
-    compact(&mut result);
     let item_count = list_of(&result).map(Vec::len);
     ToolOutcome {
-        content: fit_to_budget(result),
+        content: result.to_string(),
         snapshots,
         item_count,
         error: None,
@@ -169,13 +168,7 @@ fn list_of(value: &Value) -> Option<&Vec<Value>> {
     value
         .as_array()
         .or_else(|| value.get("items").and_then(Value::as_array))
-}
-
-fn list_of_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
-    if value.is_array() {
-        return value.as_array_mut();
-    }
-    value.get_mut("items").and_then(Value::as_array_mut)
+        .or_else(|| value.get("ocr_results").and_then(Value::as_array))
 }
 
 /// OCR, activity and cluster IDs can never become screenshot references.
@@ -210,54 +203,8 @@ fn compact(value: &mut Value) {
             map.values_mut().for_each(compact);
         }
         Value::Array(items) => items.iter_mut().for_each(compact),
-        Value::String(text) if text.chars().count() > MAX_STRING_CHARS => {
-            let cut: String = text.chars().take(MAX_STRING_CHARS).collect();
-            *text = format!("{cut}…");
-        }
         _ => {}
     }
-}
-
-/// Drops trailing list items until the serialized result fits, and tells the
-/// model how many it lost so it can narrow the query or page further.
-fn fit_to_budget(mut value: Value) -> String {
-    let mut text = value.to_string();
-    if text.chars().count() <= MAX_RESULT_CHARS {
-        return text;
-    }
-    let mut omitted = 0usize;
-    while let Some(list) = list_of_mut(&mut value) {
-        if list.len() <= 1 {
-            break;
-        }
-        // Halve rather than pop one at a time; results can hold hundreds.
-        let keep = list.len() / 2;
-        omitted += list.len() - keep;
-        list.truncate(keep);
-        // Paginated tools must resume after the items actually shown to the
-        // model, not after the larger page returned by storage.
-        if value.get("total").and_then(Value::as_u64).is_some() {
-            if let Some(offset) = value.get("offset").and_then(Value::as_u64) {
-                value["next_offset"] = offset.saturating_add(keep as u64).into();
-            }
-        }
-        text = value.to_string();
-        if text.chars().count() <= MAX_RESULT_CHARS {
-            break;
-        }
-    }
-    if text.chars().count() > MAX_RESULT_CHARS {
-        let partial: String = text.chars().take(MAX_RESULT_CHARS).collect();
-        return serde_json::json!({ "note": "result cut to fit", "partial": partial }).to_string();
-    }
-    if omitted > 0 {
-        return serde_json::json!({
-            "note": format!("{omitted} more items omitted to fit; use next_offset when present, otherwise narrow the query or use offset/limit"),
-            "result": value,
-        })
-        .to_string();
-    }
-    text
 }
 
 #[cfg(test)]
@@ -334,15 +281,21 @@ mod tests {
     }
 
     #[test]
-    fn oversized_lists_are_trimmed_with_a_note() {
+    fn oversized_pages_report_only_visible_items_and_their_continuation() {
         let items: Vec<Value> = (0..400)
             .map(|i| json!({ "screenshot_id": i + 1, "text": "x".repeat(200) }))
             .collect();
-        let outcome = summarize("search_nl", Value::Array(items));
-        assert!(outcome.content.chars().count() < MAX_RESULT_CHARS + 200);
-        assert!(outcome.content.contains("more items omitted"));
-        assert_eq!(outcome.snapshots.len(), 400);
-        serde_json::from_str::<Value>(&outcome.content).unwrap();
+        let outcome = summarize(
+            "search_nl",
+            json!({"items": items,"offset":0,"limit":400,"next_offset":400}),
+        );
+        assert!(outcome.content.chars().count() <= MAX_RESULT_CHARS);
+        let result: Value = serde_json::from_str(&outcome.content).unwrap();
+        let shown = result["items"].as_array().unwrap().len();
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["next_offset"], shown);
+        assert_eq!(outcome.snapshots.len(), shown);
+        assert_eq!(outcome.item_count, Some(shown));
     }
 
     #[test]
@@ -382,9 +335,9 @@ mod tests {
             }),
         );
         let content: Value = serde_json::from_str(&outcome.content).unwrap();
-        let visible = content["result"]["items"].as_array().unwrap().len();
+        let visible = content["items"].as_array().unwrap().len();
         assert!(visible < 50);
-        assert_eq!(content["result"]["next_offset"], 10 + visible);
+        assert_eq!(content["next_offset"], 10 + visible);
     }
 
     #[test]

@@ -305,7 +305,7 @@ pub async fn run(port: u16, token: &str) -> McpSmokeReport {
             return runner.finish_failed("metadata_query", started, failure);
         }
     };
-    if !metadata_result_is_array(metadata_result) {
+    if !metadata_result_is_page(metadata_result) {
         return runner.finish_failed("metadata_query", started, SmokeFailure::ProtocolError);
     }
     runner.push_passed("metadata_query", started);
@@ -357,9 +357,13 @@ fn classify_metadata_failure(response: &Value) -> Option<SmokeFailure> {
     }
 }
 
-fn metadata_result_is_array(result: &Value) -> bool {
+fn metadata_result_is_page(result: &Value) -> bool {
     result.get("isError").and_then(Value::as_bool) != Some(true)
-        && tool_payload(result).is_some_and(|value| value.is_array())
+        && tool_payload(result).is_some_and(|value| {
+            value["items"].is_array()
+                && value["offset"].is_u64()
+                && value.get("next_offset").is_some()
+        })
 }
 
 fn tool_payload(result: &Value) -> Option<Value> {
@@ -408,12 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_result_requires_a_json_array_payload() {
-        let good = json!({ "content": [{ "type": "text", "text": "[]" }] });
+    fn metadata_result_requires_a_page_with_an_explicit_end_marker() {
+        let good = json!({ "content": [{ "type": "text", "text": json!({"items":[],"offset":0,"next_offset":null}).to_string() }] });
         let bad = json!({ "content": [{ "type": "text", "text": "{\"id\":1}" }] });
-        assert!(metadata_result_is_array(&good));
-        assert!(!metadata_result_is_array(&bad));
-        assert!(!metadata_result_is_array(
+        assert!(metadata_result_is_page(&good));
+        assert!(!metadata_result_is_page(&bad));
+        assert!(!metadata_result_is_page(
             &json!({ "isError": true, "content": [{ "type": "text", "text": "[]" }] })
         ));
     }

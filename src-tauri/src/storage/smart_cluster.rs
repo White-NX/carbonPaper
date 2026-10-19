@@ -470,7 +470,7 @@ impl StorageState {
             .ok_or_else(|| "Database connection is None".to_string())?;
         let mut stmt = conn
             .prepare(&format!(
-                "{SMART_CLUSTER_PROJECTION} ORDER BY sc.updated_at DESC"
+                "{SMART_CLUSTER_PROJECTION} ORDER BY sc.updated_at DESC, sc.id ASC"
             ))
             .map_err(|e| format!("Failed to prepare list_smart_clusters: {}", e))?;
         let rows = stmt
@@ -820,11 +820,19 @@ impl StorageState {
         page: i64,
         page_size: i64,
     ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
+        self.list_smart_cluster_assignments_offset(cluster_id, page * page_size, page_size)
+    }
+
+    fn list_smart_cluster_assignments_offset(
+        &self,
+        cluster_id: i64,
+        offset: i64,
+        page_size: i64,
+    ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
         let guard = self.get_connection_named("list_smart_cluster_assignments")?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
-        let offset = page * page_size;
         let mut stmt = conn
             .prepare(
                 "SELECT a.screenshot_id, a.rerank_score, s.image_path, s.process_name, \
@@ -832,7 +840,7 @@ impl StorageState {
                  FROM smart_cluster_assignments a \
                  JOIN screenshots s ON s.id = a.screenshot_id \
                  WHERE a.smart_cluster_id = ? AND s.is_deleted = 0 \
-                 ORDER BY a.rerank_score DESC \
+                 ORDER BY a.rerank_score DESC, a.screenshot_id ASC \
                  LIMIT ? OFFSET ?",
             )
             .map_err(|e| format!("Failed to prepare list assignments: {}", e))?;
@@ -909,10 +917,11 @@ impl StorageState {
     pub fn list_smart_cluster_ocr_corpus_blocks(
         &self,
         cluster_id: i64,
-        page: i64,
+        offset: i64,
         page_size: i64,
     ) -> Result<Vec<(SmartClusterOcrCorpusItem, Vec<super::OcrResult>)>, String> {
-        let assignments = self.list_smart_cluster_assignments(cluster_id, page, page_size)?;
+        let assignments =
+            self.list_smart_cluster_assignments_offset(cluster_id, offset, page_size)?;
         let screenshot_ids: Vec<i64> = assignments.iter().map(|s| s.screenshot_id).collect();
         let blocks = self.get_ocr_blocks_by_screenshot_ids(&screenshot_ids)?;
         Ok(assignments
@@ -1397,6 +1406,43 @@ mod tests {
             ],
         )
         .expect("insert screenshot");
+    }
+
+    #[test]
+    fn corpus_offsets_resume_inside_a_legacy_page_with_stable_score_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        crate::credential_manager::save_public_key_to_file(&credential, b"paging-test-public-key")
+            .unwrap();
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
+        storage.initialize().unwrap();
+        let cluster = insert_cluster(&storage, "Paging");
+        for id in [9, 3, 7, 1] {
+            insert_screenshot(&storage, id, "editor.exe", "Paging");
+            storage
+                .record_smart_cluster_assignment(cluster, id, 0.5)
+                .unwrap();
+        }
+        let first = storage
+            .list_smart_cluster_assignments(cluster, 0, 4)
+            .unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.screenshot_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 7, 9]
+        );
+        let resumed = storage
+            .list_smart_cluster_ocr_corpus_blocks(cluster, 2, 2)
+            .unwrap();
+        assert_eq!(
+            resumed
+                .iter()
+                .map(|(row, _)| row.screenshot_id)
+                .collect::<Vec<_>>(),
+            vec![7, 9]
+        );
     }
 
     #[test]

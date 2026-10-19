@@ -30,8 +30,10 @@ use crate::storage::{OcrResult, StorageState};
 use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
+pub(crate) mod page;
 mod recap;
 mod wire;
+use page::Page;
 use recap::{tool_get_recap_day, tool_get_recap_days, tool_search_recaps};
 
 // ==================== Default config ====================
@@ -383,7 +385,11 @@ pub async fn call_tool(
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
     }
     mcp_contract::validate_arguments(tool_name, &args)?;
-    dispatch_mcp_tool(app_handle, tool_name, args).await
+    let mut result = dispatch_mcp_tool(app_handle, tool_name, args).await?;
+    if let Some(key) = page::list_key(&result) {
+        result["returned_count"] = result[key].as_array().unwrap().len().into();
+    }
+    Ok(result)
 }
 
 async fn handle_tools_call(
@@ -912,48 +918,41 @@ mod privacy_filter_tests {
 
 async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
-
+    let page = Page::parse(&args, 500, 500)?;
     let range = mcp_contract::TimeRange::from_args(&args, true)?;
     let (start_ts, end_ts) = range.storage_seconds();
     let (start_ts, end_ts) = (start_ts.unwrap(), end_ts.unwrap());
     if start_ts > end_ts {
-        return Ok(serde_json::json!([]));
+        return Ok(page.complete(vec![]));
     }
-    let max_records = args.get("max_records").and_then(|v| v.as_i64());
 
     let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
     let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
-    let records: Vec<_> = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let mode = filter.mode();
-        let records = storage.get_screenshots_by_time_range_limited(
+        let records = storage.get_screenshots_by_time_range_paged(
             start_ts,
             end_ts,
-            max_records.or(Some(500)),
+            page.offset as i64,
+            page.limit as i64,
         )?;
         // Metadata only: a flagged title or URL is replaced, or the record is
         // withheld in reject mode.
-        let records: Vec<_> = records
-            .into_iter()
-            .filter_map(|mut r| {
-                if let Some(title) = r.window_title.take() {
-                    r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
-                }
-                if let Some(url) = r.page_url.take() {
-                    r.page_url = Some(filter_url(&filter, mode, &url).ok()?);
-                }
-                Some(r)
-            })
-            .collect();
-        Ok::<_, String>(records)
+        Ok::<_, String>(page.filtered(records, |mut r| {
+            if let Some(title) = r.window_title.take() {
+                r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
+            }
+            if let Some(url) = r.page_url.take() {
+                r.page_url = Some(filter_url(&filter, mode, &url).ok()?);
+            }
+            Some(wire::screenshot(&r))
+        }))
     })
     .await
-    .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    let output: Vec<Value> = records.iter().map(wire::screenshot).collect();
-    Ok(Value::Array(output))
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 async fn tool_get_snapshot_details(
@@ -963,6 +962,7 @@ async fn tool_get_snapshot_details(
     require_authenticated_session(app_handle)?;
 
     let id = mcp_contract::screenshot_id(&args)?;
+    let page = Page::parse(&args, 100, 500)?;
     let include_coords = args
         .get("include_coords")
         .and_then(|v| v.as_bool())
@@ -1011,7 +1011,9 @@ async fn tool_get_snapshot_details(
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    snapshot_details_result(id, result, include_coords)
+    let mut result = snapshot_details_result(id, result, include_coords)?;
+    page.complete_field(&mut result, "ocr_results");
+    Ok(result)
 }
 
 fn snapshot_details_result(
@@ -1040,8 +1042,7 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or("Missing required parameter: query")?
         .to_string();
-    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20) as i32;
-    let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let page = Page::parse(&args, 20, 500)?;
     let fuzzy = args.get("fuzzy").and_then(|v| v.as_bool()).unwrap_or(true);
     let process_names: Option<Vec<String>> = args
         .get("process_names")
@@ -1049,7 +1050,7 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
     let (start_time, end_time) =
         mcp_contract::TimeRange::from_args(&args, false)?.storage_seconds();
     if matches!((start_time, end_time), (Some(a), Some(b)) if a > b) {
-        return Ok(serde_json::json!([]));
+        return Ok(page.complete(vec![]));
     }
     let categories: Option<Vec<String>> = args
         .get("categories")
@@ -1060,12 +1061,12 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
     let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
-    let results = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let mode = filter.mode();
         let results = storage.search_text(
             &query,
-            limit,
-            offset,
+            page.limit as i32,
+            page.offset as i32,
             fuzzy,
             process_names,
             start_time,
@@ -1074,22 +1075,16 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
         )?;
         // Each hit is one OCR segment. Its neighbours are not loaded, so only
         // labels inside the segment count as context.
-        let results: Vec<_> = results
-            .into_iter()
-            .filter_map(|mut r| {
-                if let Some(title) = r.window_title.take() {
-                    r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
-                }
-                r.text = filter_segment(&filter, mode, &r.text, pii::Context::default()).ok()??;
-                Some(r)
-            })
-            .collect();
-        Ok::<_, String>(results)
+        Ok::<_, String>(page.filtered(results, |mut r| {
+            if let Some(title) = r.window_title.take() {
+                r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
+            }
+            r.text = filter_segment(&filter, mode, &r.text, pii::Context::default()).ok()??;
+            Some(wire::ocr_hit(&r))
+        }))
     })
     .await
-    .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    Ok(Value::Array(results.iter().map(wire::ocr_hit).collect()))
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
@@ -1100,8 +1095,7 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
         .and_then(Value::as_str)
         .ok_or("Missing required parameter: query")?
         .to_string();
-    let limit = args.get("limit").and_then(Value::as_u64);
-    let offset = args.get("offset").and_then(Value::as_u64);
+    let page = Page::parse(&args, 20, crate::clip_query::MAX_CLIP_RESULTS as usize)?;
     let process_names: Vec<String> = args
         .get("process_names")
         .and_then(Value::as_array)
@@ -1115,7 +1109,7 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
     let range = mcp_contract::TimeRange::from_args(&args, false)?;
     let (start_time, end_time) = range.storage_seconds();
     if matches!((start_time, end_time), (Some(a), Some(b)) if a > b) {
-        return Ok(serde_json::json!([]));
+        return Ok(page.complete(vec![]));
     }
 
     // Use the same Rust CLIP path as the application search surface.
@@ -1123,8 +1117,8 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
         app_handle,
         crate::clip_query::ClipQueryRequest::new(
             &query,
-            limit,
-            offset,
+            Some(page.limit as u64),
+            Some(page.offset as u64),
             &process_names,
             start_time,
             end_time,
@@ -1134,9 +1128,11 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
 
     let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let mode = filter.mode();
-    let items: Vec<Value> = items
+    let scanned = items.len();
+    let items: Vec<(usize, Value)> = items
         .into_iter()
-        .filter_map(|mut item| {
+        .enumerate()
+        .filter_map(|(position, mut item)| {
             let title = item
                 .get("metadata")
                 .and_then(|m| m.get("window_title"))
@@ -1165,14 +1161,14 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
                     obj.insert("ocr_text".into(), Value::String(snippet));
                 }
             }
-            Some(item)
+            Some((position, item))
         })
         .collect();
 
     // Resolve screenshot_ids from image_hash and clean up output
     let hashes: Vec<String> = items
         .iter()
-        .filter_map(|item| {
+        .filter_map(|(_, item)| {
             item.get("image_path")
                 .and_then(|v| v.as_str())
                 .and_then(|p| p.strip_prefix("memory://"))
@@ -1193,7 +1189,7 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
     // Build clean output: add screenshot_id, flatten metadata, remove internal fields
     let cleaned: Vec<Value> = items
         .iter()
-        .filter_map(|item| {
+        .filter_map(|(position, item)| {
             let image_path = item
                 .get("image_path")
                 .and_then(|v| v.as_str())
@@ -1201,21 +1197,23 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
             let screenshot_id = image_path
                 .strip_prefix("memory://")
                 .and_then(|hash| hash_to_id.get(hash))?;
-            let value = wire::visual_hit(item, *screenshot_id);
+            let mut value = wire::visual_hit(item, *screenshot_id);
+            value["result_offset"] = (page.offset + position).into();
             range
                 .contains(value["captured_at_ms"].as_i64())
                 .then_some(value)
         })
         .collect();
 
-    Ok(Value::Array(cleaned))
+    Ok(page.exported(cleaned, scanned))
 }
 
 async fn tool_get_smart_clusters(
     app_handle: &tauri::AppHandle,
-    _args: Value,
+    args: Value,
 ) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
+    let page = Page::parse(&args, 50, 200)?;
 
     let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
@@ -1239,7 +1237,7 @@ async fn tool_get_smart_clusters(
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    Ok(Value::Array(
+    Ok(page.complete(
         clusters
             .iter()
             .map(|cluster| wire::archive(serde_json::json!(cluster)))
@@ -1258,16 +1256,7 @@ async fn tool_get_smart_cluster_ocr_corpus(
         .or_else(|| args.get("smart_cluster_id"))
         .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: cluster_id")?;
-    let page = args
-        .get("page")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0);
-    let page_size = args
-        .get("page_size")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(50)
-        .clamp(1, 200);
+    let page = Page::parse(&args, 50, 200)?;
     let include_empty_ocr = args
         .get("include_empty_ocr")
         .and_then(|v| v.as_bool())
@@ -1278,41 +1267,37 @@ async fn tool_get_smart_cluster_ocr_corpus(
     let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
-    let items = tokio::task::spawn_blocking(move || {
+    let mut result = tokio::task::spawn_blocking(move || {
         let mode = filter.mode();
-        let pages = storage.list_smart_cluster_ocr_corpus_blocks(cluster_id, page, page_size)?;
-        let items: Vec<_> = pages
-            .into_iter()
-            .filter_map(|(mut item, blocks)| {
-                if let Some(title) = item.window_title.take() {
-                    item.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
-                }
-                // Rebuilt from the remaining segments, joined with spaces as
-                // the unfiltered corpus is.
-                let kept = filter_ocr_blocks(&filter, mode, blocks).ok()?;
-                item.ocr_text = kept
-                    .iter()
-                    .map(|block| block.text.as_str())
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !include_empty_ocr && item.ocr_text.trim().is_empty() {
-                    return None;
-                }
-                Some(wire::corpus_item(&item))
-            })
-            .collect();
-        Ok::<_, String>(items)
+        let pages = storage.list_smart_cluster_ocr_corpus_blocks(
+            cluster_id,
+            page.offset as i64,
+            page.limit as i64,
+        )?;
+        Ok::<_, String>(page.filtered(pages, |(mut item, blocks)| {
+            if let Some(title) = item.window_title.take() {
+                item.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
+            }
+            // Rebuilt from the remaining segments, joined with spaces as
+            // the unfiltered corpus is.
+            let kept = filter_ocr_blocks(&filter, mode, blocks).ok()?;
+            item.ocr_text = kept
+                .iter()
+                .map(|block| block.text.as_str())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !include_empty_ocr && item.ocr_text.trim().is_empty() {
+                return None;
+            }
+            Some(wire::corpus_item(&item))
+        }))
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    Ok(serde_json::json!({
-        "cluster_id": cluster_id,
-        "page": page,
-        "page_size": page_size,
-        "items": items,
-    }))
+    result["cluster_id"] = cluster_id.into();
+    Ok(result)
 }
 
 async fn tool_get_smart_cluster_summary(

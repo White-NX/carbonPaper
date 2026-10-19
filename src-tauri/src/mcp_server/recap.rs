@@ -17,6 +17,11 @@ struct Page {
 
 impl Page {
     fn limit(&self, default: usize, max: usize) -> Result<usize, String> {
+        if self.offset > 100_000 {
+            return Err(crate::mcp_contract::invalid_argument(
+                "offset must not exceed 100000",
+            ));
+        }
         let limit = self.limit.unwrap_or(default);
         if limit == 0 || limit > max {
             return Err(crate::mcp_contract::invalid_argument(format!(
@@ -61,15 +66,7 @@ struct DayQuery {
 }
 
 fn page_result(items: Vec<Value>, offset: usize, limit: usize) -> Value {
-    let total = items.len();
-    let end = offset.saturating_add(limit).min(total);
-    json!({
-        "items": items.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "next_offset": (end < total).then_some(end),
-    })
+    super::page::Page { offset, limit }.complete(items)
 }
 
 fn dates_result(mut days: Vec<String>, query: &DaysQuery, limit: usize) -> Value {
@@ -172,7 +169,10 @@ fn search_result(mut result: RecapSearchResult) -> Result<Value, String> {
     // Runtime paths and raw worker diagnostics stay in the local UI and logs,
     // rather than becoming model inputs through MCP or interactive AI search.
     result.semantic_error = None;
+    let returned_count = result.items.len();
     let mut result = serde_json::to_value(result).map_err(|_| "RECAP_INVALID_CACHE")?;
+    result["returned_count"] = returned_count.into();
+    super::page::bound_continuation(&mut result);
     // Keep the established MCP screenshot citation and Unix-millisecond contract.
     if let Some(items) = result["items"].as_array_mut() {
         for item in items {
@@ -268,7 +268,12 @@ fn day_result(
             }
         }
     }
-    items.sort_by_key(|item| item["start_ms"].as_i64().unwrap_or_default());
+    items.sort_by(|a, b| {
+        a["start_ms"]
+            .as_i64()
+            .cmp(&b["start_ms"].as_i64())
+            .then_with(|| a["activity_id"].as_str().cmp(&b["activity_id"].as_str()))
+    });
     let mut result = page_result(items, query.page.offset, limit);
     result["date"] = day.date.into();
     result["calendar"] = json!(day.calendar);
@@ -429,6 +434,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result["semantic_status"], "unavailable");
+        assert_eq!(result["returned_count"], 1);
         assert!(result.get("semantic_error").is_none());
         assert_eq!(
             result["items"][0]["sources"][0]["screenshot_id"],
@@ -487,13 +493,13 @@ mod tests {
         let mut day = fixture();
         let mut second = day.batches[0].activities[0].clone();
         second.id = "activity-2".into();
-        second.start_ms += 1;
         day.batches[0].activities.insert(0, second);
         let mut query = query();
         query.page.limit = Some(1);
         let first = day_result(day.clone(), &query, &filter("mask")).unwrap();
         assert_eq!(first["items"][0]["activity_id"], "activity-1");
         assert_eq!(first["next_offset"], 1);
+        assert_eq!(first["returned_count"], 1);
         query.page.offset = 1;
         let last = day_result(day.clone(), &query, &filter("mask")).unwrap();
         assert_eq!(last["items"][0]["activity_id"], "activity-2");
@@ -521,11 +527,13 @@ mod tests {
         assert_eq!(result["items"], json!(["2026-10-02"]));
         assert_eq!(result["total"], 2);
         assert_eq!(result["next_offset"], 1);
+        assert_eq!(result["returned_count"], 1);
         for args in [
             json!({"start_date":"2026-02-30"}),
             json!({"start_date":"2026-10-02","end_date":"2026-10-01"}),
             json!({"limit":0}),
             json!({"limit":101}),
+            json!({"offset":100001}),
         ] {
             assert!(serde_json::from_value::<DaysQuery>(args)
                 .unwrap()

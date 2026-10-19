@@ -56,6 +56,41 @@ OCR search is lexical: extract words likely visible on screen, such as `保存�
 or `save location`. Whitespace separates terms; fuzzy matching tolerates OCR and
 spelling errors and does not turn an arbitrary question into semantic retrieval.
 
+## Pagination and Agent context
+
+All list tools accept `offset` / `limit` and return an object containing `items`,
+`offset`, `limit`, `returned_count`, and `next_offset`. Screenshot details use
+`ocr_results` as their paginated list. `total` is included only when known.
+Screenshot listing keeps `max_records` as a legacy alias for `limit`; archive
+corpus keeps `page` / `page_size` aliases. Do not combine `limit` with a legacy
+size argument, or `offset` with `page`. To continue a legacy request, use the
+returned `next_offset` as `offset` and omit `page`.
+
+Always follow `next_offset` with the same filters. Export filtering can withhold
+rows, so a short or empty page may still have a continuation. `result_offset`
+identifies a retained row's position before that filtering. A full final storage
+page may require an empty probe to establish the end. A null continuation means
+the current result set ended, except when `end_reason: "offset_limit"` explicitly
+reports the 100,000-offset ceiling; narrow the query in that case. Visual search
+accepts at most 200 records per page and the same 100,000-offset ceiling.
+
+The Agent targets 12,000 characters per result by deferring whole trailing items
+and setting `truncated: true`. It updates `next_offset` to the first omitted row,
+prunes calendars belonging to omitted dates, and counts only visible evidence.
+It never cuts strings, nested evidence lists, or JSON fragments. A single record
+larger than the target remains whole. External MCP clients receive the requested
+page without this additional Agent budget.
+
+If the complete model request needs further compression, it applies the same
+whole-item paging to tool results and prefetched result blocks. Continuations,
+fact citations and member lists remain intact. A request that cannot fit even
+one complete item fails with `AI_CONTEXT_LIMIT`; a larger context budget is
+required to read that item. Legacy plain-text transcripts retain labelled excerpts.
+
+Offset pagination assumes unchanged source data, index and filters. Restart after
+these change. Recap `ranking_revision` rejects a changed ranking explicitly;
+it must be carried to subsequent pages. No other list promises a frozen snapshot.
+
 ## Errors
 
 The Agent receives this payload for a failed tool call:

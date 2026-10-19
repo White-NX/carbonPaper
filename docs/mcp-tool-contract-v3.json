@@ -24,6 +24,14 @@
     "screenshot": "screenshot_id"
   },
   "mcp_protocol_version": "2025-03-26",
+  "pagination_contract": {
+    "arguments": "offset and limit; retain filters and recap ranking_revision when continuing",
+    "compaction": "Result and request compaction defer whole trailing items with truncated=true. JSON records and nested evidence stay whole; if a request cannot fit a single complete item, it fails with AI_CONTEXT_LIMIT.",
+    "completion": "Follow non-null next_offset even on an empty page. A full last page may require one empty probe. null ends the current result set except end_reason=offset_limit, which requires a narrower query.",
+    "consistency": "Offsets require unchanged filters and data. Recap ranking_revision rejects changed rankings; other tools should be restarted after source or index changes.",
+    "positions": "result_offset refers to the row before privacy filtering; next_offset is the next unread position, not offset plus returned_count",
+    "results": "items (ocr_results for snapshot details), offset, limit, returned_count, next_offset; total only when known"
+  },
   "skill": {
     "id": "carbonpaper-memory",
     "source_repository": "https://github.com/White-NX/carbonPaperSkill"
@@ -39,7 +47,7 @@
   "tool_schema_version": 3,
   "tools": [
     {
-      "description": "Get screenshot metadata in the half-open interval [start_ms, end_ms). Results use screenshot_id and captured_at_ms (Unix milliseconds); null capture time means unknown. Returns the earliest matching records up to max_records.",
+      "description": "Page screenshot metadata in the half-open interval [start_ms, end_ms), ordered by capture time then screenshot_id. Results use screenshot_id and captured_at_ms (Unix milliseconds); null capture time means unknown. Use offset/limit; max_records is a legacy alias for limit. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -49,10 +57,22 @@
             "minimum": 0,
             "type": "integer"
           },
-          "max_records": {
-            "description": "Maximum number of records to return (default 500)",
+          "limit": {
+            "description": "Page size (default 500)",
             "maximum": 500,
             "minimum": 1,
+            "type": "integer"
+          },
+          "max_records": {
+            "description": "Legacy alias for limit; omit when supplying limit",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "description": "Continuation offset (default 0)",
+            "maximum": 100000,
+            "minimum": 0,
             "type": "integer"
           },
           "start_ms": {
@@ -71,13 +91,24 @@
       "name": "get_snapshots_by_time_range"
     },
     {
-      "description": "Read one screenshot using screenshot_id from another tool. Returns status=found, record with captured_at_ms, and OCR rows with ocr_processed_at_ms. An empty OCR list means no text is currently available for export. Missing screenshots return SNAPSHOT_NOT_FOUND; privacy rejection returns PRIVACY_REJECTED. Include OCR bounding boxes with include_coords=true.",
+      "description": "Read one screenshot using screenshot_id from another tool. Returns status=found, record with captured_at_ms, and paginated ocr_results with ocr_processed_at_ms. Use offset/limit to read all OCR rows. Missing screenshots return SNAPSHOT_NOT_FOUND; privacy rejection returns PRIVACY_REJECTED. Include OCR bounding boxes with include_coords=true. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "include_coords": {
             "description": "Include OCR bounding box coordinates (default false)",
             "type": "boolean"
+          },
+          "limit": {
+            "description": "OCR rows per page (default 100)",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "maximum": 100000,
+            "minimum": 0,
+            "type": "integer"
           },
           "screenshot_id": {
             "description": "screenshot_id returned by another tool; OCR row IDs cannot be used here",
@@ -93,7 +124,7 @@
       "name": "get_snapshot_details"
     },
     {
-      "description": "Find words visible on screen using lexical OCR search. Extract distinctive keywords from a question, e.g. 保存路径 or save location. Separate keywords with spaces; a Chinese question is otherwise one long phrase. Fuzzy matching tolerates spelling/OCR errors. Results use screenshot_id for evidence, ocr_id for the text row, captured_at_ms for capture time, and ocr_processed_at_ms for recognition completion; all times are Unix milliseconds.",
+      "description": "Find words visible on screen using lexical OCR search. Extract distinctive keywords from a question, e.g. 保存路径 or save location. Separate keywords with spaces; a Chinese question is otherwise one long phrase. Fuzzy matching tolerates spelling/OCR errors. Results use screenshot_id for evidence, ocr_id for the text row, captured_at_ms for capture time, and ocr_processed_at_ms for recognition completion; all times are Unix milliseconds. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -152,7 +183,7 @@
       "name": "search_ocr_text"
     },
     {
-      "description": "Natural language visual search over screenshots using Chinese-CLIP image embeddings. Describe what the screen looks like; use search_ocr_text for visible words. Results use screenshot_id and captured_at_ms (Unix milliseconds). A time filter excludes captures whose time is unknown.",
+      "description": "Natural language visual search over screenshots using Chinese-CLIP image embeddings. Describe what the screen looks like; use search_ocr_text for visible words. Results use screenshot_id and captured_at_ms (Unix milliseconds). A time filter excludes captures whose time is unknown. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -164,7 +195,7 @@
           },
           "limit": {
             "description": "Max results (default 20)",
-            "maximum": 500,
+            "maximum": 200,
             "minimum": 1,
             "type": "integer"
           },
@@ -200,16 +231,28 @@
       "name": "search_nl"
     },
     {
-      "description": "List smart clusters with cluster_id, assignment counts, stored summaries, and explicit Unix-millisecond created_at_ms, updated_at_ms and last_assigned_at_ms fields. Unknown times are null.",
+      "description": "List smart clusters with cluster_id, assignment counts, stored summaries, and explicit Unix-millisecond created_at_ms, updated_at_ms and last_assigned_at_ms fields. Unknown times are null. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
-        "properties": {},
+        "properties": {
+          "limit": {
+            "description": "Clusters per page (default 50)",
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "maximum": 100000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "name": "get_smart_clusters"
     },
     {
-      "description": "Get smart-cluster screenshots with joined OCR text, screenshot_id, captured_at_ms and assigned_at_ms (Unix milliseconds). Results are paginated and ordered by rerank score.",
+      "description": "Get smart-cluster screenshots with joined OCR text, screenshot_id, captured_at_ms and assigned_at_ms (Unix milliseconds). Results are ordered by rerank score then screenshot_id. Use offset/limit; page/page_size remain legacy aliases. When continuing with next_offset, omit page. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -221,6 +264,17 @@
           "include_empty_ocr": {
             "description": "Include snapshots that have no OCR text (default false)",
             "type": "boolean"
+          },
+          "limit": {
+            "description": "Page size (default 50)",
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "maximum": 100000,
+            "minimum": 0,
+            "type": "integer"
           },
           "page": {
             "description": "Page number (0-based, default 0)",
@@ -261,7 +315,7 @@
       "name": "get_smart_cluster_summary"
     },
     {
-      "description": "List recorded daily recap dates, newest first, from the most recent 730 non-deleted dates. Each YYYY-MM-DD date retains its saved calendar; inspect calendars[date] for the recorded time zone and UTC boundaries. A listed date may have pending or stale periods; use get_recap_day to read available content. Does not generate recaps.",
+      "description": "List recorded daily recap dates, newest first, from the most recent 730 non-deleted dates. Each YYYY-MM-DD date retains its saved calendar; inspect calendars[date] for the recorded time zone and UTC boundaries. A listed date may have pending or stale periods; use get_recap_day to read available content. Does not generate recaps. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -277,6 +331,7 @@
           },
           "offset": {
             "description": "Pagination offset (default 0)",
+            "maximum": 100000,
             "minimum": 0,
             "type": "integer"
           },
@@ -290,7 +345,7 @@
       "name": "get_recap_days"
     },
     {
-      "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is YYYY-MM-DD in the returned calendar, whose recorded time zone and day/period boundaries remain fixed. Sources use screenshot_id and captured_at_ms; all instants are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details.",
+      "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is YYYY-MM-DD in the returned calendar, whose recorded time zone and day/period boundaries remain fixed. Sources use screenshot_id and captured_at_ms; all instants are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -310,6 +365,7 @@
           },
           "offset": {
             "description": "Activity offset (default 0)",
+            "maximum": 100000,
             "minimum": 0,
             "type": "integer"
           }
@@ -322,7 +378,7 @@
       "name": "get_recap_day"
     },
     {
-      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for each result's recorded time zone and boundaries. Sources use screenshot_id and captured_at_ms (Unix milliseconds). Verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index.",
+      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for each result's recorded time zone and boundaries. Sources use screenshot_id and captured_at_ms (Unix milliseconds). Verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
