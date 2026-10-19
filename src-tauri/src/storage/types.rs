@@ -108,6 +108,21 @@ pub struct SearchResult {
     /// CLIP hits carry. Present so display code never has to interpret a
     /// string, and `None` only when the row has no usable time at all.
     pub timestamp: Option<i64>,
+    /// Lexical match evidence is present only on ranked OCR search rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_evidence: Option<SearchMatchEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMatchEvidence {
+    pub scope: String,
+    pub relevance_score: f64,
+    pub matched_terms: Vec<String>,
+    pub literal_terms: Vec<String>,
+    pub match_type: String,
+    pub phrase_matched: bool,
+    pub matched_bigram_groups: Option<u32>,
+    pub total_bigram_groups: Option<u32>,
 }
 
 /// One recent capture as shown in the search landing area.

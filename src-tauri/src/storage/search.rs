@@ -33,8 +33,8 @@ use super::screenshot::unwrap_batch_parallel;
 use super::search_plan::{BigramGroup, QueryPlan};
 use super::search_rank;
 use super::{
-    connection::IndependentReadConnection, wire_time, BackgroundReadError, SearchResult,
-    StorageState,
+    connection::IndependentReadConnection, wire_time, BackgroundReadError, SearchMatchEvidence,
+    SearchResult, StorageState,
 };
 
 type SearchSqlParam = Box<dyn ToSql>;
@@ -1089,6 +1089,7 @@ pub(super) struct CachedSearchOrder {
     /// only: a partial bounded order is still reused so later pages cannot
     /// reshuffle the prefix the user already saw.
     complete: bool,
+    match_evidence: HashMap<i64, SearchMatchEvidence>,
 }
 
 fn order_cache_key(
@@ -1269,6 +1270,7 @@ impl StorageState {
                             raw.screenshot_created_ts,
                         ),
                         timestamp: raw.screenshot_created_ts,
+                        match_evidence: None,
                     }
                 })
                 .collect();
@@ -1387,7 +1389,11 @@ impl StorageState {
         .map_err(describe_read_error)
     }
 
-    fn cached_order(&self, key: &str, reset_generation: u64) -> Option<(Vec<i64>, bool)> {
+    fn cached_order(
+        &self,
+        key: &str,
+        reset_generation: u64,
+    ) -> Option<(Vec<i64>, bool, HashMap<i64, SearchMatchEvidence>)> {
         let mut guard = self
             .search_order_cache
             .lock()
@@ -1410,7 +1416,11 @@ impl StorageState {
             return None;
         }
         let cached = guard.as_ref().expect("cache validity was checked above");
-        Some((cached.ordered.clone(), cached.complete))
+        Some((
+            cached.ordered.clone(),
+            cached.complete,
+            cached.match_evidence.clone(),
+        ))
     }
 
     fn store_order(
@@ -1418,6 +1428,7 @@ impl StorageState {
         key: String,
         ordered: &[i64],
         complete: bool,
+        match_evidence: HashMap<i64, SearchMatchEvidence>,
         data_version: i64,
         reset_generation: u64,
         version_connection: IndependentReadConnection,
@@ -1447,6 +1458,7 @@ impl StorageState {
             reset_generation,
             ordered: ordered.to_vec(),
             complete,
+            match_evidence,
         });
     }
 
@@ -1524,14 +1536,19 @@ impl StorageState {
         let reset_generation = self
             .semantic_cache_reset_generation
             .load(AtomicOrdering::Acquire);
-        if let Some((ordered, complete)) = self.cached_order(&cache_key, reset_generation) {
+        if let Some((ordered, complete, match_evidence)) =
+            self.cached_order(&cache_key, reset_generation)
+        {
             telemetry.tier = "cached";
             telemetry.cached = true;
             telemetry.complete = complete;
             telemetry.counts.candidates = ordered.len() as u64;
             let page = page_of(&ordered, offset as usize, limit as usize);
-            let results =
+            let mut results =
                 self.materialize_ordered(&conn, &page, &HashMap::new(), &mut telemetry.stages)?;
+            for result in &mut results {
+                result.match_evidence = match_evidence.get(&result.id).cloned();
+            }
             telemetry.stages.materializing += watch.lap();
             telemetry.counts.rows_returned = results.len();
             return Ok(results);
@@ -1662,6 +1679,7 @@ impl StorageState {
         let mut texts: HashMap<i64, String> = HashMap::new();
         let mut scored: Vec<Scored> = Vec::new();
         let mut tolerated: Vec<Scored> = Vec::new();
+        let mut match_evidence = HashMap::new();
         let ids: Vec<i64> = candidates
             .iter()
             .map(|candidate| candidate.ocr_id)
@@ -1692,6 +1710,32 @@ impl StorageState {
                     _ => continue,
                 }
             };
+
+            let candidate = evidence.get(&row.id);
+            match_evidence.insert(
+                row.id,
+                SearchMatchEvidence {
+                    scope: "representative_ocr_row_before_privacy_filter".into(),
+                    relevance_score: score,
+                    matched_terms: ranked.matched_terms,
+                    literal_terms: ranked.literal_terms,
+                    match_type: if !ranked.matched {
+                        "bigram_only"
+                    } else if ranked.literal {
+                        "literal"
+                    } else {
+                        "approximate"
+                    }
+                    .into(),
+                    phrase_matched: ranked.phrase_matched,
+                    matched_bigram_groups: candidate
+                        .filter(|c| c.tier == Tier::Fuzzy)
+                        .map(|c| c.hits),
+                    total_bigram_groups: candidate
+                        .filter(|c| c.tier == Tier::Fuzzy)
+                        .map(|c| c.total),
+                },
+            );
 
             texts.insert(row.id, row.text);
             into.push(Scored {
@@ -1728,15 +1772,21 @@ impl StorageState {
         telemetry.counts.kept = scored.len();
 
         let ordered: Vec<i64> = scored.iter().map(|row| row.ocr_id).collect();
+        let retained: HashSet<_> = ordered.iter().copied().collect();
+        match_evidence.retain(|id, _| retained.contains(id));
         let page = page_of(&ordered, offset, limit);
         texts.retain(|id, _| page.contains(id));
-        let results = self.materialize_ordered(&conn, &page, &texts, &mut telemetry.stages)?;
+        let mut results = self.materialize_ordered(&conn, &page, &texts, &mut telemetry.stages)?;
+        for result in &mut results {
+            result.match_evidence = match_evidence.get(&result.id).cloned();
+        }
         telemetry.stages.materializing += watch.lap();
         telemetry.counts.rows_returned = results.len();
         self.store_order(
             cache_key,
             &ordered,
             complete,
+            match_evidence,
             data_version,
             reset_generation,
             conn,
@@ -3002,10 +3052,21 @@ mod tests {
         let writer = Connection::open(&path).expect("open writer");
         let (_state_dir, storage) = test_storage();
 
+        let explanation = SearchMatchEvidence {
+            scope: "representative_ocr_row_before_privacy_filter".into(),
+            relevance_score: 321.0,
+            matched_terms: vec!["codex".into()],
+            literal_terms: vec!["codex".into()],
+            match_type: "literal".into(),
+            phrase_matched: false,
+            matched_bigram_groups: None,
+            total_bigram_groups: None,
+        };
         storage.store_order(
             "query".to_string(),
             &[9, 8, 7, 6],
             false,
+            HashMap::from([(7, explanation)]),
             version,
             0,
             IndependentReadConnection::new(
@@ -3014,11 +3075,13 @@ mod tests {
             ),
         );
 
-        let (ordered, complete) = storage
+        let (ordered, complete, evidence) = storage
             .cached_order("query", 0)
             .expect("partial order remains pageable");
         assert_eq!(ordered, vec![9, 8, 7, 6]);
         assert!(!complete);
+        assert_eq!(evidence[&7].relevance_score, 321.0);
+        assert_eq!(evidence[&7].matched_terms, vec!["codex"]);
         assert_eq!(page_of(&ordered, 2, 2), vec![7, 6]);
 
         writer
@@ -3047,6 +3110,7 @@ mod tests {
             "query".to_string(),
             &[4, 3, 2, 1],
             false,
+            HashMap::new(),
             1,
             0,
             version_connection,

@@ -258,6 +258,9 @@ pub(super) struct RankedText {
     /// only reported, never ranked on: the quality multiplier has already
     /// placed the approximate matches below the exact ones.
     pub literal: bool,
+    pub phrase_matched: bool,
+    pub matched_terms: Vec<String>,
+    pub literal_terms: Vec<String>,
 }
 
 impl RankedText {
@@ -265,6 +268,9 @@ impl RankedText {
         score: 0.0,
         matched: false,
         literal: false,
+        phrase_matched: false,
+        matched_terms: Vec::new(),
+        literal_terms: Vec::new(),
     };
 }
 
@@ -294,6 +300,8 @@ pub(super) fn score_folded(plan: &QueryPlan, folded: &FoldedText) -> RankedText 
     let mut quality_total = 0.0;
     let mut matched_chars = 0usize;
     let mut earliest = usize::MAX;
+    let mut matched_terms = Vec::new();
+    let mut literal_terms = Vec::new();
     for keyword in &plan.keywords {
         // A one-word query has the phrase for its only keyword; searching for
         // it twice would run the approximate matcher twice for one answer.
@@ -316,6 +324,11 @@ pub(super) fn score_folded(plan: &QueryPlan, folded: &FoldedText) -> RankedText 
 
         hits += 1;
         literal |= hit.quality >= 1.0;
+        let term: String = keyword.iter().collect();
+        if hit.quality >= 1.0 {
+            literal_terms.push(term.clone());
+        }
+        matched_terms.push(term);
         quality_total += hit.quality;
         matched_chars += keyword.len();
         earliest = earliest.min(hit.at);
@@ -342,6 +355,9 @@ pub(super) fn score_folded(plan: &QueryPlan, folded: &FoldedText) -> RankedText 
         score,
         matched: true,
         literal,
+        phrase_matched: phrase_match.is_some(),
+        matched_terms,
+        literal_terms,
     }
 }
 
@@ -505,6 +521,25 @@ mod tests {
         let one = score("six degrees", "six of them, ninety apart");
         assert!(all > one);
         assert!(one > 0.0);
+    }
+
+    #[test]
+    fn match_explanation_uses_the_same_literal_and_approximate_decisions_as_ranking() {
+        let hit = score_text(
+            &QueryPlan::build("AgentRouter Codex 配置"),
+            "Use CODEX here",
+        );
+        assert_eq!(hit.matched_terms, vec!["codex"]);
+        assert_eq!(hit.literal_terms, vec!["codex"]);
+        assert!(!hit.phrase_matched);
+        assert!(hit.score > 0.0);
+        let near = score_text(&QueryPlan::build("sepation"), "Separation");
+        assert_eq!(near.matched_terms, vec!["sepation"]);
+        assert!(near.literal_terms.is_empty());
+        assert!(near.phrase_matched);
+        let weak = score_text(&QueryPlan::build("separation"), "onset deep pass art ratio");
+        assert!(weak.matched_terms.is_empty());
+        assert!(!weak.matched);
     }
 
     #[test]

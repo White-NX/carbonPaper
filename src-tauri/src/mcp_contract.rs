@@ -257,7 +257,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_ocr_text",
-            "description": "Find words visible on screen using lexical OCR search. Extract distinctive keywords from a question, e.g. 保存路径 or save location. Separate keywords with spaces; a Chinese question is otherwise one long phrase. Fuzzy matching tolerates spelling/OCR errors. Results use screenshot_id for evidence, ocr_id for the text row, captured_at_ms for capture time, and ocr_processed_at_ms for recognition completion; all times are Unix milliseconds.",
+            "description": "Find words visible on screen using lexical OCR search. Extract distinctive keywords from a question, e.g. 保存路径 or save location. Separate keywords with spaces; a Chinese question is otherwise one long phrase. Fuzzy matching tolerates spelling/OCR errors. Results use screenshot_id for evidence, ocr_id for the text row, captured_at_ms for capture time, and ocr_processed_at_ms for recognition completion; all times are Unix milliseconds. Ranked hits include match_evidence with relevance_score, matched_terms, literal_terms, match_type (literal, approximate, or bigram_only), phrase_matched, and optional matched/total_bigram_groups. Scores and terms describe the representative OCR row before privacy filtering, not the whole screenshot. confidence is OCR recognition confidence, not search relevance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

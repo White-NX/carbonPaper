@@ -25,7 +25,7 @@ pub(super) fn screenshot(record: &ScreenshotRecord) -> Value {
 }
 
 pub(super) fn ocr_hit(hit: &SearchResult) -> Value {
-    json!({
+    let mut value = json!({
         "ocr_id": hit.id,
         "screenshot_id": hit.screenshot_id,
         "captured_at_ms": millis(hit.timestamp, &hit.screenshot_created_at),
@@ -35,7 +35,11 @@ pub(super) fn ocr_hit(hit: &SearchResult) -> Value {
         "window_title": hit.window_title,
         "process_name": hit.process_name,
         "category": hit.category,
-    })
+    });
+    if let Some(evidence) = &hit.match_evidence {
+        value["match_evidence"] = json!(evidence);
+    }
+    value
 }
 
 pub(super) fn details(record: &ScreenshotRecord, ocr: &[OcrResult], include_coords: bool) -> Value {
@@ -168,6 +172,16 @@ mod tests {
             created_at: ocr.created_at.clone(),
             screenshot_created_at: record.created_at.clone(),
             timestamp: record.timestamp,
+            match_evidence: Some(crate::storage::SearchMatchEvidence {
+                scope: "representative_ocr_row_before_privacy_filter".into(),
+                relevance_score: 1234.0,
+                matched_terms: vec!["save".into(), "location".into()],
+                literal_terms: vec!["save".into(), "location".into()],
+                match_type: "literal".into(),
+                phrase_matched: true,
+                matched_bigram_groups: None,
+                total_bigram_groups: None,
+            }),
         };
         let corpus = SmartClusterOcrCorpusItem {
             screenshot_id: record.id,
@@ -195,6 +209,20 @@ mod tests {
             f["ocr_processed_at_ms"]
         );
         assert_eq!(ocr_hit(&hit)["ocr_id"], f["ocr_id"]);
+        let explained = tools::summarize(
+            "search_ocr_text",
+            json!({"items":[ocr_hit(&hit)],"offset":0,"limit":20,"next_offset":null}),
+        );
+        let explained: Value = serde_json::from_str(&explained.content).unwrap();
+        assert_eq!(
+            explained["items"][0]["match_evidence"]["relevance_score"],
+            1234.0
+        );
+        assert_eq!(
+            explained["items"][0]["match_evidence"]["matched_terms"],
+            json!(["save", "location"])
+        );
+        assert!(explained["items"][0].get("confidence").is_none());
         assert!(details["ocr_results"][0].get("box_coords").is_none());
 
         let projections = [

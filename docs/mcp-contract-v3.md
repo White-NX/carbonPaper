@@ -56,6 +56,24 @@ OCR search is lexical: extract words likely visible on screen, such as `保存�
 or `save location`. Whitespace separates terms; fuzzy matching tolerates OCR and
 spelling errors and does not turn an arbitrary question into semantic retrieval.
 
+Ranked OCR rows include `match_evidence`. `relevance_score` is the lexical score
+used for ordering, with higher values first; it is not a probability or a score
+to compare across different queries. `matched_terms` lists normalized query terms
+matched literally or approximately; `literal_terms` is the literal subset.
+`match_type` is `literal` when any term matched literally, `approximate` when only
+approximate terms matched, and `bigram_only` for a weak recall candidate without
+verified text matches. `phrase_matched` includes approximate phrase matches.
+`matched_bigram_groups` / `total_bigram_groups` are populated only for the fuzzy
+recall tier; other tiers and scan fallback leave them null.
+
+These fields explain the representative OCR row before privacy filtering;
+`match_evidence.scope` is `representative_ocr_row_before_privacy_filter`.
+A multi-word query may recall a screenshot using several rows; it returns the
+best ranked row as its representative. Its terms do not describe the whole
+screenshot. Inspect `get_snapshot_details` to check other rows. Scores and match
+evidence survive cached pagination. Recent-list fallback has no match evidence.
+`confidence` is the recognizer's confidence, unrelated to search relevance.
+
 ## Pagination and Agent context
 
 All list tools accept `offset` / `limit` and return an object containing `items`,

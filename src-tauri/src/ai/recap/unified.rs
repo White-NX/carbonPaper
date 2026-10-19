@@ -260,6 +260,7 @@ mod tests {
             created_at: String::new(),
             screenshot_created_at: String::new(),
             timestamp: Some(timestamp),
+            match_evidence: None,
         }
     }
 
