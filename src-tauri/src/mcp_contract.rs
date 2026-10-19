@@ -356,7 +356,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_recaps",
-            "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for each result's recorded time zone and boundaries. Sources use screenshot_id and captured_at_ms (Unix milliseconds). Verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index.",
+            "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for recorded zones and boundaries. process_names matches any cited source, case-insensitively. Sources use screenshot_id and captured_at_ms. Verify factual claims with get_snapshot_details. Hybrid searches all filtered activities by keyword and uses available vectors even with a partial index; unavailable semantics leave keyword results. coverage reports unique text chunks and activity coverage globally, in the query scope, and per scoped date; missing_chunks identifies dates with gaps. execution reports requested mode, executed branches, pre-pagination match counts, fallback reason and the semantic top-200 candidate cap. total counts fused candidates, not all possible semantic matches. index_progress reports index construction separately. A null keyword_rank means the activity did not match keywords. Does not generate recaps or build the index.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -365,6 +365,7 @@ pub fn tool_definitions() -> Value {
                     "mode": { "type": "string", "enum": ["keyword", "semantic", "hybrid"], "default": "hybrid" },
                     "start_date": { "type": "string", "description": "Inclusive local date YYYY-MM-DD" },
                     "end_date": { "type": "string", "description": "Inclusive local date YYYY-MM-DD" },
+                    "process_names": { "type": "array", "maxItems": 100, "items": { "type": "string", "minLength": 1, "maxLength": 1024 }, "description": "Match any cited source process name, case-insensitively; empty array means all processes" },
                     "include_details": { "type": "boolean", "default": true, "description": "Include saved key facts in retrieval" },
                     "ranking_revision": { "type": "string", "description": "When paging, pass ranking_revision from the previous result. If results changed, restart at offset 0 without this field." },
                     "offset": { "type": "integer", "minimum": 0, "maximum": 100000 },

@@ -91,6 +91,38 @@ Offset pagination assumes unchanged source data, index and filters. Restart afte
 these change. Recap `ranking_revision` rejects a changed ranking explicitly;
 it must be carried to subsequent pages. No other list promises a frozen snapshot.
 
+## Recap retrieval coverage and execution
+
+`search_recaps.process_names` matches any cited source process name without case
+distinctions. It filters activities before ranking, coverage counting and paging;
+an empty list includes all processes. A match retains the activity's full evidence.
+Date bounds remain inclusive saved date labels.
+
+`coverage.global` counts the privacy-filtered searchable corpus. `query_scope`
+and `dates` apply the current date/process filters before text matching and paging.
+Chunk counts refer to unique content-addressed text windows, never durations,
+dates or recall percentages. Shared chunks count once in each scope; per-date
+counts therefore need not sum to the global count. Activity counts distinguish
+fully, partially and unindexed activities. `status` is `empty`, `not_prepared`,
+`partial` or `ready`. `missing_dates` lists scoped dates with missing chunks.
+Dates without searchable saved activities are absent; coverage does not describe
+whether recap generation has finished. Legacy top-level chunk counts are global.
+
+`execution` reports the requested mode, `keyword_executed`, `keyword_matches`,
+`semantic_executed`, `semantic_matches`, `semantic_candidates`,
+`semantic_candidate_limit` (200), `semantic_candidates_truncated`, and
+`fallback_reason` (`disabled`, `empty`, `not_prepared`, `unavailable`, or null).
+Counts precede pagination. Hybrid runs keywords over all scoped activities plus
+semantic retrieval over available vectors, including when coverage is partial.
+`keyword_rank: null` means that activity did not match the keyword branch.
+`total` counts the fused candidates after the semantic cap, while all keyword
+matches survive. Coverage remains available for keyword-only searches and failed
+semantic fallback. Pure semantic searches still fail if semantics cannot run.
+`mode` retains the effective configured mode; `execution` states what ran.
+`semantic_status` remains a compatibility field; use `coverage` for index coverage
+and `execution` for this search. `index_progress` is the runtime construction
+snapshot (running/phase/wait/retry), distinct from either search branch.
+
 ## Errors
 
 The Agent receives this payload for a failed tool call:

@@ -106,6 +106,14 @@ impl RecapSearchQuery {
         if matches!((self.start_ms, self.end_ms), (Some(a), Some(b)) if a > b) {
             return Err("RECAP_INVALID_DATE".into());
         }
+        if self.process_names.len() > 100
+            || self
+                .process_names
+                .iter()
+                .any(|name| name.trim().is_empty() || name.len() > 1024)
+        {
+            return Err("RECAP_INVALID_SEARCH".into());
+        }
         Ok(())
     }
 
@@ -157,7 +165,137 @@ pub struct RecapSearchResult {
     pub semantic_error: Option<String>,
     pub indexed_chunks: usize,
     pub total_chunks: usize,
+    pub coverage: SearchCoverage,
+    pub execution: SearchExecution,
+    pub index_progress: RecapIndexProgress,
     pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CoverageCounts {
+    pub status: &'static str,
+    pub total_chunks: usize,
+    pub indexed_chunks: usize,
+    pub missing_chunks: usize,
+    pub activities: usize,
+    pub fully_indexed_activities: usize,
+    pub partially_indexed_activities: usize,
+    pub unindexed_activities: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DateCoverage {
+    pub date: String,
+    #[serde(flatten)]
+    pub counts: CoverageCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SearchCoverage {
+    pub global: CoverageCounts,
+    pub query_scope: CoverageCounts,
+    pub dates: Vec<DateCoverage>,
+    pub missing_dates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SearchExecution {
+    pub requested_mode: SearchMode,
+    pub keyword_executed: bool,
+    pub keyword_matches: usize,
+    pub semantic_executed: bool,
+    pub semantic_matches: usize,
+    pub semantic_candidates: usize,
+    pub semantic_candidate_limit: usize,
+    pub semantic_candidates_truncated: bool,
+    pub fallback_reason: Option<&'static str>,
+}
+
+fn coverage_counts(
+    documents: &[&Document],
+    vectors: &HashMap<String, Vec<f32>>,
+    details: bool,
+) -> CoverageCounts {
+    let mut counts = CoverageCounts {
+        activities: documents.len(),
+        ..Default::default()
+    };
+    let mut keys = HashSet::new();
+    for document in documents {
+        let chunks: Vec<_> = document
+            .chunks
+            .iter()
+            .filter(|chunk| details || !chunk.detail)
+            .collect();
+        if chunks.is_empty() {
+            continue;
+        }
+        let indexed = chunks
+            .iter()
+            .filter(|chunk| vectors.contains_key(&chunk.key))
+            .count();
+        if indexed == 0 {
+            counts.unindexed_activities += 1;
+        } else if indexed == chunks.len() {
+            counts.fully_indexed_activities += 1;
+        } else {
+            counts.partially_indexed_activities += 1;
+        }
+        keys.extend(chunks.into_iter().map(|chunk| chunk.key.as_str()));
+    }
+    counts.total_chunks = keys.len();
+    counts.indexed_chunks = keys
+        .iter()
+        .filter(|key| vectors.contains_key(**key))
+        .count();
+    counts.missing_chunks = counts.total_chunks - counts.indexed_chunks;
+    counts.status = if counts.total_chunks == 0 {
+        "empty"
+    } else if counts.indexed_chunks == 0 {
+        "not_prepared"
+    } else if counts.missing_chunks > 0 {
+        "partial"
+    } else {
+        "ready"
+    };
+    counts
+}
+
+fn search_coverage(
+    corpus: &Corpus,
+    query: &RecapSearchQuery,
+    vectors: &HashMap<String, Vec<f32>>,
+) -> SearchCoverage {
+    let global: Vec<_> = corpus.documents.iter().collect();
+    let scoped: Vec<_> = global
+        .iter()
+        .copied()
+        .filter(|document| {
+            query.includes(&document.date) && query.includes_activity(&document.activity)
+        })
+        .collect();
+    let mut dates = BTreeMap::<&str, Vec<&Document>>::new();
+    for document in &scoped {
+        dates.entry(&document.date).or_default().push(document);
+    }
+    let dates: Vec<_> = dates
+        .into_iter()
+        .map(|(date, documents)| DateCoverage {
+            date: date.into(),
+            counts: coverage_counts(&documents, vectors, query.include_details),
+        })
+        .collect();
+    let missing_dates = dates
+        .iter()
+        .filter(|coverage| coverage.counts.missing_chunks > 0)
+        .map(|coverage| coverage.date.clone())
+        .collect();
+    SearchCoverage {
+        global: coverage_counts(&global, vectors, true),
+        query_scope: coverage_counts(&scoped, vectors, query.include_details),
+        dates,
+        missing_dates,
+    }
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -1180,11 +1318,29 @@ fn keyword_score(activity: &RecapActivity, query: &str, details: bool) -> f64 {
         + if text.contains(&query) { 4.0 } else { 0.0 }
 }
 
+struct RankedSearch {
+    items: Vec<RecapSearchHit>,
+    total: usize,
+    indexed_chunks: usize,
+    coverage: SearchCoverage,
+    execution: SearchExecution,
+}
+
+#[cfg(test)]
 fn rank(
     corpus: &Corpus,
     query: &RecapSearchQuery,
     embedding: Option<&[f32]>,
 ) -> (Vec<RecapSearchHit>, usize, usize) {
+    let ranked = rank_with_report(corpus, query, embedding);
+    (ranked.items, ranked.total, ranked.indexed_chunks)
+}
+
+fn rank_with_report(
+    corpus: &Corpus,
+    query: &RecapSearchQuery,
+    embedding: Option<&[f32]>,
+) -> RankedSearch {
     let mut keywords = Vec::new();
     let mut semantic = Vec::new();
     let normalized = normalize(&query.query);
@@ -1235,7 +1391,19 @@ fn rank(
         }
     }
     let indexed = vectors.len();
+    let coverage = search_coverage(corpus, query, &vectors);
     drop(vectors);
+    let execution = SearchExecution {
+        requested_mode: query.mode,
+        keyword_executed: query.mode != SearchMode::Semantic,
+        keyword_matches: keywords.len(),
+        semantic_executed: embedding.is_some(),
+        semantic_matches: 0,
+        semantic_candidates: semantic.len().min(200),
+        semantic_candidate_limit: 200,
+        semantic_candidates_truncated: false,
+        fallback_reason: None,
+    };
     let sort = |rows: &mut Vec<(usize, f64)>| {
         rows.sort_by(|a, b| {
             b.1.total_cmp(&a.1)
@@ -1251,7 +1419,9 @@ fn rank(
     sort(&mut keywords);
     // Exact activity top-200 needs no full semantic sort. Keep deterministic
     // ties when selecting the prefix so later pages retain the same ranking.
-    if semantic.len() > 200 {
+    let semantic_matches = semantic.len();
+    let semantic_candidates_truncated = semantic_matches > 200;
+    if semantic_candidates_truncated {
         semantic.select_nth_unstable_by(200, |a, b| {
             b.1.total_cmp(&a.1)
                 .then_with(|| {
@@ -1316,7 +1486,16 @@ fn rank(
             }
         })
         .collect();
-    (hits, total, indexed)
+    let mut execution = execution;
+    execution.semantic_matches = semantic_matches;
+    execution.semantic_candidates_truncated = semantic_candidates_truncated;
+    RankedSearch {
+        items: hits,
+        total,
+        indexed_chunks: indexed,
+        coverage,
+        execution,
+    }
 }
 
 fn ranking_revision(
@@ -1354,6 +1533,7 @@ pub(super) async fn search_inner(
     app: tauri::AppHandle,
     mut query: RecapSearchQuery,
 ) -> Result<RecapSearchResult, String> {
+    let requested_mode = query.mode;
     let enabled = semantic_enabled(&app)?;
     if !enabled {
         query.mode = SearchMode::Keyword;
@@ -1407,7 +1587,32 @@ pub(super) async fn search_inner(
     }
     let result = tokio::task::spawn_blocking(move || {
         corpus.identity.check(&app)?;
-        let (items, total, indexed_chunks) = rank(&corpus, &query, embedding.as_deref());
+        let RankedSearch {
+            items,
+            total,
+            indexed_chunks,
+            coverage,
+            mut execution,
+            ..
+        } = rank_with_report(&corpus, &query, embedding.as_deref());
+        execution.requested_mode = requested_mode;
+        if requested_mode != SearchMode::Keyword && !execution.semantic_executed {
+            execution.fallback_reason = Some(if !enabled {
+                "disabled"
+            } else if semantic_error.is_some() {
+                "unavailable"
+            } else if coverage.query_scope.total_chunks == 0 {
+                "empty"
+            } else {
+                "not_prepared"
+            });
+        }
+        let semantic_status = if matches!(semantic_status, "disabled" | "unavailable") {
+            semantic_status
+        } else {
+            coverage.global.status
+        };
+        let index_progress = app.state::<RecapSearchRuntime>().progress();
         let ranking_revision = ranking_revision(
             &corpus.identity,
             &query,
@@ -1434,6 +1639,9 @@ pub(super) async fn search_inner(
             semantic_error,
             indexed_chunks,
             total_chunks,
+            coverage,
+            execution,
+            index_progress,
             elapsed_ms: started.elapsed().as_millis() as u64,
         };
         corpus.identity.check(&app)?;
@@ -1762,6 +1970,93 @@ mod tests {
         q.start_date = Some("2026-10-12".into());
         q.end_date = Some("2026-10-01".into());
         assert!(q.validate().is_err());
+    }
+
+    #[test]
+    fn coverage_tracks_shared_chunks_and_scoped_missing_dates_independently_of_hits() {
+        let mut first = activity("shared", "first body");
+        first.sources[0].process_name = "editor.exe".into();
+        let mut second = activity("shared", "second body");
+        second.sources[0].process_name = "browser.exe".into();
+        let documents = vec![
+            Document::new("2026-10-01".into(), 0, 0, first),
+            Document::new("2026-10-02".into(), 0, 0, second),
+        ];
+        let vectors = HashMap::from([(documents[0].chunks[0].key.clone(), vec![1.0, 0.0])]);
+        let corpus = Corpus {
+            identity: Identity {
+                generation: 0,
+                epoch: 0,
+                privacy: String::new(),
+                serial: 0,
+                session: None,
+            },
+            documents,
+            total_chunks: 0,
+            dates: 2,
+            vectors: Mutex::new(vectors),
+        };
+        let query = RecapSearchQuery {
+            query: "absent".into(),
+            process_names: vec!["EDITOR.EXE".into()],
+            ..Default::default()
+        };
+        let report = rank_with_report(&corpus, &query, Some(&[1.0, 0.0]));
+        assert_eq!(report.coverage.global.activities, 2);
+        assert_eq!(report.coverage.global.indexed_chunks, 1);
+        assert_eq!(report.coverage.global.partially_indexed_activities, 2);
+        assert_eq!(report.coverage.query_scope.activities, 1);
+        assert_eq!(report.coverage.dates.len(), 1);
+        assert_eq!(report.coverage.missing_dates, vec!["2026-10-01"]);
+        assert_eq!(report.coverage.query_scope.status, "partial");
+        assert!(report.execution.keyword_executed);
+        assert_eq!(report.execution.keyword_matches, 0);
+        assert!(report.execution.semantic_executed);
+        assert_eq!(report.execution.semantic_matches, 1);
+        assert!(report.items[0].keyword_rank.is_none());
+        let keyword = rank_with_report(&corpus, &query, None);
+        assert!(keyword.execution.keyword_executed);
+        assert!(!keyword.execution.semantic_executed);
+        assert_eq!(keyword.total, 0);
+        assert_eq!(keyword.coverage.query_scope.indexed_chunks, 1);
+    }
+
+    #[test]
+    fn semantic_report_counts_matches_before_candidate_cap_and_pagination() {
+        let documents: Vec<_> = (0..205)
+            .map(|i| {
+                let mut a = activity("shared", "body");
+                a.id = i.to_string();
+                Document::new("2026-10-01".into(), 0, 0, a)
+            })
+            .collect();
+        let vectors = HashMap::from([(documents[0].chunks[0].key.clone(), vec![1.0, 0.0])]);
+        let corpus = Corpus {
+            identity: Identity {
+                generation: 0,
+                epoch: 0,
+                privacy: String::new(),
+                serial: 0,
+                session: None,
+            },
+            documents,
+            total_chunks: 0,
+            dates: 1,
+            vectors: Mutex::new(vectors),
+        };
+        let query = RecapSearchQuery {
+            query: "absent".into(),
+            limit: 1,
+            offset: 3,
+            ..Default::default()
+        };
+        let report = rank_with_report(&corpus, &query, Some(&[1.0, 0.0]));
+        assert_eq!(report.execution.semantic_matches, 205);
+        assert_eq!(report.execution.semantic_candidates, 200);
+        assert!(report.execution.semantic_candidates_truncated);
+        assert_eq!(report.total, 200);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.coverage.query_scope.activities, 205);
     }
 
     #[test]

@@ -430,6 +430,9 @@ mod tests {
             semantic_error: Some(diagnostic.into()),
             indexed_chunks: 1,
             total_chunks: 1,
+            coverage: Default::default(),
+            execution: Default::default(),
+            index_progress: Default::default(),
             elapsed_ms: 5000,
         })
         .unwrap();

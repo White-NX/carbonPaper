@@ -378,7 +378,7 @@
       "name": "get_recap_day"
     },
     {
-      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for each result's recorded time zone and boundaries. Sources use screenshot_id and captured_at_ms (Unix milliseconds). Verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
+      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for recorded zones and boundaries. process_names matches any cited source, case-insensitively. Sources use screenshot_id and captured_at_ms. Verify factual claims with get_snapshot_details. Hybrid searches all filtered activities by keyword and uses available vectors even with a partial index; unavailable semantics leave keyword results. coverage reports unique text chunks and activity coverage globally, in the query scope, and per scoped date; missing_chunks identifies dates with gaps. execution reports requested mode, executed branches, pre-pagination match counts, fallback reason and the semantic top-200 candidate cap. total counts fused candidates, not all possible semantic matches. index_progress reports index construction separately. A null keyword_rank means the activity did not match keywords. Does not generate recaps or build the index. Pages return items (ocr_results for details), offset, limit, returned_count and next_offset. Follow next_offset with unchanged filters even after a short/empty page; never advance by returned_count or limit. Agent truncation preserves the next unread position. result_offset counts rows before privacy filtering. null ends this result set unless end_reason=offset_limit; then narrow the query. Restart after source/index changes.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -410,6 +410,16 @@
             "maximum": 100000,
             "minimum": 0,
             "type": "integer"
+          },
+          "process_names": {
+            "description": "Match any cited source process name, case-insensitively; empty array means all processes",
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "type": "array"
           },
           "query": {
             "maxLength": 256,
