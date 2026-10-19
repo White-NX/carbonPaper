@@ -105,13 +105,13 @@ export default function LeftSidebar({ selectedEvent, selectedDetails, onCategory
                 {selectedDetails?.record?.window_title || selectedEvent.windowTitle}
               </div>
             </div>
-            <div>
+            {Number.isFinite(selectedEvent.timestamp) && <div>
               <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.time')}</label>
               <div className="flex items-center gap-2 mt-1 text-sm opacity-80">
                 <Clock size={14} />
                 {new Date(selectedEvent.timestamp).toLocaleString()}
               </div>
-            </div>
+            </div>}
             <div>
               <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category')}</label>
               <div className="mt-1">

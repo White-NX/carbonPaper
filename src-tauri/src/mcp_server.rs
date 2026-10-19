@@ -31,6 +31,7 @@ use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
 mod recap;
+mod wire;
 use recap::{tool_get_recap_day, tool_get_recap_days, tool_search_recaps};
 
 // ==================== Default config ====================
@@ -293,7 +294,8 @@ fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
             "serverInfo": {
                 "name": "CarbonPaper",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": "Tool schema v3: use screenshot_id for screenshots, captured_at_ms for capture time, and ocr_processed_at_ms only for OCR completion. Time filters are [start_ms, end_ms) in Unix milliseconds. Recap dates use their saved calendar. Tool failures return isError=true with error.code and error.message."
         }),
     )
 }
@@ -380,6 +382,7 @@ pub async fn call_tool(
     if crate::maintenance::is_active() {
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
     }
+    mcp_contract::validate_arguments(tool_name, &args)?;
     dispatch_mcp_tool(app_handle, tool_name, args).await
 }
 
@@ -403,29 +406,25 @@ async fn handle_tools_call(
 
     let result = call_tool(&state.app_handle, tool_name, args).await;
 
+    tool_call_response(id, result)
+}
+
+fn tool_call_response(id: Option<Value>, result: Result<Value, String>) -> JsonRpcResponse {
     match result {
-        Ok(content) => {
-            tracing::info!("MCP tools/call: tool={} — ok", tool_name);
-            JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "content": [{ "type": "text", "text": content.to_string() }]
-                }),
-            )
-        }
-        Err(e) => {
-            tracing::warn!("MCP tools/call: tool={} — error: {}", tool_name, e);
-            let code =
-                if e.contains("AUTH_REQUIRED") || e.contains("CNG") || e.contains("authentication")
-                {
-                    -32001 // CNG auth required
-                } else if e.contains("Monitor not started") {
-                    -32002 // Monitor not running
-                } else {
-                    -32000 // Generic tool error
-                };
-            JsonRpcResponse::error(id, code, e)
-        }
+        Ok(content) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": content.to_string() }],
+                "isError": false
+            }),
+        ),
+        Err(e) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{"type": "text", "text": mcp_contract::error_payload(&e).to_string()}],
+                "isError": true
+            }),
+        ),
     }
 }
 
@@ -914,19 +913,13 @@ mod privacy_filter_tests {
 async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
 
-    let start_time = args
-        .get("start_time")
-        .and_then(|v| v.as_f64())
-        .ok_or("Missing required parameter: start_time")?;
-    let end_time = args
-        .get("end_time")
-        .and_then(|v| v.as_f64())
-        .ok_or("Missing required parameter: end_time")?;
+    let range = mcp_contract::TimeRange::from_args(&args, true)?;
+    let (start_ts, end_ts) = range.storage_seconds();
+    let (start_ts, end_ts) = (start_ts.unwrap(), end_ts.unwrap());
+    if start_ts > end_ts {
+        return Ok(serde_json::json!([]));
+    }
     let max_records = args.get("max_records").and_then(|v| v.as_i64());
-
-    // Convert ms to seconds if needed
-    let start_ts = crate::mcp_contract::timestamp_seconds(start_time);
-    let end_ts = crate::mcp_contract::timestamp_seconds(end_time);
 
     let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
@@ -959,30 +952,7 @@ async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Resul
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    // Build compact response (strip metadata, image_hash, image_path which are not useful to AI clients)
-    let output: Vec<Value> = records
-        .iter()
-        .map(|r| {
-            let mut obj = serde_json::json!({
-                "id": r.id,
-                "window_title": r.window_title,
-                "process_name": r.process_name,
-                "created_at": r.created_at,
-                "timestamp": r.timestamp,
-            });
-            let m = obj.as_object_mut().expect("just constructed as object");
-            if let Some(ref v) = r.source {
-                m.insert("source".into(), serde_json::json!(v));
-            }
-            if let Some(ref v) = r.page_url {
-                m.insert("page_url".into(), serde_json::json!(v));
-            }
-            if let Some(ref v) = r.category {
-                m.insert("category".into(), serde_json::json!(v));
-            }
-            obj
-        })
-        .collect();
+    let output: Vec<Value> = records.iter().map(wire::screenshot).collect();
     Ok(Value::Array(output))
 }
 
@@ -992,10 +962,7 @@ async fn tool_get_snapshot_details(
 ) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
 
-    let id = args
-        .get("id")
-        .and_then(|v| v.as_i64())
-        .ok_or("Missing required parameter: id")?;
+    let id = mcp_contract::screenshot_id(&args)?;
     let include_coords = args
         .get("include_coords")
         .and_then(|v| v.as_bool())
@@ -1044,40 +1011,25 @@ async fn tool_get_snapshot_details(
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
+    snapshot_details_result(id, result, include_coords)
+}
+
+fn snapshot_details_result(
+    id: i64,
+    result: Option<Result<(crate::storage::ScreenshotRecord, Vec<OcrResult>), Rejected>>,
+    include_coords: bool,
+) -> Result<Value, String> {
     let (r, ocr_results) = match result {
         None => {
-            return Ok(serde_json::json!({
-                "record": null,
-                "ocr_results": []
-            }));
+            return Err(format!("SNAPSHOT_NOT_FOUND: Screenshot {id} was not found"));
         }
         Some(Err(Rejected)) => {
-            return Ok(serde_json::json!({
-                "error": "Rejected by user's privacy settings"
-            }));
+            return Err("PRIVACY_REJECTED: Rejected by user's privacy settings".into());
         }
         Some(Ok(cleansed)) => cleansed,
     };
 
-    // Build response
-    let ocr_value: Value = if include_coords {
-        serde_json::to_value(&ocr_results).unwrap_or(Value::Null)
-    } else {
-        ocr_results
-            .iter()
-            .map(|o| {
-                serde_json::json!({
-                    "text": o.text,
-                    "confidence": o.confidence,
-                })
-            })
-            .collect::<Vec<_>>()
-            .into()
-    };
-    Ok(serde_json::json!({
-        "record": r,
-        "ocr_results": ocr_value
-    }))
+    Ok(wire::details(&r, &ocr_results, include_coords))
 }
 
 async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
@@ -1094,14 +1046,11 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
     let process_names: Option<Vec<String>> = args
         .get("process_names")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let start_time = args
-        .get("start_time")
-        .and_then(|v| v.as_f64())
-        .map(crate::mcp_contract::timestamp_seconds);
-    let end_time = args
-        .get("end_time")
-        .and_then(|v| v.as_f64())
-        .map(crate::mcp_contract::timestamp_seconds);
+    let (start_time, end_time) =
+        mcp_contract::TimeRange::from_args(&args, false)?.storage_seconds();
+    if matches!((start_time, end_time), (Some(a), Some(b)) if a > b) {
+        return Ok(serde_json::json!([]));
+    }
     let categories: Option<Vec<String>> = args
         .get("categories")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1140,27 +1089,7 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    // Strip box_coords to save tokens — not useful in MCP search results
-    let stripped: Vec<Value> = results
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "screenshot_id": r.screenshot_id,
-                "text": r.text,
-                "confidence": r.confidence,
-                "image_path": r.image_path,
-                "window_title": r.window_title,
-                "process_name": r.process_name,
-                "category": r.category,
-                "created_at": r.created_at,
-                "screenshot_created_at": r.screenshot_created_at,
-                "timestamp": r.timestamp,
-            })
-        })
-        .collect();
-
-    Ok(serde_json::to_value(&stripped).unwrap_or(Value::Null))
+    Ok(Value::Array(results.iter().map(wire::ocr_hit).collect()))
 }
 
 async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
@@ -1183,14 +1112,11 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
                 .collect()
         })
         .unwrap_or_default();
-    let start_time = args
-        .get("start_time")
-        .and_then(Value::as_f64)
-        .map(crate::mcp_contract::timestamp_seconds);
-    let end_time = args
-        .get("end_time")
-        .and_then(Value::as_f64)
-        .map(crate::mcp_contract::timestamp_seconds);
+    let range = mcp_contract::TimeRange::from_args(&args, false)?;
+    let (start_time, end_time) = range.storage_seconds();
+    if matches!((start_time, end_time), (Some(a), Some(b)) if a > b) {
+        return Ok(serde_json::json!([]));
+    }
 
     // Use the same Rust CLIP path as the application search surface.
     let items = crate::clip_query::search(
@@ -1259,8 +1185,7 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
         let storage = storage.inner().clone();
         tokio::task::spawn_blocking(move || storage.batch_get_screenshot_ids_by_hash(&hashes))
             .await
-            .map_err(|e| format!("Task join error: {:?}", e))?
-            .unwrap_or_default()
+            .map_err(|e| format!("Task join error: {:?}", e))??
     } else {
         std::collections::HashMap::new()
     };
@@ -1268,41 +1193,18 @@ async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Va
     // Build clean output: add screenshot_id, flatten metadata, remove internal fields
     let cleaned: Vec<Value> = items
         .iter()
-        .map(|item| {
+        .filter_map(|item| {
             let image_path = item
                 .get("image_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let screenshot_id = image_path
                 .strip_prefix("memory://")
-                .and_then(|hash| hash_to_id.get(hash));
-
-            let window_title = item
-                .get("metadata")
-                .and_then(|m| m.get("window_title"))
-                .and_then(|v| v.as_str())
-                .or_else(|| item.get("window_title").and_then(|v| v.as_str()));
-            let process_name = item
-                .get("metadata")
-                .and_then(|m| m.get("process_name"))
-                .and_then(|v| v.as_str())
-                .or_else(|| item.get("process_name").and_then(|v| v.as_str()));
-
-            let mut obj = serde_json::json!({
-                "screenshot_id": screenshot_id,
-                "ocr_text": item.get("ocr_text"),
-                "distance": item.get("distance"),
-                "similarity": item.get("similarity"),
-                "screenshot_created_at": item.get("screenshot_created_at"),
-            });
-            let m = obj.as_object_mut().expect("just constructed as object");
-            if let Some(t) = window_title {
-                m.insert("window_title".into(), Value::String(t.to_string()));
-            }
-            if let Some(p) = process_name {
-                m.insert("process_name".into(), Value::String(p.to_string()));
-            }
-            obj
+                .and_then(|hash| hash_to_id.get(hash))?;
+            let value = wire::visual_hit(item, *screenshot_id);
+            range
+                .contains(value["captured_at_ms"].as_i64())
+                .then_some(value)
         })
         .collect();
 
@@ -1337,7 +1239,12 @@ async fn tool_get_smart_clusters(
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    Ok(serde_json::to_value(&clusters).unwrap_or(Value::Null))
+    Ok(Value::Array(
+        clusters
+            .iter()
+            .map(|cluster| wire::archive(serde_json::json!(cluster)))
+            .collect(),
+    ))
 }
 
 async fn tool_get_smart_cluster_ocr_corpus(
@@ -1392,7 +1299,7 @@ async fn tool_get_smart_cluster_ocr_corpus(
                 if !include_empty_ocr && item.ocr_text.trim().is_empty() {
                     return None;
                 }
-                Some(item)
+                Some(wire::corpus_item(&item))
             })
             .collect();
         Ok::<_, String>(items)
@@ -1433,7 +1340,7 @@ async fn tool_get_smart_cluster_summary(
 
     Ok(serde_json::json!({
         "cluster_id": cluster_id,
-        "summary": summary,
+        "summary": summary.map(|summary| wire::archive(serde_json::json!(summary))),
     }))
 }
 
@@ -1476,7 +1383,7 @@ async fn tool_upsert_smart_cluster_summary(
 
     Ok(serde_json::json!({
         "status": "ok",
-        "summary": saved,
+        "summary": wire::archive(serde_json::json!(saved)),
     }))
 }
 

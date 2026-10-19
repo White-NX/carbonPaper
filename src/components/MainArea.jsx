@@ -12,6 +12,7 @@ import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
 import PreviewActionBar from './PreviewActionBar';
 import EmptyPreview from './EmptyPreview';
+import { captureDateOf } from '../lib/search_grouping';
 import {
   getSnapshotPreviewKey,
   normalizeSnapshotPreviewItem,
@@ -308,6 +309,7 @@ export default function MainArea({
       window_title: selectedDetails?.record?.window_title || selectedEvent.windowTitle,
       category: selectedDetails?.record?.category || selectedEvent.category,
       created_at: selectedDetails?.record?.created_at || selectedEvent.timestamp,
+      captured_at_ms: captureDateOf(selectedDetails?.record)?.getTime() ?? selectedEvent.timestamp ?? null,
     }, {
       sourceLabel: t('snapshotPreview.sources.mainPreview'),
       sourceDetail: selectedDetails?.record?.window_title || selectedEvent.windowTitle || selectedEvent.appName || null,

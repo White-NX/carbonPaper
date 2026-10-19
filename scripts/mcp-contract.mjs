@@ -34,11 +34,12 @@ if (cargo.status !== 0) {
 }
 
 const runtimeContract = JSON.parse(cargo.stdout);
-const targets = [resolve(root, 'docs/mcp-tool-contract-v2.json')];
+const contractFile = `mcp-tool-contract-v${runtimeContract.tool_schema_version}.json`;
+const targets = [resolve(root, 'docs', contractFile)];
 if (skillRoot) {
   targets.push(resolve(
     skillRoot,
-    'carbonpaper-memory/references/mcp-tool-contract-v2.json',
+    'carbonpaper-memory/references', contractFile,
   ));
 }
 

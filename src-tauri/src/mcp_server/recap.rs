@@ -19,7 +19,9 @@ impl Page {
     fn limit(&self, default: usize, max: usize) -> Result<usize, String> {
         let limit = self.limit.unwrap_or(default);
         if limit == 0 || limit > max {
-            return Err(format!("limit must be between 1 and {max}"));
+            return Err(crate::mcp_contract::invalid_argument(format!(
+                "limit must be between 1 and {max}"
+            )));
         }
         Ok(limit)
     }
@@ -39,10 +41,12 @@ impl DaysQuery {
             .into_iter()
             .flatten()
         {
-            recap::day_bounds(date)?;
+            crate::calendar::parse_date(date)?;
         }
         if matches!((&self.start_date, &self.end_date), (Some(a), Some(b)) if a > b) {
-            return Err("start_date must not be after end_date".into());
+            return Err(crate::mcp_contract::invalid_argument(
+                "start_date must not be after end_date",
+            ));
         }
         self.page.limit(30, 100)
     }
@@ -86,7 +90,8 @@ pub(super) async fn tool_get_recap_days(
     args: Value,
 ) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
-    let query: DaysQuery = serde_json::from_value(args).map_err(|e| e.to_string())?;
+    let query: DaysQuery =
+        serde_json::from_value(args).map_err(crate::mcp_contract::invalid_argument)?;
     let limit = query.validate()?;
     let app = app_handle.clone();
     tokio::task::spawn_blocking(move || {
@@ -96,7 +101,17 @@ pub(super) async fn tool_get_recap_days(
         }
         let storage = app.state::<Arc<StorageState>>();
         let generation = storage.db_generation();
-        let result = dates_result(storage.recap_list_days()?, &query, limit);
+        let mut result = dates_result(storage.recap_list_days()?, &query, limit);
+        let mut calendars = serde_json::Map::new();
+        for date in result["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            calendars.insert(date.into(), json!(storage.recap_calendar(date)?));
+        }
+        result["calendars"] = calendars.into();
         require_authenticated_session(&app)?;
         if generation != storage.db_generation() {
             return Err("RECAP_SOURCE_CHANGED".into());
@@ -112,12 +127,31 @@ pub(super) async fn tool_search_recaps(
     args: Value,
 ) -> Result<Value, String> {
     require_authenticated_session(app_handle)?;
-    let query: recap::RecapSearchQuery = serde_json::from_value(args).map_err(|e| e.to_string())?;
+    let query: recap::RecapSearchQuery =
+        serde_json::from_value(args).map_err(crate::mcp_contract::invalid_argument)?;
+    let storage = app_handle.state::<Arc<StorageState>>().inner().clone();
+    let generation = storage.db_generation();
     let result = recap::search_activities(app_handle.clone(), query)
         .await
         .map_err(search_error)?;
-    require_authenticated_session(app_handle)?;
-    search_result(result)
+    let app = app_handle.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut calendars = serde_json::Map::new();
+        for hit in &result.items {
+            if !calendars.contains_key(&hit.date) {
+                calendars.insert(hit.date.clone(), json!(storage.recap_calendar(&hit.date)?));
+            }
+        }
+        let mut result = search_result(result)?;
+        result["calendars"] = calendars.into();
+        require_authenticated_session(&app)?;
+        if generation != storage.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
 }
 
 fn search_error(error: String) -> String {
@@ -149,7 +183,7 @@ fn search_result(mut result: RecapSearchResult) -> Result<Value, String> {
                             source.insert("screenshot_id".into(), id);
                         }
                         if let Some(time) = source.remove("timestamp_ms") {
-                            source.insert("timestamp".into(), time);
+                            source.insert("captured_at_ms".into(), time);
                         }
                     }
                 }
@@ -172,7 +206,9 @@ fn day_result(
         .batch_start_ms
         .is_some_and(|start| !day.batches.iter().any(|b| b.start_ms == start))
     {
-        return Err("Unknown recap period".into());
+        return Err(crate::mcp_contract::invalid_argument(
+            "Unknown recap period",
+        ));
     }
     let mode = filter.mode();
     let mut periods = Vec::new();
@@ -190,42 +226,43 @@ fn day_result(
             "status": batch.status, "overview": overview,
         }));
         for activity in batch.activities {
-            let clean =
-                (|| {
-                    let title = filter_identity(filter, mode, &activity.task_title)?;
-                    let text = filter_joined_text(filter, mode, &activity.text)?;
-                    let details = activity
-                        .details
-                        .iter()
-                        .filter_map(|detail| {
-                            if detail.evidence_ids.is_empty()
-                                || !detail
-                                    .evidence_ids
-                                    .iter()
-                                    .all(|id| activity.sources.iter().any(|s| s.id == *id))
-                            {
-                                return None;
-                            }
-                            filter_joined_text(filter, mode, &detail.text)
-                                .ok()
-                                .map(|text| json!({"text":text,"evidence_ids":detail.evidence_ids}))
-                        })
-                        .collect::<Vec<_>>();
-                    let sources = activity.sources.iter().map(|source| {
-                    Ok(json!({
-                        "screenshot_id": source.id,
-                        "timestamp": source.timestamp_ms,
-                        "process_name": filter_identity(filter, mode, &source.process_name)?,
-                        "window_title": filter_identity(filter, mode, &source.window_title)?,
-                    }))
-                }).collect::<Result<Vec<_>, super::Rejected>>()?;
-                    Ok::<_, super::Rejected>(json!({
-                        "activity_id": activity.id, "task_id": activity.task_id,
-                        "task_title": title, "text": text, "details": details,
-                        "start_ms": activity.start_ms, "end_ms": activity.end_ms,
-                        "batch_start_ms": batch.start_ms, "sources": sources,
-                    }))
-                })();
+            let clean = (|| {
+                let title = filter_identity(filter, mode, &activity.task_title)?;
+                let text = filter_joined_text(filter, mode, &activity.text)?;
+                let details = activity
+                    .details
+                    .iter()
+                    .filter_map(|detail| {
+                        if detail.evidence_ids.is_empty()
+                            || !detail
+                                .evidence_ids
+                                .iter()
+                                .all(|id| activity.sources.iter().any(|s| s.id == *id))
+                        {
+                            return None;
+                        }
+                        filter_joined_text(filter, mode, &detail.text)
+                            .ok()
+                            .map(|text| json!({"text":text,"evidence_ids":detail.evidence_ids}))
+                    })
+                    .collect::<Vec<_>>();
+                let sources = activity
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        let mut source = source.clone();
+                        source.process_name = filter_identity(filter, mode, &source.process_name)?;
+                        source.window_title = filter_identity(filter, mode, &source.window_title)?;
+                        Ok(super::wire::recap_source(&source))
+                    })
+                    .collect::<Result<Vec<_>, super::Rejected>>()?;
+                Ok::<_, super::Rejected>(json!({
+                    "activity_id": activity.id, "task_id": activity.task_id,
+                    "task_title": title, "text": text, "details": details,
+                    "start_ms": activity.start_ms, "end_ms": activity.end_ms,
+                    "batch_start_ms": batch.start_ms, "sources": sources,
+                }))
+            })();
             if let Ok(item) = clean {
                 items.push(item);
             }
@@ -234,6 +271,7 @@ fn day_result(
     items.sort_by_key(|item| item["start_ms"].as_i64().unwrap_or_default());
     let mut result = page_result(items, query.page.offset, limit);
     result["date"] = day.date.into();
+    result["calendar"] = json!(day.calendar);
     result["running"] = day.running.into();
     result["periods"] = periods.into();
     Ok(result)
@@ -270,6 +308,11 @@ mod tests {
         };
         RecapDay {
             date: "2026-10-01".into(),
+            calendar: crate::calendar::CalendarDay::in_zone(
+                "2026-10-01",
+                chrono_tz::Asia::Shanghai,
+            )
+            .unwrap(),
             threads: vec![],
             usage: Default::default(),
             can_undo: false,
@@ -326,10 +369,11 @@ mod tests {
         assert_eq!(result["items"][0]["task_title"], "Corrected title");
         assert_eq!(result["items"][0]["sources"][0]["screenshot_id"], 42);
         assert_eq!(
-            result["items"][0]["sources"][0]["timestamp"],
+            result["items"][0]["sources"][0]["captured_at_ms"],
             1_790_784_000_000_i64
         );
         assert_eq!(result["periods"][0]["overview"], "Read the notes");
+        assert_eq!(result["calendar"]["time_zone"], "Asia/Shanghai");
         for field in [
             "reasoning",
             "attempts",
@@ -345,11 +389,34 @@ mod tests {
     #[test]
     fn search_projection_omits_local_diagnostics_and_preserves_fallback_status() {
         let diagnostic = "RECAP_SEARCH_MODEL_UNAVAILABLE: model_missing: private runtime path";
+        let capture: Value = serde_json::from_str(include_str!(
+            "../../../src/tests/fixtures/screenshot_contract_v3.json"
+        ))
+        .unwrap();
+        let source = SourceRef {
+            id: capture["screenshot_id"].as_i64().unwrap(),
+            timestamp_ms: capture["captured_at_ms"].as_i64().unwrap(),
+            process_name: "editor.exe".into(),
+            window_title: "Save location".into(),
+        };
         let result = search_result(RecapSearchResult {
             revision: "source".into(),
             ranking_revision: "ranking".into(),
-            items: vec![],
-            total: 0,
+            items: vec![recap::search::RecapSearchHit {
+                date: capture["local_date"].as_str().unwrap().into(),
+                batch_start_ms: source.timestamp_ms,
+                activity_id: "activity".into(),
+                task_id: "task".into(),
+                task_title: "Save location".into(),
+                text: "Change the save location".into(),
+                details: vec![],
+                start_ms: source.timestamp_ms,
+                end_ms: source.timestamp_ms,
+                sources: vec![source],
+                keyword_rank: Some(1),
+                semantic_rank: None,
+            }],
+            total: 1,
             offset: 0,
             limit: 20,
             next_offset: None,
@@ -363,6 +430,24 @@ mod tests {
         .unwrap();
         assert_eq!(result["semantic_status"], "unavailable");
         assert!(result.get("semantic_error").is_none());
+        assert_eq!(
+            result["items"][0]["sources"][0]["screenshot_id"],
+            capture["screenshot_id"]
+        );
+        assert_eq!(
+            result["items"][0]["sources"][0]["captured_at_ms"],
+            capture["captured_at_ms"]
+        );
+        let outcome = crate::ai::tools::summarize("search_recaps", result.clone());
+        assert_eq!(outcome.snapshots.len(), 1);
+        assert_eq!(
+            outcome.snapshots[0].screenshot_id,
+            capture["screenshot_id"].as_i64().unwrap()
+        );
+        assert_eq!(
+            outcome.snapshots[0].captured_at_ms,
+            capture["captured_at_ms"].as_i64()
+        );
         assert!(!result.to_string().contains("private runtime path"));
         assert_eq!(
             search_error(diagnostic.into()),

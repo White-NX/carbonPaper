@@ -13,8 +13,14 @@ pub(super) const PREFETCH_PREFIX: &str = "You cannot search yourself this time. 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchTimeRange {
     pub tool: String,
-    pub start_time: Option<i64>,
-    pub end_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,31 +54,36 @@ impl TurnContext {
         let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
             return;
         };
-        let timestamp = |key: &str| {
-            args.get(key)
-                .and_then(Value::as_f64)
-                .map(|n| crate::mcp_contract::timestamp_seconds(n) * 1000.0)
-                .filter(|n| n.is_finite() && *n >= 0.0 && *n < i64::MAX as f64)
-                .map(|n| n as i64)
-        };
-        let recap_date = |key: &str, end: bool| {
-            args.get(key)
-                .and_then(Value::as_str)
-                .and_then(|date| super::recap::day_bounds(date).ok())
-                .map(|(start, next_day)| if end { next_day - 1 } else { start })
-        };
-        let range = SearchTimeRange {
-            tool: call.name.clone(),
-            start_time: if call.name == "search_recaps" {
-                recap_date("start_date", false)
-            } else {
-                timestamp("start_time")
-            },
-            end_time: if call.name == "search_recaps" {
-                recap_date("end_date", true)
-            } else {
-                timestamp("end_time")
-            },
+        let range = if call.name == "search_recaps" {
+            // These filters select saved date labels, whose calendars can use
+            // different zones. Do not invent UTC bounds using today's zone.
+            SearchTimeRange {
+                tool: call.name.clone(),
+                start_ms: None,
+                end_ms: None,
+                start_date: args
+                    .get("start_date")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                end_date: args
+                    .get("end_date")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }
+        } else {
+            let Ok(bounds) = crate::mcp_contract::TimeRange::from_args(
+                &args,
+                call.name == "get_snapshots_by_time_range",
+            ) else {
+                return;
+            };
+            SearchTimeRange {
+                tool: call.name.clone(),
+                start_ms: bounds.start_ms,
+                end_ms: bounds.end_ms,
+                start_date: None,
+                end_date: None,
+            }
         };
         if range.valid() && !self.searched_ranges.contains(&range) {
             self.searched_ranges.push(range);
@@ -98,7 +109,7 @@ impl TurnContext {
             return String::new();
         }
         format!(
-            "\n\n<searched_time_ranges unit=\"unix_ms\">\n{}\n</searched_time_ranges>",
+            "\n\n<searched_time_ranges unit=\"unix_ms\" end_ms=\"exclusive\" date_bounds=\"inclusive_saved_dates\">\n{}\n</searched_time_ranges>",
             serde_json::to_string(&ranges).expect("time ranges serialize")
         )
     }
@@ -106,11 +117,28 @@ impl TurnContext {
 
 impl SearchTimeRange {
     fn valid(&self) -> bool {
+        if self.tool == "search_recaps" {
+            return self.start_ms.is_none()
+                && self.end_ms.is_none()
+                && (self.start_date.is_some() || self.end_date.is_some())
+                && self
+                    .start_date
+                    .iter()
+                    .chain(self.end_date.iter())
+                    .all(|date| crate::calendar::parse_date(date).is_ok())
+                && !matches!((&self.start_date, &self.end_date), (Some(a), Some(b)) if a > b);
+        }
         is_time_search(&self.tool)
-            && (self.start_time.is_some() || self.end_time.is_some())
-            && self.start_time.is_none_or(|t| t >= 0)
-            && self.end_time.is_none_or(|t| t >= 0)
-            && !matches!((self.start_time, self.end_time), (Some(a), Some(b)) if a > b)
+            && self.start_date.is_none()
+            && self.end_date.is_none()
+            && (self.start_ms.is_some() || self.end_ms.is_some())
+            && self
+                .start_ms
+                .is_none_or(|t| (0..=253_402_300_799_999).contains(&t))
+            && self
+                .end_ms
+                .is_none_or(|t| (0..=253_402_300_799_999).contains(&t))
+            && !matches!((self.start_ms, self.end_ms), (Some(a), Some(b)) if a >= b)
     }
 }
 
@@ -387,15 +415,17 @@ mod tests {
             name: name.into(),
             arguments: args.to_string(),
         };
-        let valid = call("search_ocr_text", json!({"start_time":1790467200000i64}));
+        let valid = call("search_ocr_text", json!({"start_ms":1790467200000i64}));
         context.record_search(&valid);
         context.record_search(&valid);
-        context.record_search(&call("search_nl", json!({"end_time":1790553600})));
+        context.record_search(&call("search_nl", json!({"end_ms":1790553600})));
         context.record_search(&call("search_nl", json!({"query":"no time"})));
-        context.record_search(&call("search_nl", json!({"start_time":20,"end_time":10})));
-        context.record_search(&call("get_snapshot_details", json!({"start_time":10})));
+        context.record_search(&call("search_nl", json!({"start_ms":20,"end_ms":10})));
+        context.record_search(&call("search_nl", json!({"start_time":1790467200})));
+        context.record_search(&call("get_snapshot_details", json!({"start_ms":10})));
         assert_eq!(context.searched_ranges.len(), 2);
-        assert_eq!(context.searched_ranges[1].end_time, Some(1790553600000));
+        // Even early millisecond instants are never rescaled by magnitude.
+        assert_eq!(context.searched_ranges[1].end_ms, Some(1790553600));
         let restored: TurnContext =
             serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
         assert_eq!(restored.question("q"), context.question("q"));
@@ -407,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn recap_search_preserves_inclusive_local_dates_for_later_followups() {
+    fn recap_search_preserves_saved_date_filters_without_inventing_a_current_zone() {
         let now: DateTime<FixedOffset> = "2026-10-15T12:00:00+08:00".parse().unwrap();
         let mut context = TurnContext::new(now);
         context.record_search(&ToolCall {
@@ -418,13 +448,15 @@ mod tests {
         });
         assert_eq!(context.searched_ranges.len(), 1);
         assert_eq!(
-            context.searched_ranges[0].start_time,
-            Some(super::super::recap::day_bounds("2026-10-01").unwrap().0)
+            context.searched_ranges[0].start_date.as_deref(),
+            Some("2026-10-01")
         );
         assert_eq!(
-            context.searched_ranges[0].end_time,
-            Some(super::super::recap::day_bounds("2026-10-03").unwrap().1 - 1)
+            context.searched_ranges[0].end_date.as_deref(),
+            Some("2026-10-03")
         );
+        assert_eq!(context.searched_ranges[0].start_ms, None);
+        assert_eq!(context.searched_ranges[0].end_ms, None);
         assert!(context.range_note().contains("search_recaps"));
     }
 }

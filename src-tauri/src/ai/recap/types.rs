@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use chrono::{Local, NaiveDate, TimeZone, Timelike};
+pub use crate::calendar::CalendarDay;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -353,6 +353,7 @@ pub struct RecapUsage {
 #[derive(Clone, Debug, Serialize)]
 pub struct RecapDay {
     pub date: String,
+    pub calendar: CalendarDay,
     pub batches: Vec<RecapBatch>,
     pub threads: Vec<TaskThread>,
     pub usage: RecapUsage,
@@ -392,39 +393,8 @@ pub fn limited(text: &str, max: usize) -> String {
 }
 
 pub fn day_bounds(date: &str) -> Result<(i64, i64), String> {
-    let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| "RECAP_INVALID_DATE")?;
-    if day.to_string() != date {
-        return Err("RECAP_INVALID_DATE".into());
-    }
-    let next = day.succ_opt().ok_or("RECAP_INVALID_DATE")?;
-    let midnight = |d: NaiveDate| {
-        Local
-            .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
-            .earliest()
-            .map(|t| t.timestamp_millis())
-            .ok_or("RECAP_INVALID_DATE".to_string())
-    };
-    Ok((midnight(day)?, midnight(next)?))
-}
-
-pub fn batch_bounds(start: i64, end: i64, now: i64) -> Vec<(i64, i64)> {
-    // Calendar boundaries survive DST; a day's UTC length need not be 24 h.
-    let mut boundaries = vec![start];
-    if let Some(t) = Local.timestamp_millis_opt(start).single() {
-        for hour in [4, 8, 12, 16, 20] {
-            if let Some(t) = t.with_hour(hour) {
-                boundaries.push(t.timestamp_millis());
-            }
-        }
-    }
-    boundaries.push(end);
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .windows(2)
-        .filter(|w| w[1] <= now)
-        .map(|w| (w[0], w[1]))
-        .collect()
+    let calendar = CalendarDay::local(date)?;
+    Ok((calendar.start_ms, calendar.end_ms))
 }
 
 pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) -> Vec<TaskThread> {
@@ -679,14 +649,15 @@ mod tests {
     }
     #[test]
     fn four_hour_windows_are_half_open_and_only_closed_windows_are_returned() {
-        let (start, end) = day_bounds("2026-01-01").unwrap();
-        let windows = batch_bounds(start, end, end);
+        let calendar = CalendarDay::in_zone("2026-01-01", chrono_tz::Asia::Shanghai).unwrap();
+        let (start, end) = (calendar.start_ms, calendar.end_ms);
+        let windows = calendar.closed_periods(end);
         assert_eq!(windows.len(), 6);
         assert_eq!(windows[0].0, start);
         assert_eq!(windows.last().unwrap().1, end);
         assert!(windows.windows(2).all(|w| w[0].1 == w[1].0));
-        assert_eq!(batch_bounds(start, end, windows[0].1 - 1).len(), 0);
-        assert_eq!(batch_bounds(start, end, windows[0].1).len(), 1);
+        assert_eq!(calendar.closed_periods(windows[0].1 - 1).len(), 0);
+        assert_eq!(calendar.closed_periods(windows[0].1).len(), 1);
         assert!(day_bounds("2026-02-30").is_err());
     }
 }

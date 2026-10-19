@@ -446,22 +446,24 @@ export const getProcessStorageStats = async () => {
     }
 };
 
-export const getProcessMonthlyThumbnails = async (processName, page = 0, pageSize = 60) => {
+export const getProcessMonthlyThumbnails = async (processName, page = 0, pageSize = 60, timeZone = null) => {
     return withAuth(async () => {
         const response = await invoke('storage_get_process_monthly_thumbnails', {
             processName,
             page,
             pageSize,
+            timeZone,
         });
         return response || null;
     });
 };
 
-export const softDeleteProcessMonth = async (processName, month = null) => {
+export const softDeleteProcessMonth = async (processName, month = null, timeZone = null) => {
     return withAuth(async () => {
         const response = await invoke('storage_soft_delete', {
             processName,
             month,
+            timeZone,
         });
         return response;
     });

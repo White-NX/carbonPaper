@@ -16,6 +16,7 @@ mod background_policy;
 mod background_resources;
 mod background_scheduler;
 mod blind_index_repair;
+mod calendar;
 mod capture;
 mod classification;
 mod classification_runtime;

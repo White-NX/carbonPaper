@@ -387,6 +387,8 @@ pub struct ProcessMonthlyThumbnailItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessMonthlyThumbnailPage {
     pub process_name: String,
+    /// Calendar used for grouping. Clients pass it back for paging and deletion.
+    pub time_zone: String,
     pub page: i64,
     pub page_size: i64,
     pub total: i64,

@@ -166,10 +166,14 @@ impl StorageState {
         process_name: &str,
         page: i64,
         page_size: i64,
+        time_zone: Option<&str>,
     ) -> Result<ProcessMonthlyThumbnailPage, String> {
+        let zone = crate::calendar::time_zone(time_zone)?;
         let safe_page = page.max(0);
         let safe_page_size = page_size.clamp(1, 200);
-        let offset = safe_page * safe_page_size;
+        let offset = safe_page
+            .checked_mul(safe_page_size)
+            .ok_or("Invalid page")?;
 
         let guard = self.get_connection_named("get_process_monthly_thumbnails")?;
         let conn = guard.as_ref().unwrap();
@@ -184,7 +188,7 @@ impl StorageState {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, image_path, strftime('%s', created_at) AS ts, strftime('%Y-%m', created_at) AS month_key
+                "SELECT id, image_path, strftime('%s', created_at) AS ts
                  FROM screenshots
                  WHERE is_deleted = 0 AND process_name = ?1
                  ORDER BY created_at DESC
@@ -207,15 +211,16 @@ impl StorageState {
                         image_path: row.get(1)?,
                         created_at: wire_time::from_optional_seconds(timestamp),
                         timestamp,
-                        month: row
-                            .get::<_, Option<String>>(3)?
+                        month: timestamp
+                            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                            .map(|time| time.with_timezone(&zone).format("%Y-%m").to_string())
                             .unwrap_or_else(|| "unknown".to_string()),
                     })
                 },
             )
             .map_err(|e| format!("Failed to execute monthly thumbnails query: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read monthly thumbnail: {e}"))?;
 
         let next_page = if (offset + items.len() as i64) < total {
             Some(safe_page + 1)
@@ -225,11 +230,149 @@ impl StorageState {
 
         Ok(ProcessMonthlyThumbnailPage {
             process_name: process_name.to_string(),
+            time_zone: zone.name().to_string(),
             page: safe_page,
             page_size: safe_page_size,
             total,
             items,
             next_page,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credential_manager::CredentialManagerState;
+    use rusqlite::{params, Connection};
+    use std::sync::Arc;
+
+    fn storage() -> (tempfile::TempDir, StorageState) {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        *storage.db.lock().unwrap() = Some(conn);
+        (temp, storage)
+    }
+
+    #[test]
+    fn local_month_grouping_and_deletion_share_exact_half_open_bounds() {
+        for (zone, month, start, end) in [
+            (
+                "Asia/Shanghai",
+                "2026-10",
+                "2026-09-30T16:00:00Z",
+                "2026-10-31T16:00:00Z",
+            ),
+            (
+                "America/New_York",
+                "2026-11",
+                "2026-11-01T04:00:00Z",
+                "2026-12-01T05:00:00Z",
+            ),
+        ] {
+            let (_temp, storage) = storage();
+            let start = chrono::DateTime::parse_from_rfc3339(start)
+                .unwrap()
+                .timestamp_millis();
+            let end = chrono::DateTime::parse_from_rfc3339(end)
+                .unwrap()
+                .timestamp_millis();
+            {
+                let guard = storage.db.lock().unwrap();
+                let conn = guard.as_ref().unwrap();
+                for (id, time) in [
+                    (1, start - 1000),
+                    (2, start),
+                    (3, end - 1000),
+                    (4, end),
+                    (5, start),
+                ] {
+                    conn.execute("INSERT INTO screenshots(id,image_path,image_hash,process_name,created_at,status) VALUES(?1,'fixture',?1,?2,?3,'committed')",
+                        params![id, if id == 5 { "other.exe" } else { "editor.exe" }, crate::calendar::sqlite_utc(time).unwrap()]).unwrap();
+                    conn.execute(
+                        "INSERT INTO ocr_results(id,screenshot_id,text_hash) VALUES(?1,?1,?1)",
+                        [id],
+                    )
+                    .unwrap();
+                }
+            }
+            let page = storage
+                .get_process_monthly_thumbnails("editor.exe", 0, 60, Some(zone))
+                .unwrap();
+            assert_eq!(page.time_zone, zone);
+            let mut displayed_ids = page
+                .items
+                .iter()
+                .filter(|item| item.month == month)
+                .map(|item| item.screenshot_id)
+                .collect::<Vec<_>>();
+            displayed_ids.sort_unstable();
+            assert_eq!(displayed_ids, vec![2, 3], "{zone}");
+            assert!(page.items.iter().all(|item| item.created_at.ends_with('Z')));
+
+            let range = crate::mcp_contract::TimeRange::from_args(
+                &serde_json::json!({"start_ms":start,"end_ms":end}),
+                true,
+            )
+            .unwrap();
+            let (a, b) = range.storage_seconds();
+            let snapshots = storage
+                .get_screenshots_by_time_range_limited(a.unwrap(), b.unwrap(), Some(500))
+                .unwrap();
+            let mut snapshot_ids = snapshots.iter().map(|record| record.id).collect::<Vec<_>>();
+            snapshot_ids.sort_unstable();
+            assert_eq!(snapshot_ids, vec![2, 3, 5], "MCP time range: {zone}");
+
+            let deleted = storage
+                .soft_delete_process_month("editor.exe", Some(month), Some(&page.time_zone))
+                .unwrap();
+            assert_eq!(deleted.screenshots_marked, 2);
+            assert_eq!(deleted.ocr_marked, 2);
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            for sql in [
+                "SELECT id FROM screenshots WHERE is_deleted=1 ORDER BY id",
+                "SELECT id FROM ocr_results WHERE is_deleted=1 ORDER BY id",
+                "SELECT id FROM delete_queue_screenshots ORDER BY id",
+                "SELECT id FROM delete_queue_ocr ORDER BY id",
+            ] {
+                let ids = conn
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(ids, displayed_ids, "{zone}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_month_or_missing_zone_cannot_turn_into_process_wide_deletion() {
+        let (_temp, storage) = storage();
+        for month in ["", "2026-00", "2026-13", "2026-1", "2026-10-01"] {
+            assert!(storage
+                .soft_delete_process_month("editor.exe", Some(month), Some("Asia/Shanghai"))
+                .is_err());
+        }
+        assert_eq!(
+            storage
+                .soft_delete_process_month("editor.exe", Some("2026-10"), None)
+                .unwrap_err(),
+            "CALENDAR_TIME_ZONE_REQUIRED"
+        );
+        assert!(storage
+            .soft_delete_process_month("editor.exe", Some("2026-10"), Some("invalid"))
+            .is_err());
+        assert!(storage
+            .get_process_monthly_thumbnails("editor.exe", 0, 60, Some("invalid"))
+            .is_err());
+        assert!(storage
+            .soft_delete_process_month("editor.exe", None, None)
+            .is_ok());
     }
 }

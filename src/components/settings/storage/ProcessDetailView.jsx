@@ -11,9 +11,9 @@ import { captureDateOf } from '../../../lib/search_grouping';
  * 以前这里直接把后端给的字符串当文本贴出来，而那是数据库里的世界协调时，
  * 于是设置页显示的时间和时间线对不上（Issue #166）。
  */
-function formatCapturedAt(item) {
+function formatCapturedAt(item, timeZone) {
   const parsed = captureDateOf(item);
-  return parsed ? parsed.toLocaleString() : '';
+  return parsed ? parsed.toLocaleString(undefined, timeZone ? { timeZone } : undefined) : '';
 }
 
 export default function ProcessDetailView({
@@ -77,7 +77,7 @@ export default function ProcessDetailView({
       {groupedMonthItems.map(([month, items]) => {
         const monthDeleteKey = `${selectedProcess}::${month}`;
         const deletingMonth = deletingTarget === monthDeleteKey;
-        const monthDeletable = /^\d{4}-\d{2}$/.test(month);
+        const monthDeletable = /^\d{4}-\d{2}$/.test(month) && Boolean(processMonthData?.time_zone);
         const selectedInMonth = items
           .map((item) => item.screenshot_id)
           .filter((id) => selectedScreenshotIds.has(id));
@@ -105,7 +105,7 @@ export default function ProcessDetailView({
               {items.map((item) => {
                 const selected = selectedScreenshotIds.has(item.screenshot_id);
                 const thumbSrc = processThumbMap?.[String(item.screenshot_id)] || null;
-                const capturedAt = formatCapturedAt(item);
+                const capturedAt = formatCapturedAt(item, processMonthData?.time_zone);
                 return (
                   <div
                     key={item.screenshot_id}

@@ -268,10 +268,11 @@ pub fn read_day(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> 
     }
     let generation = storage.db_generation();
     let (start, end) = day_bounds(date)?;
-    let (revision, start, end) =
+    let (revision, _, _) =
         storage.recap_day_revision(date, start, end, &privacy_fingerprint(app)?)?;
+    let calendar = storage.recap_calendar(date)?;
     let mut batches = Vec::new();
-    for (a, b) in batch_bounds(start, end, chrono::Utc::now().timestamp_millis()) {
+    for (a, b) in calendar.closed_periods(chrono::Utc::now().timestamp_millis()) {
         let key = format!("{date}:{a}");
         batches.push(
             storage
@@ -314,6 +315,7 @@ pub fn read_day(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> 
     }
     Ok(RecapDay {
         date: date.into(),
+        calendar,
         batches,
         threads,
         usage: storage.recap_usage(&Local::now().date_naive().to_string())?,
@@ -503,7 +505,7 @@ fn initial_request(
         .collect::<Vec<_>>();
     let mut segments = HashSet::new();
     let mut directory=order.iter().filter_map(|i| {let e=&records[*i];segments.insert(&e.segment).then(||json!({"id":e.id,"segment":e.segment,"time_ms":e.timestamp_ms,"title":limited(&e.window_title,80)}))}).take(128).collect::<Vec<_>>();
-    let mut payload = json!({"language":settings.language,"include_key_details":settings.include_key_details,"answer_tokens":settings.answer_tokens,"existing_tasks":tasks,"directory":directory,"directory_omitted":records.len().saturating_sub(directory.len()),"evidence":[]});
+    let mut payload = json!({"language":settings.language,"calendar":prior.calendar,"include_key_details":settings.include_key_details,"answer_tokens":settings.answer_tokens,"existing_tasks":tasks,"directory":directory,"directory_omitted":records.len().saturating_sub(directory.len()),"evidence":[]});
     while context::estimated_input_tokens(provider.kind, &request(&payload, output)) > allowance / 2
         && !directory.is_empty()
     {
@@ -1167,7 +1169,8 @@ async fn generate_inner(
     }
     let privacy = privacy_fingerprint(&app)?;
     let (start, end) = day_bounds(&date)?;
-    let (revision, start, end) = storage.recap_day_revision(&date, start, end, &privacy)?;
+    let (revision, _, _) = storage.recap_day_revision(&date, start, end, &privacy)?;
+    let calendar = storage.recap_calendar(&date)?;
     let ctx = RunContext {
         app: app.clone(),
         storage: storage.clone(),
@@ -1180,7 +1183,7 @@ async fn generate_inner(
         automatic,
     };
     ctx.check()?;
-    let bounds = batch_bounds(start, end, chrono::Utc::now().timestamp_millis());
+    let bounds = calendar.closed_periods(chrono::Utc::now().timestamp_millis());
     if !automatic {
         storage.recap_allow_generation(&date, generation)?;
     }
@@ -1441,6 +1444,7 @@ mod tests {
         .unwrap();
         let mut day = RecapDay {
             date: "2026-01-01".into(),
+            calendar: CalendarDay::in_zone("2026-01-01", chrono_tz::UTC).unwrap(),
             batches: vec![batch],
             threads: vec![],
             usage: Default::default(),
@@ -1476,6 +1480,7 @@ mod tests {
         let mut provider = provider();
         let prior = RecapDay {
             date: "2026-09-30".into(),
+            calendar: CalendarDay::in_zone("2026-09-30", chrono_tz::UTC).unwrap(),
             batches: vec![],
             threads: vec![],
             usage: Default::default(),
@@ -1512,6 +1517,7 @@ mod tests {
         };
         let prior = RecapDay {
             date: "2026-09-30".into(),
+            calendar: CalendarDay::in_zone("2026-09-30", chrono_tz::UTC).unwrap(),
             batches: vec![],
             threads: vec![],
             usage: Default::default(),
@@ -1618,6 +1624,7 @@ mod tests {
         let provider = provider();
         let prior = RecapDay {
             date: "2026-09-30".into(),
+            calendar: CalendarDay::in_zone("2026-09-30", chrono_tz::UTC).unwrap(),
             batches: vec![],
             threads: vec![],
             usage: Default::default(),

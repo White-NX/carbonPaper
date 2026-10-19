@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, FileText, Merge, MoreHorizontal, Pencil, RefreshCw, Trash2, Undo2 } from 'lucide-react';
 import { grantAiRemoteConsent } from '../../lib/ai_api';
+import { calendarTimeFormatter } from '../../lib/calendar_time';
 import { cancelRecap, correctRecap, deleteRecap, generateRecap, localDate } from '../../lib/recap_api';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { openSettingsWindow } from '../../lib/settings_api';
@@ -111,8 +112,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   const focusTask = useRef(null);
   const originEntry = useRef(null);
   const epoch = useRef(0);
-  const formatter = useMemo(() => new Intl.DateTimeFormat(i18n.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }), [i18n.language]);
-  const time = useCallback((ms) => formatter.format(new Date(ms)), [formatter]);
+  const time = useMemo(() => calendarTimeFormatter(i18n.language, day?.calendar), [i18n.language, day?.calendar]);
   const route = task ? `task:${task}` : tab;
   const batches = day?.batches || [];
   const activities = useMemo(() => (day?.batches || []).flatMap((batch) => batch.activities).filter((activity) => activity.task_id === task).sort((a, b) => a.start_ms - b.start_ms), [day, task]);

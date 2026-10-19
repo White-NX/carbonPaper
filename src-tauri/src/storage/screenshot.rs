@@ -2719,34 +2719,20 @@ impl StorageState {
         Ok(result.screenshots_marked.clamp(0, i32::MAX as i64) as i32)
     }
 
-    /// Soft-delete screenshots by process (and optional month key `YYYY-MM`) and enqueue IDs.
+    /// Soft-delete screenshots by process and optional local month. A month
+    /// requires the named time zone returned with its thumbnail page.
     pub fn soft_delete_process_month(
         &self,
         process_name: &str,
         month: Option<&str>,
+        time_zone: Option<&str>,
     ) -> Result<SoftDeleteResult, String> {
         let normalized_process = process_name.trim();
         if normalized_process.is_empty() {
             return Err("process_name is required".to_string());
         }
 
-        let normalized_month = month
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
-        if let Some(ref m) = normalized_month {
-            let valid = m.len() == 7
-                && m.as_bytes().get(4) == Some(&b'-')
-                && m.chars().enumerate().all(|(idx, ch)| {
-                    if idx == 4 {
-                        ch == '-'
-                    } else {
-                        ch.is_ascii_digit()
-                    }
-                });
-            if !valid {
-                return Err("month must be in YYYY-MM format".to_string());
-            }
-        }
+        let normalized_month = month.map(|m| m.trim().to_string());
 
         let mut filter_plain = String::from("process_name = ?1 AND is_deleted = 0");
         let mut filter_alias = String::from("s.process_name = ?1 AND s.is_deleted = 0");
@@ -2754,9 +2740,13 @@ impl StorageState {
             vec![Box::new(normalized_process.to_string())];
 
         if let Some(ref month_key) = normalized_month {
-            filter_plain.push_str(" AND strftime('%Y-%m', created_at) = ?2");
-            filter_alias.push_str(" AND strftime('%Y-%m', s.created_at) = ?2");
-            param_values.push(Box::new(month_key.clone()));
+            let zone =
+                crate::calendar::time_zone(Some(time_zone.ok_or("CALENDAR_TIME_ZONE_REQUIRED")?))?;
+            let (start_ms, end_ms) = crate::calendar::month_bounds(month_key, zone)?;
+            filter_plain.push_str(" AND created_at >= ?2 AND created_at < ?3");
+            filter_alias.push_str(" AND s.created_at >= ?2 AND s.created_at < ?3");
+            param_values.push(Box::new(crate::calendar::sqlite_utc(start_ms)?));
+            param_values.push(Box::new(crate::calendar::sqlite_utc(end_ms)?));
         }
 
         let params_ref: Vec<&dyn rusqlite::ToSql> =

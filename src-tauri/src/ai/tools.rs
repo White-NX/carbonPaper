@@ -54,17 +54,11 @@ pub fn specs(scope: ToolScope) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// A screenshot a tool result mentioned, with the fields the interface needs
-/// to open it. Time fields are passed through in whatever unit the tool used.
+/// The same screenshot reference used by every tool and the frontend.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SnapshotRef {
-    pub id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub screenshot_created_at: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<Value>,
+    pub screenshot_id: i64,
+    pub captured_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,13 +67,10 @@ pub struct SnapshotRef {
 
 impl SnapshotRef {
     fn from_record(id: i64, map: &Map<String, Value>) -> Self {
-        let value = |key: &str| map.get(key).filter(|v| !v.is_null()).cloned();
         let text = |key: &str| map.get(key).and_then(Value::as_str).map(str::to_string);
         Self {
-            id,
-            timestamp: value("timestamp"),
-            screenshot_created_at: value("screenshot_created_at"),
-            created_at: value("created_at"),
+            screenshot_id: id,
+            captured_at_ms: map.get("captured_at_ms").and_then(Value::as_i64),
             window_title: text("window_title"),
             process_name: text("process_name"),
         }
@@ -87,12 +78,7 @@ impl SnapshotRef {
 
     /// Fills fields this reference lacks from another sighting of the same id.
     fn absorb(&mut self, other: SnapshotRef) {
-        self.timestamp = self.timestamp.take().or(other.timestamp);
-        self.screenshot_created_at = self
-            .screenshot_created_at
-            .take()
-            .or(other.screenshot_created_at);
-        self.created_at = self.created_at.take().or(other.created_at);
+        self.captured_at_ms = self.captured_at_ms.or(other.captured_at_ms);
         self.window_title = self.window_title.take().or(other.window_title);
         self.process_name = self.process_name.take().or(other.process_name);
     }
@@ -101,7 +87,10 @@ impl SnapshotRef {
 /// Adds references to `into`, merging repeated ids in first-seen order.
 pub fn merge_snapshots(into: &mut Vec<SnapshotRef>, refs: impl IntoIterator<Item = SnapshotRef>) {
     for r in refs {
-        match into.iter_mut().find(|existing| existing.id == r.id) {
+        match into
+            .iter_mut()
+            .find(|existing| existing.screenshot_id == r.screenshot_id)
+        {
             Some(existing) => existing.absorb(r),
             None => into.push(r),
         }
@@ -127,11 +116,18 @@ pub async fn execute(
     allowed: &[ToolSpec],
 ) -> ToolOutcome {
     if !allowed.iter().any(|tool| tool.name == call.name) {
-        return failure(format!("Tool `{}` is not available.", call.name));
+        return failure(format!(
+            "TOOL_NOT_FOUND: Tool `{}` is not available.",
+            call.name
+        ));
     }
     let args = match parse_arguments(&call.arguments) {
         Ok(args) => args,
-        Err(e) => return failure(format!("Arguments are not valid JSON: {e}")),
+        Err(e) => {
+            return failure(mcp_contract::invalid_argument(format!(
+                "Arguments are not valid JSON: {e}"
+            )))
+        }
     };
     match crate::mcp_server::call_tool(app_handle, &call.name, args).await {
         Ok(result) => summarize(&call.name, result),
@@ -141,7 +137,7 @@ pub async fn execute(
 
 fn failure(message: String) -> ToolOutcome {
     ToolOutcome {
-        content: serde_json::json!({ "error": message }).to_string(),
+        content: mcp_contract::error_payload(&message).to_string(),
         snapshots: Vec::new(),
         item_count: None,
         error: Some(message),
@@ -155,9 +151,9 @@ fn parse_arguments(raw: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(raw)
 }
 
-pub(crate) fn summarize(tool_name: &str, mut result: Value) -> ToolOutcome {
+pub(crate) fn summarize(_tool_name: &str, mut result: Value) -> ToolOutcome {
     let mut snapshots = Vec::new();
-    collect_snapshots(tool_name, &result, &mut snapshots, 0);
+    collect_snapshots(&result, &mut snapshots);
     compact(&mut result);
     let item_count = list_of(&result).map(Vec::len);
     ToolOutcome {
@@ -182,33 +178,21 @@ fn list_of_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
     value.get_mut("items").and_then(Value::as_array_mut)
 }
 
-/// Screenshot ids appear as `screenshot_id` everywhere, except in the two
-/// snapshot tools whose records are screenshots and use a plain `id`.
-fn collect_snapshots(tool_name: &str, value: &Value, out: &mut Vec<SnapshotRef>, depth: usize) {
-    let plain_id_is_snapshot = matches!(
-        tool_name,
-        "get_snapshots_by_time_range" | "get_snapshot_details"
-    );
+/// OCR, activity and cluster IDs can never become screenshot references.
+fn collect_snapshots(value: &Value, out: &mut Vec<SnapshotRef>) {
     match value {
         Value::Object(map) => {
-            let id = map
-                .get("screenshot_id")
-                .and_then(Value::as_i64)
-                .or_else(|| {
-                    (plain_id_is_snapshot && depth <= 1)
-                        .then(|| map.get("id").and_then(Value::as_i64))
-                        .flatten()
-                });
+            let id = map.get("screenshot_id").and_then(Value::as_i64);
             if let Some(id) = id.filter(|id| *id > 0) {
                 merge_snapshots(out, [SnapshotRef::from_record(id, map)]);
             }
             for child in map.values() {
-                collect_snapshots(tool_name, child, out, depth + 1);
+                collect_snapshots(child, out);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_snapshots(tool_name, item, out, depth);
+                collect_snapshots(item, out);
             }
         }
         _ => {}
@@ -221,7 +205,8 @@ fn compact(value: &mut Value) {
             for field in DROPPED_FIELDS {
                 map.remove(*field);
             }
-            map.retain(|_, v| !v.is_null());
+            // Null timestamps mean unknown and null next_offset means done.
+            // Preserve these contract values when compacting model context.
             map.values_mut().for_each(compact);
         }
         Value::Array(items) => items.iter_mut().for_each(compact),
@@ -302,14 +287,14 @@ mod tests {
     }
 
     fn ids(outcome: &ToolOutcome) -> Vec<i64> {
-        outcome.snapshots.iter().map(|s| s.id).collect()
+        outcome.snapshots.iter().map(|s| s.screenshot_id).collect()
     }
 
     #[test]
     fn repeated_sightings_fill_in_missing_fields() {
         let result = json!([
             { "screenshot_id": 7 },
-            { "screenshot_id": 7, "process_name": "code.exe", "timestamp": 1700000000 }
+            { "screenshot_id": 7, "process_name": "code.exe", "captured_at_ms": 1700000000000i64 }
         ]);
         let outcome = summarize("search_nl", result);
         assert_eq!(outcome.snapshots.len(), 1);
@@ -317,28 +302,33 @@ mod tests {
             outcome.snapshots[0].process_name.as_deref(),
             Some("code.exe")
         );
-        assert_eq!(outcome.snapshots[0].timestamp, Some(json!(1700000000)));
+        assert_eq!(outcome.snapshots[0].captured_at_ms, Some(1700000000000));
     }
 
     #[test]
     fn snapshot_ids_come_from_the_right_fields() {
         let ocr = json!([
-            { "id": 900, "screenshot_id": 7, "text": "a", "image_path": "memory://x" },
-            { "id": 901, "screenshot_id": 7 },
-            { "id": 902, "screenshot_id": 3 }
+            { "ocr_id": 900, "screenshot_id": 7, "text": "a", "image_path": "memory://x" },
+            { "ocr_id": 901, "screenshot_id": 7 },
+            { "ocr_id": 902, "screenshot_id": 3 }
         ]);
         let outcome = summarize("search_ocr_text", ocr);
         assert_eq!(ids(&outcome), vec![7, 3]);
         assert_eq!(outcome.item_count, Some(3));
         assert!(!outcome.content.contains("image_path"));
 
-        let snapshots = json!([{ "id": 11, "window_title": "t" }, { "id": 12 }]);
+        let snapshots =
+            json!([{ "screenshot_id": 11, "window_title": "t" }, { "screenshot_id": 12 }]);
         let outcome = summarize("get_snapshots_by_time_range", snapshots);
         assert_eq!(ids(&outcome), vec![11, 12]);
         assert_eq!(outcome.snapshots[0].window_title.as_deref(), Some("t"));
 
         let clusters = json!([{ "id": 5, "name": "c" }]);
         assert!(summarize("get_smart_clusters", clusters)
+            .snapshots
+            .is_empty());
+        let ambiguous = json!({"record": {"id": 7}, "ocr_results": [{"ocr_id": 11}]});
+        assert!(summarize("get_snapshot_details", ambiguous)
             .snapshots
             .is_empty());
     }
@@ -362,15 +352,15 @@ mod tests {
             json!({
                 "date": "2026-10-01", "items": [{
                     "activity_id": "activity-1", "task_id": "task-1",
-                    "sources": [{ "screenshot_id": 42, "timestamp": 1_790_784_000_000_i64,
+                    "sources": [{ "screenshot_id": 42, "captured_at_ms": 1_790_784_000_000_i64,
                         "process_name": "editor.exe", "window_title": "Release notes" }]
                 }]
             }),
         );
         assert_eq!(ids(&outcome), vec![42]);
         assert_eq!(
-            outcome.snapshots[0].timestamp,
-            Some(json!(1_790_784_000_000_i64))
+            outcome.snapshots[0].captured_at_ms,
+            Some(1_790_784_000_000_i64)
         );
         assert_eq!(outcome.item_count, Some(1));
     }
@@ -401,5 +391,32 @@ mod tests {
     fn empty_arguments_mean_an_empty_object() {
         assert_eq!(parse_arguments(" ").unwrap(), json!({}));
         assert!(parse_arguments("{bad").is_err());
+    }
+
+    #[test]
+    fn failures_and_unknown_times_survive_model_compaction() {
+        for code in [
+            "SNAPSHOT_NOT_FOUND",
+            "PRIVACY_REJECTED",
+            "AUTH_REQUIRED",
+            "INVALID_ARGUMENT",
+        ] {
+            let outcome = failure(format!("{code}: unavailable"));
+            assert!(outcome.error.is_some());
+            assert!(outcome.snapshots.is_empty());
+            let content: Value = serde_json::from_str(&outcome.content).unwrap();
+            assert_eq!(content["error"]["code"], code);
+        }
+        let outcome = summarize(
+            "get_recap_day",
+            json!({"items": [{
+            "screenshot_id": 42, "captured_at_ms": null
+        }], "next_offset": null}),
+        );
+        let content: Value = serde_json::from_str(&outcome.content).unwrap();
+        assert!(content.get("next_offset").is_some_and(Value::is_null));
+        assert!(content["items"][0]
+            .get("captured_at_ms")
+            .is_some_and(Value::is_null));
     }
 }

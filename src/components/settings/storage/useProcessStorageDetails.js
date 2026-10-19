@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
 import { notifySettingsChanged } from '../../../lib/settings_api';
 import {
@@ -19,6 +19,8 @@ export function useProcessStorageDetails({ onRefresh, t }) {
   const [selectedProcess, setSelectedProcess] = useState('');
   const [processPage, setProcessPage] = useState(0);
   const [processMonthData, setProcessMonthData] = useState(null);
+  const processCalendarRef = useRef(null);
+  const processRequestRef = useRef(0);
   const [processMonthLoading, setProcessMonthLoading] = useState(false);
   const [processMonthError, setProcessMonthError] = useState('');
   const [processThumbMap, setProcessThumbMap] = useState({});
@@ -55,22 +57,30 @@ export function useProcessStorageDetails({ onRefresh, t }) {
 
   const loadProcessMonthPage = useCallback(async (processName, page = 0) => {
     if (!processName) return;
+    const request = ++processRequestRef.current;
+    const timeZone = processCalendarRef.current?.processName === processName
+      ? processCalendarRef.current.timeZone : null;
     setProcessMonthLoading(true);
     setProcessMonthError('');
     try {
-      const data = await getProcessMonthlyThumbnails(processName, page, 60);
+      const data = await getProcessMonthlyThumbnails(processName, page, 60, timeZone);
+      if (request !== processRequestRef.current) return;
+      processCalendarRef.current = { processName, timeZone: data?.time_zone ?? null };
       setProcessMonthData(data);
       setProcessPage(page);
       setSelectedScreenshotIds(new Set());
     } catch (e) {
+      if (request !== processRequestRef.current) return;
       setProcessMonthData(null);
       setProcessMonthError(String(e));
     } finally {
-      setProcessMonthLoading(false);
+      if (request === processRequestRef.current) setProcessMonthLoading(false);
     }
   }, []);
 
   const openProcessDetail = useCallback((processName) => {
+    processCalendarRef.current = null;
+    setProcessMonthData(null);
     setSelectedProcess(processName);
     setPanelView('process-detail');
     setProcessThumbMap({});
@@ -99,6 +109,7 @@ export function useProcessStorageDetails({ onRefresh, t }) {
     setPendingDeleteIntent({
       processName,
       month,
+      timeZone: processMonthData?.process_name === processName ? processMonthData.time_zone : null,
       screenshotIds: selectedIds,
       hasSelectedIds,
       targetKey: `${processName}::${month || 'all'}`,
@@ -114,13 +125,14 @@ export function useProcessStorageDetails({ onRefresh, t }) {
           ? t('settings.storageManagement.processDetails.deleteMonth')
           : t('settings.storageManagement.processDetails.deleteProcess'),
     });
-  }, [t]);
+  }, [processMonthData, t]);
 
   const executeSoftDelete = useCallback(async (intent) => {
     if (!intent?.processName) return;
     const {
       processName,
       month,
+      timeZone,
       screenshotIds,
       hasSelectedIds,
       targetKey,
@@ -136,7 +148,7 @@ export function useProcessStorageDetails({ onRefresh, t }) {
           return next;
         });
       } else {
-        await softDeleteProcessMonth(processName, month);
+        await softDeleteProcessMonth(processName, month, timeZone);
       }
       await loadDeleteQueueStatus();
       await loadProcessStats();

@@ -14,7 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::derived_index::{decode_vector, encode_vector};
-use super::StorageState;
+use super::{wire_time, StorageState};
 
 /// The identity of an anchor text, for deciding whether a stored encoding of it
 /// is still the encoding of *this* text.
@@ -145,11 +145,17 @@ fn read_cluster_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmartClust
         threshold: row.get(2)?,
         enabled: row.get::<_, i64>(3)? != 0,
         dominant_color: row.get(4)?,
-        created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-        updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        created_at: wire_time::from_sqlite_utc(
+            &row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        ),
+        updated_at: wire_time::from_sqlite_utc(
+            &row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        ),
         assignment_count: Some(row.get::<_, i64>(7)?),
         recent_assignment_count: Some(row.get::<_, i64>(21)?),
-        last_assigned_at: row.get(22)?,
+        last_assigned_at: row
+            .get::<_, Option<String>>(22)?
+            .map(|time| wire_time::from_sqlite_utc(&time)),
         last_process_name: row.get(23)?,
         last_window_title: row.get(24)?,
         summary: read_summary_from_row(row, 8)?,
@@ -325,12 +331,14 @@ fn read_summary_from_row(
             model_provider: row.get(start + 8)?,
             model_name: row.get(start + 9)?,
             prompt_version: row.get(start + 10)?,
-            created_at: row
-                .get::<_, Option<String>>(start + 11)?
-                .unwrap_or_default(),
-            updated_at: row
-                .get::<_, Option<String>>(start + 12)?
-                .unwrap_or_default(),
+            created_at: wire_time::from_sqlite_utc(
+                &row.get::<_, Option<String>>(start + 11)?
+                    .unwrap_or_default(),
+            ),
+            updated_at: wire_time::from_sqlite_utc(
+                &row.get::<_, Option<String>>(start + 12)?
+                    .unwrap_or_default(),
+            ),
         })),
         None => Ok(None),
     }
@@ -836,9 +844,13 @@ impl StorageState {
                     image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     process_name: row.get(3)?,
                     window_title: row.get(4)?,
-                    created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    created_at: wire_time::from_sqlite_utc(
+                        &row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    ),
                     category: row.get(6)?,
-                    assigned_at: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    assigned_at: wire_time::from_sqlite_utc(
+                        &row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    ),
                 })
             })
             .map_err(|e| format!("Failed to query assignments: {}", e))?;
@@ -1304,6 +1316,36 @@ mod tests {
         (temp, storage)
     }
 
+    #[test]
+    fn archive_records_and_assignments_export_unambiguous_utc_instants() {
+        let (_temp, storage) = test_storage();
+        let cluster = insert_cluster(&storage, "Save location");
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute("INSERT INTO screenshots(id,image_path,image_hash,created_at,status) VALUES(83558,'fixture','fixture','2026-09-30 16:30:00','committed')", []).unwrap();
+            conn.execute("INSERT INTO smart_cluster_assignments(smart_cluster_id,screenshot_id,assigned_at) VALUES(?1,83558,'2026-10-02 01:52:09')", [cluster]).unwrap();
+            conn.execute("UPDATE smart_clusters SET created_at='2026-09-30 16:30:00', updated_at='2026-10-02 01:52:09' WHERE id=?1", [cluster]).unwrap();
+            conn.execute("INSERT INTO smart_cluster_summaries(smart_cluster_id,created_at,updated_at) VALUES(?1,'2026-09-30 16:30:00','2026-10-02 01:52:09')", [cluster]).unwrap();
+        }
+        let record = storage.get_smart_cluster(cluster).unwrap().unwrap();
+        assert_eq!(record.created_at, "2026-09-30T16:30:00Z");
+        assert_eq!(record.updated_at, "2026-10-02T01:52:09Z");
+        assert_eq!(
+            record.last_assigned_at.as_deref(),
+            Some("2026-10-02T01:52:09Z")
+        );
+        let summary = record.summary.unwrap();
+        assert_eq!(summary.created_at, "2026-09-30T16:30:00Z");
+        assert_eq!(summary.updated_at, "2026-10-02T01:52:09Z");
+        let assignments = storage
+            .list_smart_cluster_assignments(cluster, 0, 50)
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].created_at, "2026-09-30T16:30:00Z");
+        assert_eq!(assignments[0].assigned_at, "2026-10-02T01:52:09Z");
+    }
+
     /// Put the table back into the shape it had before the anchor cache
     /// existed, so the next `init_tables` is a migration rather than a create.
     fn drop_anchor_cache_columns(storage: &StorageState) {
@@ -1648,7 +1690,7 @@ mod tests {
             .find(|assignment| assignment.screenshot_id == 1)
             .expect("rescored assignment");
         assert_eq!(rescored.rerank_score, Some(0.95));
-        assert_eq!(rescored.assigned_at, "2000-01-01 00:00:00");
+        assert_eq!(rescored.assigned_at, "2000-01-01T00:00:00Z");
 
         let record = storage
             .get_smart_cluster(cluster_id)
@@ -1657,7 +1699,7 @@ mod tests {
         assert_eq!(record.recent_assignment_count, Some(0));
         assert_eq!(
             record.last_assigned_at.as_deref(),
-            Some("2000-01-02 00:00:00")
+            Some("2000-01-02T00:00:00Z")
         );
         assert_eq!(record.last_process_name.as_deref(), Some("new.exe"));
         assert_eq!(record.last_window_title.as_deref(), Some("New source"));

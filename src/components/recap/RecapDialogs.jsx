@@ -74,7 +74,7 @@ export function DiagnosticsDialog({ date, onClose }) {
     <div className="min-h-0 overflow-y-auto px-4 py-4 sm:px-6" data-recap-diagnostics-scroll>
       {error && <div className="mb-3"><DiagnosticError error={error} /></div>}
       {!day && !error && <p role="status" className="text-sm text-ide-muted">{t('recap.loading')}</p>}
-      {(day || progress) && <RecapProgress key={date} progress={progress} batches={day?.batches || []} error={day?.error} />}
+      {(day || progress) && <RecapProgress key={date} progress={progress} batches={day?.batches || []} error={day?.error} calendar={day?.calendar} />}
     </div>
     <div className="flex shrink-0 justify-end border-t border-ide-border px-4 py-3 sm:px-6"><Button onClick={onClose}>{t('recap.close')}</Button></div>
   </Dialog>;

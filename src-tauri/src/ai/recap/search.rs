@@ -98,7 +98,7 @@ impl RecapSearchQuery {
             return Err("RECAP_INVALID_SEARCH".into());
         }
         for date in [&self.start_date, &self.end_date].into_iter().flatten() {
-            day_bounds(date)?;
+            crate::calendar::parse_date(date)?;
         }
         if matches!((&self.start_date, &self.end_date), (Some(a), Some(b)) if a > b) {
             return Err("RECAP_INVALID_DATE".into());

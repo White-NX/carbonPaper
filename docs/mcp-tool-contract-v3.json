@@ -1,59 +1,101 @@
 {
+  "error_contract": {
+    "codes": [
+      "INVALID_ARGUMENT",
+      "TOOL_NOT_FOUND",
+      "SNAPSHOT_NOT_FOUND",
+      "PRIVACY_REJECTED",
+      "AUTH_REQUIRED",
+      "MAINTENANCE_IN_PROGRESS",
+      "TOOL_FAILED"
+    ],
+    "domain_errors": "Existing RECAP_* and other domain error codes are preserved.",
+    "mcp": "Tool failures are tools/call results with isError=true; malformed JSON-RPC requests remain protocol errors.",
+    "shape": {
+      "error": {
+        "code": "STABLE_ERROR_CODE",
+        "message": "Description"
+      }
+    }
+  },
+  "identity_contract": {
+    "cluster": "cluster_id",
+    "ocr_row": "ocr_id",
+    "screenshot": "screenshot_id"
+  },
   "mcp_protocol_version": "2025-03-26",
   "skill": {
     "id": "carbonpaper-memory",
     "source_repository": "https://github.com/White-NX/carbonPaperSkill"
   },
-  "tool_schema_version": 2,
+  "time_contract": {
+    "calendar": "Recap dates retain their recorded time zone and absolute day/period boundaries. Inspect calendar on a day, or calendars[date] on date lists and search results. Legacy days use rule=recorded_bounds with time_zone=null.",
+    "capture_field": "captured_at_ms",
+    "instant_unit": "unix_milliseconds",
+    "ocr_processing_field": "ocr_processed_at_ms",
+    "range": "start_ms <= captured_at_ms < end_ms",
+    "unknown_instant": null
+  },
+  "tool_schema_version": 3,
   "tools": [
     {
-      "description": "Get screenshot snapshots within a time range. Returns metadata only (no image data). Timestamps are in milliseconds since Unix epoch.",
+      "description": "Get screenshot metadata in the half-open interval [start_ms, end_ms). Results use screenshot_id and captured_at_ms (Unix milliseconds); null capture time means unknown. Returns the earliest matching records up to max_records.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
-          "end_time": {
-            "description": "End timestamp in milliseconds",
-            "type": "number"
+          "end_ms": {
+            "description": "Exclusive end, Unix milliseconds",
+            "maximum": 253402300799999,
+            "minimum": 0,
+            "type": "integer"
           },
           "max_records": {
             "description": "Maximum number of records to return (default 500)",
+            "maximum": 500,
+            "minimum": 1,
             "type": "integer"
           },
-          "start_time": {
-            "description": "Start timestamp in milliseconds",
-            "type": "number"
+          "start_ms": {
+            "description": "Inclusive start, Unix milliseconds",
+            "maximum": 253402300799999,
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
-          "start_time",
-          "end_time"
+          "start_ms",
+          "end_ms"
         ],
         "type": "object"
       },
       "name": "get_snapshots_by_time_range"
     },
     {
-      "description": "Get full details of a specific snapshot including metadata and OCR text. By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
+      "description": "Read one screenshot using screenshot_id from another tool. Returns status=found, record with captured_at_ms, and OCR rows with ocr_processed_at_ms. An empty OCR list means no text is currently available for export. Missing screenshots return SNAPSHOT_NOT_FOUND; privacy rejection returns PRIVACY_REJECTED. Include OCR bounding boxes with include_coords=true.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
-          "id": {
-            "description": "Screenshot ID",
-            "type": "integer"
-          },
           "include_coords": {
             "description": "Include OCR bounding box coordinates (default false)",
             "type": "boolean"
+          },
+          "screenshot_id": {
+            "description": "screenshot_id returned by another tool; OCR row IDs cannot be used here",
+            "minimum": 1,
+            "type": "integer"
           }
         },
         "required": [
-          "id"
+          "screenshot_id"
         ],
         "type": "object"
       },
       "name": "get_snapshot_details"
     },
     {
-      "description": "Search screenshot OCR text using full-text search. Supports CJK and English text.",
+      "description": "Find words visible on screen using lexical OCR search. Extract distinctive keywords from a question, e.g. 保存路径 or save location. Separate keywords with spaces; a Chinese question is otherwise one long phrase. Fuzzy matching tolerates spelling/OCR errors. Results use screenshot_id for evidence, ocr_id for the text row, captured_at_ms for capture time, and ocr_processed_at_ms for recognition completion; all times are Unix milliseconds.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "categories": {
             "description": "Filter by categories",
@@ -62,9 +104,11 @@
             },
             "type": "array"
           },
-          "end_time": {
-            "description": "Filter end time (ms)",
-            "type": "number"
+          "end_ms": {
+            "description": "Exclusive capture time, Unix milliseconds",
+            "maximum": 253402300799999,
+            "minimum": 0,
+            "type": "integer"
           },
           "fuzzy": {
             "description": "Enable fuzzy matching (default true)",
@@ -72,10 +116,14 @@
           },
           "limit": {
             "description": "Max results (default 20)",
+            "maximum": 500,
+            "minimum": 1,
             "type": "integer"
           },
           "offset": {
             "description": "Pagination offset (default 0)",
+            "maximum": 100000,
+            "minimum": 0,
             "type": "integer"
           },
           "process_names": {
@@ -86,12 +134,14 @@
             "type": "array"
           },
           "query": {
-            "description": "Search query text",
+            "description": "Visible words or phrases; use space-separated keywords rather than a full question",
             "type": "string"
           },
-          "start_time": {
-            "description": "Filter start time (ms)",
-            "type": "number"
+          "start_ms": {
+            "description": "Inclusive capture time, Unix milliseconds",
+            "maximum": 253402300799999,
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -102,19 +152,26 @@
       "name": "search_ocr_text"
     },
     {
-      "description": "Natural language visual search over screenshots: a text query matched against what each screenshot looks like, using Chinese-CLIP image embeddings. Complements search_ocr_text, which matches the literal text on screen.",
+      "description": "Natural language visual search over screenshots using Chinese-CLIP image embeddings. Describe what the screen looks like; use search_ocr_text for visible words. Results use screenshot_id and captured_at_ms (Unix milliseconds). A time filter excludes captures whose time is unknown.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
-          "end_time": {
-            "description": "Filter end time (ms)",
-            "type": "number"
+          "end_ms": {
+            "description": "Exclusive capture time, Unix milliseconds",
+            "maximum": 253402300799999,
+            "minimum": 0,
+            "type": "integer"
           },
           "limit": {
             "description": "Max results (default 20)",
+            "maximum": 500,
+            "minimum": 1,
             "type": "integer"
           },
           "offset": {
             "description": "Pagination offset (default 0)",
+            "maximum": 100000,
+            "minimum": 0,
             "type": "integer"
           },
           "process_names": {
@@ -128,9 +185,11 @@
             "description": "Natural language search query",
             "type": "string"
           },
-          "start_time": {
-            "description": "Filter start time (ms)",
-            "type": "number"
+          "start_ms": {
+            "description": "Inclusive capture time, Unix milliseconds",
+            "maximum": 253402300799999,
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -141,19 +200,22 @@
       "name": "search_nl"
     },
     {
-      "description": "List smart clusters with assignment counts and any stored AI-generated summary.",
+      "description": "List smart clusters with cluster_id, assignment counts, stored summaries, and explicit Unix-millisecond created_at_ms, updated_at_ms and last_assigned_at_ms fields. Unknown times are null.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {},
         "type": "object"
       },
       "name": "get_smart_clusters"
     },
     {
-      "description": "Get assigned smart-cluster snapshots with joined OCR text for AI summarization. Results are paginated and ordered by rerank score.",
+      "description": "Get smart-cluster screenshots with joined OCR text, screenshot_id, captured_at_ms and assigned_at_ms (Unix milliseconds). Results are paginated and ordered by rerank score.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "cluster_id": {
             "description": "Smart cluster ID",
+            "minimum": 1,
             "type": "integer"
           },
           "include_empty_ocr": {
@@ -162,10 +224,14 @@
           },
           "page": {
             "description": "Page number (0-based, default 0)",
+            "maximum": 100000,
+            "minimum": 0,
             "type": "integer"
           },
           "page_size": {
             "description": "Page size (default 50, max 200)",
+            "maximum": 200,
+            "minimum": 1,
             "type": "integer"
           }
         },
@@ -179,9 +245,11 @@
     {
       "description": "Get the stored AI-generated summary for a smart cluster, if one exists.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "cluster_id": {
             "description": "Smart cluster ID",
+            "minimum": 1,
             "type": "integer"
           }
         },
@@ -193,8 +261,9 @@
       "name": "get_smart_cluster_summary"
     },
     {
-      "description": "List recorded daily recap dates, newest first, from the most recent 730 non-deleted dates. Dates use the user's local calendar (YYYY-MM-DD). A listed date may have pending or stale periods; use get_recap_day to read available content. Does not generate recaps.",
+      "description": "List recorded daily recap dates, newest first, from the most recent 730 non-deleted dates. Each YYYY-MM-DD date retains its saved calendar; inspect calendars[date] for the recorded time zone and UTC boundaries. A listed date may have pending or stale periods; use get_recap_day to read available content. Does not generate recaps.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "end_date": {
             "description": "Inclusive local date YYYY-MM-DD",
@@ -221,8 +290,9 @@
       "name": "get_recap_days"
     },
     {
-      "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is local YYYY-MM-DD; timestamps are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details.",
+      "description": "Read a saved daily recap with corrected activities, period overviews and screenshot evidence. Date is YYYY-MM-DD in the returned calendar, whose recorded time zone and day/period boundaries remain fixed. Sources use screenshot_id and captured_at_ms; all instants are Unix milliseconds. Activities are paginated chronologically; follow next_offset or narrow to batch_start_ms. Empty/pending periods do not establish inactivity. Does not generate or modify recap content. Use get_snapshot_details to verify source details.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "batch_start_ms": {
             "description": "Optional period start from a previous response, in Unix milliseconds",
@@ -252,7 +322,7 @@
       "name": "get_recap_day"
     },
     {
-      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Returns concise activities, key details and citable screenshots; verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index. Timestamps are Unix milliseconds.",
+      "description": "Search saved, corrected daily recap activities across dates using keywords, local text meaning, or both. Date filters are inclusive saved YYYY-MM-DD labels; inspect calendars[date] for each result's recorded time zone and boundaries. Sources use screenshot_id and captured_at_ms (Unix milliseconds). Verify factual claims with get_snapshot_details. Unlike screenshot semantic search this covers all saved recap dates. Hybrid mode falls back to keywords when the local recap index is incomplete or unavailable; inspect semantic_status. Summaries can omit details, so use OCR or image search when needed. Does not generate recaps or build the index.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -309,9 +379,11 @@
     {
       "description": "Create or replace the stored AI-generated title, cluster overview, OCR summary, key points, evidence, and model metadata for a smart cluster.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "cluster_id": {
             "description": "Smart cluster ID",
+            "minimum": 1,
             "type": "integer"
           },
           "evidence": {
@@ -342,6 +414,7 @@
           },
           "source_snapshot_count": {
             "description": "Number of source snapshots used",
+            "minimum": 0,
             "type": "integer"
           },
           "summary": {
@@ -363,9 +436,11 @@
     {
       "description": "Delete the stored AI-generated summary for a smart cluster. The smart cluster and its assigned snapshots are preserved.",
       "inputSchema": {
+        "additionalProperties": false,
         "properties": {
           "cluster_id": {
             "description": "Smart cluster ID",
+            "minimum": 1,
             "type": "integer"
           }
         },

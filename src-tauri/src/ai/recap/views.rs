@@ -193,8 +193,9 @@ pub fn read_records(
     let generation = storage.db_generation();
     let privacy = privacy_fingerprint(app)?;
     let (start, end) = day_bounds(date)?;
-    let (revision, start, end) = storage.recap_day_revision(date, start, end, &privacy)?;
-    let bounds = batch_bounds(start, end, chrono::Utc::now().timestamp_millis());
+    let (revision, _, _) = storage.recap_day_revision(date, start, end, &privacy)?;
+    let calendar = storage.recap_calendar(date)?;
+    let bounds = calendar.closed_periods(chrono::Utc::now().timestamp_millis());
     if batch_start.is_some_and(|a| !bounds.iter().any(|(b, _)| a == *b)) {
         return Err("RECAP_INVALID_DATE".into());
     }
@@ -285,6 +286,7 @@ mod tests {
         })).unwrap();
         let day = RecapDay {
             date: "2026-10-01".into(),
+            calendar: CalendarDay::in_zone("2026-10-01", chrono_tz::UTC).unwrap(),
             batches: vec![batch],
             threads: vec![],
             usage: RecapUsage::default(),
@@ -317,6 +319,7 @@ mod tests {
         };
         let day = RecapDay {
             date: "2026-10-01".into(),
+            calendar: CalendarDay::in_zone("2026-10-01", chrono_tz::UTC).unwrap(),
             threads: vec![],
             usage: RecapUsage::default(),
             can_undo: false,

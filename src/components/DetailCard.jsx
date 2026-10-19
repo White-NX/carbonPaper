@@ -216,13 +216,13 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
           </div>
 
           {/* Timestamp */}
-          <div>
+          {Number.isFinite(selectedEvent.timestamp) && <div>
             <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.time')}</label>
             <div className="flex items-center gap-2 mt-1 text-sm opacity-80">
               <Clock size={14} />
               {new Date(selectedEvent.timestamp).toLocaleString()}
             </div>
-          </div>
+          </div>}
 
           {/* Category */}
           <div>

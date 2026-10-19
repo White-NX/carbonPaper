@@ -11,13 +11,9 @@ import { useFollowOutput } from '../../hooks/useFollowOutput';
 const MAX_SOURCES = 12;
 
 function formatTime(value) {
-  const ms = typeof value === 'number' && value < 1e12 ? value * 1000 : value;
-  const date = new Date(ms);
+  if (!Number.isFinite(value)) return '';
+  const date = new Date(value);
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
-}
-
-function snapshotTime(ref) {
-  return [ref.timestamp, ref.screenshot_created_at, ref.created_at].find((v) => v !== undefined && v !== null && v !== 0);
 }
 
 /** One line describing a tool call, e.g. 搜索文字「发票」. */
@@ -27,8 +23,8 @@ function describeStep(step, t) {
     case 'search_ocr_text': return t('aiSearch.steps.search_ocr_text', { query: args.query ?? '' });
     case 'search_nl': return t('aiSearch.steps.search_nl', { query: args.query ?? '' });
     case 'get_snapshots_by_time_range':
-      return t('aiSearch.steps.time_range', { start: formatTime(args.start_time), end: formatTime(args.end_time) });
-    case 'get_snapshot_details': return t('aiSearch.steps.details', { id: args.id ?? '' });
+      return t('aiSearch.steps.time_range', { start: formatTime(args.start_ms), end: formatTime(args.end_ms) });
+    case 'get_snapshot_details': return t('aiSearch.steps.details', { id: args.screenshot_id ?? '' });
     case 'get_smart_clusters': return t('aiSearch.steps.clusters');
     case 'get_smart_cluster_ocr_corpus':
     case 'get_smart_cluster_summary': return t('aiSearch.steps.cluster_content');
@@ -227,16 +223,16 @@ function Sources({ refs, onSelect, activeId, t }) {
       <h3 id={titleId} className="mb-3 text-xs font-medium text-ide-muted">{t('aiSearch.sources')}</h3>
       <div ref={gridRef} className="ai-search-source-grid custom-scrollbar grid gap-3 p-0.5">
         {refs.map((ref) => (
-          <button key={ref.id} type="button" data-source-id={ref.id} onClick={() => onSelect(ref)}
+          <button key={ref.screenshot_id} type="button" data-source-id={ref.screenshot_id} onClick={() => onSelect(ref)}
             className="group flex min-w-0 flex-col rounded-lg p-1 text-left transition-colors hover:bg-ide-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60">
-            <SourceThumbnail id={ref.id} />
-            <span data-highlighted={activeId === ref.id} className={`mt-1 flex w-full min-w-0 flex-col gap-1 rounded-b border-b-2 px-1.5 py-1.5 transition-colors ${activeId === ref.id ? 'border-ide-accent bg-ide-accent/15' : 'border-transparent group-hover:bg-ide-hover'}`}>
+            <SourceThumbnail id={ref.screenshot_id} />
+            <span data-highlighted={activeId === ref.screenshot_id} className={`mt-1 flex w-full min-w-0 flex-col gap-1 rounded-b border-b-2 px-1.5 py-1.5 transition-colors ${activeId === ref.screenshot_id ? 'border-ide-accent bg-ide-accent/15' : 'border-transparent group-hover:bg-ide-hover'}`}>
               <span className="flex items-center gap-1.5 text-[11px] text-ide-muted">
-                <span className="font-medium text-ide-accent">#{ref.id}</span>
+                <span className="font-medium text-ide-accent">#{ref.screenshot_id}</span>
                 <span className="truncate">{ref.process_name || ''}</span>
               </span>
               {ref.window_title && <span className="line-clamp-1 text-[11px] text-ide-text">{ref.window_title}</span>}
-              {snapshotTime(ref) !== undefined && <span className="text-[10px] text-ide-muted">{formatTime(snapshotTime(ref))}</span>}
+              {ref.captured_at_ms != null && <span className="text-[10px] text-ide-muted">{formatTime(ref.captured_at_ms)}</span>}
             </span>
           </button>
         ))}
@@ -256,7 +252,16 @@ function SearchTurn({ c, t, onSelectResult, previous, onBrowse }) {
   const refs = useMemo(() => {
     const byId = new Map();
     // Earlier sightings win; later ones only fill fields that were missing.
-    const add = (ref) => { if (ref?.id) byId.set(ref.id, { ...ref, ...byId.get(ref.id) }); };
+    const add = (ref) => {
+      if (!ref?.screenshot_id) return;
+      const previousRef = byId.get(ref.screenshot_id);
+      byId.set(ref.screenshot_id, {
+        ...ref, ...previousRef,
+        captured_at_ms: previousRef?.captured_at_ms ?? ref.captured_at_ms,
+        window_title: previousRef?.window_title ?? ref.window_title,
+        process_name: previousRef?.process_name ?? ref.process_name,
+      });
+    };
     previous.forEach((turn) => {
       turn.steps?.forEach((step) => step.snapshots?.forEach(add));
       turn.outcome?.snapshots?.forEach(add);
@@ -275,7 +280,7 @@ function SearchTurn({ c, t, onSelectResult, previous, onBrowse }) {
   }, [c.answer, c.rounds, refs, running]);
 
   const known = useMemo(() => new Set(refs.keys()), [refs]);
-  const select = (ref) => onSelectResult?.({ ...ref, screenshot_id: ref.id });
+  const select = (ref) => onSelectResult?.(ref);
   const cite = (id) => { const ref = refs.get(id); if (ref) select(ref); };
   const citationProps = { onCite: cite, onCiteHover: setHoveredCitation, onCiteFocus: setFocusedCitation, known };
   const latestRound = c.rounds?.at(-1);

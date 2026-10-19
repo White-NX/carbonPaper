@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use super::{BackgroundReadError, StorageState};
 use crate::ai::recap::{PrivacyFingerprint, RecapSettings, RecapUsage};
+use crate::calendar::CalendarDay;
 
 const PAYLOAD_KEYS_SQL: &str =
     "SELECT key FROM recap_payloads WHERE kind=?1 AND day=?2 AND revision=?3 ORDER BY key";
@@ -24,6 +25,9 @@ impl StorageState {
              CREATE INDEX IF NOT EXISTS idx_recap_payload_day_kind_revision_key
                 ON recap_payloads(day,kind,revision,key);
              CREATE TABLE IF NOT EXISTS recap_deleted_days (day TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS recap_calendars (day TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS recap_calendar_delete AFTER DELETE ON recap_days BEGIN
+                DELETE FROM recap_calendars WHERE day=OLD.day; END;
              CREATE TABLE IF NOT EXISTS recap_usage (
                 id INTEGER PRIMARY KEY, day TEXT NOT NULL, role TEXT NOT NULL, run_id TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, settled INTEGER NOT NULL DEFAULT 0);
@@ -187,6 +191,10 @@ impl StorageState {
     ) -> Result<(i64, i64, i64), String> {
         let guard = self.get_connection_named("recap_day_revision")?;
         let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let conn = &*tx;
+        let calendar = ensure_day_calendar(conn, day, start, end)?;
+        let (start, end) = (calendar.start_ms, calendar.end_ms);
         let previous: Option<String> = conn
             .query_row(
                 "SELECT privacy_hash FROM recap_days WHERE day=?",
@@ -199,11 +207,11 @@ impl StorageState {
             Some(hash) if hash != privacy.as_str() => privacy.matches_legacy(hash)?,
             _ => false,
         };
-        let covered =
-            crate::ai::recap::batch_bounds(start, end, chrono::Utc::now().timestamp_millis())
-                .last()
-                .map(|(_, b)| *b)
-                .unwrap_or(start);
+        let covered = calendar
+            .closed_periods(chrono::Utc::now().timestamp_millis())
+            .last()
+            .map(|(_, b)| *b)
+            .unwrap_or(start);
         conn.execute("INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms) VALUES (?1,?2,?3,?4,?5)
             ON CONFLICT(day) DO UPDATE SET revision=revision+CASE WHEN ?6 AND privacy_hash=?7 THEN 0 ELSE 1 END,privacy_hash=excluded.privacy_hash
             WHERE privacy_hash<>excluded.privacy_hash", params![day,start,end,privacy.as_str(),covered,adopt_legacy,previous]).map_err(|e| e.to_string())?;
@@ -212,12 +220,28 @@ impl StorageState {
             params![covered, day],
         )
         .map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT revision,start_ms,end_ms FROM recap_days WHERE day=?",
-            [day],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|e| e.to_string())
+        let result = conn
+            .query_row(
+                "SELECT revision,start_ms,end_ms FROM recap_days WHERE day=?",
+                [day],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    pub(crate) fn recap_calendar(&self, day: &str) -> Result<CalendarDay, String> {
+        let guard = self.get_connection_named("recap_calendar")?;
+        let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        let (start, end) = conn
+            .query_row(
+                "SELECT start_ms,end_ms FROM recap_days WHERE day=?",
+                [day],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        ensure_day_calendar(conn, day, start, end)
     }
 
     pub(crate) fn recap_revision_matches(
@@ -644,6 +668,74 @@ impl StorageState {
     }
 }
 
+fn ensure_day_calendar(
+    conn: &Connection,
+    day: &str,
+    start: i64,
+    end: i64,
+) -> Result<CalendarDay, String> {
+    let previous: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT start_ms,end_ms FROM recap_days WHERE day=?",
+            [day],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let stored: Option<String> = conn
+        .query_row("SELECT data FROM recap_calendars WHERE day=?", [day], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(data) = stored {
+        let calendar: CalendarDay =
+            serde_json::from_str(&data).map_err(|_| "RECAP_INVALID_CACHE")?;
+        if calendar.date != day
+            || calendar.start_ms >= calendar.end_ms
+            || previous.is_some_and(|bounds| bounds != (calendar.start_ms, calendar.end_ms))
+            || calendar.period_boundaries_ms.first() != Some(&calendar.start_ms)
+            || calendar.period_boundaries_ms.last() != Some(&calendar.end_ms)
+            || calendar
+                .period_boundaries_ms
+                .windows(2)
+                .any(|w| w[0] >= w[1])
+        {
+            return Err("RECAP_INVALID_CACHE".into());
+        }
+        return Ok(calendar);
+    }
+    let calendar = if let Some((start, end)) = previous {
+        let mut statement = conn.prepare("SELECT p.key FROM recap_payloads p JOIN recap_days d ON d.day=p.day AND d.revision=p.revision WHERE p.day=? AND p.kind IN ('batch','index')").map_err(|e| e.to_string())?;
+        let keys = statement
+            .query_map([day], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let starts: Vec<i64> = keys
+            .iter()
+            .filter_map(|key| key.rsplit_once(':')?.1.parse().ok())
+            .collect();
+        CalendarDay::recorded(day, start, end, &starts)?
+    } else {
+        let current = CalendarDay::local(day)?;
+        if (current.start_ms, current.end_ms) == (start, end) {
+            current
+        } else {
+            CalendarDay::recorded(day, start, end, &[])?
+        }
+    };
+    conn.execute(
+        "INSERT INTO recap_calendars(day,data) VALUES(?,?)",
+        params![
+            day,
+            serde_json::to_string(&calendar).map_err(|e| e.to_string())?
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(calendar)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +762,113 @@ mod tests {
         StorageState::init_recap_tables(&conn).unwrap();
         *storage.db.lock().unwrap() = Some(conn);
         (temp, storage)
+    }
+
+    #[test]
+    fn a_saved_calendar_survives_zone_changes_and_regeneration_until_its_day_is_removed() {
+        let (_temp, s) = storage();
+        let date = "2026-01-01";
+        let original = CalendarDay::local(date).unwrap();
+        let (revision, start, end) = s
+            .recap_day_revision(date, original.start_ms, original.end_ms, &privacy(true))
+            .unwrap();
+        assert_eq!(s.recap_calendar(date).unwrap(), original);
+        let changed = CalendarDay::in_zone(
+            date,
+            if original.time_zone.as_deref() == Some("Asia/Tokyo") {
+                chrono_tz::America::New_York
+            } else {
+                chrono_tz::Asia::Tokyo
+            },
+        )
+        .unwrap();
+        assert_ne!(changed.start_ms, start);
+        assert_eq!(
+            s.recap_day_revision(date, changed.start_ms, changed.end_ms, &privacy(true))
+                .unwrap(),
+            (revision, start, end)
+        );
+        assert_eq!(
+            s.recap_calendar(date).unwrap().closed_periods(end),
+            original.closed_periods(end)
+        );
+        let mut guard = s.db.lock().unwrap();
+        let conn = guard.as_mut().unwrap();
+        let tx = conn.transaction().unwrap();
+        StorageState::delete_recap_rows(&tx, date).unwrap();
+        tx.commit().unwrap();
+        // Recap deletion retains the day's monotonic revision and UTC bounds.
+        // Keep the matching calendar so regeneration uses that same day.
+        let saved: String = conn
+            .query_row(
+                "SELECT data FROM recap_calendars WHERE day=?",
+                [date],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<CalendarDay>(&saved).unwrap(),
+            original
+        );
+        conn.execute("DELETE FROM recap_days WHERE day=?", [date])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM recap_calendars WHERE day=?",
+                [date],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_dst_days_keep_recorded_bounds_keys_and_source_revisions() {
+        for date in ["2026-03-08", "2026-11-01"] {
+            let (_temp, s) = storage();
+            let original = CalendarDay::in_zone(date, chrono_tz::America::New_York).unwrap();
+            {
+                let guard = s.db.lock().unwrap();
+                let conn = guard.as_ref().unwrap();
+                conn.execute(
+                    "INSERT INTO recap_days VALUES(?1,?2,?3,5,?4,?3)",
+                    params![
+                        date,
+                        original.start_ms,
+                        original.end_ms,
+                        privacy(true).as_str()
+                    ],
+                )
+                .unwrap();
+                for (start, _) in original.closed_periods(original.end_ms) {
+                    conn.execute(
+                        "INSERT INTO recap_payloads VALUES('batch',?1,?2,5,x'00',x'00')",
+                        params![format!("{date}:{start}"), date],
+                    )
+                    .unwrap();
+                }
+            }
+            let changed = CalendarDay::in_zone(date, chrono_tz::Asia::Shanghai).unwrap();
+            assert_eq!(
+                s.recap_day_revision(date, changed.start_ms, changed.end_ms, &privacy(true))
+                    .unwrap(),
+                (5, original.start_ms, original.end_ms)
+            );
+            let calendar = s.recap_calendar(date).unwrap();
+            assert_eq!(calendar.time_zone, None);
+            assert_eq!(calendar.rule, "recorded_bounds");
+            assert_eq!(calendar.period_boundaries_ms, original.period_boundaries_ms);
+            assert_eq!(
+                calendar.start_utc_offset_seconds,
+                original.start_utc_offset_seconds
+            );
+            assert_eq!(
+                calendar.end_utc_offset_seconds,
+                original.end_utc_offset_seconds
+            );
+            assert_eq!(s.recap_calendar(date).unwrap(), calendar);
+        }
     }
 
     #[test]
@@ -1128,7 +1327,8 @@ mod tests {
         {
             let guard = s.db.lock().unwrap();
             let conn = guard.as_ref().unwrap();
-            for (day, revision) in [("current", 5), ("stale", 6)] {
+            for (day, revision) in [("2026-01-01", 5), ("2026-01-02", 6)] {
+                let (start, end) = crate::ai::recap::day_bounds(day).unwrap();
                 conn.execute(
                     "INSERT INTO recap_days VALUES (?1,?2,?3,?4,?5,?3)",
                     params![day, start, end, revision, legacy],
@@ -1143,7 +1343,8 @@ mod tests {
                 }
             }
         }
-        for (day, revision, visible) in [("current", 5, 3), ("stale", 6, 0)] {
+        for (day, revision, visible) in [("2026-01-01", 5, 3), ("2026-01-02", 6, 0)] {
+            let (start, end) = crate::ai::recap::day_bounds(day).unwrap();
             assert_eq!(
                 s.recap_day_revision(day, start, end, &reloaded).unwrap().0,
                 revision
@@ -1163,7 +1364,7 @@ mod tests {
             assert_eq!(count, visible);
         }
         assert_eq!(
-            s.recap_day_revision("current", start, end, &privacy(false))
+            s.recap_day_revision("2026-01-01", start, end, &privacy(false))
                 .unwrap()
                 .0,
             6

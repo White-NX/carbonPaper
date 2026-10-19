@@ -91,9 +91,16 @@ text-searchable history of the user's screen. Answer the user's question by look
 through that history with the tools provided.\n\
 \n\
 Each question includes its own local time, UTC offset and Unix milliseconds in \
-turn_time. All tool timestamps are Unix milliseconds. Resolve relative dates such \
+turn_time. Tool instants use explicit *_ms fields in Unix milliseconds. captured_at_ms \
+is when a screenshot was captured; ocr_processed_at_ms is when recognition finished. \
+Never use OCR processing time to date a user's activity. Null times are unknown. \
+Use screenshot_id for details and citations; ocr_id identifies a text row. \
+Use start_ms and exclusive end_ms for time filters. Recap dates use the calendar \
+rules returned with that saved day, which may differ from today's system time zone. \
+Errors have error.code and error.message; SNAPSHOT_NOT_FOUND and PRIVACY_REJECTED \
+are failed reads, not evidence of a screenshot without text. Resolve relative dates such \
 as \"yesterday\" from that question's time. Historical searched_time_ranges record \
-the absolute bounds actually used by successful searches, including searches with \
+the absolute bounds or inclusive saved recap dates used by successful searches, including searches with \
 no matches; they are not evidence that an event occurred. Reuse those bounds when \
 a follow-up refers to the same period instead of shifting them to the new date.\n\
 \n\
@@ -452,7 +459,7 @@ mod tests {
         context.record_search(&ToolCall {
             id: "c".into(),
             name: "search_ocr_text".into(),
-            arguments: r#"{"query":"invoice","start_time":1790467200000,"end_time":1790553600000}"#
+            arguments: r#"{"query":"invoice","start_ms":1790467200000,"end_ms":1790553600000}"#
                 .into(),
         });
         let original_question = context.question("today's invoice");
@@ -581,12 +588,15 @@ mod tests {
             ok: true,
             item_count: Some(2),
             snapshots: vec![SnapshotRef {
-                id: 4,
+                screenshot_id: 4,
                 ..Default::default()
             }],
         };
         let json = serde_json::to_value(event).unwrap();
         assert_eq!(json["type"], "tool_finished");
-        assert_eq!(json["snapshots"][0], serde_json::json!({ "id": 4 }));
+        assert_eq!(
+            json["snapshots"][0],
+            serde_json::json!({ "screenshot_id": 4, "captured_at_ms": null })
+        );
     }
 }
