@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { correctRecap, deleteRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, groupRecapActivities, recapErrorKey, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex } from './recap_api';
+import { correctRecap, deleteRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, getRecapUsage, groupRecapActivities, recapErrorKey, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex } from './recap_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((action) => action()) }));
 
 describe('recap API and occurrence display', () => {
+  it('reads usage through the authenticated lightweight command without prompting', async () => {
+    const usage = { input_tokens: 1, output_tokens: 2, screening_input_tokens: 3, requests: 1 };
+    invoke.mockResolvedValueOnce(usage);
+    expect(await getRecapUsage()).toEqual(usage);
+    expect(invoke).toHaveBeenLastCalledWith('recap_get_usage', undefined);
+    expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: false });
+  });
   it('keeps the translated recap error code when diagnostics include underlying errors', () => {
     expect(recapErrorKey('RECAP_SEARCH_MODEL_UNAVAILABLE: timeout: semantic worker busy\nstage=query_embedding')).toBe('recap.errors.RECAP_SEARCH_MODEL_UNAVAILABLE');
     expect(recapErrorKey(new Error('RECAP_SEARCH_MODEL_UNAVAILABLE: model_missing: MiniLM model is missing'))).toBe('recap.errors.RECAP_SEARCH_MODEL_UNAVAILABLE');

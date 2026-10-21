@@ -54,12 +54,41 @@ pub async fn recap_get_settings(
     storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<RecapSettings, String> {
     check_auth_required(&credential_state)?;
-    Ok(storage_state
-        .recap_read::<RecapSettings>("settings", "settings", None)?
-        .unwrap_or_default()
-        .current_defaults()
-        .with_app_language()
-        .view())
+    let storage = storage_state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        Ok(storage
+            .recap_read::<RecapSettings>("settings", "settings", None)?
+            .unwrap_or_default()
+            .current_defaults()
+            .with_app_language()
+            .view())
+    })
+    .await
+    .map_err(|_| "RECAP_WORKER_FAILED")?
+}
+
+/// Authentication: required. Today's request usage without reading saved
+/// activities, source records, corrections or application icons.
+#[tauri::command]
+pub async fn recap_get_usage(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<RecapUsage, String> {
+    check_auth_required(&credential_state)?;
+    let credentials = credential_state.inner().clone();
+    let storage = storage_state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        check_auth_required(&credentials)?;
+        let generation = storage.db_generation();
+        let usage = storage.recap_usage(&chrono::Local::now().date_naive().to_string())?;
+        check_auth_required(&credentials)?;
+        if generation != storage.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        Ok(usage)
+    })
+    .await
+    .map_err(|_| "RECAP_WORKER_FAILED")?
 }
 
 /// Authentication: required. A missing screening key preserves the saved key.

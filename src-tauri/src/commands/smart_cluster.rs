@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::credential_manager::CredentialManagerState;
 use crate::storage::smart_cluster::{
     SmartClusterAssignmentStub, SmartClusterExample, SmartClusterOcrCorpusItem, SmartClusterRecord,
-    SmartClusterSummaryRecord, SmartClusterSummaryUpsert,
+    SmartClusterStatus, SmartClusterSummaryRecord, SmartClusterSummaryUpsert,
 };
 use crate::storage::StorageState;
 use serde::{Deserialize, Serialize};
@@ -378,32 +378,32 @@ pub fn smart_cluster_clear_assignments(
     state.clear_smart_cluster_assignments(cluster_id)
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SmartClusterStatus {
-    pub pending_count: i64,
-    pub enabled_cluster_count: i64,
-    pub total_cluster_count: i64,
-}
-
 /// Returns pending-work and enabled/total cluster counts.
 ///
 /// Authentication: required. Returns `{ "pending_count", "enabled_cluster_count",
 /// "total_cluster_count" }`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
-pub fn smart_cluster_status(
+pub async fn smart_cluster_status(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<SmartClusterStatus, String> {
     check_auth_required(&credential_state)?;
-    let pending_count = state.count_smart_cluster_pending()?;
-    let clusters = state.list_smart_clusters()?;
-    let enabled_cluster_count = clusters.iter().filter(|c| c.enabled).count() as i64;
-    let total_cluster_count = clusters.len() as i64;
-    Ok(SmartClusterStatus {
-        pending_count,
-        enabled_cluster_count,
-        total_cluster_count,
+    let credentials = credential_state.inner().clone();
+    let storage = state.inner().clone();
+    // Synchronous commands execute on the window event thread. Even a small
+    // count must not freeze that thread behind a database or maintenance wait.
+    tokio::task::spawn_blocking(move || {
+        check_auth_required(&credentials)?;
+        let generation = storage.db_generation();
+        let status = storage.get_smart_cluster_status()?;
+        check_auth_required(&credentials)?;
+        if generation != storage.db_generation() {
+            return Err("Database changed while reading smart cluster status".into());
+        }
+        Ok(status)
     })
+    .await
+    .map_err(|error| format!("Failed to read smart cluster status: {error}"))?
 }
 
 #[cfg(test)]

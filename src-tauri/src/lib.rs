@@ -1299,6 +1299,7 @@ pub fn run() {
             commands::ai::ai_search,
             commands::ai::ai_search_cancel,
             commands::recap::recap_get_settings,
+            commands::recap::recap_get_usage,
             commands::recap::recap_search,
             commands::recap::recap_search_status,
             commands::recap::recap_prepare_search,

@@ -99,6 +99,19 @@ pub struct SmartClusterRecord {
     pub summary: Option<SmartClusterSummaryRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SmartClusterStatus {
+    pub pending_count: i64,
+    pub enabled_cluster_count: i64,
+    pub total_cluster_count: i64,
+}
+
+const SMART_CLUSTER_STATUS_SQL: &str = "SELECT
+    (SELECT COUNT(*) FROM smart_cluster_pending
+     WHERE queued_at >= datetime('now', '-' || ?1 || ' days')),
+    COALESCE(SUM(CASE WHEN enabled THEN 1 ELSE 0 END), 0), COUNT(*)
+    FROM smart_clusters";
+
 /// The columns and joins every read of a cluster row shares.
 ///
 /// Column layout, which [`read_cluster_from_row`] depends on: `0..=6` the
@@ -481,6 +494,25 @@ impl StorageState {
             out.push(row.map_err(|e| format!("Failed to read smart cluster row: {}", e))?);
         }
         Ok(out)
+    }
+
+    /// Settings needs only counts, without assignment joins, summaries or
+    /// screenshot metadata. Keep this read off the primary connection mutex.
+    pub fn get_smart_cluster_status(&self) -> Result<SmartClusterStatus, String> {
+        self.with_read_connection_named("smart_cluster_status", |conn| {
+            conn.query_row(
+                SMART_CLUSTER_STATUS_SQL,
+                [Self::SMART_CLUSTER_PENDING_TTL_DAYS],
+                |row| {
+                    Ok(SmartClusterStatus {
+                        pending_count: row.get(0)?,
+                        enabled_cluster_count: row.get(1)?,
+                        total_cluster_count: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Failed to read smart cluster status: {error}"))
+        })
     }
 
     pub fn get_smart_cluster(&self, id: i64) -> Result<Option<SmartClusterRecord>, String> {
@@ -1107,7 +1139,7 @@ impl StorageState {
              AND EXISTS(SELECT 1 FROM smart_cluster_pending p JOIN screenshots s ON s.id=p.screenshot_id
                WHERE p.screenshot_id=CAST(e.subject_key AS INTEGER) AND s.is_deleted=0 AND s.status='committed'
                  AND p.queued_at>=datetime('now','-{} days'))",
-            super::derived_index::VISIBLE_EMBEDDING_SOURCE,
+            super::derived_index::visible_embedding_source(),
             Self::SMART_CLUSTER_PENDING_TTL_DAYS,
         )
     }
@@ -1323,6 +1355,59 @@ mod tests {
         storage.init_tables(&connection).expect("initialize schema");
         *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
         (temp, storage)
+    }
+
+    #[test]
+    fn status_counts_clusters_and_unexpired_pending_without_loading_details() {
+        let (_temp, storage) = test_storage();
+        assert_eq!(
+            storage.get_smart_cluster_status().unwrap(),
+            SmartClusterStatus {
+                pending_count: 0,
+                enabled_cluster_count: 0,
+                total_cluster_count: 0,
+            }
+        );
+        let enabled = insert_cluster(&storage, "Enabled");
+        let disabled = insert_cluster(&storage, "Disabled");
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute(
+                "UPDATE smart_clusters SET enabled=0 WHERE id=?1",
+                [disabled],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO screenshots(id,image_path,image_hash) VALUES
+                    (1,'one.enc','one'),(2,'two.enc','two'),(3,'expired.enc','expired');
+                 INSERT INTO smart_cluster_pending(screenshot_id,queued_at) VALUES
+                    (1,datetime('now')),(2,datetime('now','-1 day')),
+                    (3,datetime('now','-31 days'));",
+            )
+            .unwrap();
+            // Status must stay independent of summary parsing, assignment
+            // joins and screenshot metadata in the detailed list projection.
+            conn.execute(
+                "INSERT INTO smart_cluster_summaries(smart_cluster_id,key_points_json)
+                 VALUES(?1,'invalid-json')",
+                [enabled],
+            )
+            .unwrap();
+        }
+        let status = storage.get_smart_cluster_status().unwrap();
+        assert_eq!(
+            status.pending_count,
+            storage.count_smart_cluster_pending().unwrap()
+        );
+        assert_eq!(
+            status,
+            SmartClusterStatus {
+                pending_count: 2,
+                enabled_cluster_count: 1,
+                total_cluster_count: 2,
+            }
+        );
     }
 
     #[test]

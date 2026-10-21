@@ -658,13 +658,12 @@ impl StorageState {
     }
 
     pub(crate) fn recap_usage(&self, day: &str) -> Result<RecapUsage, String> {
-        let guard = self.get_connection_named("recap_usage")?;
-        guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?.query_row(
+        self.with_read_connection_named("recap_usage", |conn| conn.query_row(
             "SELECT coalesce(sum(CASE WHEN role='generation' THEN input_tokens ELSE 0 END),0),
              coalesce(sum(CASE WHEN role='generation' THEN output_tokens ELSE 0 END),0),
              coalesce(sum(CASE WHEN role='screening' THEN input_tokens ELSE 0 END),0),count(*) FROM recap_usage WHERE day=?", [day],
             |r| Ok(RecapUsage {input_tokens:r.get::<_,i64>(0)?.max(0) as u64,output_tokens:r.get::<_,i64>(1)?.max(0) as u64,screening_input_tokens:r.get::<_,i64>(2)?.max(0) as u64,requests:r.get::<_,i64>(3)?.max(0) as u64})
-        ).map_err(|e| e.to_string())
+        ).map_err(|e| e.to_string()))
     }
 }
 

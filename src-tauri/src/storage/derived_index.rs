@@ -1024,16 +1024,16 @@ impl StorageState {
         &self,
         index_kind: DerivedIndexKind,
     ) -> Result<u64, String> {
-        let guard = self.get_connection_named("count_query_visible_embeddings")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        let count: i64 = conn
-            .query_row(
-                &visible_embedding_count_sql(),
-                [index_kind.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Failed to count query-visible embeddings: {error}"))?;
-        u64::try_from(count).map_err(|_| "Invalid query-visible embedding count".to_string())
+        self.with_read_connection_named("count_query_visible_embeddings", |conn| {
+            let count: i64 = conn
+                .query_row(
+                    &visible_embedding_count_sql(),
+                    [index_kind.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Failed to count query-visible embeddings: {error}"))?;
+            u64::try_from(count).map_err(|_| "Invalid query-visible embedding count".to_string())
+        })
     }
 
     /// Whether at least one embedding is query-visible for an index kind.
@@ -1046,16 +1046,16 @@ impl StorageState {
         &self,
         index_kind: DerivedIndexKind,
     ) -> Result<bool, String> {
-        let guard = self.get_connection_named("has_query_visible_embeddings")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        conn.query_row(
-            &visible_embedding_exists_sql(),
-            [index_kind.as_str()],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map(|value| value.is_some())
-        .map_err(|error| format!("Failed to check query-visible embeddings: {error}"))
+        self.with_read_connection_named("has_query_visible_embeddings", |conn| {
+            conn.query_row(
+                &visible_embedding_exists_sql(),
+                [index_kind.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(|error| format!("Failed to check query-visible embeddings: {error}"))
+        })
     }
 
     /// Exact-scan cosine top-K over the query-visible `semantic_text`
@@ -1298,7 +1298,7 @@ impl StorageState {
                         MIN(CASE WHEN {CLAIMABLE_JOB_PREDICATE} THEN updated_at END)
                     )) * 86400 AS INTEGER)
                 FROM derived_index_jobs
-                WHERE index_kind = ?1
+                WHERE index_kind = ?1 AND status IN ('pending', 'waiting_for_auth', 'failed')
                 "#
             ),
             params![index_kind.as_str(), max_attempts],
@@ -2742,24 +2742,42 @@ pub(super) fn read_derived_data_epoch(
 /// Single definition of "query-visible": a completed ledger row whose model
 /// contract and fingerprint still match the stored vector. Every projection
 /// below shares it so the resident cache cannot drift from the SQL readers.
-pub(super) const VISIBLE_EMBEDDING_SOURCE: &str = r#"
-        FROM derived_embeddings e
-        INNER JOIN derived_index_jobs j
+fn visible_embedding_source_with_indexes(embedding_index: &str, job_index: &str) -> String {
+    format!(
+        r#"
+        FROM derived_embeddings e {embedding_index}
+        INNER JOIN derived_index_jobs j {job_index}
           ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
         WHERE e.index_kind = ?1 AND j.status = 'completed'
           AND j.model_id = e.model_id
           AND j.model_revision = e.model_revision
           AND j.embedding_version = e.embedding_version
           AND j.source_fingerprint = e.source_fingerprint
-"#;
+"#
+    )
+}
+
+pub(super) fn visible_embedding_source() -> String {
+    visible_embedding_source_with_indexes("", "")
+}
+
+fn visible_embedding_metadata_source() -> String {
+    // Both sides are covering: even COUNT(*) otherwise reads the embedding
+    // table's large vector records to compare their model/fingerprint fields.
+    visible_embedding_source_with_indexes(
+        "INDEXED BY idx_derived_embeddings_visibility",
+        "INDEXED BY idx_derived_jobs_completed_visibility",
+    )
+}
 
 fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
+    let source = visible_embedding_source();
     format!(
         r#"
         SELECT e.subject_key, e.dimensions, e.vector_f32, e.model_id,
                e.model_revision, e.embedding_version, e.source_fingerprint,
                e.updated_at
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
           {predicate} {suffix}
         "#
     )
@@ -2782,10 +2800,11 @@ fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
 /// walks the `(index_kind, subject_key)` primary-key index directly, so no page
 /// costs a temporary sort.
 pub(super) fn visible_embedding_page_sql() -> String {
+    let source = visible_embedding_source();
     format!(
         r#"
         SELECT e.subject_key, e.dimensions, e.vector_f32
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
           AND e.subject_key > ?2
         ORDER BY e.subject_key
         LIMIT ?3
@@ -2802,35 +2821,39 @@ pub(super) fn visible_embedding_page_sql() -> String {
 /// statement is dropped before the vector pages are opened so a writer is not
 /// held behind one long read transaction.
 pub(super) fn visible_embedding_cache_stats_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT COUNT(*), MIN(e.dimensions), MAX(e.dimensions),
                COALESCE(SUM(LENGTH(CAST(e.subject_key AS BLOB))), 0)
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         "#
     )
 }
 
 fn visible_embedding_exists_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT 1
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         LIMIT 1
         "#
     )
 }
 
 fn visible_embedding_count_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT COUNT(*)
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         "#
     )
 }
 
 fn visible_embedding_aggregate_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT COUNT(*),
@@ -2839,7 +2862,7 @@ fn visible_embedding_aggregate_sql() -> String {
                MIN(e.model_id), MAX(e.model_id),
                MIN(e.model_revision), MAX(e.model_revision),
                MIN(e.embedding_version), MAX(e.embedding_version)
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         "#
     )
 }
@@ -5257,6 +5280,112 @@ mod tests {
         assert!(!storage
             .has_query_visible_embeddings(DerivedIndexKind::ClipImage)
             .unwrap());
+    }
+
+    #[test]
+    fn visibility_metadata_reads_use_covering_indexes_after_schema_upgrade() {
+        let (_temp, storage) = test_storage();
+        let guard = storage.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        // An existing archive gets the new indexes through the normal,
+        // idempotent startup schema path, without rebuilding its vectors.
+        conn.execute_batch(
+            "DROP INDEX idx_derived_embeddings_visibility;
+             DROP INDEX idx_derived_jobs_completed_visibility;",
+        )
+        .unwrap();
+        storage.init_tables(conn).unwrap();
+        storage.init_tables(conn).unwrap();
+        for sql in [
+            visible_embedding_count_sql(),
+            visible_embedding_exists_sql(),
+            visible_embedding_cache_stats_sql(),
+            visible_embedding_aggregate_sql(),
+        ] {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan = statement
+                .query_map([DerivedIndexKind::SemanticText.as_str()], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for index in [
+                "idx_derived_embeddings_visibility",
+                "idx_derived_jobs_completed_visibility",
+            ] {
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains(&format!("COVERING INDEX {index}"))),
+                    "metadata must not read vector or job payload pages: {plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visibility_metadata_preserves_every_model_and_source_contract_check() {
+        let (_temp, storage) = test_storage();
+        for id in 1..=7 {
+            commit_vector(
+                &storage,
+                job(DerivedIndexKind::SemanticText, &id.to_string()),
+                vec![0.6, 0.8],
+            )
+            .unwrap();
+        }
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "other-kind"),
+            vec![0.6, 0.8],
+        )
+        .unwrap();
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute_batch(
+                "UPDATE derived_index_jobs SET model_id='other-model'
+                    WHERE index_kind='semantic_text' AND subject_key='2';
+                 UPDATE derived_index_jobs SET model_revision='other-revision'
+                    WHERE index_kind='semantic_text' AND subject_key='3';
+                 UPDATE derived_index_jobs SET embedding_version=2
+                    WHERE index_kind='semantic_text' AND subject_key='4';
+                 UPDATE derived_index_jobs SET source_fingerprint='changed-source'
+                    WHERE index_kind='semantic_text' AND subject_key='5';
+                 UPDATE derived_index_jobs SET status='pending'
+                    WHERE index_kind='semantic_text' AND subject_key='6';
+                 UPDATE derived_index_jobs SET status='failed'
+                    WHERE index_kind='semantic_text' AND subject_key='7';",
+            )
+            .unwrap();
+            let shape: (i64, i64, i64, i64) = conn
+                .query_row(
+                    &visible_embedding_cache_stats_sql(),
+                    [DerivedIndexKind::SemanticText.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(shape, (1, 2, 2, 1));
+        }
+        assert_eq!(
+            storage
+                .count_query_visible_embeddings(DerivedIndexKind::SemanticText)
+                .unwrap(),
+            1
+        );
+        assert!(storage
+            .has_query_visible_embeddings(DerivedIndexKind::SemanticText)
+            .unwrap());
+        let visible = storage
+            .list_query_visible_embeddings(DerivedIndexKind::SemanticText, 0, 10)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].job.subject_key, "1");
+        let (_, row_count, _, dimensions, ..) = storage
+            .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
+            .unwrap();
+        assert_eq!(row_count, 1);
+        assert_eq!(dimensions, 2);
     }
 
     #[test]

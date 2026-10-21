@@ -660,25 +660,13 @@ impl StorageState {
         }
     }
 
-    /// Production scans use an independent SQLCipher read connection. Unit
-    /// tests use an in-memory database attached only to the process-wide
-    /// connection, so they deliberately take that connection instead.
+    /// Vector scans share the independent read and maintenance policy.
     pub(super) fn with_vector_scan_connection<T>(
         &self,
         caller: &'static str,
         operation: impl FnOnce(&Connection) -> Result<T, String>,
     ) -> Result<T, String> {
-        #[cfg(test)]
-        {
-            let guard = self.get_connection_named(caller)?;
-            let conn = guard.as_ref().ok_or("Database not initialized")?;
-            operation(conn)
-        }
-        #[cfg(not(test))]
-        {
-            let conn = self.open_read_connection_named(caller)?;
-            operation(&conn)
-        }
+        self.with_read_connection_named(caller, operation)
     }
 
     /// Cosine top-K over the resident matrix, loading it on first use.

@@ -18,7 +18,10 @@ use std::sync::Arc;
 pub async fn ai_get_settings(
     storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<AiSettingsView, String> {
-    Ok(AiSettings::load(&storage_state)?.view())
+    let storage = storage_state.inner().clone();
+    tokio::task::spawn_blocking(move || Ok(AiSettings::load(&storage)?.view()))
+        .await
+        .map_err(|error| format!("Failed to read AI settings: {error}"))?
 }
 
 /// Authentication: required. Creates or updates a provider and returns the

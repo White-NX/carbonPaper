@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../../lib/auth_api';
 import { useTauriEventListener } from '../../../hooks/useTauriEventListener';
+import { usePolling } from '../../../hooks/usePolling';
 import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
 import { notifySettingsChanged } from '../../../lib/settings_api';
 
@@ -13,6 +14,7 @@ export function useSmartClusterControls() {
   const [scDownloadLog, setScDownloadLog] = useState([]);
   const [scDownloadError, setScDownloadError] = useState(null);
   const scDownloadStartedRef = useRef(false);
+  const scStatusRequestRef = useRef(null);
   useSettingsActivity('smart-component', { busy: scDownloading });
 
   const refreshSmartClusterModel = async () => {
@@ -25,24 +27,21 @@ export function useSmartClusterControls() {
     }
   };
 
-  const refreshSmartClusterStatus = async () => {
-    try {
-      const status = await withAuth(() => invoke('smart_cluster_status'));
-      setScStatus(status);
-    } catch {
-      // ignore
-    }
+  const refreshSmartClusterStatus = () => {
+    if (scStatusRequestRef.current) return scStatusRequestRef.current;
+    const request = withAuth(() => invoke('smart_cluster_status'))
+      .then(setScStatus)
+      .catch(() => {})
+      .finally(() => { scStatusRequestRef.current = null; });
+    scStatusRequestRef.current = request;
+    return request;
   };
 
   useEffect(() => {
-    if (!active) return undefined;
-    refreshSmartClusterModel();
-    refreshSmartClusterStatus();
-    const interval = setInterval(() => {
-      refreshSmartClusterStatus();
-    }, 10000);
-    return () => clearInterval(interval);
+    if (active) refreshSmartClusterModel();
   }, [active]);
+
+  usePolling(refreshSmartClusterStatus, { intervalMs: 10000, enabled: active });
 
   useTauriEventListener('install-log', (event) => {
     const line = event?.payload?.line || JSON.stringify(event?.payload || {});

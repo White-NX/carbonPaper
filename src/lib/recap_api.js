@@ -5,6 +5,7 @@ const read = (command, args) => withAuth(() => invoke(command, args), { autoProm
 const write = (command, args) => withAuth(() => invoke(command, args), { autoPrompt: true });
 
 export const getRecapSettings = () => read('recap_get_settings');
+export const getRecapUsage = () => read('recap_get_usage');
 export const saveRecapSettings = (settings) => write('recap_save_settings', { settings });
 export const listRecapDays = () => read('recap_list_days');
 export const getRecapDay = (date, options = {}) => read('recap_get_day', { date, ...options });

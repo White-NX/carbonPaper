@@ -8,6 +8,7 @@ const COMMAND_TIERS = {
   'commands::recap::recap_prepare_search': 'session_required',
   'commands::recap::recap_cancel_search_index': 'runtime_public',
   'commands::recap::recap_get_settings': 'session_required',
+  'commands::recap::recap_get_usage': 'session_required',
   'commands::recap::recap_save_settings': 'session_required',
   'commands::recap::recap_list_days': 'session_required',
   'commands::recap::recap_get_day': 'session_required',

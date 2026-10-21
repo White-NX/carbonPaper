@@ -1629,29 +1629,25 @@ impl StorageState {
     }
 
     pub fn count_active_screenshots(&self) -> Result<i64, String> {
-        let guard = self.get_connection_named("count_active_screenshots")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database connection is None".to_string())?;
-        conn.query_row(
-            "SELECT COUNT(*) FROM screenshots WHERE is_deleted = 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|e| format!("Failed to count active screenshots: {}", e))
+        self.with_read_connection_named("count_active_screenshots", |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM screenshots WHERE is_deleted = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("Failed to count active screenshots: {}", e))
+        })
     }
 
     pub fn count_active_ocr_rows(&self) -> Result<i64, String> {
-        let guard = self.get_connection_named("count_active_ocr_rows")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database connection is None".to_string())?;
-        conn.query_row(
-            "SELECT COUNT(*) FROM ocr_results WHERE is_deleted = 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|e| format!("Failed to count active OCR rows: {}", e))
+        self.with_read_connection_named("count_active_ocr_rows", |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM ocr_results WHERE is_deleted = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("Failed to count active OCR rows: {}", e))
+        })
     }
 
     /// Estimated expected row count for the derived CLIP image index.
