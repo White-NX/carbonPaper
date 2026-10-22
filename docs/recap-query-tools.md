@@ -25,11 +25,21 @@ the existing MCP bearer token and unlocked application session.
   activities across all saved dates, including independently cited key details.
   Date filters select saved date labels; `calendars[date]` describes each result's
   calendar. These dates are not reinterpreted in the current system time zone.
-  `semantic_status` reports index coverage or keyword fallback. Pass the returned
-  `ranking_revision` when requesting another page; restart at offset zero if
-  results change. Search does not generate recaps or prepare embeddings; the
-  shared scheduler maintains the index. See the
-  [recap search guide](recap-search-experiment.md) for the UI and ranking behavior.
+  Keywords reuse the snapshot HMAC blind index and verify at most 800 candidate
+  activities. `complete: false` reports bounded retrieval; `total` counts the
+  retained matches, not every possible match in history. Hybrid adds up to 200
+  semantic candidates and preserves keywords when inference fails. Hits expose
+  `keyword_score`, `match_evidence`, and `semantic_score` (best positive cosine
+  similarity, or null without a vector match).
+  `semantic_status` reports index coverage or keyword fallback; keyword-only
+  execution reports `not_requested` when semantics are enabled, `disabled`
+  otherwise, and leaves `coverage`, `indexed_chunks` and `total_chunks` null.
+  Pass the returned `ranking_revision` when requesting another page;
+  restart at offset zero if
+  results change. Search prepares keyword documents only for changed dates;
+  it does not generate recaps or prepare embeddings. The shared scheduler
+  maintains vector indexing. See the [recap search guide](recap-search-experiment.md)
+  for the UI and ranking behavior.
 
 Example MCP call:
 

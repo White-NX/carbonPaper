@@ -12,5 +12,7 @@ export const searchSnapshotsAndRecaps = (query, options = {}) => withAuth(() => 
     offset: options.offset || 0,
     limit: options.limit || 40,
     include_semantic: options.includeSemantic ?? false,
+    target: options.target ?? 'mixed',
+    ranking_revision: options.rankingRevision ?? null,
   },
 }), { autoPrompt: false });

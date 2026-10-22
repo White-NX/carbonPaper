@@ -180,7 +180,13 @@ fn rank_reference(
         .filter(|(_, d)| query.includes(&d.date))
     {
         if query.mode != SearchMode::Semantic {
-            let score = keyword_score(&document.activity, &query.query, query.include_details);
+            let score = lexical_evidence(
+                &document.activity,
+                &QueryPlan::build(&query.query),
+                query.include_details,
+            )
+            .map(|e| e.relevance_score)
+            .unwrap_or_default();
             if score > 0.0 {
                 keywords.push((i, score));
             }
@@ -256,6 +262,7 @@ fn rank_reference(
             let d = &corpus.documents[i];
             let a = &d.activity;
             RecapSearchHit {
+                result_offset: None,
                 date: d.date.clone(),
                 batch_start_ms: d.batch_start_ms,
                 activity_id: a.id.clone(),
@@ -269,6 +276,9 @@ fn rank_reference(
                 evidence: d.evidence.clone(),
                 keyword_rank,
                 semantic_rank,
+                keyword_score: None,
+                semantic_score: None,
+                match_evidence: None,
             }
         })
         .collect();

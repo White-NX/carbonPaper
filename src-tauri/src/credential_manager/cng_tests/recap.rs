@@ -47,6 +47,274 @@ fn storage_credentials(data_dir: PathBuf) -> Arc<CredentialManagerState> {
 }
 
 #[test]
+fn recap_keyword_documents_are_encrypted_searchable_and_invalidated_with_their_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = storage_credentials(temp.path().to_path_buf());
+    let storage = StorageState::new(temp.path().to_path_buf(), credentials.clone());
+    storage.initialize().unwrap();
+    let day = "2026-01-01";
+    let privacy = PrivacyFingerprint::new(SensitiveFilterConfig::default()).unwrap();
+    let (start, end) = day_bounds(day).unwrap();
+    let (revision, _, _) = storage
+        .recap_day_revision(day, start, end, &privacy)
+        .unwrap();
+    let generation = storage.db_generation();
+    storage
+        .recap_write(
+            "batch",
+            day,
+            day,
+            revision,
+            generation,
+            &json!({"activities": []}),
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .recap_keyword_pending_dates(privacy.as_str())
+            .unwrap(),
+        vec![day]
+    );
+    let original = "Six Degrees of Separation\n采用内存缓存降低查询延迟";
+    let publish = |text: &str| {
+        storage.recap_keyword_replace_day(
+            day,
+            revision,
+            privacy.as_str(),
+            generation,
+            storage.recap_search_epoch().unwrap(),
+            vec![(
+                json!({"text": text}),
+                text.to_owned(),
+                vec!["Code.exe".into()],
+                start + 1000,
+                start + 2000,
+            )],
+        )
+    };
+    publish(original).unwrap();
+    assert!(storage
+        .recap_keyword_pending_dates(privacy.as_str())
+        .unwrap()
+        .is_empty());
+    let search = |query: &str, processes: &[String], from: Option<i64>, until: Option<i64>| {
+        let (mut candidates, complete) = storage
+            .recap_keyword_candidates::<Value>(
+                query,
+                privacy.as_str(),
+                None,
+                None,
+                from,
+                until,
+                processes,
+            )
+            .unwrap();
+        // The bitmap API proposes candidates. The public search verifies them
+        // with this same plaintext scorer before returning results.
+        let plan = crate::storage::search_plan::QueryPlan::build(query);
+        candidates.retain(|candidate| {
+            crate::storage::search_rank::score_text(
+                &plan,
+                candidate.value["text"].as_str().unwrap(),
+            )
+            .matched
+        });
+        (candidates, complete)
+    };
+    let (matches, complete) = search("separation", &[], None, None);
+    assert!(complete);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].value["text"], original);
+    assert_eq!(search("Separtion", &[], None, None).0.len(), 1);
+    assert_eq!(
+        search("内存缓存", &["CODE.EXE".into()], None, None).0.len(),
+        1
+    );
+    assert!(search("内存缓存", &["edge.exe".into()], None, None)
+        .0
+        .is_empty());
+    assert!(search("内存缓存", &[], Some(start + 2001), None)
+        .0
+        .is_empty());
+    assert_eq!(search("内存缓存", &[], Some(start + 2000), None).0.len(), 1);
+    assert!(search("内存缓存", &[], None, Some(start + 999))
+        .0
+        .is_empty());
+    {
+        let conn = storage
+            .open_read_connection_named("verify_recap_ciphertext")
+            .unwrap();
+        let bytes: Vec<u8> = conn
+            .query_row("SELECT data FROM recap_search_documents", [], |r| r.get(0))
+            .unwrap();
+        assert!(!bytes
+            .windows(b"Separation".len())
+            .any(|part| part == b"Separation"));
+        let hash: String = conn
+            .query_row(
+                "SELECT token_hash FROM recap_search_tokens LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash.len(), 64);
+    }
+    storage
+        .recap_write(
+            "corrections",
+            day,
+            day,
+            -1,
+            generation,
+            &json!({"renamed": true}),
+        )
+        .unwrap();
+    assert!(search("separation", &[], None, None).0.is_empty());
+    assert_eq!(
+        storage
+            .recap_keyword_pending_dates(privacy.as_str())
+            .unwrap(),
+        vec![day]
+    );
+    publish("Renamed discussion\n内存预算").unwrap();
+    assert!(search("separation", &[], None, None).0.is_empty());
+    assert_eq!(search("discussion", &[], None, None).0.len(), 1);
+    storage.recap_keyword_prune("changed-privacy").unwrap();
+    assert!(search("discussion", &[], None, None).0.is_empty());
+    assert!(storage
+        .recap_keyword_pending_dates("changed-privacy")
+        .unwrap()
+        .is_empty());
+    publish("Renamed discussion\n内存预算").unwrap();
+    storage.shutdown().unwrap();
+    storage.initialize().unwrap();
+    assert_eq!(search("discussion", &[], None, None).0.len(), 1);
+    assert!(storage
+        .recap_keyword_pending_dates(privacy.as_str())
+        .unwrap()
+        .is_empty());
+    storage
+        .recap_delete_day(day, storage.db_generation())
+        .unwrap();
+    assert!(search("discussion", &[], None, None).0.is_empty());
+    {
+        let conn = storage
+            .open_read_connection_named("verify_recap_purge")
+            .unwrap();
+        for table in [
+            "recap_search_documents",
+            "recap_search_tokens",
+            "recap_search_processes",
+            "recap_search_removed_tokens",
+            "recap_blind_bitmap_inline",
+            "recap_blind_bitmap_chunks",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table}"
+            );
+        }
+    }
+    credentials.invalidate_session();
+    assert_eq!(
+        storage
+            .recap_keyword_candidates::<Value>(
+                "discussion",
+                privacy.as_str(),
+                None,
+                None,
+                None,
+                None,
+                &[]
+            )
+            .err()
+            .unwrap(),
+        "AUTH_REQUIRED"
+    );
+    storage.shutdown().unwrap();
+}
+
+#[test]
+fn recap_keyword_candidates_bound_blank_and_short_queries_by_observation_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = storage_credentials(temp.path().to_path_buf());
+    let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+    storage.initialize().unwrap();
+    let day = "2026-01-01";
+    let privacy = PrivacyFingerprint::new(SensitiveFilterConfig::default()).unwrap();
+    let (start, end) = day_bounds(day).unwrap();
+    let (revision, _, _) = storage
+        .recap_day_revision(day, start, end, &privacy)
+        .unwrap();
+    let generation = storage.db_generation();
+    storage
+        .recap_write("batch", day, day, revision, generation, &json!({}))
+        .unwrap();
+    // Write the oldest observation last: row IDs must not displace recent
+    // observations from the bounded fallback when a scope filter is applied.
+    storage
+        .recap_keyword_replace_day(
+            day,
+            revision,
+            privacy.as_str(),
+            generation,
+            storage.recap_search_epoch().unwrap(),
+            (0..801)
+                .rev()
+                .map(|i| {
+                    (
+                        json!({"observation": i}),
+                        "内存".to_owned(),
+                        vec!["Code.exe".into()],
+                        start + i,
+                        start + i,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+    for query in ["", "内"] {
+        let (candidates, complete) = storage
+            .recap_keyword_candidates::<Value>(
+                query,
+                privacy.as_str(),
+                None,
+                None,
+                Some(start),
+                None,
+                &["CODE.EXE".into()],
+            )
+            .unwrap();
+        assert!(!complete);
+        assert_eq!(candidates.len(), 800);
+        let observations: std::collections::HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.value["observation"].as_i64().unwrap())
+            .collect();
+        assert!(observations.contains(&800));
+        assert!(!observations.contains(&0));
+    }
+    let (candidates, complete) = storage
+        .recap_keyword_candidates::<Value>(
+            "内存",
+            privacy.as_str(),
+            None,
+            None,
+            Some(start + 800),
+            None,
+            &[],
+        )
+        .unwrap();
+    assert!(complete);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].value["observation"], 800);
+    storage.shutdown().unwrap();
+}
+
+#[test]
 fn recap_icons_read_encrypted_metadata_skip_favicons_and_require_unlock() {
     let temp = tempfile::tempdir().unwrap();
     let credentials = storage_credentials(temp.path().to_path_buf());

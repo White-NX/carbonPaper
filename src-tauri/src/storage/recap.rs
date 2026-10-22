@@ -93,6 +93,7 @@ impl StorageState {
             return Err(error.to_string());
         }
         Self::init_recap_search_epoch(conn)?;
+        Self::init_recap_keyword_tables(conn)?;
         Ok(())
     }
 
@@ -141,16 +142,17 @@ impl StorageState {
 
     /// Search covers all saved dates, independently of the calendar's 730-date
     /// discovery limit and the screenshot MiniLM index's 30-day retention.
-    pub(crate) fn recap_search_days(&self) -> Result<Vec<(String, i64)>, String> {
+    pub(crate) fn recap_search_days(&self, privacy: &str) -> Result<Vec<(String, i64)>, String> {
         let guard = self.get_connection_named("recap_search_days")?;
         let mut statement = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?.prepare(
             "SELECT d.day,d.revision FROM recap_days d
              WHERE d.day NOT IN (SELECT day FROM recap_deleted_days)
+             AND d.privacy_hash=?1
              AND EXISTS(SELECT 1 FROM recap_payloads p WHERE p.kind='batch' AND p.day=d.day AND p.revision=d.revision)
              ORDER BY d.day DESC"
         ).map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map([privacy], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string());
@@ -426,6 +428,7 @@ impl StorageState {
     }
 
     fn delete_recap_rows(conn: &Connection, day: &str) -> Result<(), String> {
+        super::recap_search::remove_day(conn, day)?;
         // Keep the revision monotonic and retain spent budgets. Reading the day
         // must not revive old results or enable additional requests for free.
         for sql in [
@@ -1037,9 +1040,15 @@ mod tests {
         );
         let original = s.recap_search_epoch().unwrap();
         assert_eq!(
-            s.recap_search_days().unwrap(),
+            s.recap_search_days("privacy").unwrap(),
             vec![("2026-01-01".into(), 0)]
         );
+        assert!(s.recap_search_days("changed-privacy").unwrap().is_empty());
+        assert!(s
+            .recap_keyword_pending_dates("changed-privacy")
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.recap_search_epoch().unwrap(), original);
         write(
             "INSERT INTO recap_payloads VALUES('search','2026-01-01','2026-01-01',0,x'00',x'00');",
         );
@@ -1050,7 +1059,7 @@ mod tests {
         write("INSERT INTO screenshots(id,created_at) VALUES(1,'2026-01-01 01:00:00');");
         assert!(s.recap_search_epoch().unwrap() > corrected);
         assert!(
-            s.recap_search_days().unwrap().is_empty(),
+            s.recap_search_days("privacy").unwrap().is_empty(),
             "stale batches must leave the corpus"
         );
         write("UPDATE screenshots SET is_deleted=1 WHERE id=1;");

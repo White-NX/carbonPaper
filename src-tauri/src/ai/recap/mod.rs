@@ -5,6 +5,7 @@ mod progress;
 mod runner;
 mod screening;
 pub(crate) mod search;
+mod search_pages;
 mod search_progress;
 mod selection;
 mod summary;

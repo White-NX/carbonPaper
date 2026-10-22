@@ -116,7 +116,8 @@ distinctions. It filters activities before ranking, coverage counting and paging
 an empty list includes all processes. A match retains the activity's full evidence.
 Date bounds remain inclusive saved date labels.
 
-`coverage.global` counts the privacy-filtered searchable corpus. `query_scope`
+When vector retrieval is requested, `coverage.global` counts the privacy-filtered
+searchable corpus. `query_scope`
 and `dates` apply the current date/process filters before text matching and paging.
 Chunk counts refer to unique content-addressed text windows, never durations,
 dates or recall percentages. Shared chunks count once in each scope; per-date
@@ -124,21 +125,29 @@ counts therefore need not sum to the global count. Activity counts distinguish
 fully, partially and unindexed activities. `status` is `empty`, `not_prepared`,
 `partial` or `ready`. `missing_dates` lists scoped dates with missing chunks.
 Dates without searchable saved activities are absent; coverage does not describe
-whether recap generation has finished. Legacy top-level chunk counts are global.
+whether recap generation has finished. Top-level chunk counts are global.
+Keyword-only execution leaves `coverage`, `indexed_chunks` and `total_chunks`
+null so ordinary keyword queries do not materialize the vector corpus.
 
 `execution` reports the requested mode, `keyword_executed`, `keyword_matches`,
+`keyword_complete`,
 `semantic_executed`, `semantic_matches`, `semantic_candidates`,
 `semantic_candidate_limit` (200), `semantic_candidates_truncated`, and
 `fallback_reason` (`disabled`, `empty`, `not_prepared`, `unavailable`, or null).
-Counts precede pagination. Hybrid runs keywords over all scoped activities plus
-semantic retrieval over available vectors, including when coverage is partial.
+Counts precede pagination. Keyword retrieval uses the shared HMAC blind index
+and verifies at most 800 candidate activities with the snapshot plaintext scorer.
+Hybrid adds semantic retrieval over available vectors, including partial coverage.
 `keyword_rank: null` means that activity did not match the keyword branch.
-`total` counts the fused candidates after the semantic cap, while all keyword
-matches survive. Coverage remains available for keyword-only searches and failed
-semantic fallback. Pure semantic searches still fail if semantics cannot run.
+`total` counts the retained fused candidates. `complete: false` means the keyword
+verification budget or semantic candidate cap bounded retrieval; narrow the scope
+instead of treating this count as exhaustive. `keyword_score` and `match_evidence`
+describe lexical matches. `semantic_score` is the activity's best positive cosine
+similarity, or null without a vector match. Coverage remains available after failed
+hybrid inference. Pure semantic searches still fail if semantics cannot run.
 `mode` retains the effective configured mode; `execution` states what ran.
-`semantic_status` remains a compatibility field; use `coverage` for index coverage
-and `execution` for this search. `index_progress` is the runtime construction
+Keyword-only `semantic_status` is `not_requested` when semantic search is enabled,
+otherwise `disabled`. Use non-null `coverage` for index coverage and `execution`
+for this search. `index_progress` is the runtime construction
 snapshot (running/phase/wait/retry), distinct from either search branch.
 
 ## Errors

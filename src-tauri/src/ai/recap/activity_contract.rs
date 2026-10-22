@@ -1,18 +1,18 @@
 //! Public activity evidence semantics shared by day reads and search.
 use super::{RecapActivity, SourceRef};
 use crate::sensitive_filter::SensitiveFilterState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActivityEvidence {
-    pub time_semantics: &'static str,
-    pub observation_kind: &'static str,
+    pub time_semantics: String,
+    pub observation_kind: String,
     #[serde(rename = "span_ms")]
     pub observed_span_ms: i64,
     #[serde(rename = "member_ids")]
     pub member_screenshot_ids: Vec<i64>,
-    pub membership_status: &'static str,
+    pub membership_status: String,
 }
 
 #[derive(Default)]
@@ -68,15 +68,16 @@ impl ActivityEvidence {
             "filtered"
         };
         Self {
-            time_semantics: "evidence_observation_span",
+            time_semantics: "evidence_observation_span".into(),
             observation_kind: if activity.start_ms == activity.end_ms {
                 "instant"
             } else {
                 "span"
-            },
+            }
+            .into(),
             observed_span_ms: activity.end_ms.saturating_sub(activity.start_ms).max(0),
             member_screenshot_ids,
-            membership_status,
+            membership_status: membership_status.into(),
         }
     }
 }

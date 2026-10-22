@@ -1499,6 +1499,8 @@
     "search": {
       "error": "搜索出错：{{message}}",
       "placeholder_ocr": "搜索快照与回顾",
+      "placeholder_snapshots": "搜索快照中的文字",
+      "placeholder_recaps": "搜索回顾",
       "placeholder_nl": "描述你想找的画面，比如「月亮」",
       "go": "搜索",
       "searching": "搜索中...",
@@ -1557,7 +1559,8 @@
       "sort_relevance": "按相关程度",
       "total": "{{count}} 条结果",
       "resultTypes": "快照 {{snapshots}} · 回顾 {{recaps}}",
-      "categoryScope": "分类仅筛选快照"
+      "categoryScope": "分类仅筛选快照",
+      "partial": "已显示部分匹配，缩小范围可找到更准确的结果"
     },
     "group": {
       "expand": "同一窗口另有 {{count}} 条",
@@ -1584,6 +1587,16 @@
       "我是皱皮",
       "阿米娅你听我解释，我真的没有偏向佩丽卡！"
     ],
+    "targets": {
+      "label": "搜索对象",
+      "snapshots": "仅快照",
+      "mixed": "快照与回顾",
+      "recaps": "仅回顾"
+    },
+    "recapSemantic": "回顾语义搜索",
+    "recapSemanticHint": "按含义补充相关回顾，并显示相关度。",
+    "recapRelevance": "相关度：{{score}}",
+    "recapRelevanceHint": "数值越高，含义越接近你的搜索内容。",
     "semanticUpdating": "正在补充相关回顾…",
     "semanticFallback": "已显示关键词及当前可用的语义匹配。",
     "resultTypes": {

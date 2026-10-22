@@ -41,6 +41,8 @@ export function useAdvancedSearchController({
 }) {
   const [query, setQuery] = useState(searchParams?.query || '');
   const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
+  const [searchTarget, setSearchTarget] = useState('mixed');
+  const [recapSemantic, setRecapSemantic] = useState(false);
   const [results, setResults] = useState([]);
   const [thumbnailCache, setThumbnailCache] = useState({});
   const [loading, setLoading] = useState(false);
@@ -60,10 +62,12 @@ export function useAdvancedSearchController({
   const [landingCaptures, setLandingCaptures] = useState([]);
   const offsetRef = useRef(0);
   const stageRef = useRef(false);
+  const rankingRevisionRef = useRef(null);
   const [semanticUpdating, setSemanticUpdating] = useState(false);
   const [semanticStatus, setSemanticStatus] = useState('empty');
   const [totals, setTotals] = useState(null);
-  const unified = mode === 'ocr' && Boolean(query.trim());
+  const useRecapSemantic = mode === 'ocr' && searchTarget !== 'snapshots' && recapSemantic;
+  const unified = mode === 'ocr' && Boolean(query.trim() || searchTarget === 'recaps' || selectedProcesses.length || (searchTarget !== 'recaps' && selectedCategories.length) || startDate || endDate);
   const observerRef = useRef(null);
   const sentinelRef = useRef(null);
   const lastParamsRef = useRef({ query: '', mode: 'ocr' });
@@ -85,7 +89,7 @@ export function useAdvancedSearchController({
     setResults([]);
     setHasMore(false);
     setTotals(null);
-  }, [query, active, mode, selectedProcesses, selectedCategories, startDate, endDate]);
+  }, [query, active, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate]);
   useEffect(() => () => { searchIdRef.current += 1; }, []);
   /** 重取的判据：只有用户显式刷新时它才变化。 */
   const reloadToken = searchParams?.refreshKey ?? 0;
@@ -135,6 +139,7 @@ export function useAdvancedSearchController({
     setLoadingMore(false);
     setError(null);
     offsetRef.current = 0;
+    rankingRevisionRef.current = null;
     if (searchMode === undefined) {
       setMode(nextMode);
     }
@@ -168,8 +173,8 @@ export function useAdvancedSearchController({
 
   /** 除关键词以外是否还有生效的筛选条件。 */
   const hasFilters = useMemo(
-    () => selectedProcesses.length > 0 || selectedCategories.length > 0 || Boolean(startDate) || Boolean(endDate),
-    [selectedProcesses, selectedCategories, startDate, endDate]
+    () => selectedProcesses.length > 0 || (mode === 'ocr' && searchTarget !== 'recaps' && selectedCategories.length > 0) || Boolean(startDate) || Boolean(endDate),
+    [mode, searchTarget, selectedProcesses, selectedCategories, startDate, endDate]
   );
 
   const computeTimestamp = useCallback((value) => {
@@ -200,7 +205,7 @@ export function useAdvancedSearchController({
     if (!active) return;
     if (query.trim() !== debouncedQuery.trim()) return;
     const normalizedQuery = debouncedQuery.trim();
-    if (!normalizedQuery && !hasFilters) {
+    if (!normalizedQuery && !hasFilters && !(mode === 'ocr' && searchTarget === 'recaps')) {
       searchIdRef.current += 1;
       setResults([]);
       setThumbnailCache({});
@@ -222,11 +227,13 @@ export function useAdvancedSearchController({
     setThumbnailCache({});
     offsetRef.current = 0;
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
+    rankingRevisionRef.current = null;
     try {
       let fetched;
-      if (mode === 'ocr' && normalizedQuery) {
+      if (mode === 'ocr' && (normalizedQuery || hasFilters || searchTarget === 'recaps')) {
         const options = { limit: PAGE_SIZE, processNames: selectedProcesses,
-          categories: selectedCategories, startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate) };
+          categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget,
+          includeSemantic: false, startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate) };
         const apply = (response, semantic) => {
           const items = response.items.map((item) => item.kind === 'snapshot'
             ? { ...item.snapshot, kind: 'snapshot' } : { kind: 'recap', recap: item.recap });
@@ -234,15 +241,16 @@ export function useAdvancedSearchController({
           setHasMore(response.next_offset != null);
           offsetRef.current = response.next_offset ?? items.length;
           stageRef.current = semantic;
+          rankingRevisionRef.current = response.ranking_revision ?? null;
           setSemanticStatus(response.semantic_status);
-          setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count });
+          setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count, complete: response.complete });
           setElapsedMs(performance.now() - startedAt); setLoading(false);
           if (items.length) setRecentQueries(pushRecentSearch(normalizedQuery, mode));
         };
         const keywords = await searchSnapshotsAndRecaps(normalizedQuery, options);
         if (searchIdRef.current !== currentSearchId) return;
         apply(keywords, false);
-        if (['disabled', 'empty', 'not_prepared'].includes(keywords.semantic_status)) return;
+        if (!normalizedQuery || !useRecapSemantic || keywords.semantic_status === 'disabled') return;
         setSemanticUpdating(true);
         try {
           const combined = await searchSnapshotsAndRecaps(normalizedQuery, { ...options, includeSemantic: true });
@@ -284,7 +292,7 @@ export function useAdvancedSearchController({
     } catch (e) {
       console.error('Advanced search resetAndFetch failed:', e);
       if (searchIdRef.current === currentSearchId) {
-        setError(e.message || String(e));
+        setError(e?.message || String(e));
         setResults([]);
         setHasMore(false);
         setElapsedMs(null);
@@ -294,7 +302,7 @@ export function useAdvancedSearchController({
         setLoading(false);
       }
     }
-  }, [active, query, debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters]);
+  }, [active, query, debouncedQuery, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters]);
 
   useEffect(() => {
     // Query/filter changes and explicit refresh share one trigger. A separate
@@ -312,7 +320,7 @@ export function useAdvancedSearchController({
    *
    * 取回后按来源折叠再挑选，理由见 sampleRecentCaptures。
    */
-  const isLanding = !debouncedQuery.trim() && !hasFilters;
+  const isLanding = !debouncedQuery.trim() && !hasFilters && !(mode === 'ocr' && searchTarget === 'recaps');
   useEffect(() => {
     if (!active || !isLanding) return undefined;
     if (landingTokenRef.current === reloadToken) return undefined;
@@ -351,17 +359,39 @@ export function useAdvancedSearchController({
     setError(null);
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     try {
-      if (mode === 'ocr' && debouncedQuery.trim()) {
+      if (mode === 'ocr' && (debouncedQuery.trim() || hasFilters || searchTarget === 'recaps')) {
         const response = await searchSnapshotsAndRecaps(debouncedQuery.trim(), {
           limit: PAGE_SIZE, offset: offsetRef.current,
-          includeSemantic: stageRef.current, processNames: selectedProcesses, categories: selectedCategories,
+          includeSemantic: stageRef.current, target: searchTarget, processNames: selectedProcesses,
+          rankingRevision: rankingRevisionRef.current,
+          categories: searchTarget === 'recaps' ? [] : selectedCategories,
           startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate),
         });
         if (searchIdRef.current !== currentSearchId) return;
         const items = response.items.map((item) => item.kind === 'snapshot'
           ? { ...item.snapshot, kind: 'snapshot' } : { kind: 'recap', recap: item.recap });
-        setResults((previous) => [...previous, ...items]);
-        offsetRef.current = response.next_offset ?? offsetRef.current + items.length;
+        const restarted = response.offset === 0;
+        setResults((previous) => {
+          const prefix = restarted ? [] : previous;
+          const key = (item) => item.kind === 'recap'
+            ? `recap:${item.recap.date}:${item.recap.activity_id}`
+            : `snapshot:${item.screenshot_id}`;
+          const seen = new Set(prefix.map(key));
+          return [...prefix, ...items.filter((item) => {
+            const id = key(item);
+            if (seen.has(id)) return false;
+            seen.add(id);
+            return true;
+          })];
+        });
+        rankingRevisionRef.current = response.ranking_revision ?? null;
+        if (restarted) {
+          setResultSetKey(++searchIdRef.current);
+          setLoadingMore(false);
+        }
+        setSemanticStatus(response.semantic_status);
+        setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count, complete: response.complete });
+        offsetRef.current = response.next_offset ?? (response.offset ?? offsetRef.current) + items.length;
         setHasMore(response.next_offset != null);
         return;
       }
@@ -386,7 +416,7 @@ export function useAdvancedSearchController({
     } catch (e) {
       console.error('Advanced search loadMore failed:', e);
       if (searchIdRef.current === currentSearchId) {
-        setError(e.message || String(e));
+        setError(e?.message || String(e));
         setHasMore(false);
       }
     } finally {
@@ -394,7 +424,7 @@ export function useAdvancedSearchController({
         setLoadingMore(false);
       }
     }
-  }, [debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating]);
+  }, [debouncedQuery, mode, searchTarget, hasFilters, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating]);
 
   useEffect(() => {
     if (!active) return;
@@ -478,6 +508,11 @@ export function useAdvancedSearchController({
     query,
     setQuery,
     mode,
+    searchTarget,
+    setSearchTarget,
+    recapSemantic,
+    setRecapSemantic,
+    useRecapSemantic,
     results,
     groupedResults,
     unified,

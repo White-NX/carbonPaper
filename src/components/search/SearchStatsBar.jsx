@@ -15,7 +15,7 @@ import { useTranslation } from 'react-i18next';
  * @param {boolean} props.hasMore 是否还有下一页
  * @param {'ocr'|'nl'} props.mode 当前检索模式，决定排序说明
  */
-export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, mode, snapshotCount, recapCount, categoryScoped = false }) {
+export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, mode, snapshotCount, recapCount, categoryScoped = false, complete = true }) {
   const { t } = useTranslation();
 
   const parts = [t(totalKnown ? 'advancedSearch.stats.total' : 'advancedSearch.stats.loaded', { count })];
@@ -23,6 +23,7 @@ export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, 
     parts.push(t('advancedSearch.stats.resultTypes', { snapshots: snapshotCount, recaps: recapCount }));
   }
   if (categoryScoped) parts.push(t('advancedSearch.stats.categoryScope'));
+  if (complete === false) parts.push(t('advancedSearch.stats.partial'));
   if (typeof elapsedMs === 'number') {
     parts.push(t('advancedSearch.stats.elapsed', { ms: Math.max(1, Math.round(elapsedMs)) }));
   }

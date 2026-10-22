@@ -3,7 +3,7 @@ import { Search, X, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { ThumbnailCard } from './ThumbnailCard';
 import { SearchModeTabs } from './search/SearchModeTabs';
-import { TimeRangeChip, ProcessChip, CategoryChip } from './search/SearchFilters';
+import { TimeRangeChip, ProcessChip, CategoryChip, SearchTargetChip, RecapSemanticToggle } from './search/SearchFilters';
 import { SearchStatsBar } from './search/SearchStatsBar';
 import { SearchResultRow } from './search/SearchResultRow';
 import { SearchLanding, SearchNoResults } from './search/SearchLanding';
@@ -69,6 +69,11 @@ export function AdvancedSearch({
     unified,
     semanticUpdating,
     semanticStatus,
+    searchTarget,
+    setSearchTarget,
+    recapSemantic,
+    setRecapSemantic,
+    useRecapSemantic,
   } = useAdvancedSearchController({
     active: active && isAuthenticated,
     searchParams,
@@ -252,10 +257,14 @@ export function AdvancedSearch({
         bordered={!showStats}
         flushBottom
         secondaryRow={(
-          <>
+          <div className="flex w-full flex-wrap items-center gap-x-7 gap-y-2">
             {tabs}
 
-            <div className="flex flex-1 flex-wrap items-center gap-2">
+            <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:flex-1">
+              {mode === 'ocr' && <>
+                <SearchTargetChip value={searchTarget} onChange={setSearchTarget} />
+                {searchTarget !== 'snapshots' && <RecapSemanticToggle checked={recapSemantic} onChange={setRecapSemantic} />}
+              </>}
               <TimeRangeChip
                 preset={rangePreset}
                 startDate={startDate}
@@ -267,7 +276,7 @@ export function AdvancedSearch({
                 selected={selectedProcesses}
                 onChange={setSelectedProcesses}
               />
-              {mode === 'ocr' && (
+              {mode === 'ocr' && searchTarget !== 'recaps' && (
                 <CategoryChip
                   categories={categoryOptions}
                   selected={selectedCategories}
@@ -285,7 +294,7 @@ export function AdvancedSearch({
                 </button>
               )}
             </div>
-          </>
+          </div>
         )}
       >
         <div className="flex h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
@@ -293,7 +302,7 @@ export function AdvancedSearch({
             type="text"
             className="min-w-0 flex-1 bg-transparent text-sm text-ide-text outline-none placeholder:text-ide-muted"
             placeholder={mode === 'ocr'
-              ? t('advancedSearch.search.placeholder_ocr')
+              ? t(searchTarget === 'mixed' ? 'advancedSearch.search.placeholder_ocr' : `advancedSearch.search.placeholder_${searchTarget}`)
               : t('advancedSearch.search.placeholder_nl')}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
@@ -322,10 +331,10 @@ export function AdvancedSearch({
       {showStats && (
       <SearchStatsBar count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode}
         snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
-        categoryScoped={mode === 'ocr' && selectedCategories.length > 0} />
+        categoryScoped={mode === 'ocr' && searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />
       )}
       {unified && semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticUpdating')}</p>}
-      {unified && ['not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
+      {unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
 
       {mode === 'nl' && !isLanding && (
         <p className="shrink-0 border-b border-ide-border bg-ide-panel px-6 pb-2 text-[11px] leading-relaxed text-ide-muted">

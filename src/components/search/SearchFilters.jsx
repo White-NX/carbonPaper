@@ -1,8 +1,38 @@
 import React from 'react';
-import { CalendarRange, Filter, Tag } from 'lucide-react';
+import { CalendarRange, Filter, Tag, Layers, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS } from '../../lib/categories';
 import { FilterChip, ChipPanelHeading } from './FilterChip';
+
+export function SearchTargetChip({ value, onChange }) {
+  const { t } = useTranslation();
+  return <FilterChip icon={<Layers className="h-3.5 w-3.5" />} label={t(`advancedSearch.targets.${value}`)}
+    title={t('advancedSearch.targets.label')} active={value !== 'mixed'} panelClassName="min-w-[180px]">
+    {({ close }) => <>
+      <ChipPanelHeading>{t('advancedSearch.targets.label')}</ChipPanelHeading>
+      <div role="radiogroup" aria-label={t('advancedSearch.targets.label')}>
+        {['snapshots', 'mixed', 'recaps'].map((target) => <button key={target} type="button" role="radio"
+          aria-checked={value === target} onClick={() => { onChange(target); close(); }}
+          className="flex w-full items-center justify-between gap-3 rounded px-2.5 py-2 text-left text-xs text-ide-text hover:bg-ide-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60">
+          {t(`advancedSearch.targets.${target}`)}{value === target && <span aria-hidden="true" className="text-ide-accent">✓</span>}
+        </button>)}
+      </div>
+    </>}
+  </FilterChip>;
+}
+
+export function RecapSemanticToggle({ checked, onChange }) {
+  const { t } = useTranslation();
+  return <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)}
+    title={t('advancedSearch.recapSemanticHint')}
+    className={`inline-flex h-[30px] items-center gap-2 whitespace-nowrap rounded-full border px-3 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 ${checked
+      ? 'border-ide-accent/40 bg-ide-accent/10 text-ide-accent' : 'border-transparent text-ide-muted hover:bg-ide-hover hover:text-ide-text'}`}>
+    <Sparkles className="h-3.5 w-3.5" /><span>{t('advancedSearch.recapSemantic')}</span>
+    <span aria-hidden="true" className={`relative inline-flex h-3.5 w-6 shrink-0 rounded-full transition-colors ${checked ? 'bg-ide-accent' : 'bg-ide-border'}`}>
+      <span className={`absolute left-0 top-0.5 h-2.5 w-2.5 rounded-full bg-white transition-transform ${checked ? 'translate-x-3' : 'translate-x-0.5'}`} />
+    </span>
+  </button>;
+}
 
 /** 把 Date 转成 `datetime-local` 输入需要的本地时间字符串。 */
 function toDateTimeLocal(date) {

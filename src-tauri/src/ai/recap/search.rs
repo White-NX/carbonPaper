@@ -13,6 +13,7 @@ use tauri::{Emitter, Manager};
 use zeroize::Zeroize;
 
 use super::activity_contract::{member_directory, ActivityEvidence};
+use super::search_pages::SearchPages;
 use super::{runner::privacy_hash, types::*, with_current_day, RecapIndexProgress};
 use crate::ai::provider::Cancellation;
 use crate::credential_manager::CredentialManagerState;
@@ -24,7 +25,7 @@ use crate::semantic_runtime::{
     SemanticEmbeddingResult, SemanticRuntimeState, SemanticRuntimeStatus, SemanticTimeouts,
 };
 use crate::sensitive_filter::SensitiveFilterState;
-use crate::storage::StorageState;
+use crate::storage::{search_plan::QueryPlan, search_rank, SearchMatchEvidence, StorageState};
 use crate::task_error::TaskError;
 
 const INDEX_VERSION: u32 = 2;
@@ -135,8 +136,10 @@ impl RecapSearchQuery {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecapSearchHit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_offset: Option<usize>,
     pub date: String,
     pub batch_start_ms: i64,
     pub activity_id: String,
@@ -151,14 +154,18 @@ pub struct RecapSearchHit {
     pub evidence: ActivityEvidence,
     pub keyword_rank: Option<usize>,
     pub semantic_rank: Option<usize>,
+    pub keyword_score: Option<f64>,
+    pub semantic_score: Option<f64>,
+    pub match_evidence: Option<SearchMatchEvidence>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RecapSearchResult {
     pub revision: String,
     pub ranking_revision: String,
     pub items: Vec<RecapSearchHit>,
     pub total: usize,
+    pub complete: bool,
     pub offset: usize,
     pub limit: usize,
     pub next_offset: Option<usize>,
@@ -166,9 +173,9 @@ pub struct RecapSearchResult {
     pub semantic_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_error: Option<String>,
-    pub indexed_chunks: usize,
-    pub total_chunks: usize,
-    pub coverage: SearchCoverage,
+    pub indexed_chunks: Option<usize>,
+    pub total_chunks: Option<usize>,
+    pub coverage: Option<SearchCoverage>,
     pub execution: SearchExecution,
     pub index_progress: RecapIndexProgress,
     pub elapsed_ms: u64,
@@ -206,6 +213,7 @@ pub struct SearchExecution {
     pub requested_mode: SearchMode,
     pub keyword_executed: bool,
     pub keyword_matches: usize,
+    pub keyword_complete: bool,
     pub semantic_executed: bool,
     pub semantic_matches: usize,
     pub semantic_candidates: usize,
@@ -325,8 +333,12 @@ struct IndexRun {
 pub struct RecapSearchRuntime {
     serial: AtomicU64,
     loading: Mutex<()>,
+    keyword_loading: Mutex<()>,
+    keyword_identity: Mutex<Option<Identity>>,
     corpus: Mutex<Option<Arc<Corpus>>>,
     index: Mutex<IndexRun>,
+    pages: Mutex<SearchPages<RecapSearchResult>>,
+    pub(super) unified_pages: Mutex<SearchPages<super::unified::UnifiedSearchResult>>,
 }
 
 impl RecapSearchRuntime {
@@ -425,7 +437,13 @@ impl RecapSearchRuntime {
         self.serial.fetch_add(1, Ordering::SeqCst);
         self.cancel();
         *self.corpus.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .keyword_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.index.lock().unwrap_or_else(|e| e.into_inner()).error = None;
+        self.pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.unified_pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -442,6 +460,48 @@ pub(super) struct Identity {
     privacy: String,
     serial: u64,
     session: Option<Instant>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SearchContext {
+    pub generation: u64,
+    pub privacy: String,
+    pub serial: u64,
+    pub session: Option<Instant>,
+}
+
+pub(super) fn search_context(app: &tauri::AppHandle) -> Result<SearchContext, String> {
+    let credentials = app.state::<Arc<CredentialManagerState>>();
+    if !credentials.is_session_valid() {
+        app.state::<RecapSearchRuntime>().clear();
+        return Err("AUTH_REQUIRED".into());
+    }
+    if crate::maintenance::is_active() {
+        return Err("MAINTENANCE_IN_PROGRESS".into());
+    }
+    Ok(SearchContext {
+        generation: app.state::<Arc<StorageState>>().db_generation(),
+        privacy: privacy_hash(app)?,
+        serial: app.state::<RecapSearchRuntime>().serial.load(Ordering::SeqCst),
+        session: credentials.session_marker(),
+    })
+}
+
+impl SearchContext {
+    pub fn token(&self) -> String {
+        digest(&format!("{}:{}:{}:{:?}", self.generation, self.privacy, self.serial, self.session))
+    }
+
+    pub fn check(&self, app: &tauri::AppHandle) -> Result<(), String> {
+        let current = search_context(app)?;
+        if self.session != current.session || self.serial != current.serial {
+            return Err("AUTH_REQUIRED".into());
+        }
+        if self != &current {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn identity(app: &tauri::AppHandle) -> Result<Identity, String> {
@@ -479,6 +539,12 @@ pub(crate) fn semantic_enabled(app: &tauri::AppHandle) -> Result<bool, String> {
 /// Changes enqueue automatic work; scheduler reconciliation also catches source
 /// and privacy changes that arrive without a recap UI event.
 pub(crate) fn schedule_index(app: &tauri::AppHandle) {
+    let keyword_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = prepare_keywords(&keyword_app) {
+            tracing::debug!("[RECAP:SEARCH] Keyword index update deferred: {error}");
+        }
+    });
     if semantic_enabled(app).is_ok_and(|enabled| enabled) {
         if let Some(scheduler) =
             app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
@@ -495,6 +561,14 @@ pub(crate) fn schedule_index(app: &tauri::AppHandle) {
 }
 
 impl Identity {
+    fn context(&self) -> SearchContext {
+        SearchContext {
+            generation: self.generation,
+            privacy: self.privacy.clone(),
+            serial: self.serial,
+            session: self.session,
+        }
+    }
     pub(super) fn token(&self) -> String {
         digest(&format!(
             "{}:{}:{}:{}:{:?}",
@@ -520,7 +594,6 @@ struct Document {
     batch_start_ms: i64,
     activity: RecapActivity,
     chunks: Vec<Chunk>,
-    keywords: KeywordText,
     evidence: ActivityEvidence,
 }
 
@@ -531,7 +604,6 @@ impl Document {
             revision,
             batch_start_ms,
             chunks: chunks(&activity),
-            keywords: KeywordText::new(&activity),
             evidence: ActivityEvidence::project(
                 &activity,
                 &super::activity_contract::MemberDirectory::default(),
@@ -552,8 +624,6 @@ impl Drop for Corpus {
     fn drop(&mut self) {
         for document in &mut self.documents {
             document.date.zeroize();
-            document.keywords.title.zeroize();
-            document.keywords.text.zeroize();
             let activity = &mut document.activity;
             activity.task_title.zeroize();
             activity.text.zeroize();
@@ -856,6 +926,10 @@ fn filtered_activity(
 }
 
 fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
+    load_corpus_inner(app, true)
+}
+
+fn load_corpus_inner(app: &tauri::AppHandle, strict: bool) -> Result<Arc<Corpus>, String> {
     let runtime = app.state::<RecapSearchRuntime>();
     let _loading = runtime.loading.lock().unwrap_or_else(|e| e.into_inner());
     let current = identity(app)?;
@@ -872,9 +946,10 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
     let filter = app.state::<Arc<SensitiveFilterState>>();
     let mut documents = Vec::new();
     let mut vectors = HashMap::new();
-    for (date, revision) in storage.recap_search_days()? {
-        current.check(app)?;
-        with_current_day(app, &date, |day| {
+    for (date, revision) in storage.recap_search_days(&current.privacy)? {
+        current.context().check(app)?;
+        let first_document = documents.len();
+        let day_result = with_current_day(app, &date, |day| {
             for batch in day.batches {
                 let directory = member_directory(&batch.records, &filter);
                 for activity in batch.activities {
@@ -888,9 +963,16 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
                 }
             }
             Ok(())
-        })?;
+        });
+        if let Err(error) = day_result {
+            documents.truncate(first_document);
+            if !strict && error == "RECAP_SOURCE_CHANGED" {
+                continue;
+            }
+            return Err(error);
+        }
         for key in storage.recap_payload_keys("search", &date, revision)? {
-            current.check(app)?;
+            current.context().check(app)?;
             match storage.recap_read::<SavedVectors>("search", &key, Some(revision)) {
                 Ok(Some(mut saved))
                     if saved.version == INDEX_VERSION
@@ -914,7 +996,7 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
         .map(|c| c.key.as_str())
         .collect();
     vectors.retain(|key, _| keys.contains(key.as_str()));
-    current.check(app)?;
+    current.context().check(app)?;
     let total_chunks = keys.len();
     let dates = documents
         .iter()
@@ -928,9 +1010,15 @@ fn load_corpus(app: &tauri::AppHandle) -> Result<Arc<Corpus>, String> {
         dates,
         vectors: Mutex::new(vectors),
     });
-    *runtime.corpus.lock().unwrap_or_else(|e| e.into_inner()) = Some(corpus.clone());
+    let unchanged = corpus.identity == identity(app)?;
+    if strict && !unchanged {
+        return Err("RECAP_SOURCE_CHANGED".into());
+    }
+    if unchanged {
+        *runtime.corpus.lock().unwrap_or_else(|e| e.into_inner()) = Some(corpus.clone());
+    }
     // A lock event between publication and this fence must not resurrect a cache.
-    if let Err(error) = corpus.identity.check(app) {
+    if let Err(error) = corpus.identity.context().check(app) {
         runtime.clear();
         return Err(error);
     }
@@ -1232,100 +1320,208 @@ async fn prepare_inner(
     Ok(false)
 }
 
-fn normalize(text: &str) -> String {
-    text.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-struct KeywordText {
-    title: String,
-    text: String,
-    body_bytes: usize,
-}
-
-impl KeywordText {
-    fn new(activity: &RecapActivity) -> Self {
-        let mut text = normalize(&activity.text);
-        let body_bytes = text.len();
+fn activity_text(activity: &RecapActivity, details: bool) -> String {
+    let mut text = format!("{}\n{}", activity.task_title, activity.text);
+    if details {
         for detail in &activity.details {
-            let detail = normalize(&detail.text);
-            if !detail.is_empty() {
-                if !text.is_empty() {
-                    text.push(' ');
+            text.push('\n');
+            text.push_str(&detail.text);
+        }
+    }
+    text
+}
+
+fn lexical_evidence(
+    activity: &RecapActivity,
+    plan: &QueryPlan,
+    details: bool,
+) -> Option<SearchMatchEvidence> {
+    let mut text = activity_text(activity, details);
+    let ranked = search_rank::score_text(plan, &text);
+    text.zeroize();
+    ranked.matched.then(|| SearchMatchEvidence {
+        scope: "recap_activity".into(),
+        relevance_score: ranked.score,
+        matched_terms: ranked.matched_terms,
+        literal_terms: ranked.literal_terms,
+        match_type: if ranked.literal {
+            "literal"
+        } else {
+            "approximate"
+        }
+        .into(),
+        phrase_matched: ranked.phrase_matched,
+        matched_bigram_groups: None,
+        total_bigram_groups: None,
+    })
+}
+
+fn activity_hit(
+    date: String,
+    batch_start_ms: i64,
+    activity: RecapActivity,
+    evidence: ActivityEvidence,
+) -> RecapSearchHit {
+    RecapSearchHit {
+        result_offset: None,
+        date,
+        batch_start_ms,
+        activity_id: activity.id,
+        task_id: activity.task_id,
+        task_title: activity.task_title,
+        text: activity.text,
+        details: activity.details,
+        start_ms: activity.start_ms,
+        end_ms: activity.end_ms,
+        sources: activity.sources,
+        evidence,
+        keyword_rank: None,
+        semantic_rank: None,
+        keyword_score: None,
+        semantic_score: None,
+        match_evidence: None,
+    }
+}
+
+fn hit_activity(hit: &RecapSearchHit) -> RecapActivity {
+    RecapActivity {
+        id: hit.activity_id.clone(),
+        task_id: hit.task_id.clone(),
+        task_title: hit.task_title.clone(),
+        text: hit.text.clone(),
+        details: hit.details.clone(),
+        start_ms: hit.start_ms,
+        end_ms: hit.end_ms,
+        sources: hit.sources.clone(),
+        member_ids: hit.evidence.member_screenshot_ids.clone(),
+        segments: vec![],
+    }
+}
+
+/// Build the blind index one changed day at a time. Ordinary searches never
+/// materialize the semantic corpus or read unrelated saved activity payloads.
+fn prepare_keywords(app: &tauri::AppHandle) -> Result<Identity, String> {
+    let runtime = app.state::<RecapSearchRuntime>();
+    let _loading = runtime
+        .keyword_loading
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let storage = app.state::<Arc<StorageState>>();
+    let filter = app.state::<Arc<SensitiveFilterState>>();
+    let current = identity(app)?;
+    let prepared = runtime
+        .keyword_identity
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        == Some(&current);
+    if !prepared {
+        storage.recap_keyword_prune(&current.privacy)?;
+    }
+    let pending = if prepared {
+        vec![]
+    } else {
+        storage.recap_keyword_pending_dates(&current.privacy)?
+    };
+    for date in pending {
+        current.check(app)?;
+        let revision = storage.recap_keyword_day_revision(&date)?;
+        let mut documents = Vec::new();
+        with_current_day(app, &date, |day| {
+            for batch in day.batches {
+                let directory = member_directory(&batch.records, &filter);
+                for activity in batch.activities {
+                    if let Some(activity) = filtered_activity(activity, &filter) {
+                        let evidence = ActivityEvidence::project(&activity, &directory);
+                        let text = activity_text(&activity, true);
+                        let processes = activity
+                            .sources
+                            .iter()
+                            .map(|s| s.process_name.clone())
+                            .collect();
+                        let (start, end) = (activity.start_ms, activity.end_ms);
+                        documents.push((
+                            activity_hit(date.clone(), batch.start_ms, activity, evidence),
+                            text,
+                            processes,
+                            start,
+                            end,
+                        ));
+                    }
                 }
-                text.push_str(&detail);
+            }
+            Ok(())
+        })?;
+        current.check(app)?;
+        storage.recap_keyword_replace_day(
+            &date,
+            revision,
+            &current.privacy,
+            current.generation,
+            current.epoch,
+            documents,
+        )?;
+    }
+    current.check(app)?;
+    *runtime
+        .keyword_identity
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(current.clone());
+    current.check(app)?;
+    Ok(current)
+}
+
+fn keyword_search(
+    app: &tauri::AppHandle,
+    query: &RecapSearchQuery,
+) -> Result<(Vec<RecapSearchHit>, bool), String> {
+    let (current, prepared) = match prepare_keywords(app) {
+        Ok(current) => (current, true),
+        Err(error) if error == "RECAP_SOURCE_CHANGED" => (identity(app)?, false),
+        Err(error) => return Err(error),
+    };
+    let storage = app.state::<Arc<StorageState>>();
+    let filter = app.state::<Arc<SensitiveFilterState>>();
+    let (candidates, complete) = storage.recap_keyword_candidates::<RecapSearchHit>(
+        &query.query,
+        &current.privacy,
+        query.start_date.as_deref(),
+        query.end_date.as_deref(),
+        query.start_ms,
+        query.end_ms,
+        &query.process_names,
+    )?;
+    let plan = QueryPlan::build(&query.query);
+    let mut hits = Vec::new();
+    for candidate in candidates {
+        let mut hit = candidate.value;
+        if query.query.trim().is_empty() {
+            hit.keyword_score = Some(0.0);
+            hits.push(hit);
+            continue;
+        }
+        if let Some(activity) = filtered_activity(hit_activity(&hit), &filter) {
+            if let Some(mut evidence) = lexical_evidence(&activity, &plan, query.include_details) {
+                evidence.matched_bigram_groups = Some(candidate.hits);
+                evidence.total_bigram_groups = Some(candidate.groups);
+                hit.keyword_score = Some(evidence.relevance_score);
+                hit.match_evidence = Some(evidence);
+                hits.push(hit);
             }
         }
-        Self {
-            title: normalize(&activity.task_title),
-            text,
-            body_bytes,
-        }
     }
-
-    fn score(&self, query: &str, terms: &[&str], details: bool) -> f64 {
-        if query.is_empty() {
-            return 0.0;
-        }
-        let text = if details {
-            &self.text
-        } else {
-            &self.text[..self.body_bytes]
-        };
-        if !terms
-            .iter()
-            .all(|term| self.title.contains(term) || text.contains(term))
-        {
-            return 0.0;
-        }
-        let title_hits = terms
-            .iter()
-            .filter(|term| self.title.contains(**term))
-            .count();
-        1.0 + title_hits as f64 * 3.0
-            + if self.title.contains(query) { 8.0 } else { 0.0 }
-            + if text.contains(query) { 4.0 } else { 0.0 }
+    hits.sort_by(|a, b| {
+        b.keyword_score
+            .unwrap_or_default()
+            .total_cmp(&a.keyword_score.unwrap_or_default())
+            .then_with(|| b.start_ms.cmp(&a.start_ms))
+            .then_with(|| a.activity_id.cmp(&b.activity_id))
+    });
+    for (i, hit) in hits.iter_mut().enumerate() {
+        hit.keyword_rank = Some(i + 1);
     }
-}
-
-#[cfg(test)]
-fn keyword_score(activity: &RecapActivity, query: &str, details: bool) -> f64 {
-    let query = normalize(query);
-    if query.is_empty() {
-        return 0.0;
-    }
-    let title = normalize(&activity.task_title);
-    let text = normalize(&format!(
-        "{} {}",
-        activity.text,
-        if details {
-            activity
-                .details
-                .iter()
-                .map(|d| d.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            String::new()
-        }
-    ));
-    let terms: HashSet<_> = query.split_whitespace().collect();
-    let matched = terms
-        .iter()
-        .filter(|term| title.contains(**term) || text.contains(**term))
-        .count();
-    if matched != terms.len() {
-        return 0.0;
-    }
-    let title_hits = terms.iter().filter(|term| title.contains(**term)).count();
-    1.0 + title_hits as f64 * 3.0
-        + if title.contains(&query) { 8.0 } else { 0.0 }
-        + if text.contains(&query) { 4.0 } else { 0.0 }
+    current.context().check(app)?;
+    Ok((hits, complete && prepared))
 }
 
 struct RankedSearch {
@@ -1353,10 +1549,8 @@ fn rank_with_report(
 ) -> RankedSearch {
     let mut keywords = Vec::new();
     let mut semantic = Vec::new();
-    let normalized = normalize(&query.query);
-    let mut terms: Vec<_> = normalized.split_whitespace().collect();
-    terms.sort_unstable();
-    terms.dedup();
+    let plan = QueryPlan::build(&query.query);
+    let mut evidence_by_document = HashMap::new();
     // Shared titles and repeated excerpts are content-addressed: score each
     // vector once, after date/detail filtering, for the lifetime of this query.
     let mut scores = HashMap::<&str, f64>::new();
@@ -1368,11 +1562,11 @@ fn rank_with_report(
         .filter(|(_, d)| query.includes(&d.date) && query.includes_activity(&d.activity))
     {
         if query.mode != SearchMode::Semantic {
-            let score = document
-                .keywords
-                .score(&normalized, &terms, query.include_details);
-            if score > 0.0 {
-                keywords.push((i, score));
+            if let Some(evidence) =
+                lexical_evidence(&document.activity, &plan, query.include_details)
+            {
+                keywords.push((i, evidence.relevance_score));
+                evidence_by_document.insert(i, evidence);
             }
         }
         if let Some(embedding) = embedding {
@@ -1407,6 +1601,7 @@ fn rank_with_report(
         requested_mode: query.mode,
         keyword_executed: query.mode != SearchMode::Semantic,
         keyword_matches: keywords.len(),
+        keyword_complete: true,
         semantic_executed: embedding.is_some(),
         semantic_matches: 0,
         semantic_candidates: semantic.len().min(200),
@@ -1453,6 +1648,8 @@ fn rank_with_report(
     for (position, (i, _)) in semantic.iter().take(200).enumerate() {
         ranks.entry(*i).or_default().1 = Some(position + 1);
     }
+    let keyword_scores: HashMap<_, _> = keywords.iter().copied().collect();
+    let semantic_scores: HashMap<_, _> = semantic.iter().copied().collect();
     let mut ranked: Vec<_> = ranks.into_iter().collect();
     let rrf = |ranks: &(Option<usize>, Option<usize>)| {
         [ranks.0, ranks.1]
@@ -1481,6 +1678,7 @@ fn rank_with_report(
             let d = &corpus.documents[i];
             let a = &d.activity;
             RecapSearchHit {
+                result_offset: None,
                 date: d.date.clone(),
                 batch_start_ms: d.batch_start_ms,
                 activity_id: a.id.clone(),
@@ -1494,6 +1692,9 @@ fn rank_with_report(
                 evidence: d.evidence.clone(),
                 keyword_rank,
                 semantic_rank,
+                keyword_score: keyword_scores.get(&i).copied(),
+                semantic_score: semantic_scores.get(&i).copied(),
+                match_evidence: evidence_by_document.remove(&i),
             }
         })
         .collect();
@@ -1509,14 +1710,9 @@ fn rank_with_report(
     }
 }
 
-fn ranking_revision(
-    identity: &Identity,
-    query: &RecapSearchQuery,
-    semantic_indexed: Option<usize>,
-) -> String {
+fn query_key(query: &RecapSearchQuery) -> String {
     digest(
         &serde_json::json!([
-            identity.token(),
             query.query.trim(),
             query.mode,
             query.start_date,
@@ -1524,11 +1720,62 @@ fn ranking_revision(
             query.include_details,
             query.process_names,
             query.start_ms,
-            query.end_ms,
-            semantic_indexed
+            query.end_ms
         ])
         .to_string(),
     )
+}
+
+fn rank_semantic_with_keywords(
+    corpus: &Corpus,
+    query: &RecapSearchQuery,
+    embedding: Option<&[f32]>,
+    keywords: Vec<RecapSearchHit>,
+) -> RankedSearch {
+    let mut semantic_query = query.clone();
+    semantic_query.mode = SearchMode::Semantic;
+    semantic_query.offset = 0;
+    semantic_query.limit = 200;
+    let mut semantic = rank_with_report(corpus, &semantic_query, embedding);
+    let keyword_count = keywords.len();
+    let mut hits: HashMap<_, _> = keywords
+        .into_iter()
+        .map(|hit| ((hit.date.clone(), hit.activity_id.clone()), hit))
+        .collect();
+    for hit in semantic.items {
+        let key = (hit.date.clone(), hit.activity_id.clone());
+        if let Some(existing) = hits.get_mut(&key) {
+            existing.semantic_rank = hit.semantic_rank;
+            existing.semantic_score = hit.semantic_score;
+        } else {
+            hits.insert(key, hit);
+        }
+    }
+    let score = |hit: &RecapSearchHit| {
+        [hit.keyword_rank, hit.semantic_rank]
+            .into_iter()
+            .flatten()
+            .map(|rank| 1.0 / (60 + rank) as f64)
+            .sum::<f64>()
+    };
+    let mut items: Vec<_> = hits.into_values().collect();
+    items.sort_by(|a, b| {
+        score(b)
+            .total_cmp(&score(a))
+            .then_with(|| b.start_ms.cmp(&a.start_ms))
+            .then_with(|| a.date.cmp(&b.date))
+            .then_with(|| a.activity_id.cmp(&b.activity_id))
+    });
+    semantic.total = items.len();
+    semantic.items = items
+        .into_iter()
+        .skip(query.offset)
+        .take(query.limit)
+        .collect();
+    semantic.execution.requested_mode = query.mode;
+    semantic.execution.keyword_executed = query.mode != SearchMode::Semantic;
+    semantic.execution.keyword_matches = keyword_count;
+    semantic
 }
 
 pub async fn search(
@@ -1542,18 +1789,172 @@ pub async fn search(
 
 pub(super) async fn search_inner(
     app: tauri::AppHandle,
+    query: RecapSearchQuery,
+) -> Result<RecapSearchResult, String> {
+    let started = Instant::now();
+    for _ in 0..3 {
+        let result = search_page(app.clone(), query.clone(), started).await;
+        if !matches!(&result, Err(error) if error == "RECAP_SOURCE_CHANGED") {
+            return result;
+        }
+        tokio::task::yield_now().await;
+    }
+    let context = search_context(&app)?;
+    let (enabled, progress) = (semantic_enabled(&app)?, app.state::<RecapSearchRuntime>().progress());
+    let fallback = RecapSearchResult {
+        revision: context.token(), ranking_revision: String::new(), items: vec![], total: 0,
+        complete: false, offset: 0, limit: query.limit, next_offset: None, mode: SearchMode::Keyword,
+        semantic_status: if enabled { "not_prepared" } else { "disabled" }.into(),
+        semantic_error: None, indexed_chunks: None, total_chunks: None, coverage: None,
+        execution: SearchExecution { requested_mode: query.mode, keyword_executed: true,
+            keyword_complete: false, fallback_reason: Some("not_prepared"), ..Default::default() },
+        index_progress: progress, elapsed_ms: started.elapsed().as_millis() as u64,
+    };
+    store_search_page(&app, &query, &context, fallback, started)
+}
+
+async fn search_page(
+    app: tauri::AppHandle,
+    query: RecapSearchQuery,
+    started: Instant,
+) -> Result<RecapSearchResult, String> {
+    let context = search_context(&app)?;
+    let cached = app.state::<RecapSearchRuntime>().pages.lock().unwrap_or_else(|e| e.into_inner())
+        .find(&context, &query_key(&query), query.ranking_revision.as_deref(), query.offset);
+    if let Some(cached) = cached {
+        return read_search_page(&app, &query, &context, cached, query.offset, started);
+    }
+    let mut full_query = query.clone();
+    full_query.offset = 0;
+    full_query.limit = 1000;
+    full_query.ranking_revision = None;
+    let result = collect_search(app.clone(), full_query).await?;
+    store_search_page(&app, &query, &context, result, started)
+}
+
+fn store_search_page(
+    app: &tauri::AppHandle,
+    query: &RecapSearchQuery,
+    context: &SearchContext,
+    mut result: RecapSearchResult,
+    started: Instant,
+) -> Result<RecapSearchResult, String> {
+    context.check(app)?;
+    let items = std::mem::take(&mut result.items);
+    let snapshot = app.state::<RecapSearchRuntime>().pages.lock().unwrap_or_else(|e| e.into_inner())
+        .insert(context.clone(), query_key(query), result, &items)?;
+    // An expired or evicted token starts a new set at zero. Clients can replace
+    // their old prefix instead of appending a page from another ranking.
+    let offset = if query.ranking_revision.is_some() { 0 } else { query.offset };
+    read_search_page(app, query, context, snapshot, offset, started)
+}
+
+fn read_search_page(
+    app: &tauri::AppHandle,
+    query: &RecapSearchQuery,
+    context: &SearchContext,
+    snapshot: Arc<super::search_pages::SearchSnapshot<RecapSearchResult>>,
+    offset: usize,
+    started: Instant,
+) -> Result<RecapSearchResult, String> {
+    context.check(app)?;
+    let mut result = snapshot.header.clone();
+    result.items = snapshot.items()?;
+    let storage = app.state::<Arc<StorageState>>();
+    let days: Vec<_> = result.items.iter().map(|item| item.date.clone()).collect::<HashSet<_>>().into_iter().collect();
+    let visible = storage.search_visible_recap_days(&days)?;
+    let total = result.items.len();
+    let end = offset.saturating_add(query.limit).min(total);
+    result.items = result.items.into_iter().enumerate().skip(offset).take(query.limit)
+        .filter_map(|(position, mut item)| {
+            item.result_offset = Some(position);
+            visible.contains(&item.date).then_some(item)
+        }).collect();
+    result.offset = offset;
+    result.limit = query.limit;
+    result.next_offset = (end < total).then_some(end);
+    result.ranking_revision = snapshot.token.clone();
+    result.index_progress = app.state::<RecapSearchRuntime>().progress();
+    result.elapsed_ms = started.elapsed().as_millis() as u64;
+    context.check(app)?;
+    Ok(result)
+}
+
+async fn collect_search(
+    app: tauri::AppHandle,
     mut query: RecapSearchQuery,
 ) -> Result<RecapSearchResult, String> {
+    let request_identity = identity(&app)?;
     let requested_mode = query.mode;
     let enabled = semantic_enabled(&app)?;
-    if !enabled {
+    if !enabled || query.query.trim().is_empty() {
         query.mode = SearchMode::Keyword;
     }
     let started = Instant::now();
+    if query.mode == SearchMode::Keyword {
+        return tokio::task::spawn_blocking(move || {
+            let (mut items, complete) = keyword_search(&app, &query)?;
+            request_identity.context().check(&app)?;
+            let current = request_identity;
+            let total = items.len();
+            let end = query.offset.saturating_add(query.limit).min(total);
+            items = items
+                .into_iter()
+                .skip(query.offset)
+                .take(query.limit)
+                .collect();
+            let result = RecapSearchResult {
+                revision: current.token(),
+                ranking_revision: String::new(),
+                items,
+                total,
+                complete,
+                offset: query.offset,
+                limit: query.limit,
+                next_offset: (end < total).then_some(end),
+                mode: SearchMode::Keyword,
+                semantic_status: if !enabled {
+                    "disabled"
+                } else {
+                    "not_requested"
+                }
+                .into(),
+                semantic_error: None,
+                indexed_chunks: None,
+                total_chunks: None,
+                coverage: None,
+                execution: SearchExecution {
+                    requested_mode,
+                    keyword_executed: true,
+                    keyword_matches: total,
+                    keyword_complete: complete,
+                    fallback_reason: (requested_mode != SearchMode::Keyword)
+                        .then_some(if enabled { "empty" } else { "disabled" }),
+                    ..Default::default()
+                },
+                index_progress: app.state::<RecapSearchRuntime>().progress(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            };
+            current.context().check(&app)?;
+            Ok(result)
+        })
+        .await
+        .map_err(|error| worker_failure("query_keywords", error))?;
+    }
     let load_app = app.clone();
-    let corpus = tokio::task::spawn_blocking(move || load_corpus(&load_app))
+    let keyword_query = query.clone();
+    let (keyword_hits, keyword_complete) = if query.mode == SearchMode::Hybrid {
+        tokio::task::spawn_blocking(move || keyword_search(&load_app, &keyword_query))
+            .await
+            .map_err(|error| worker_failure("query_keywords", error))??
+    } else {
+        (Vec::new(), true)
+    };
+    let load_app = app.clone();
+    let corpus = tokio::task::spawn_blocking(move || load_corpus_inner(&load_app, false))
         .await
         .map_err(|error| worker_failure("query_load", error))??;
+    request_identity.context().check(&app)?;
     let (indexed_chunks, total_chunks) = counts(&corpus);
     let mut semantic_status = if !enabled {
         "disabled"
@@ -1592,12 +1993,12 @@ pub(super) async fn search_inner(
         }
     }
     drop(_foreground);
-    corpus.identity.check(&app)?;
+    corpus.identity.context().check(&app)?;
     if query.mode == SearchMode::Semantic && embedding.is_none() && total_chunks > 0 {
         return Err(semantic_error.unwrap_or_else(|| "RECAP_SEARCH_NOT_READY".into()));
     }
     let result = tokio::task::spawn_blocking(move || {
-        corpus.identity.check(&app)?;
+        corpus.identity.context().check(&app)?;
         let RankedSearch {
             items,
             total,
@@ -1605,7 +2006,8 @@ pub(super) async fn search_inner(
             coverage,
             mut execution,
             ..
-        } = rank_with_report(&corpus, &query, embedding.as_deref());
+        } = rank_semantic_with_keywords(&corpus, &query, embedding.as_deref(), keyword_hits);
+        execution.keyword_complete = keyword_complete;
         execution.requested_mode = requested_mode;
         if requested_mode != SearchMode::Keyword && !execution.semantic_executed {
             execution.fallback_reason = Some(if !enabled {
@@ -1624,38 +2026,27 @@ pub(super) async fn search_inner(
             coverage.global.status
         };
         let index_progress = app.state::<RecapSearchRuntime>().progress();
-        let ranking_revision = ranking_revision(
-            &corpus.identity,
-            &query,
-            embedding.as_ref().map(|_| indexed_chunks),
-        );
-        if query
-            .ranking_revision
-            .as_ref()
-            .is_some_and(|previous| previous != &ranking_revision)
-        {
-            return Err("RECAP_SEARCH_RESULTS_CHANGED".into());
-        }
         let end = query.offset.saturating_add(query.limit).min(total);
         let result = RecapSearchResult {
             revision: corpus.identity.token(),
-            ranking_revision,
+            ranking_revision: String::new(),
             items,
             total,
+            complete: keyword_complete && !execution.semantic_candidates_truncated,
             offset: query.offset,
             limit: query.limit,
             next_offset: (end < total).then_some(end),
             mode: query.mode,
             semantic_status: semantic_status.into(),
             semantic_error,
-            indexed_chunks,
-            total_chunks,
-            coverage,
+            indexed_chunks: Some(indexed_chunks),
+            total_chunks: Some(total_chunks),
+            coverage: Some(coverage),
             execution,
             index_progress,
             elapsed_ms: started.elapsed().as_millis() as u64,
         };
-        corpus.identity.check(&app)?;
+        corpus.identity.context().check(&app)?;
         Ok(result)
     })
     .await
@@ -1828,47 +2219,15 @@ mod tests {
     }
 
     #[test]
-    fn keyword_requires_all_terms_and_details_are_an_independent_ablation() {
-        let a = activity("回顾搜索", "比较关键词与语义检索");
-        assert!(keyword_score(&a, "回顾 检索", false) > 0.0);
-        assert_eq!(keyword_score(&a, "回顾 火星", true), 0.0);
-        assert_eq!(keyword_score(&a, "内存缓存", false), 0.0);
-        assert!(keyword_score(&a, "内存缓存", true) > 0.0);
-        assert_eq!(keyword_score(&a, "!!!", true), 0.0);
-    }
-
-    #[test]
-    fn cached_keywords_match_the_original_scores_in_both_detail_modes() {
-        for a in [
-            activity("回顾 SEARCH", "比较 project"),
-            activity("", ""),
-            activity("Unicode：界", "多余  空格、与标点，mixed-CASE"),
-        ] {
-            let cached = KeywordText::new(&a);
-            for query in [
-                "回顾 检索",
-                "SEARCH SEARCH",
-                "project 采用内存缓存降低查询延迟",
-                "mixed CASE",
-                "火星",
-                "!!!",
-                "界",
-            ] {
-                let normalized = normalize(query);
-                let terms = normalized
-                    .split_whitespace()
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                for details in [true, false] {
-                    assert_eq!(
-                        cached.score(&normalized, &terms, details),
-                        keyword_score(&a, query, details),
-                        "{query}, details={details}"
-                    );
-                }
-            }
-        }
+    fn recap_keywords_use_snapshot_scores_and_tolerate_typos() {
+        let a = activity("回顾搜索", "Six Degrees of Separation");
+        let exact = lexical_evidence(&a, &QueryPlan::build("separation"), true).unwrap();
+        let near = lexical_evidence(&a, &QueryPlan::build("Separtion"), true).unwrap();
+        assert!(exact.relevance_score > near.relevance_score);
+        assert_eq!(near.match_type, "approximate");
+        assert!(lexical_evidence(&a, &QueryPlan::build("内存缓存"), false).is_none());
+        assert!(lexical_evidence(&a, &QueryPlan::build("内存缓存"), true).is_some());
+        assert!(lexical_evidence(&a, &QueryPlan::build("火星"), true).is_none());
     }
 
     #[test]
@@ -2104,25 +2463,18 @@ mod tests {
     }
 
     #[test]
-    fn page_identity_changes_when_index_coverage_or_search_options_change() {
-        let identity = Identity {
-            generation: 1,
-            epoch: 2,
-            privacy: "policy".into(),
-            serial: 3,
-            session: None,
-        };
+    fn page_query_key_keeps_pagination_separate_from_search_options() {
         let mut query = RecapSearchQuery {
             query: "cache".into(),
             ..Default::default()
         };
-        let original = ranking_revision(&identity, &query, Some(10));
+        let original = query_key(&query);
         query.offset = 20;
-        assert_eq!(original, ranking_revision(&identity, &query, Some(10)));
-        assert_ne!(original, ranking_revision(&identity, &query, Some(11)));
-        assert_ne!(original, ranking_revision(&identity, &query, None));
+        query.limit = 5;
+        query.ranking_revision = Some("a".repeat(64));
+        assert_eq!(original, query_key(&query));
         query.include_details = false;
-        assert_ne!(original, ranking_revision(&identity, &query, Some(10)));
+        assert_ne!(original, query_key(&query));
     }
 
     #[test]

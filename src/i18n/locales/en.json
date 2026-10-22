@@ -1499,6 +1499,8 @@
     "search": {
       "error": "Search failed: {{message}}",
       "placeholder_ocr": "Search snapshots and recaps",
+      "placeholder_snapshots": "Search text in snapshots",
+      "placeholder_recaps": "Search recaps",
       "placeholder_nl": "Describe the screen you are looking for",
       "go": "Search",
       "searching": "Searching...",
@@ -1557,7 +1559,8 @@
       "sort_relevance": "By relevance",
       "total": "{{count}} results",
       "resultTypes": "{{snapshots}} snapshots · {{recaps}} recaps",
-      "categoryScope": "Categories filter snapshots"
+      "categoryScope": "Categories filter snapshots",
+      "partial": "Showing some matches. Narrow the search for more precise results."
     },
     "group": {
       "expand": "{{count}} more from this window",
@@ -1584,6 +1587,16 @@
       "btw, I play arknights",
       "Amiya, hear me out, I really didn't favor Pelica..."
     ],
+    "targets": {
+      "label": "Search in",
+      "snapshots": "Snapshots only",
+      "mixed": "Snapshots and recaps",
+      "recaps": "Recaps only"
+    },
+    "recapSemantic": "Recap meaning search",
+    "recapSemanticHint": "Include recaps with a similar meaning and show their relevance.",
+    "recapRelevance": "Relevance: {{score}}",
+    "recapRelevanceHint": "Higher values indicate a closer meaning to your search.",
     "semanticUpdating": "Finding related recaps…",
     "semanticFallback": "Showing keyword matches and available meaning matches.",
     "resultTypes": {

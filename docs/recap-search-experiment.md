@@ -2,20 +2,22 @@
 
 This branch combines cross-date activity retrieval with selective, cited key
 details. Existing recaps are searchable from Advanced Search alongside OCR
-snapshot matches. Local MiniLM embeddings add meaning-based retrieval when the
-recap semantic-search setting is enabled; keyword retrieval remains immediate.
+snapshot matches. Keywords reuse the snapshot HMAC blind index and plaintext
+scorer. Local MiniLM embeddings add meaning-based retrieval when the user opts
+in; the Advanced Search vector toggle starts off.
 Newly generated recaps preserve a few concrete details for important activities.
 
 ## Try it
 
-1. Open **Advanced Search**, choose **Text**, and enter a description or
-   keywords. The field is labelled **Search snapshots and recaps**. Date and
-   process filters apply to both result types; category filters apply to
-   snapshots.
-2. Keyword matches appear first. When semantic search is enabled, the local
-   index is queried in the background and the same list is replaced by a hybrid
-   ranking using reciprocal-rank fusion (constant 60). Indexing is automatic,
-   resumable, and runs through the shared background scheduler.
+1. Open **Advanced Search**, choose **Text**, and select **Snapshots only**,
+   **Snapshots and recaps** (default), or **Recaps only**. Date and process
+   filters apply to both result types; category filters apply to snapshots
+   and are hidden for recap-only searches.
+2. Keyword results share one ranking based on the snapshot text scorer. In
+   mixed or recap-only mode, turn on **Recap semantic search** to add vector
+   matches. The toggle is off by default. With it on, keyword matches appear
+   first, followed by a hybrid ranking using reciprocal-rank fusion (constant
+   60). Vector matches show their cosine relevance score to two decimals.
 3. In **Settings → Organize → Daily recap**, use **Enable recap semantic
    search** to pause or resume vector indexing and semantic queries. Turning it
    off keeps recap keyword matches available.
@@ -33,11 +35,11 @@ documented in `AGENTS.md`. UI preview screenshots below use synthetic records.
 
 ## Interface
 
-![Unified snapshot and recap results](images/unified-search-results.jpg)
+![Search targets and opt-in recap vector relevance](images/recap-search-options.png)
 
-![Recap activity details and source references](images/unified-search-recap-details.jpg)
+![Recap activity details and source references](images/recap-search-details.png)
 
-![English results in a narrow window](images/unified-search-narrow.jpg)
+![Search filters in a narrow window](images/recap-search-options-narrow.png)
 
 Advanced Search keeps snapshot rows and recap rows in one relevance stream while
 retaining their distinct cards and opening behavior. Recap rows show the date,
@@ -45,8 +47,9 @@ activity interval, title, summary, key-detail excerpt, source count, primary
 process, source-screenshot action, and a link back to that day's recap. The
 statistics bar reports total, snapshot, and recap counts; category filtering is
 called out as snapshot-scoped. Empty history, no matches, partial coverage and
-unavailable inference have distinct messages. The top search bar reports a
-short **Recap vectors** progress message while automatic indexing is active.
+unavailable inference have distinct messages. Bounded retrieval shows a prompt
+to narrow the scope. Vector fallback messages appear when the search toggle
+is enabled; vector preparation still uses the shared background scheduler.
 
 ## Generation and evidence
 
@@ -71,44 +74,71 @@ the cited material when judging generation quality.
 
 ## Retrieval and storage
 
-The searchable unit is a corrected activity, not a whole day. Titles,
-descriptions and details are encoded separately in overlapping windows. A
-72-byte title prefix and 160-byte content window leave conservative space under
-the current encoder's 256-token limit. Full titles also have their own windows.
-Content fingerprints include the search contract and MiniLM vector-space
-revision; the screenshot index and its 30-day expiry are not reused.
+The searchable unit is a corrected activity. Its title, description and key
+details form one keyword document. `storage/search_plan.rs`, `search_rank.rs`
+and the extracted `blind_search.rs` share query planning, case variants,
+rarest-first posting intersections, bounded fuzzy recall and plaintext scoring
+with snapshots. Both indexes use `StorageState::bigram_tokenize()` and the same
+HMAC key. `BlindIndex::recaps()` selects separate recap posting tables while
+reusing the complete inline/chunked posting format and mutation logic; document
+IDs cannot collide with snapshot IDs. Ranking favors phrases and word boundaries,
+then keyword coverage and density, and tolerates small typing/OCR errors.
 
-Keyword retrieval normalizes case and punctuation, requires all whitespace-
-separated query terms, and boosts title and phrase matches. Meaning retrieval
-uses the best positive cosine score among an activity's included windows and
-retains up to 200 semantic candidates. Combined retrieval uses reciprocal rank
-fusion with a constant of 60. Only the requested page's source metadata is
-cloned into results. Similarity is a retrieval signal, not proof of an event.
+`recap_search_documents` stores encrypted per-activity JSON and CNG-wrapped row
+keys. `recap_search_tokens` stores reverse HMAC postings for deletion, and
+`recap_search_processes` stores HMAC process filters. Date, revision and
+observation-time metadata support filtering before candidate caps. Dates are
+prepared one at a time after source or correction changes; ordinary indexed
+queries decrypt only the recalled candidates, up to 800 activities, without
+loading the full recap corpus. Blank and single-character queries inspect a
+bounded recent observation window. Shared text verification removes blind-index
+false positives before returning hits. HMAC postings do not store plaintext
+keywords; text and vectors retain the existing SQLCipher and row encryption.
+
+Mixed keyword search compares the same text scores across snapshot and recap
+hits, then observation time and stable ID. Explicit vector retrieval adds a
+second rank channel against this combined lexical list using reciprocal-rank
+fusion with a constant of 60. Unified search retains at most 200 candidates per
+route; recap semantic retrieval also caps its candidates at 200. `complete: false`
+reports bounded retrieval, and `total` counts retained candidates rather
+than every possible match in history.
+
+For vectors, titles, descriptions and details are encoded in separate overlapping
+windows. A 72-byte title prefix and 160-byte content window leave conservative
+space under the encoder's 256-token limit. Full titles also have their own
+windows. Content fingerprints include the search contract and MiniLM vector-space
+revision. The best positive cosine score among an activity's windows is exposed
+as `semantic_score`, or null without a vector match. The snapshot vector index's
+30-day expiry does not apply to recap vectors. Similarity is a retrieval signal,
+not proof of an event.
 
 Vectors are stored as encrypted `recap_payloads` of kind `search`, grouped by
 date in deterministic shards of up to 64 vectors. Preparation encodes and saves
 four vectors at a time within each shard; interrupted runs resume from the last
 encrypted batch commit. Shard writes leave the source/correction epoch intact;
 database generation, day revision, privacy and session remain fenced. Search
-itself never starts preparation. The shared scheduler creates a `recap_index`
+never starts embedding preparation. The shared scheduler creates a `recap_index`
 task after recap generation, correction, deletion, or source/privacy changes.
 The task uses encrypted shards, checkpointed batches, retries, foreground
 request yielding, and the same progress and failure policy as other background
 indexers. The index covers all saved dates, independently of the calendar
 discovery API's 730-date limit.
 
-A resident activity projection avoids decrypting every recap for every query.
-Its identity includes database generation, a source/correction epoch, privacy
-policy and authenticated session. Lock notifications clear it and cancel
-preparation. Every composed read checks its identity before returning; a later
-unlock cannot authorize a request from the preceding session. Normalized
-keyword text and vectors are retained alongside activities and zeroized when
-the projection's last reference drops. Concurrent first reads share one corpus
-materialization.
+A keyword preparation marker caches only database generation, a source/correction
+epoch, privacy policy and authenticated session. Triggers remove stale encrypted
+documents and queue posting removals on payload edits, day revision changes and
+deletions. Keyword preparation prunes these postings and rebuilds changed dates.
+The optional vector path still uses a resident activity/window projection, shared
+by concurrent first reads. Lock notifications clear both markers and the vector
+corpus and cancel preparation; the projection zeroizes text and vectors when its
+last reference drops. Every composed read checks its identity before returning;
+a later unlock cannot authorize a request from the preceding session.
 
-Source edits, recap regeneration, corrections and deletions invalidate the
-projection. Screenshot deletion also purges persisted search payloads. Search
-refilters generated text, corrected names, details and source identities before
+Source edits, recap regeneration, corrections and deletions invalidate search
+documents and the vector projection. Screenshot deletion also purges persisted
+search payloads. Dates saved under a different privacy policy are excluded through
+metadata before reading their content. Search refilters generated text,
+corrected names, details and source identities before
 returning data. Privacy and source changes during indexing or inference reject
 the operation rather than publish results from the old identity.
 
@@ -124,7 +154,11 @@ references, coverage and pagination. Screenshot timestamps remain Unix
 milliseconds in the MCP contract. Pass the response's `ranking_revision` with
 later pages; restart without it when the ranking changes.
 Executed local date bounds are retained in AI turn context so later follow-up
-questions keep the originally searched dates.
+questions keep the originally searched dates. The MCP `mode` default remains
+`hybrid`; the Advanced Search toggle controls only UI requests. Keyword-only
+execution leaves `coverage`, `indexed_chunks` and `total_chunks` null so vector
+coverage does not require a full corpus read. It reports
+`semantic_status: "not_requested"` when semantics are enabled, `"disabled"` otherwise.
 
 AI can inspect a relevant activity and then verify its sources with
 `get_snapshot_details`. Missing or filtered recap content does not prove that an
@@ -145,22 +179,25 @@ Include exact names, paraphrases, activities repeated across dates, facts omitte
 from summaries, and questions with no recorded answer. Record relevant activity
 and screenshot IDs, top-ten retrieval, final answer correctness, citations, cold
 and warm query time, indexing time and memory, and generation cost separately.
-The UI's query time includes corpus loading and query encoding, but excludes
-past preparation and recap generation. Do not infer end-to-end improvements
-from the ranking unit tests or synthetic UI screenshots.
+The UI's query time includes changed-date keyword preparation and, when selected,
+vector corpus loading and query encoding. It excludes past preparation and recap
+generation. Do not infer end-to-end improvements from the ranking unit tests
+or synthetic UI screenshots.
 
-See [the timeout investigation and scaling measurements](recap-search-performance.md)
-for cold-start budgets, reproducible synthetic benchmarks and remaining costs
-when searching several years of activities.
+The opt-in synthetic benchmark in `src-tauri/src/ai/recap/search_benchmark.rs`
+measures in-memory scoring and vector-window ranking. It does not measure the
+new blind-index lookup, SQLCipher reads, CNG decryption or end-to-end latency.
 
 Relevant checks are `npm run test:frontend`, `npm run build`, `npm run lint:ci`,
 `npm run i18n:check`, `npm run test:security`, `npm run test:mcp-contract`,
 `cargo check --manifest-path src-tauri/Cargo.toml`, and
 `cargo test --manifest-path src-tauri/Cargo.toml --lib`.
 
-Validation on Windows: 559 frontend tests passed across 84 files; 867 Rust
+Validation on Windows: 587 frontend tests passed across 88 files; pagination
+and API checks passed all 25 targeted tests. 905 Rust
 library tests passed and nine opt-in tests were ignored. Build, lint, locale
 parity, security guards, Cargo check, Rust formatting, and MCP contract checks
-passed. Browser checks exercised Chinese/dark and English/light views and a
-560-pixel window using synthetic records. Real-provider generation quality and
+passed. Browser checks exercised both locales at 1280 and 560 pixels using
+synthetic records, including target switching and opt-in vector relevance.
+Real-provider generation quality and
 end-to-end retrieval performance on personal history have not been benchmarked.

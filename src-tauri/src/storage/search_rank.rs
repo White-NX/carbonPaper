@@ -43,7 +43,7 @@ const W_EARLINESS: f64 = 60.0;
 /// Deliberately below [`W_KEYWORD`]: a block whose text bears the query out —
 /// even approximately — always outranks one that merely shares most of its
 /// bigrams.
-pub(super) const W_FUZZY_PRIOR: f64 = 150.0;
+pub(crate) const W_FUZZY_PRIOR: f64 = 150.0;
 
 /// Characters a needle must have per edit it is allowed to absorb.
 ///
@@ -76,7 +76,7 @@ const NEAR_QUALITY_CEILING: f64 = 0.55;
 const APPROX_CELL_BUDGET: usize = 1 << 20;
 
 /// How many edits a needle of this length is allowed to absorb.
-pub(super) fn edit_budget(len: usize) -> usize {
+pub(crate) fn edit_budget(len: usize) -> usize {
     (len / CHARS_PER_EDIT).min(MAX_EDITS)
 }
 
@@ -109,7 +109,7 @@ struct Match {
 /// bitmap hit meant: `Six Degrees of Separation` and `six-degrees-of-
 /// separation` fold to the same characters. The dropped positions are still
 /// worth knowing, because they are exactly the word boundaries.
-pub(super) struct FoldedText {
+pub(crate) struct FoldedText {
     chars: Vec<char>,
     /// `breaks[i]` is true when position `i` begins a word — the character
     /// before it in the original text was dropped by folding, or there was no
@@ -118,7 +118,7 @@ pub(super) struct FoldedText {
 }
 
 impl FoldedText {
-    pub(super) fn new(text: &str) -> Self {
+    pub(crate) fn new(text: &str) -> Self {
         let mut chars = Vec::with_capacity(text.len());
         let mut breaks = Vec::with_capacity(text.len());
         let mut at_break = true;
@@ -138,7 +138,7 @@ impl FoldedText {
         Self { chars, breaks }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.chars.len()
     }
 
@@ -247,7 +247,7 @@ impl FoldedText {
 }
 
 /// What one candidate's decrypted text is worth for this query.
-pub(super) struct RankedText {
+pub(crate) struct RankedText {
     pub score: f64,
     /// Whether the text bears the query out — containing one of its words
     /// either literally or within the edit budget. A candidate that fails
@@ -275,12 +275,12 @@ impl RankedText {
 }
 
 /// Scores decrypted text against the query.
-pub(super) fn score_text(plan: &QueryPlan, text: &str) -> RankedText {
+pub(crate) fn score_text(plan: &QueryPlan, text: &str) -> RankedText {
     let folded = FoldedText::new(text);
     score_folded(plan, &folded)
 }
 
-pub(super) fn score_folded(plan: &QueryPlan, folded: &FoldedText) -> RankedText {
+pub(crate) fn score_folded(plan: &QueryPlan, folded: &FoldedText) -> RankedText {
     let length = folded.len();
     if length == 0 || plan.phrase.is_empty() {
         return RankedText::NOTHING;
@@ -367,7 +367,7 @@ pub(super) fn score_folded(plan: &QueryPlan, folded: &FoldedText) -> RankedText 
 ///
 /// `hits` of `total` bigram groups matched. Used only for the tail of a search
 /// that found too little to fill a page; see `search.rs::rank_and_page`.
-pub(super) fn fuzzy_prior(hits: u32, total: u32) -> f64 {
+pub(crate) fn fuzzy_prior(hits: u32, total: u32) -> f64 {
     if total == 0 {
         return 0.0;
     }
