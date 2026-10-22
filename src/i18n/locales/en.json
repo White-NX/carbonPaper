@@ -1594,8 +1594,10 @@
       "recaps": "Recaps only"
     },
     "recapSemantic": "Recap meaning search",
-    "recapSemanticHint": "Include recaps with a similar meaning and show their relevance.",
-    "recapRelevance": "Relevance: {{score}}",
+    "recapSemanticHint": "Include recaps with a similar meaning and show their semantic relevance.",
+    "recapKeywordMatch": "Keyword match",
+    "recapApproximateKeywordMatch": "Approximate keyword match",
+    "recapRelevance": "Semantic relevance: {{score}}",
     "recapRelevanceHint": "Higher values indicate a closer meaning to your search.",
     "semanticUpdating": "Finding related recaps…",
     "semanticFallback": "Showing keyword matches and available meaning matches.",

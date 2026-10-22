@@ -42,7 +42,7 @@ export function useAdvancedSearchController({
   const [query, setQuery] = useState(searchParams?.query || '');
   const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
   const [searchTarget, setSearchTarget] = useState('mixed');
-  const [recapSemantic, setRecapSemantic] = useState(false);
+  const [recapSemantic, setRecapSemantic] = useState(true);
   const [results, setResults] = useState([]);
   const [thumbnailCache, setThumbnailCache] = useState({});
   const [loading, setLoading] = useState(false);

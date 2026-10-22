@@ -4,7 +4,7 @@ This branch combines cross-date activity retrieval with selective, cited key
 details. Existing recaps are searchable from Advanced Search alongside OCR
 snapshot matches. Keywords reuse the snapshot HMAC blind index and plaintext
 scorer. Local MiniLM embeddings add meaning-based retrieval when the user opts
-in; the Advanced Search vector toggle starts off.
+in; the Advanced Search vector toggle starts on.
 Newly generated recaps preserve a few concrete details for important activities.
 
 ## Try it
@@ -15,9 +15,12 @@ Newly generated recaps preserve a few concrete details for important activities.
    and are hidden for recap-only searches.
 2. Keyword results share one ranking based on the snapshot text scorer. In
    mixed or recap-only mode, turn on **Recap semantic search** to add vector
-   matches. The toggle is off by default. With it on, keyword matches appear
+   matches. The toggle is on by default. With it on, keyword matches appear
    first, followed by a hybrid ranking using reciprocal-rank fusion (constant
-   60). Vector matches show their cosine relevance score to two decimals.
+   60). Only vector matches with a cosine score of at least 0.5 enter the semantic
+   ranking. Verified keyword matches remain available at any vector score,
+   including when vectors are missing. Recap cards label keyword and approximate
+   keyword matches; vector matches show their semantic relevance to two decimals.
 3. In **Settings → Organize → Daily recap**, use **Enable recap semantic
    search** to pause or resume vector indexing and semantic queries. Turning it
    off keeps recap keyword matches available.
@@ -103,14 +106,20 @@ route; recap semantic retrieval also caps its candidates at 200. `complete: fals
 reports bounded retrieval, and `total` counts retained candidates rather
 than every possible match in history.
 
+The semantic score threshold of 0.5 is applied before ranking, candidate caps and
+pagination in both UI and MCP recap search. Weaker vectors contribute no semantic
+rank or fusion boost. Keyword eligibility uses the verified plaintext scorer
+independently, preserving literal, approximate and key-detail matches. Semantic
+execution counts include only activities that meet the threshold.
+
 For vectors, titles, descriptions and details are encoded in separate overlapping
 windows. A 72-byte title prefix and 160-byte content window leave conservative
 space under the encoder's 256-token limit. Full titles also have their own
 windows. Content fingerprints include the search contract and MiniLM vector-space
-revision. The best positive cosine score among an activity's windows is exposed
-as `semantic_score`, or null without a vector match. The snapshot vector index's
-30-day expiry does not apply to recap vectors. Similarity is a retrieval signal,
-not proof of an event.
+revision. The best cosine score of at least 0.5 among an activity's windows is
+exposed as `semantic_score`, or null without a qualifying vector match. The
+snapshot vector index's 30-day expiry does not apply to recap vectors. Similarity
+is a retrieval signal, not proof of an event.
 
 Vectors are stored as encrypted `recap_payloads` of kind `search`, grouped by
 date in deterministic shards of up to 64 vectors. Preparation encodes and saves

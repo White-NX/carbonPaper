@@ -13,8 +13,8 @@ export function SearchTargetChip({ value, onChange }) {
       <div role="radiogroup" aria-label={t('advancedSearch.targets.label')}>
         {['snapshots', 'mixed', 'recaps'].map((target) => <button key={target} type="button" role="radio"
           aria-checked={value === target} onClick={() => { onChange(target); close(); }}
-          className="flex w-full items-center justify-between gap-3 rounded px-2.5 py-2 text-left text-xs text-ide-text hover:bg-ide-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60">
-          {t(`advancedSearch.targets.${target}`)}{value === target && <span aria-hidden="true" className="text-ide-accent">✓</span>}
+          className={`flex w-full items-center justify-between gap-3 rounded px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-ide-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 ${value === target ? 'bg-ide-accent/10 text-ide-accent' : 'text-ide-text'}`}>
+          <span>{t(`advancedSearch.targets.${target}`)}</span>{value === target && <span aria-hidden="true">✓</span>}
         </button>)}
       </div>
     </>}

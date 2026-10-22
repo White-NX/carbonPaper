@@ -38,6 +38,8 @@ export function RecapSearchResultRow({ item, time, queryTokens, onDetails, onOpe
         </button>
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ide-muted">
           <span>{t('recap.search.sources', { count: sources.length })}</span><span>{processes.join(' · ')}</span>
+          {item.keyword_rank != null && <span>{t(item.match_evidence?.match_type === 'approximate'
+            ? 'advancedSearch.recapApproximateKeywordMatch' : 'advancedSearch.recapKeywordMatch')}</span>}
           {Number.isFinite(item.semantic_score) && <span className="font-mono tabular-nums" title={t('advancedSearch.recapRelevanceHint')}>
             {t('advancedSearch.recapRelevance', { score: item.semantic_score.toFixed(2) })}
           </span>}

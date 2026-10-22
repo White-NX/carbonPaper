@@ -39,6 +39,9 @@ const QUERY_EMBED_TIMEOUT: SemanticTimeouts = SemanticTimeouts {
     cold: Duration::from_secs(20),
 };
 const INDEX_EMBED_TIMEOUT: Duration = Duration::from_secs(60);
+// Gate the semantic channel before ranking and candidate caps. Verified keyword
+// hits remain eligible independently and receive no boost from weak vectors.
+const MIN_SEMANTIC_SCORE: f64 = 0.5;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -443,7 +446,10 @@ impl RecapSearchRuntime {
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.index.lock().unwrap_or_else(|e| e.into_inner()).error = None;
         self.pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.unified_pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.unified_pages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -482,14 +488,20 @@ pub(super) fn search_context(app: &tauri::AppHandle) -> Result<SearchContext, St
     Ok(SearchContext {
         generation: app.state::<Arc<StorageState>>().db_generation(),
         privacy: privacy_hash(app)?,
-        serial: app.state::<RecapSearchRuntime>().serial.load(Ordering::SeqCst),
+        serial: app
+            .state::<RecapSearchRuntime>()
+            .serial
+            .load(Ordering::SeqCst),
         session: credentials.session_marker(),
     })
 }
 
 impl SearchContext {
     pub fn token(&self) -> String {
-        digest(&format!("{}:{}:{}:{:?}", self.generation, self.privacy, self.serial, self.session))
+        digest(&format!(
+            "{}:{}:{}:{:?}",
+            self.generation, self.privacy, self.serial, self.session
+        ))
     }
 
     pub fn check(&self, app: &tauri::AppHandle) -> Result<(), String> {
@@ -1587,7 +1599,7 @@ fn rank_with_report(
                     scores.insert(&c.key, score);
                     Some(score)
                 })
-                .filter(|s| s.is_finite() && *s > 0.0)
+                .filter(|s| s.is_finite() && *s >= MIN_SEMANTIC_SCORE)
                 .max_by(f64::total_cmp);
             if let Some(score) = score {
                 semantic.push((i, score));
@@ -1800,15 +1812,34 @@ pub(super) async fn search_inner(
         tokio::task::yield_now().await;
     }
     let context = search_context(&app)?;
-    let (enabled, progress) = (semantic_enabled(&app)?, app.state::<RecapSearchRuntime>().progress());
+    let (enabled, progress) = (
+        semantic_enabled(&app)?,
+        app.state::<RecapSearchRuntime>().progress(),
+    );
     let fallback = RecapSearchResult {
-        revision: context.token(), ranking_revision: String::new(), items: vec![], total: 0,
-        complete: false, offset: 0, limit: query.limit, next_offset: None, mode: SearchMode::Keyword,
+        revision: context.token(),
+        ranking_revision: String::new(),
+        items: vec![],
+        total: 0,
+        complete: false,
+        offset: 0,
+        limit: query.limit,
+        next_offset: None,
+        mode: SearchMode::Keyword,
         semantic_status: if enabled { "not_prepared" } else { "disabled" }.into(),
-        semantic_error: None, indexed_chunks: None, total_chunks: None, coverage: None,
-        execution: SearchExecution { requested_mode: query.mode, keyword_executed: true,
-            keyword_complete: false, fallback_reason: Some("not_prepared"), ..Default::default() },
-        index_progress: progress, elapsed_ms: started.elapsed().as_millis() as u64,
+        semantic_error: None,
+        indexed_chunks: None,
+        total_chunks: None,
+        coverage: None,
+        execution: SearchExecution {
+            requested_mode: query.mode,
+            keyword_executed: true,
+            keyword_complete: false,
+            fallback_reason: Some("not_prepared"),
+            ..Default::default()
+        },
+        index_progress: progress,
+        elapsed_ms: started.elapsed().as_millis() as u64,
     };
     store_search_page(&app, &query, &context, fallback, started)
 }
@@ -1819,8 +1850,17 @@ async fn search_page(
     started: Instant,
 ) -> Result<RecapSearchResult, String> {
     let context = search_context(&app)?;
-    let cached = app.state::<RecapSearchRuntime>().pages.lock().unwrap_or_else(|e| e.into_inner())
-        .find(&context, &query_key(&query), query.ranking_revision.as_deref(), query.offset);
+    let cached = app
+        .state::<RecapSearchRuntime>()
+        .pages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .find(
+            &context,
+            &query_key(&query),
+            query.ranking_revision.as_deref(),
+            query.offset,
+        );
     if let Some(cached) = cached {
         return read_search_page(&app, &query, &context, cached, query.offset, started);
     }
@@ -1841,11 +1881,19 @@ fn store_search_page(
 ) -> Result<RecapSearchResult, String> {
     context.check(app)?;
     let items = std::mem::take(&mut result.items);
-    let snapshot = app.state::<RecapSearchRuntime>().pages.lock().unwrap_or_else(|e| e.into_inner())
+    let snapshot = app
+        .state::<RecapSearchRuntime>()
+        .pages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(context.clone(), query_key(query), result, &items)?;
     // An expired or evicted token starts a new set at zero. Clients can replace
     // their old prefix instead of appending a page from another ranking.
-    let offset = if query.ranking_revision.is_some() { 0 } else { query.offset };
+    let offset = if query.ranking_revision.is_some() {
+        0
+    } else {
+        query.offset
+    };
     read_search_page(app, query, context, snapshot, offset, started)
 }
 
@@ -1861,15 +1909,27 @@ fn read_search_page(
     let mut result = snapshot.header.clone();
     result.items = snapshot.items()?;
     let storage = app.state::<Arc<StorageState>>();
-    let days: Vec<_> = result.items.iter().map(|item| item.date.clone()).collect::<HashSet<_>>().into_iter().collect();
+    let days: Vec<_> = result
+        .items
+        .iter()
+        .map(|item| item.date.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let visible = storage.search_visible_recap_days(&days)?;
     let total = result.items.len();
     let end = offset.saturating_add(query.limit).min(total);
-    result.items = result.items.into_iter().enumerate().skip(offset).take(query.limit)
+    result.items = result
+        .items
+        .into_iter()
+        .enumerate()
+        .skip(offset)
+        .take(query.limit)
         .filter_map(|(position, mut item)| {
             item.result_offset = Some(position);
             visible.contains(&item.date).then_some(item)
-        }).collect();
+        })
+        .collect();
     result.offset = offset;
     result.limit = query.limit;
     result.next_offset = (end < total).then_some(end);
@@ -2340,6 +2400,178 @@ mod tests {
         q.start_date = Some("2026-10-12".into());
         q.end_date = Some("2026-10-01".into());
         assert!(q.validate().is_err());
+    }
+
+    #[test]
+    fn hybrid_search_keeps_verified_keywords_without_weak_semantic_boosts() {
+        let fixtures = [
+            (
+                "literal",
+                "CarbonPaper",
+                "Review capture settings",
+                Some(0.3),
+            ),
+            (
+                "approximate",
+                "CarbonPapr",
+                "Review app settings",
+                Some(0.49),
+            ),
+            ("detail", "Project notes", "Review saved notes", Some(0.2)),
+            ("unindexed", "CarbonPaper", "Read the release notes", None),
+            (
+                "boundary",
+                "Daily routine",
+                "Review today's activities",
+                Some(0.5),
+            ),
+            (
+                "strong",
+                "Screen history",
+                "Find earlier desktop work",
+                Some(0.8),
+            ),
+            (
+                "weak",
+                "Recipe notes",
+                "Plan tomorrow's dinner",
+                Some(0.499),
+            ),
+            ("invalid", "Travel plans", "Compare hotels", Some(f32::NAN)),
+        ];
+        let mut documents = Vec::new();
+        let mut vectors = HashMap::new();
+        for (id, title, text, score) in fixtures {
+            let mut a = activity(title, text);
+            a.id = id.into();
+            if id == "detail" {
+                a.details[0].text = "CarbonPaper keeps a searchable screenshot history".into();
+            }
+            let document = Document::new("2026-10-10".into(), 0, 0, a);
+            if let Some(score) = score {
+                vectors.insert(document.chunks[1].key.clone(), vec![score, 0.0]);
+            }
+            documents.push(document);
+        }
+        let corpus = Corpus {
+            identity: Identity {
+                generation: 0,
+                epoch: 0,
+                privacy: String::new(),
+                serial: 0,
+                session: None,
+            },
+            total_chunks: vectors.len(),
+            dates: 1,
+            documents,
+            vectors: Mutex::new(vectors),
+        };
+        let query = RecapSearchQuery {
+            query: "carbonpaper".into(),
+            ..Default::default()
+        };
+        let keyword_query = RecapSearchQuery {
+            mode: SearchMode::Keyword,
+            ..query.clone()
+        };
+        let keywords = rank_with_report(&corpus, &keyword_query, None).items;
+        assert_eq!(keywords.len(), 4);
+        let report = rank_semantic_with_keywords(&corpus, &query, Some(&[1.0, 0.0]), keywords);
+        assert_eq!(report.total, 6);
+        assert_eq!(report.execution.keyword_matches, 4);
+        assert_eq!(report.execution.semantic_matches, 2);
+        assert_eq!(report.execution.semantic_candidates, 2);
+        assert!(!report.execution.semantic_candidates_truncated);
+        for id in ["literal", "approximate", "detail", "unindexed"] {
+            let hit = report
+                .items
+                .iter()
+                .find(|hit| hit.activity_id == id)
+                .unwrap();
+            assert!(hit.keyword_rank.is_some(), "missing keyword match: {id}");
+            assert!(
+                hit.semantic_rank.is_none(),
+                "weak vector boosted keyword: {id}"
+            );
+            assert!(hit.semantic_score.is_none());
+            assert_eq!(
+                hit.match_evidence.as_ref().unwrap().match_type,
+                if id == "approximate" {
+                    "approximate"
+                } else {
+                    "literal"
+                }
+            );
+        }
+        let boundary = report
+            .items
+            .iter()
+            .find(|hit| hit.activity_id == "boundary")
+            .unwrap();
+        assert_eq!(boundary.semantic_score, Some(0.5));
+        assert!(boundary.keyword_rank.is_none());
+        assert!(!report
+            .items
+            .iter()
+            .any(|hit| ["weak", "invalid"].contains(&hit.activity_id.as_str())));
+
+        let semantic_query = RecapSearchQuery {
+            mode: SearchMode::Semantic,
+            ..query
+        };
+        let semantic =
+            rank_semantic_with_keywords(&corpus, &semantic_query, Some(&[1.0, 0.0]), vec![]);
+        assert_eq!(semantic.total, 2);
+        assert!(semantic.items.iter().all(|hit| hit.keyword_rank.is_none()));
+    }
+
+    #[test]
+    fn semantic_threshold_excludes_noise_before_candidate_caps_and_pagination() {
+        let mut documents: Vec<_> = (0..205)
+            .map(|i| {
+                let mut a = activity("Recipe notes", "Plan tomorrow's dinner");
+                a.id = format!("noise-{i}");
+                Document::new("2026-10-10".into(), 0, 0, a)
+            })
+            .collect();
+        let mut vectors = HashMap::from([(documents[0].chunks[0].key.clone(), vec![0.49, 0.0])]);
+        for (id, score) in [("strong", 0.9), ("boundary", 0.5)] {
+            let mut a = activity(id, "Find earlier desktop work");
+            a.id = id.into();
+            let document = Document::new("2026-10-10".into(), 0, 0, a);
+            vectors.insert(document.chunks[0].key.clone(), vec![score, 0.0]);
+            documents.push(document);
+        }
+        let corpus = Corpus {
+            identity: Identity {
+                generation: 0,
+                epoch: 0,
+                privacy: String::new(),
+                serial: 0,
+                session: None,
+            },
+            total_chunks: vectors.len(),
+            dates: 1,
+            documents,
+            vectors: Mutex::new(vectors),
+        };
+        let query = RecapSearchQuery {
+            query: "carbonpaper".into(),
+            mode: SearchMode::Semantic,
+            offset: 1,
+            limit: 1,
+            ..Default::default()
+        };
+        let report = rank_semantic_with_keywords(&corpus, &query, Some(&[1.0, 0.0]), vec![]);
+        assert_eq!(report.total, 2);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].activity_id, "boundary");
+        assert_eq!(report.items[0].semantic_rank, Some(2));
+        assert_eq!(report.items[0].semantic_score, Some(0.5));
+        assert_eq!(report.execution.semantic_matches, 2);
+        assert_eq!(report.execution.semantic_candidates, 2);
+        assert!(!report.execution.semantic_candidates_truncated);
+        assert_eq!(report.coverage.query_scope.activities, 207);
     }
 
     #[test]

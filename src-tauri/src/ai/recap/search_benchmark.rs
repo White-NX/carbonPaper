@@ -69,7 +69,7 @@ fn hit_ids(hits: &[RecapSearchHit]) -> Vec<(&str, Option<usize>, Option<usize>)>
 }
 
 #[test]
-fn optimized_ranking_matches_the_original_across_filters_ties_and_pages() {
+fn optimized_ranking_matches_the_reference_across_filters_ties_and_pages() {
     let corpus = fixture(450);
     let production = fixture(450);
     let stored = corpus.vectors.lock().unwrap();
@@ -203,7 +203,7 @@ fn rank_reference(
                         .map(|(a, b)| f64::from(a * b))
                         .sum::<f64>()
                 })
-                .filter(|s| s.is_finite() && *s > 0.0)
+                .filter(|s| s.is_finite() && *s >= MIN_SEMANTIC_SCORE)
                 .max_by(f64::total_cmp);
             if let Some(score) = score {
                 semantic.push((i, score));

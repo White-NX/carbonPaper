@@ -98,15 +98,12 @@ describe('AdvancedSearch', () => {
     });
   });
 
-  it('defaults to mixed keyword search even when vectors are ready', async () => {
+  it('defaults to mixed semantic search when vectors are ready', async () => {
     searchSnapshotsAndRecaps.mockResolvedValue(mixedResponse('ready'));
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     await screen.findByText('text-1');
-    expect(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' })).toHaveAttribute('aria-checked', 'false');
-    expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(1);
-    expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({ target: 'mixed', includeSemantic: false }));
-    expect(screen.queryByText('advancedSearch.semanticUpdating')).not.toBeInTheDocument();
-    expect(screen.queryByText('advancedSearch.semanticFallback')).not.toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' })).toHaveAttribute('aria-checked', 'true');
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({ target: 'mixed', includeSemantic: true })));
   });
 
   it('changes search targets and hides snapshot-only filters from recaps', async () => {
@@ -134,7 +131,6 @@ describe('AdvancedSearch', () => {
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     await screen.findByText('text-1');
     const toggle = screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' });
-    fireEvent.click(toggle);
     await screen.findByText('advancedSearch.semanticUpdating');
     const vectorResponse = { ...mixedResponse('ready'), items: [{ kind: 'recap', recap: { ...recapHit, semantic_score: 0.83 } }] };
     await act(async () => resolveSemantic(vectorResponse));
@@ -159,7 +155,6 @@ describe('AdvancedSearch', () => {
     await screen.findByRole('button', { name: /Recall the design decision/ });
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.targets.mixed' }));
     fireEvent.click(screen.getByRole('radio', { name: 'advancedSearch.targets.recaps' }));
-    fireEvent.click(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' }));
     await screen.findByText('advancedSearch.recapRelevance:0.76');
     await act(async () => { observerCallback?.([{ isIntersecting: true }]); });
     await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({
@@ -198,6 +193,31 @@ describe('AdvancedSearch', () => {
     expect(onOpenRecapDay).toHaveBeenCalledWith('2026-10-09');
   });
 
+  it('explains keyword-only, approximate and combined recap matches', async () => {
+    const recaps = [
+      { ...recapHit, activity_id: 'literal', task_title: 'CarbonPaper settings', keyword_rank: 1, semantic_score: null, match_evidence: { match_type: 'literal' } },
+      { ...recapHit, activity_id: 'approximate', task_title: 'CarbonPapr release', keyword_rank: 2, semantic_score: null, match_evidence: { match_type: 'approximate' } },
+      { ...recapHit, activity_id: 'both', task_title: 'CarbonPaper history', keyword_rank: 3, semantic_score: 0.83, match_evidence: { match_type: 'literal' } },
+      { ...recapHit, activity_id: 'semantic', task_title: 'Review desktop capture choices', keyword_rank: null, semantic_score: 0.65 },
+    ];
+    searchSnapshotsAndRecaps.mockResolvedValue({
+      ...response([]), items: recaps.map((recap) => ({ kind: 'recap', recap })),
+      total: 4, recap_count: 4, semantic_status: 'ready',
+    });
+    render(<AdvancedSearch active searchParams={{ query: 'carbonpaper', mode: 'ocr' }} />);
+    const literal = within((await screen.findByRole('button', { name: /CarbonPaper settings/ })).closest('article'));
+    expect(literal.getByText('advancedSearch.recapKeywordMatch')).toBeInTheDocument();
+    expect(literal.queryByText(/advancedSearch.recapRelevance:/)).not.toBeInTheDocument();
+    const approximate = within(screen.getByRole('button', { name: /CarbonPapr release/ }).closest('article'));
+    expect(approximate.getByText('advancedSearch.recapApproximateKeywordMatch')).toBeInTheDocument();
+    const both = within(screen.getByRole('button', { name: /CarbonPaper history/ }).closest('article'));
+    expect(both.getByText('advancedSearch.recapKeywordMatch')).toBeInTheDocument();
+    expect(both.getByText('advancedSearch.recapRelevance:0.83')).toBeInTheDocument();
+    const semantic = within(screen.getByRole('button', { name: /Review desktop capture choices/ }).closest('article'));
+    expect(semantic.getByText('advancedSearch.recapRelevance:0.65')).toBeInTheDocument();
+    expect(semantic.queryByText('advancedSearch.recapKeywordMatch')).not.toBeInTheDocument();
+  });
+
   it('renders keywords while semantics load and replaces the first page when ready', async () => {
     let resolveSemantic;
     searchSnapshotsAndRecaps.mockImplementation((_query, options) => options.includeSemantic
@@ -205,7 +225,6 @@ describe('AdvancedSearch', () => {
       : Promise.resolve({ ...response([makeOcrResult(1)]), semantic_status: 'ready' }));
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     expect(await screen.findByText('text-1')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' }));
     await screen.findByText('advancedSearch.semanticUpdating');
     await act(async () => resolveSemantic(mixedResponse('ready')));
     expect(screen.getByRole('button', { name: /Recall the design decision/ })).toBeInTheDocument();
@@ -220,7 +239,6 @@ describe('AdvancedSearch', () => {
       : Promise.resolve({ ...response([makeOcrResult(1)]), semantic_status: 'ready' }));
     render(<AdvancedSearch active searchParams={{ query: 'old', mode: 'ocr' }} />);
     await screen.findByText('text-1');
-    fireEvent.click(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' }));
     await screen.findByText('advancedSearch.semanticUpdating');
     fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_ocr'), { target: { value: 'new' } });
     await act(async () => resolveSemantic(mixedResponse('ready')));
@@ -235,7 +253,6 @@ describe('AdvancedSearch', () => {
       : Promise.resolve(mixedResponse('ready')));
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     await screen.findByRole('button', { name: /Recall the design decision/ });
-    fireEvent.click(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' }));
     await screen.findByText('advancedSearch.semanticUpdating');
     fireEvent.click(await screen.findByRole('button', { name: /Recall the design decision/ }));
     expect(await screen.findByRole('dialog')).toHaveTextContent('Keep local search fast');
@@ -261,7 +278,6 @@ describe('AdvancedSearch', () => {
       : Promise.resolve({ ...response([makeOcrResult(1)]), semantic_status: 'ready' }));
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     await screen.findByText('text-1');
-    fireEvent.click(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' }));
     await screen.findByText('advancedSearch.semanticFallback');
     expect(screen.getByText('text-1')).toBeInTheDocument();
   });

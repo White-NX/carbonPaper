@@ -1594,8 +1594,10 @@
       "recaps": "仅回顾"
     },
     "recapSemantic": "回顾语义搜索",
-    "recapSemanticHint": "按含义补充相关回顾，并显示相关度。",
-    "recapRelevance": "相关度：{{score}}",
+    "recapSemanticHint": "按含义补充相关回顾，并显示语义相关度。",
+    "recapKeywordMatch": "关键词匹配",
+    "recapApproximateKeywordMatch": "近似关键词匹配",
+    "recapRelevance": "语义相关度：{{score}}",
     "recapRelevanceHint": "数值越高，含义越接近你的搜索内容。",
     "semanticUpdating": "正在补充相关回顾…",
     "semanticFallback": "已显示关键词及当前可用的语义匹配。",
