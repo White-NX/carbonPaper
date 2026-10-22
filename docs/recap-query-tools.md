@@ -38,8 +38,7 @@ the existing MCP bearer token and unlocked application session.
   restart at offset zero if
   results change. Search prepares keyword documents only for changed dates;
   it does not generate recaps or prepare embeddings. The shared scheduler
-  maintains vector indexing. See the [recap search guide](recap-search-experiment.md)
-  for the UI and ranking behavior.
+  maintains vector indexing.
 
 Example MCP call:
 
@@ -69,7 +68,6 @@ Prompts, reasoning previews, provider errors, usage counters, icons and full
 record directories are excluded from tool results.
 
 The current tool definitions are recorded in
-[`mcp-tool-contract-v3.json`](mcp-tool-contract-v3.json). See the
-[v3 migration guide](mcp-contract-v3.md) for time, ID and error changes. Run
+[`mcp-tool-contract-v3.json`](mcp-tool-contract-v3.json). Run
 `npm run generate:mcp-contract` after changing the runtime catalog and
 `npm run test:mcp-contract` to check that the document matches it.
