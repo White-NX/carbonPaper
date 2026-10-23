@@ -79,7 +79,7 @@ function App() {
   }, [openOcrModelRepair]);
 
   const { darkMode, setDarkMode } = useAppTheme();
-  const { powerSavingMode, setPowerSavingMode, powerSavingSuppressed, windowFocused } = usePowerSavingState();
+  const { powerSavingMode, setPowerSavingMode, powerSavingSuppressed, powerStatusReady, windowFocused } = usePowerSavingState();
   const isMaximized = useWindowMaximizedState();
   const { minimize, toggleMaximize, hideToTray, restartApp, exitApp } = useAppWindowActions();
   const {
@@ -132,6 +132,7 @@ function App() {
     handleManualStartMonitor,
     handleManualStopMonitor,
     backendStatus,
+    monitorPowerSavingSuppressed,
     monitorPaused,
     handleStartBackend,
     handlePauseMonitor,
@@ -142,6 +143,7 @@ function App() {
     modelsNeedDownload,
     captureHeld: onboarding.captureHeld,
     powerSavingSuppressed,
+    powerStatusReady,
     formatErrorDetails,
     reportBackendError,
     resetBackendErrorDedupe,
@@ -243,6 +245,7 @@ function App() {
         searchMode={searchMode}
         onSearchModeChange={setSearchMode}
         backendStatus={backendStatus}
+        powerSavingSuppressed={monitorPowerSavingSuppressed}
         monitorPaused={monitorPaused}
         handleStartBackend={handleStartBackend}
         handlePauseMonitor={handlePauseMonitor}

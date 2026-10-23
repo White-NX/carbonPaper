@@ -18,7 +18,10 @@ pub(crate) struct RecapKeywordCandidate<T> {
 impl StorageState {
     /// Visibility checks use current rows while callers retain their original
     /// result positions. New rows never shift an existing page's offset.
-    pub(crate) fn search_visible_snapshots(&self, rows: &[(i64, i64)]) -> Result<HashSet<i64>, String> {
+    pub(crate) fn search_visible_snapshots(
+        &self,
+        rows: &[(i64, i64)],
+    ) -> Result<HashSet<i64>, String> {
         if !self.is_session_valid() {
             return Err("AUTH_REQUIRED".into());
         }
@@ -33,16 +36,29 @@ impl StorageState {
                      CROSS JOIN screenshots s NOT INDEXED ON s.id=requested.screenshot_id
                      WHERE r.screenshot_id=s.id AND r.is_deleted=0 AND s.is_deleted=0"
                 );
-                let parameters: Vec<i64> = batch.iter().flat_map(|(ocr, screenshot)| [*ocr, *screenshot]).collect();
+                let parameters: Vec<i64> = batch
+                    .iter()
+                    .flat_map(|(ocr, screenshot)| [*ocr, *screenshot])
+                    .collect();
                 let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
-                visible.extend(statement.query_map(rusqlite::params_from_iter(parameters), |row| row.get::<_, i64>(0))
-                    .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?);
+                visible.extend(
+                    statement
+                        .query_map(rusqlite::params_from_iter(parameters), |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(|e| e.to_string())?,
+                );
             }
             Ok(visible)
         })
     }
 
-    pub(crate) fn search_visible_recap_days(&self, days: &[String]) -> Result<HashSet<String>, String> {
+    pub(crate) fn search_visible_recap_days(
+        &self,
+        days: &[String],
+    ) -> Result<HashSet<String>, String> {
         if !self.is_session_valid() {
             return Err("AUTH_REQUIRED".into());
         }
@@ -59,8 +75,15 @@ impl StorageState {
                                 AND p.kind='batch' AND p.revision=d.revision)"
                 );
                 let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
-                visible.extend(statement.query_map(rusqlite::params_from_iter(batch), |row| row.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?);
+                visible.extend(
+                    statement
+                        .query_map(rusqlite::params_from_iter(batch), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|e| e.to_string())?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(|e| e.to_string())?,
+                );
             }
             Ok(visible)
         })

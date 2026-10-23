@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useTauriEventListener } from './useTauriEventListener';
@@ -10,6 +10,8 @@ export function usePowerSavingState() {
     return saved === null ? true : saved === 'true';
   });
   const [powerSavingSuppressed, setPowerSavingSuppressed] = useState(false);
+  const [powerStatusReady, setPowerStatusReady] = useState(false);
+  const powerEventVersion = useRef(0);
   const [windowFocused, setWindowFocused] = useState(true);
 
   useEffect(() => {
@@ -17,17 +19,20 @@ export function usePowerSavingState() {
   }, [powerSavingMode]);
 
   useTauriEventListener('power-saving-changed', (event) => {
+    powerEventVersion.current += 1;
     const payload = event.payload || {};
     if (typeof payload.enabled === 'boolean') setPowerSavingMode(payload.enabled);
     setPowerSavingSuppressed(payload.active === true);
+    setPowerStatusReady(true);
   });
 
   useEffect(() => {
     let cancelled = false;
+    const version = powerEventVersion.current;
     (async () => {
       try {
         const status = await invoke('get_power_saving_status');
-        if (!cancelled) {
+        if (!cancelled && version === powerEventVersion.current) {
           setPowerSavingMode(status.enabled !== false);
           setPowerSavingSuppressed(status.active === true);
         }
@@ -35,6 +40,8 @@ export function usePowerSavingState() {
         if (!cancelled) {
           console.warn('Failed to get initial power saving status:', err);
         }
+      } finally {
+        if (!cancelled) setPowerStatusReady(true);
       }
     })();
     return () => {
@@ -78,6 +85,7 @@ export function usePowerSavingState() {
     powerSavingMode,
     setPowerSavingMode,
     powerSavingSuppressed,
+    powerStatusReady,
     windowFocused,
   };
 }

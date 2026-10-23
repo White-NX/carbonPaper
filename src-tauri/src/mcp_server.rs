@@ -933,7 +933,7 @@ async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Resul
 
     tokio::task::spawn_blocking(move || {
         let mode = filter.mode();
-        let records = storage.get_screenshots_by_time_range_paged(
+        let records = storage.screenshots().in_time_range_paged(
             start_ts,
             end_ts,
             page.offset as i64,
@@ -974,7 +974,7 @@ async fn tool_get_snapshot_details(
     let filter = filter.inner().clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let Some(mut r) = storage.get_screenshot_by_id(id)? else {
+        let Some(mut r) = storage.screenshots().by_id(id)? else {
             return Ok(None);
         };
         r.metadata = None;

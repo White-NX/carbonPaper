@@ -1,6 +1,10 @@
-//! Shared queue execution for image and text indexes. Pipelines own input
-//! preparation and commit validation; this module owns yielding, retries and
-//! settlement of the leases that a pass has claimed.
+//! Shared quantum and queue execution for image and text indexes. Pipelines
+//! own input preparation and commit validation; this module owns yielding,
+//! retries and settlement of the leases that a pass has claimed.
+
+mod automatic;
+pub(crate) use automatic::{run_automatic_quantum, AutomaticIndex};
+
 use crate::background_scheduler::{deferred_release_note, AutomaticSliceContext};
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{DerivedIndexJobSpec, DerivedIndexKind, StorageState};

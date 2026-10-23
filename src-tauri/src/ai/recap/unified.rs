@@ -1,4 +1,7 @@
-use super::search::{search_context, search_inner, RecapSearchHit, RecapSearchQuery, RecapSearchRuntime, SearchContext, SearchMode};
+use super::search::{
+    search_context, search_inner, RecapSearchHit, RecapSearchQuery, RecapSearchRuntime,
+    SearchContext, SearchMode,
+};
 use super::search_pages::SearchSnapshot;
 use crate::storage::{SearchResult, StorageState};
 use serde::{Deserialize, Serialize};
@@ -132,19 +135,41 @@ pub async fn search(
         tokio::task::yield_now().await;
     }
     let context = search_context(&app)?;
-    store_page(&app, &query, &context, UnifiedSearchResult {
-        items: vec![], total: 0, snapshot_count: 0, recap_count: 0, offset: 0, limit: query.limit,
-        next_offset: None, revision: context.token(), ranking_revision: String::new(),
-        semantic_status: "not_prepared".into(), complete: false,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-    }, started)
+    store_page(
+        &app,
+        &query,
+        &context,
+        UnifiedSearchResult {
+            items: vec![],
+            total: 0,
+            snapshot_count: 0,
+            recap_count: 0,
+            offset: 0,
+            limit: query.limit,
+            next_offset: None,
+            revision: context.token(),
+            ranking_revision: String::new(),
+            semantic_status: "not_prepared".into(),
+            complete: false,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+        started,
+    )
 }
 
 fn query_key(query: &UnifiedSearchQuery) -> String {
-    super::digest(&serde_json::json!([
-        query.query.trim(), query.target, query.include_semantic, query.process_names,
-        query.categories, query.start_time, query.end_time,
-    ]).to_string())
+    super::digest(
+        &serde_json::json!([
+            query.query.trim(),
+            query.target,
+            query.include_semantic,
+            query.process_names,
+            query.categories,
+            query.start_time,
+            query.end_time,
+        ])
+        .to_string(),
+    )
 }
 
 async fn search_page(
@@ -153,8 +178,17 @@ async fn search_page(
     started: Instant,
 ) -> Result<UnifiedSearchResult, String> {
     let context = search_context(&app)?;
-    let cached = app.state::<RecapSearchRuntime>().unified_pages.lock().unwrap_or_else(|e| e.into_inner())
-        .find(&context, &query_key(&query), query.ranking_revision.as_deref(), query.offset);
+    let cached = app
+        .state::<RecapSearchRuntime>()
+        .unified_pages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .find(
+            &context,
+            &query_key(&query),
+            query.ranking_revision.as_deref(),
+            query.offset,
+        );
     if let Some(cached) = cached {
         return read_page(&app, &query, &context, cached, query.offset, started);
     }
@@ -171,9 +205,17 @@ fn store_page(
 ) -> Result<UnifiedSearchResult, String> {
     context.check(app)?;
     let items = std::mem::take(&mut result.items);
-    let snapshot = app.state::<RecapSearchRuntime>().unified_pages.lock().unwrap_or_else(|e| e.into_inner())
+    let snapshot = app
+        .state::<RecapSearchRuntime>()
+        .unified_pages
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(context.clone(), query_key(query), result, &items)?;
-    let offset = if query.ranking_revision.is_some() { 0 } else { query.offset };
+    let offset = if query.ranking_revision.is_some() {
+        0
+    } else {
+        query.offset
+    };
     read_page(app, query, context, snapshot, offset, started)
 }
 
@@ -189,17 +231,38 @@ fn read_page(
     let mut result = snapshot.header.clone();
     result.items = snapshot.items()?;
     let storage = app.state::<Arc<StorageState>>();
-    let rows: Vec<_> = result.items.iter().filter_map(|item| item.snapshot.as_ref())
-        .map(|row| (row.id, row.screenshot_id)).collect();
-    let days: Vec<_> = result.items.iter().filter_map(|item| item.recap.as_ref())
-        .map(|hit| hit.date.clone()).collect::<HashSet<_>>().into_iter().collect();
+    let rows: Vec<_> = result
+        .items
+        .iter()
+        .filter_map(|item| item.snapshot.as_ref())
+        .map(|row| (row.id, row.screenshot_id))
+        .collect();
+    let days: Vec<_> = result
+        .items
+        .iter()
+        .filter_map(|item| item.recap.as_ref())
+        .map(|hit| hit.date.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let snapshots = storage.search_visible_snapshots(&rows)?;
     let recaps = storage.search_visible_recap_days(&days)?;
     let end = offset.saturating_add(query.limit).min(result.total);
-    result.items = result.items.into_iter().skip(offset).take(query.limit).filter(|item| {
-        item.snapshot.as_ref().is_some_and(|row| snapshots.contains(&row.id))
-            || item.recap.as_ref().is_some_and(|hit| recaps.contains(&hit.date))
-    }).collect();
+    result.items = result
+        .items
+        .into_iter()
+        .skip(offset)
+        .take(query.limit)
+        .filter(|item| {
+            item.snapshot
+                .as_ref()
+                .is_some_and(|row| snapshots.contains(&row.id))
+                || item
+                    .recap
+                    .as_ref()
+                    .is_some_and(|hit| recaps.contains(&hit.date))
+        })
+        .collect();
     result.offset = offset;
     result.limit = query.limit;
     result.next_offset = (end < result.total).then_some(end);

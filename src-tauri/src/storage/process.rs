@@ -320,7 +320,8 @@ mod tests {
             .unwrap();
             let (a, b) = range.storage_seconds();
             let snapshots = storage
-                .get_screenshots_by_time_range_limited(a.unwrap(), b.unwrap(), Some(500))
+                .screenshots()
+                .in_time_range(a.unwrap(), b.unwrap(), Some(500))
                 .unwrap();
             let mut snapshot_ids = snapshots.iter().map(|record| record.id).collect::<Vec<_>>();
             snapshot_ids.sort_unstable();

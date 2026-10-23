@@ -1259,7 +1259,8 @@
       "running": "Running",
       "paused": "Paused",
       "starting": "Starting...",
-      "offline": "Offline"
+      "offline": "Offline",
+      "powerSavingOffline": "Offline due to power saving settings."
     }
   },
   "previewAction": {

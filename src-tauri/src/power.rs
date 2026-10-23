@@ -2,165 +2,226 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
+use tokio::sync::Notify;
 
 use crate::credential_manager::CredentialManagerState;
+use crate::monitor::MonitorAction;
 use crate::registry_config;
 use windows::Win32::System::Power::GetSystemPowerStatus;
 
-/// Power saving mode state
+pub(crate) const POWER_SAVING_ACTIVE: &str = "POWER_SAVING_ACTIVE";
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+// Capture postprocessing shares the semantic worker with explicit user queries.
+// Carry its power policy to queued requests, cold startup and in-flight watches
+// without cancelling a foreground query or a manually requested index run.
+tokio::task_local! { pub(crate) static CAPTURE_WORK: Arc<PowerState>; }
+
+pub(crate) fn current_capture_power() -> Option<Arc<PowerState>> {
+    CAPTURE_WORK.try_with(Arc::clone).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct PowerStatus {
+    enabled: bool,
+    active: bool,
+    ac_connected: bool,
+}
+
+impl PowerStatus {
+    fn new(enabled: bool, ac_connected: bool) -> Self {
+        Self {
+            enabled,
+            active: enabled && !ac_connected,
+            ac_connected,
+        }
+    }
+
+    fn monitor_action(
+        self,
+        previous: Option<Self>,
+        running: bool,
+        auto_start: bool,
+        maintenance_resume_pending: bool,
+    ) -> Option<MonitorAction> {
+        if self.active && running {
+            // Reconcile every pass: a failed stop must not consume the only AC edge.
+            Some(MonitorAction::Stop)
+        } else if !self.active && running && maintenance_resume_pending {
+            Some(MonitorAction::ResumeAfterPowerSaving)
+        } else if !self.active && previous.is_some_and(|status| status.active) && auto_start {
+            Some(MonitorAction::Start)
+        } else {
+            None
+        }
+    }
+}
+
 pub struct PowerState {
-    /// Whether power saving mode is enabled (user setting)
     pub enabled: AtomicBool,
-    /// Whether power saving is currently active (AC disconnected)
+    /// Last published state; admission always checks the current power source.
     pub active: AtomicBool,
-    /// Task handle for power monitoring loop
-    pub monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    monitor_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    wake: Notify,
 }
 
 impl PowerState {
     pub fn new() -> Self {
         let enabled = registry_config::get_bool("power_saving_mode_enabled").unwrap_or(true);
+        Self::with_status(PowerStatus::new(enabled, is_ac_power_connected()))
+    }
+
+    fn with_status(status: PowerStatus) -> Self {
         Self {
-            enabled: AtomicBool::new(enabled),
-            active: AtomicBool::new(false),
+            enabled: AtomicBool::new(status.enabled),
+            active: AtomicBool::new(status.active),
             monitor_task: Mutex::new(None),
+            wake: Notify::new(),
         }
+    }
+
+    fn status(&self) -> PowerStatus {
+        PowerStatus::new(self.enabled.load(Ordering::SeqCst), is_ac_power_connected())
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst) && !is_ac_power_connected()
+    }
+
+    fn publish(&self, app: &AppHandle, status: PowerStatus) {
+        self.active.store(status.active, Ordering::SeqCst);
+        let _ = app.emit("power-saving-changed", status);
     }
 }
 
-/// Check if AC power is connected (not on battery).
-///
-/// Also the third input to the idle gate (`idle.rs`), which is why it is
-/// crate-visible rather than private: background inference must decide on the
-/// power state itself, not on whether the power-saving *setting* happens to
-/// have activated.
+/// Unknown power status is not evidence of battery use (including desktops
+/// without a battery). Only an explicit offline reading closes the AC gate.
+fn ac_connected_from_status(ac_line_status: u8) -> bool {
+    ac_line_status != 0
+}
+
 pub(crate) fn is_ac_power_connected() -> bool {
-    // SAFETY: `status` is initialized writable storage of the exact Win32 structure
-    // type, and `GetSystemPowerStatus` does not retain its pointer.
+    // SAFETY: status is writable storage of the exact Win32 structure type;
+    // GetSystemPowerStatus writes it synchronously and retains no pointer.
     unsafe {
         let mut status = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
         if GetSystemPowerStatus(&mut status).is_ok() {
-            // ACLineStatus: 0 = offline, 1 = online, 255 = unknown
-            status.ACLineStatus == 1
+            ac_connected_from_status(status.ACLineStatus)
         } else {
-            // If we can't determine, assume AC is connected (fail-safe)
-            tracing::warn!("Failed to get system power status, assuming AC connected");
             true
         }
     }
 }
 
-/// Start the power monitoring loop
-pub fn start_power_monitor(app: AppHandle) {
-    let power_state = app.state::<Arc<PowerState>>();
+/// Read the live source, not the monitor's five-second-old cached flag.
+pub(crate) fn is_saving_power(app: &AppHandle) -> bool {
+    app.try_state::<Arc<PowerState>>()
+        .is_some_and(|state| state.is_active())
+}
 
-    // Stop existing monitor if any
-    {
-        let mut guard = power_state.monitor_task.lock().unwrap();
-        if let Some(handle) = guard.take() {
-            handle.abort();
+pub(crate) fn check_capture_allowed(app: &AppHandle) -> Result<(), String> {
+    if let Some(state) = app.try_state::<Arc<PowerState>>() {
+        let status = state.status();
+        if status.active {
+            state.publish(app, status);
+            state.wake.notify_one();
+            return Err(POWER_SAVING_ACTIVE.into());
         }
+    }
+    Ok(())
+}
+
+pub fn start_power_monitor(app: AppHandle) {
+    let power_state = app.state::<Arc<PowerState>>().inner().clone();
+    let mut task = power_state
+        .monitor_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = task.take() {
+        handle.abort();
     }
 
     tracing::info!("Starting power monitor");
-
-    let app_clone = app.clone();
-    let handle = tauri::async_runtime::spawn(async move {
-        let mut last_ac_connected = is_ac_power_connected();
-
+    let state = power_state.clone();
+    *task = Some(tauri::async_runtime::spawn(async move {
+        let mut previous: Option<PowerStatus> = None;
+        let mut resume_pending = false;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-            // Clone for spawned tasks
-            let app_for_spawn = app_clone.clone();
-            let power_state = app_clone.state::<Arc<PowerState>>();
-            let enabled = power_state.enabled.load(Ordering::SeqCst);
-            let current_ac_connected = is_ac_power_connected();
-
-            if !enabled {
-                // Power saving mode disabled, update last_ac_connected and reset active state
-                last_ac_connected = current_ac_connected;
-                if power_state.active.load(Ordering::SeqCst) {
-                    power_state.active.store(false, Ordering::SeqCst);
-                    let _ = app_clone.emit(
-                        "power-saving-changed",
-                        serde_json::json!({
-                            "enabled": false,
-                            "active": false,
-                        }),
-                    );
+            let status = state.status();
+            if previous != Some(status) || state.active.load(Ordering::SeqCst) != status.active {
+                // Publish BEFORE stopping. The stopped event can otherwise
+                // make frontend auto-start race the power-saving event.
+                state.publish(&app, status);
+                tracing::info!(
+                    "Power policy: enabled={} ac_connected={} active={}",
+                    status.enabled,
+                    status.ac_connected,
+                    status.active
+                );
+                if let Some(scheduler) =
+                    app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.observe_activity(&app);
+                    scheduler.wake();
                 }
-                continue;
             }
 
-            // AC power disconnected -> activate power saving mode
-            if !current_ac_connected && last_ac_connected {
-                tracing::info!("Power: AC disconnected, activating power saving mode");
+            let monitor = app.state::<crate::monitor::MonitorState>();
+            let running = monitor.is_running();
+            let auto_start = registry_config::get_bool("autoStartMonitor").unwrap_or(true)
+                && !crate::onboarding::capture_held();
+            if status.active || !auto_start || running {
+                resume_pending = false;
+            }
+            let action = status
+                .monitor_action(
+                    previous,
+                    running,
+                    auto_start,
+                    monitor.maintenance_resume_pending(),
+                )
+                .or_else(|| resume_pending.then_some(MonitorAction::Start));
+            resume_pending = false;
+            if let Some(action) = action {
+                if let Err(error) = crate::monitor::control(&app, action).await {
+                    resume_pending = matches!(action, MonitorAction::Start)
+                        && error == crate::maintenance::MAINTENANCE_IN_PROGRESS;
+                    tracing::warn!("Power policy could not update capture: {error}");
+                }
+            }
+            if status.active {
+                // Already admitted OCR keeps its timeout and finishes even if
+                // the capture drain ends first. Release the worker once idle.
+                let ml = app
+                    .state::<Arc<crate::ml_runtime::MlRuntimeState>>()
+                    .inner()
+                    .clone();
+                let power = state.clone();
+                let _ = tokio::task::spawn_blocking(move || ml.stop_for_power_saving(&power)).await;
+            }
 
-                // Stop monitor if running
-                let _ =
-                    crate::monitor::control(&app_clone, crate::monitor::MonitorAction::Stop).await;
-
-                power_state.active.store(true, Ordering::SeqCst);
-                let _ = app_clone.emit(
-                    "power-saving-changed",
-                    serde_json::json!({
-                        "enabled": true,
-                        "active": true,
-                    }),
-                );
-
-                let _ = app_clone
+            if previous.is_some_and(|old| old.active != status.active) && status.enabled {
+                let _ = app
                     .notification()
                     .builder()
                     .title("CarbonPaper")
-                    .body("已切换到节能模式，交流电源已断开")
+                    .body(if status.active {
+                        "已切换到节能模式，交流电源已断开"
+                    } else {
+                        "已退出节能模式，交流电源已恢复"
+                    })
                     .show();
             }
-            // AC power connected -> deactivate power saving mode
-            else if current_ac_connected && !last_ac_connected {
-                tracing::info!("Power: AC connected, deactivating power saving mode");
-
-                // Resume monitor if auto-start is enabled
-                let auto_start = registry_config::get_bool("autoStartMonitor").unwrap_or(true);
-                if auto_start {
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = crate::monitor::control(
-                            &app_for_spawn,
-                            crate::monitor::MonitorAction::Start,
-                        )
-                        .await
-                        {
-                            tracing::error!("Failed to start monitor after power restored: {}", e);
-                        }
-                    });
-                }
-
-                power_state.active.store(false, Ordering::SeqCst);
-                let _ = app_clone.emit(
-                    "power-saving-changed",
-                    serde_json::json!({
-                        "enabled": true,
-                        "active": false,
-                    }),
-                );
-
-                let _ = app_clone
-                    .notification()
-                    .builder()
-                    .title("CarbonPaper")
-                    .body("已退出节能模式，交流电源已恢复")
-                    .show();
+            previous = Some(status);
+            tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => {},
+                _ = state.wake.notified() => {},
             }
-
-            last_ac_connected = current_ac_connected;
         }
-    });
-
-    let mut guard = power_state.monitor_task.lock().unwrap();
-    *guard = Some(handle);
+    }));
 }
 
 // ==================== Tauri Commands ====================
@@ -169,11 +230,7 @@ pub fn start_power_monitor(app: AppHandle) {
 pub fn get_power_saving_status(
     power_state: tauri::State<'_, Arc<PowerState>>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "enabled": power_state.enabled.load(Ordering::SeqCst),
-        "active": power_state.active.load(Ordering::SeqCst),
-        "ac_connected": is_ac_power_connected(),
-    })
+    serde_json::to_value(power_state.status()).expect("power status is serializable")
 }
 
 #[tauri::command]
@@ -189,19 +246,90 @@ pub fn set_power_saving_enabled(
 
     registry_config::set_bool("power_saving_mode_enabled", enabled)?;
     power_state.enabled.store(enabled, Ordering::SeqCst);
-
-    // Publish both enabling and disabling so every UI window sees the setting.
-    if !enabled {
-        power_state.active.store(false, Ordering::SeqCst);
-    }
-    let _ = app.emit(
-        "power-saving-changed",
-        serde_json::json!({
-            "enabled": enabled,
-            "active": power_state.active.load(Ordering::SeqCst),
-        }),
-    );
-
-    tracing::info!("Power saving mode enabled: {}", enabled);
+    power_state.publish(&app, power_state.status());
+    // Enabling while already unplugged must apply without another AC edge.
+    power_state.wake.notify_one();
+    tracing::info!("Power saving mode enabled: {enabled}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starting_on_battery_publishes_active_and_stops_existing_capture() {
+        let status = PowerStatus::new(true, false);
+        let state = PowerState::with_status(status);
+        assert!(state.active.load(Ordering::SeqCst));
+        assert!(matches!(
+            status.monitor_action(None, true, true, false),
+            Some(MonitorAction::Stop)
+        ));
+        assert!(status.monitor_action(None, false, true, false).is_none());
+    }
+
+    #[test]
+    fn enabling_on_battery_and_a_missed_stop_do_not_require_an_ac_edge() {
+        let disabled = PowerStatus::new(false, false);
+        let enabled = PowerStatus::new(true, false);
+        assert!(matches!(
+            enabled.monitor_action(Some(disabled), true, true, false),
+            Some(MonitorAction::Stop)
+        ));
+        assert!(matches!(
+            enabled.monitor_action(Some(enabled), true, true, false),
+            Some(MonitorAction::Stop)
+        ));
+    }
+
+    #[test]
+    fn releasing_power_saving_respects_autostart_and_does_not_start_on_first_ac_probe() {
+        let battery = PowerStatus::new(true, false);
+        for released in [PowerStatus::new(true, true), PowerStatus::new(false, false)] {
+            assert!(matches!(
+                released.monitor_action(Some(battery), false, true, false),
+                Some(MonitorAction::Start)
+            ));
+            assert!(released
+                .monitor_action(Some(battery), false, false, false)
+                .is_none());
+            assert!(released
+                .monitor_action(Some(released), false, true, false)
+                .is_none());
+            assert!(released.monitor_action(None, false, true, false).is_none());
+        }
+    }
+
+    #[test]
+    fn deferred_maintenance_restore_resumes_the_running_session_after_ac_returns() {
+        let battery = PowerStatus::new(true, false);
+        let ac = PowerStatus::new(true, true);
+        for auto_start in [false, true] {
+            for previous in [Some(battery), Some(ac)] {
+                assert!(matches!(
+                    ac.monitor_action(previous, true, auto_start, true),
+                    Some(MonitorAction::ResumeAfterPowerSaving)
+                ));
+            }
+        }
+        assert!(matches!(
+            battery.monitor_action(Some(ac), true, true, true),
+            Some(MonitorAction::Stop)
+        ));
+    }
+
+    #[test]
+    fn a_user_pause_or_stop_does_not_gain_a_deferred_power_resume() {
+        let ac = PowerStatus::new(true, true);
+        assert!(ac.monitor_action(Some(ac), true, true, false).is_none());
+        assert!(ac.monitor_action(Some(ac), false, false, true).is_none());
+    }
+
+    #[test]
+    fn only_explicit_offline_status_counts_as_battery_power() {
+        assert!(!ac_connected_from_status(0));
+        assert!(ac_connected_from_status(1));
+        assert!(ac_connected_from_status(255));
+    }
 }

@@ -46,6 +46,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// epoch read and the scan can be dropped without a second retrieval pass.
 const VISIBILITY_MARGIN: usize = 16;
 
+#[derive(Default)]
+pub(super) struct TopKOptions {
+    pub(super) deadline: Option<Instant>,
+    /// Override the resident-memory budget for focused scan regressions.
+    pub(super) resident_budget: Option<usize>,
+}
+
 /// Idle window after which the resident matrix is released. One NL cluster
 /// session is a burst of a few queries; five minutes outlives the burst without
 /// holding the memory for the hours until the next one.
@@ -675,54 +682,12 @@ impl StorageState {
         index_kind: DerivedIndexKind,
         query: &[f32],
         k: usize,
+        options: TopKOptions,
     ) -> Result<Vec<ScoredSubject>, String> {
-        self.semantic_topk_resident_with_deadline(index_kind, query, k, None)
-    }
-
-    pub(super) fn semantic_topk_resident_with_deadline(
-        &self,
-        index_kind: DerivedIndexKind,
-        query: &[f32],
-        k: usize,
-        deadline: Option<Instant>,
-    ) -> Result<Vec<ScoredSubject>, String> {
-        self.semantic_topk_resident_with_budget_and_deadline(
-            index_kind,
-            query,
-            k,
-            cache_budget(index_kind),
-            deadline,
-        )
-    }
-
-    /// Same query path with an explicit budget for focused regression tests.
-    /// Production callers use [`cache_budget`] through
-    /// [`Self::semantic_topk_resident`].
-    #[cfg(test)]
-    pub(super) fn semantic_topk_resident_with_budget(
-        &self,
-        index_kind: DerivedIndexKind,
-        query: &[f32],
-        k: usize,
-        resident_budget: usize,
-    ) -> Result<Vec<ScoredSubject>, String> {
-        self.semantic_topk_resident_with_budget_and_deadline(
-            index_kind,
-            query,
-            k,
-            resident_budget,
-            None,
-        )
-    }
-
-    fn semantic_topk_resident_with_budget_and_deadline(
-        &self,
-        index_kind: DerivedIndexKind,
-        query: &[f32],
-        k: usize,
-        resident_budget: usize,
-        deadline: Option<Instant>,
-    ) -> Result<Vec<ScoredSubject>, String> {
+        let resident_budget = options
+            .resident_budget
+            .unwrap_or_else(|| cache_budget(index_kind));
+        let deadline = options.deadline;
         if k == 0 {
             return Ok(Vec::new());
         }

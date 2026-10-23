@@ -484,12 +484,10 @@ async fn process_nmh_request(
                 }
             }
 
-            // Check if capture is paused
-            if capture_state
-                .paused
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return StorageResponse::error("Capture is paused");
+            // A delayed extension response must not restart capture after a
+            // stop or bypass power/game-mode suppression.
+            if !extension_capture_allowed(&app_handle, &capture_state) {
+                return StorageResponse::error("Capture is paused or stopped");
             }
 
             let image_data = match req.get("image_data").and_then(|v| v.as_str()) {
@@ -602,6 +600,9 @@ async fn process_nmh_request(
                 visible_links,
             };
 
+            if !extension_capture_allowed(&app_handle, &capture_state) {
+                return StorageResponse::error("Capture is paused or stopped");
+            }
             let recap_generation = storage.db_generation();
             match storage.save_screenshot_temp_bytes(&request, &jpeg_bytes) {
                 Ok(result) => {
@@ -644,14 +645,18 @@ async fn process_nmh_request(
                             .await;
 
                             if let Err(e) = result {
-                                crate::ml_runtime::schedule_ocr_model_health_notification(
-                                    app_clone.clone(),
-                                );
-                                tracing::error!(
-                                    "Extension OCR failed for screenshot {}: {}",
-                                    screenshot_id,
-                                    e
-                                );
+                                if e == crate::power::POWER_SAVING_ACTIVE {
+                                    tracing::info!("Extension OCR interrupted by power saving for screenshot {screenshot_id}");
+                                } else {
+                                    crate::ml_runtime::schedule_ocr_model_health_notification(
+                                        app_clone.clone(),
+                                    );
+                                    tracing::error!(
+                                        "Extension OCR failed for screenshot {}: {}",
+                                        screenshot_id,
+                                        e
+                                    );
+                                }
                                 if let Err(commit_err) =
                                     storage_arc.commit_screenshot(screenshot_id, None, None, None)
                                 {
@@ -683,6 +688,15 @@ async fn process_nmh_request(
 }
 
 const EXTENSION_OCR_MAX_SIDE: u32 = 1600;
+
+fn extension_capture_allowed(app: &tauri::AppHandle, capture: &CaptureState) -> bool {
+    use tauri::Manager;
+    let monitor = app.state::<crate::monitor::MonitorState>();
+    capture.accepts_frames(
+        monitor.is_running() && !monitor.stopping.load(std::sync::atomic::Ordering::SeqCst),
+        crate::power::is_saving_power(app),
+    )
+}
 
 fn resize_extension_ocr_image(image: Arc<image::RgbImage>) -> Arc<image::RgbImage> {
     let max_dim = image.width().max(image.height());

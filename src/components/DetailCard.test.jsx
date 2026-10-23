@@ -84,15 +84,20 @@ describe('snapshot detail recap', () => {
     expect(screen.queryByText(item.text)).not.toBeInTheDocument();
   });
 
-  it('distinguishes pending periods and unmatched records without a navigation button', async () => {
+  it('hides pending periods and unmatched records without a navigation button', async () => {
+    const open = vi.fn();
     getSnapshotRecapContext.mockResolvedValueOnce({ status: 'pending', items: [] });
-    const { rerender } = render(<DetailCard selectedEvent={event(1)} isAuthenticated />);
+    const { rerender } = render(<DetailCard selectedEvent={event(1)} isAuthenticated onOpenRecap={open} />);
     await advance();
-    expect(screen.getByText('sidebar.recap.pending')).toBeInTheDocument();
+    expect(getSnapshotRecapContext).toHaveBeenLastCalledWith(1);
+    expect(screen.queryByRole('region', { name: 'sidebar.recap.title' })).not.toBeInTheDocument();
+    expect(screen.queryByText('sidebar.recap.pending')).not.toBeInTheDocument();
     getSnapshotRecapContext.mockResolvedValueOnce({ status: 'unmatched', items: [] });
-    rerender(<DetailCard selectedEvent={event(2)} isAuthenticated />);
+    rerender(<DetailCard selectedEvent={event(2)} isAuthenticated onOpenRecap={open} />);
     await advance();
-    expect(screen.getByText('sidebar.recap.unmatched')).toBeInTheDocument();
+    expect(getSnapshotRecapContext).toHaveBeenLastCalledWith(2);
+    expect(screen.queryByRole('region', { name: 'sidebar.recap.title' })).not.toBeInTheDocument();
+    expect(screen.queryByText('sidebar.recap.unmatched')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'sidebar.recap.openDetails' })).not.toBeInTheDocument();
   });
 });

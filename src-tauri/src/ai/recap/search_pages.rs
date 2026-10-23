@@ -78,8 +78,8 @@ impl<T> SearchPages<T> {
         let bytes = Zeroizing::new(serde_json::to_vec(items).map_err(|_| "RECAP_INVALID_CACHE")?);
         let mut key = Zeroizing::new([0u8; 32]);
         rand::thread_rng().fill_bytes(key.as_mut());
-        let encrypted_items = encrypt_with_master_key(key.as_ref(), &bytes)
-            .map_err(|_| "RECAP_INVALID_CACHE")?;
+        let encrypted_items =
+            encrypt_with_master_key(key.as_ref(), &bytes).map_err(|_| "RECAP_INVALID_CACHE")?;
         let mut token = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut token);
         let snapshot = Arc::new(SearchSnapshot {
@@ -112,9 +112,8 @@ impl<T> SearchPages<T> {
     }
 
     fn prune(&mut self, context: &SearchContext) {
-        self.entries.retain(|entry| {
-            entry.used.elapsed() <= IDLE_TTL && entry.snapshot.context == *context
-        });
+        self.entries
+            .retain(|entry| entry.used.elapsed() <= IDLE_TTL && entry.snapshot.context == *context);
     }
 }
 
@@ -146,19 +145,37 @@ mod tests {
         let context = context();
         let mut pages = SearchPages::default();
         let first = pages
-            .insert(context.clone(), "query".into(), (), &vec!["private activity", "second"])
+            .insert(
+                context.clone(),
+                "query".into(),
+                (),
+                &vec!["private activity", "second"],
+            )
             .unwrap();
         let second = pages
-            .insert(context.clone(), "query".into(), (), &vec!["new", "private activity", "second"])
+            .insert(
+                context.clone(),
+                "query".into(),
+                (),
+                &vec!["new", "private activity", "second"],
+            )
             .unwrap();
-        assert!(!first.encrypted_items.windows(16).any(|bytes| bytes == b"private activity"));
+        assert!(!first
+            .encrypted_items
+            .windows(16)
+            .any(|bytes| bytes == b"private activity"));
         assert_ne!(first.token, second.token);
         assert_eq!(
-            pages.find(&context, "query", Some(&first.token), 1).unwrap()
-                .items::<Vec<String>>().unwrap(),
+            pages
+                .find(&context, "query", Some(&first.token), 1)
+                .unwrap()
+                .items::<Vec<String>>()
+                .unwrap(),
             vec!["private activity", "second"]
         );
-        assert!(pages.find(&context, "different filters", Some(&first.token), 1).is_none());
+        assert!(pages
+            .find(&context, "different filters", Some(&first.token), 1)
+            .is_none());
         assert!(pages.find(&context, "query", None, 0).is_none());
     }
 
@@ -166,21 +183,43 @@ mod tests {
     fn expires_and_bounds_sets_and_fences_security_context() {
         let context = context();
         let mut pages = SearchPages::default();
-        let first = pages.insert(context.clone(), "query".into(), (), &vec![1]).unwrap();
+        let first = pages
+            .insert(context.clone(), "query".into(), (), &vec![1])
+            .unwrap();
         pages.entries[0].used = Instant::now() - IDLE_TTL - Duration::from_secs(1);
-        assert!(pages.find(&context, "query", Some(&first.token), 1).is_none());
+        assert!(pages
+            .find(&context, "query", Some(&first.token), 1)
+            .is_none());
         for i in 0..MAX_SETS + 1 {
-            pages.insert(context.clone(), "query".into(), (), &vec![i]).unwrap();
+            pages
+                .insert(context.clone(), "query".into(), (), &vec![i])
+                .unwrap();
         }
         assert_eq!(pages.entries.len(), MAX_SETS);
         for changed in [
-            SearchContext { generation: 2, ..context.clone() },
-            SearchContext { privacy: "new policy".into(), ..context.clone() },
-            SearchContext { serial: 1, ..context.clone() },
-            SearchContext { session: None, ..context.clone() },
+            SearchContext {
+                generation: 2,
+                ..context.clone()
+            },
+            SearchContext {
+                privacy: "new policy".into(),
+                ..context.clone()
+            },
+            SearchContext {
+                serial: 1,
+                ..context.clone()
+            },
+            SearchContext {
+                session: None,
+                ..context.clone()
+            },
         ] {
-            let entry = pages.insert(context.clone(), "query".into(), (), &vec![1]).unwrap();
-            assert!(pages.find(&changed, "query", Some(&entry.token), 1).is_none());
+            let entry = pages
+                .insert(context.clone(), "query".into(), (), &vec![1])
+                .unwrap();
+            assert!(pages
+                .find(&changed, "query", Some(&entry.token), 1)
+                .is_none());
         }
         pages.clear();
         assert!(pages.entries.is_empty());

@@ -28,6 +28,7 @@ mod recap_protected;
 mod recap_search;
 mod schema;
 mod screenshot;
+mod screenshot_reader;
 mod search;
 pub(crate) mod search_plan;
 pub(crate) mod search_rank;
@@ -49,6 +50,7 @@ pub use document_ref::STALE_DOCUMENT_REF_GENERATION;
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub(crate) use mode::database_mode_policy_from_environment;
 pub(crate) use policy::disk_totals_for_path;
+pub(crate) use screenshot_reader::ScreenshotReader;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use timeline::TimelineRecord;
@@ -250,6 +252,10 @@ impl StorageState {
             search_order_cache: Mutex::new(None),
             db_generation: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn screenshots(&self) -> ScreenshotReader<'_> {
+        ScreenshotReader::new(self)
     }
 
     /// Convert an absolute image path to a relative path (relative to data_dir).

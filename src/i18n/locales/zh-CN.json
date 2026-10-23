@@ -1259,7 +1259,8 @@
       "running": "运行中",
       "paused": "已暂停",
       "starting": "启动中...",
-      "offline": "离线"
+      "offline": "离线",
+      "powerSavingOffline": "因节电模式配置离线。"
     }
   },
   "previewAction": {

@@ -53,7 +53,8 @@ fn signals(app: &AppHandle, staged: bool) -> AdmissionSignals {
         enabled: storage.background_processing_enabled(),
         authorized: storage.is_background_authorized()
             || (staged && storage.background_processing_enabled()),
-        ac_connected: idle.ac_connected.load(Ordering::Relaxed),
+        // Admission/revocation must not wait for the slower battery idle probe.
+        ac_connected: crate::power::is_ac_power_connected(),
         protected_session: idle.fullscreen_exclusive.load(Ordering::Relaxed)
             || app
                 .try_state::<Arc<crate::capture::CaptureState>>()
@@ -120,7 +121,9 @@ impl AdaptiveRuntime {
                 while !runtime.stop.load(Ordering::SeqCst)
                     && runtime.adaptive.sampler_generation.load(Ordering::SeqCst) == generation
                 {
-                    if sampled_at.elapsed() >= Duration::from_secs(1) {
+                    let sample_resources = crate::power::is_ac_power_connected()
+                        && runtime.adaptive.pending.load(Ordering::Relaxed);
+                    if sample_resources && sampled_at.elapsed() >= Duration::from_secs(1) {
                         let sample = sampler.sample(runtime.adaptive.now());
                         runtime
                             .adaptive
@@ -135,10 +138,10 @@ impl AdaptiveRuntime {
                         runtime.adaptive.flush(&storage);
                         flushed_at = Instant::now();
                     }
-                    std::thread::sleep(if runtime.adaptive.pending.load(Ordering::Relaxed) {
+                    std::thread::sleep(if sample_resources {
                         Duration::from_millis(250)
                     } else {
-                        Duration::from_secs(1)
+                        crate::power::POLL_INTERVAL
                     });
                 }
                 runtime.adaptive.flush(&storage);

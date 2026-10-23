@@ -14,6 +14,7 @@ export function useMonitorLifecycle({
   modelsNeedDownload,
   captureHeld = false,
   powerSavingSuppressed,
+  powerStatusReady = true,
   formatErrorDetails,
   reportBackendError,
   resetBackendErrorDedupe,
@@ -34,6 +35,15 @@ export function useMonitorLifecycle({
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
   const unexpectedStopsRef = useRef([]);
+  const powerBlockedRef = useRef(Boolean(powerSavingSuppressed));
+  const [powerBlocked, setPowerBlocked] = useState(Boolean(powerSavingSuppressed));
+  const powerEventVersionRef = useRef(0);
+
+  useEffect(() => {
+    powerEventVersionRef.current += 1;
+    powerBlockedRef.current = Boolean(powerSavingSuppressed);
+    setPowerBlocked(Boolean(powerSavingSuppressed));
+  }, [powerSavingSuppressed]);
 
   useEffect(() => {
     backendStatusRef.current = backendStatus;
@@ -92,6 +102,16 @@ export function useMonitorLifecycle({
     } catch (err) {
       setBackendStatus('offline');
       backendStatusRef.current = 'offline';
+      // Native admission can observe unplugging before the power event reaches
+      // this window. Wait for the policy transition without a failure dialog or
+      // permanently disabling auto-start when AC returns.
+      if ((typeof err === 'string' ? err : err?.message) === 'POWER_SAVING_ACTIVE') {
+        powerEventVersionRef.current += 1;
+        powerBlockedRef.current = true;
+        setPowerBlocked(true);
+        backendStartAtRef.current = null;
+        return;
+      }
       const message = err?.message || t('settings.general.monitor.errors.startFailedFallback');
       const details = formatErrorDetails(err);
       setBackendError(message);
@@ -120,6 +140,7 @@ export function useMonitorLifecycle({
 
   const checkBackendStatus = useCallback(async () => {
     const t0 = performance.now();
+    const powerVersion = powerEventVersionRef.current;
     try {
       const resString = await invoke('get_monitor_status');
       const elapsed = performance.now() - t0;
@@ -131,6 +152,13 @@ export function useMonitorLifecycle({
         res = JSON.parse(resString);
       } catch {
         res = null;
+      }
+
+      // Status polling also recovers when a power event is missed. Do not
+      // replace a newer event or native admission failure with an older read.
+      if (powerVersion === powerEventVersionRef.current && typeof res?.power_saving_active === 'boolean') {
+        powerBlockedRef.current = res.power_saving_active;
+        setPowerBlocked(res.power_saving_active);
       }
 
       if (res?.stopped) {
@@ -185,7 +213,7 @@ export function useMonitorLifecycle({
         setAutoStartSuppressed(true);
         if (['stop', 'restart', 'maintenance-stop'].includes(action)) await invoke('stop_monitor');
         if (['start', 'restart', 'maintenance-start'].includes(action)) {
-          if (powerSavingSuppressed) throw new Error(t('settings.general.monitor.power_saving_blocked'));
+          if (powerBlockedRef.current) throw new Error(t('settings.general.monitor.power_saving_blocked'));
           setBackendStatus('waiting');
           backendStatusRef.current = 'waiting';
           await invoke('start_monitor');
@@ -198,7 +226,7 @@ export function useMonitorLifecycle({
       }
       await checkBackendStatus();
     } finally { runtimeActionRef.current = false; }
-  }, [checkBackendStatus, powerSavingSuppressed, t]);
+  }, [checkBackendStatus, t]);
 
   useTauriEventListener('settings-preferences-changed', ({ payload }) => {
     if (payload?.includes('autostart')) {
@@ -237,8 +265,8 @@ export function useMonitorLifecycle({
 
   useEffect(() => {
     if (!autoStartMonitor) return;
+    if (!powerStatusReady || powerBlocked || powerBlockedRef.current) return;
     if (autoStartSuppressed || autoStartSuppressedRef.current || runtimeActionRef.current) return;
-    if (powerSavingSuppressed) return;
     if (!modelsCheckDone) return;
     if (modelsNeedDownload) return;
     // A new user starts recording by finishing the first-run wizard.
@@ -254,7 +282,8 @@ export function useMonitorLifecycle({
     handleStartBackend,
     modelsCheckDone,
     modelsNeedDownload,
-    powerSavingSuppressed,
+    powerBlocked,
+    powerStatusReady,
   ]);
 
   return {
@@ -263,6 +292,7 @@ export function useMonitorLifecycle({
     handleManualStartMonitor,
     handleManualStopMonitor,
     backendStatus,
+    monitorPowerSavingSuppressed: powerBlocked,
     monitorPaused,
     backendError,
     handleStartBackend,

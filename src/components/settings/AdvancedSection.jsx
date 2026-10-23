@@ -32,40 +32,39 @@ function OcrTimeoutRow({ value, onChange, disabled }) {
     </div>}>{error && <SettingsStatus tone="error">{t('settings.advanced.ocr.invalidTimeout')}</SettingsStatus>}</SettingsRow>;
 }
 
-export default function AdvancedSection({ controller: r }) {
+export default function AdvancedSection({ preferences: p, ocr, indexes, scheduler }) {
   const { t } = useTranslation();
   const active = useSettingsActive();
   const [modelsOpen, setModelsOpen] = useState(false);
   const inventory = useModelInventory(active && modelsOpen);
-  const config = r.config;
-  if (!config) return <SettingsStatus>{t(r.configError ? 'settings.feedback.readFailed' : 'settings.feedback.loading')}</SettingsStatus>;
-  const gpuOptions = r.gpus.map((gpu) => ({ value: gpu.id, label: gpu.name }));
-  if (!r.selectedGpu) gpuOptions.unshift({ value: config.dml_device_id, label: t('settings.advanced.dml.selectDevice'), disabled: true });
-  const classification = r.semanticStatus?.classification_backend;
-  const scheduler = r.backgroundSchedulerStatus;
+  const config = p.config;
+  if (!config) return <SettingsStatus>{t(p.configError ? 'settings.feedback.readFailed' : 'settings.feedback.loading')}</SettingsStatus>;
+  const gpuOptions = p.gpus.map((gpu) => ({ value: gpu.id, label: gpu.name }));
+  if (!p.selectedGpu) gpuOptions.unshift({ value: config.dml_device_id, label: t('settings.advanced.dml.selectDevice'), disabled: true });
+  const classification = indexes.status?.classification_backend;
   return <div className="space-y-6">
     <SettingsSection title={t('settings.advanced.groups.performance')} icon={Cpu}>
       <SettingsGroup>
         <SettingsRow label={t('settings.advanced.cpu.label')} description={t('settings.advanced.cpu.description')}
-          control={<SettingsSwitch checked={config.cpu_limit_enabled} disabled={r.configSaving} onChange={() => r.handleToggle('cpu_limit_enabled')} />}>
-          {config.cpu_limit_enabled && <SettingsSelect label={t('settings.advanced.cpu.percent_label')} value={config.cpu_limit_percent} disabled={r.configSaving}
-            options={CPU_PERCENT_OPTIONS.map((value) => ({ value, label: value + '%' }))} onChange={r.handleCpuPercentChange} />}
+          control={<SettingsSwitch checked={config.cpu_limit_enabled} disabled={p.configSaving} onChange={() => p.handleToggle('cpu_limit_enabled')} />}>
+          {config.cpu_limit_enabled && <SettingsSelect label={t('settings.advanced.cpu.percent_label')} value={config.cpu_limit_percent} disabled={p.configSaving}
+            options={CPU_PERCENT_OPTIONS.map((value) => ({ value, label: value + '%' }))} onChange={p.handleCpuPercentChange} />}
         </SettingsRow>
         <SettingsDivider />
         <SettingsRow label={t('settings.advanced.dml.label')} description={t('settings.advanced.dml.description')}
-          control={<SettingsSwitch checked={config.use_dml} disabled={r.configSaving} onChange={() => r.handleToggle('use_dml')} />}>
-          {config.use_dml && (r.gpuLoading ? <SettingsStatus>{t('settings.advanced.dml.gpu_loading')}</SettingsStatus>
-            : r.gpus.length ? <SettingsSelect label={t('settings.advanced.dml.gpu_select')} value={config.dml_device_id} options={gpuOptions} disabled={r.configSaving} onChange={r.handleGpuChange} />
+          control={<SettingsSwitch checked={config.use_dml} disabled={p.configSaving} onChange={() => p.handleToggle('use_dml')} />}>
+          {config.use_dml && (p.gpuLoading ? <SettingsStatus>{t('settings.advanced.dml.gpu_loading')}</SettingsStatus>
+            : p.gpus.length ? <SettingsSelect label={t('settings.advanced.dml.gpu_select')} value={config.dml_device_id} options={gpuOptions} disabled={p.configSaving} onChange={p.handleGpuChange} />
               : <SettingsStatus>{t('settings.advanced.dml.gpu_none')}</SettingsStatus>)}
         </SettingsRow>
         <SettingsDivider />
-        <OcrTimeoutRow value={config.ocr_timeout_secs} disabled={r.configSaving} onChange={r.handleOcrTimeoutChange} />
+        <OcrTimeoutRow value={config.ocr_timeout_secs} disabled={p.configSaving} onChange={p.handleOcrTimeoutChange} />
       </SettingsGroup>
     </SettingsSection>
     <SettingsSection title={t('settings.advanced.groups.components')} icon={Wrench}>
-      <OcrEngineCard status={r.mlOcrStatus} statusLoading={r.mlOcrStatusLoading} modelStatus={r.rustOcrModelStatus}
-        modelDownloading={r.rustOcrModelDownloading} onRestart={r.handleRestartMlOcr} onDownloadModel={r.handleDownloadRustOcrModel}
-        onRefresh={r.refreshRustOcrModelStatus} error={r.runtimeError} />
+      <OcrEngineCard status={ocr.status} statusLoading={ocr.statusLoading} modelStatus={ocr.modelStatus}
+        modelDownloading={ocr.modelDownloading} onRestart={ocr.restart} onDownloadModel={ocr.downloadModel}
+        onRefresh={ocr.refreshModel} error={ocr.error} />
       <SettingsDisclosure title={t('settings.features.models.title')} open={modelsOpen} onOpenChange={setModelsOpen}>
         <ModelInventoryTable models={inventory.models} modelsLoading={inventory.modelsLoading} onRefresh={inventory.loadModels} onOpenLocation={inventory.handleOpenLocation} formatSize={inventory.formatSize} />
       </SettingsDisclosure>
@@ -74,12 +73,12 @@ export default function AdvancedSection({ controller: r }) {
       <SettingsGroup>
         <SettingsDisclosure title={t('settings.advanced.background_processing.diagnostics')}>
           <DiagnosticValues rows={[
-            [t('settings.advanced.background_processing.profile'), scheduler?.execution_profile],
-            [t('settings.advanced.background_processing.waitReason'), scheduler?.blocked_reason],
-            [t('settings.advanced.background_processing.pauses'), scheduler?.pauses?.total],
-            [t('settings.advanced.background_processing.yieldLatency'), scheduler?.pauses?.last_yield_ms == null ? '—' : Math.round(scheduler.pauses.last_yield_ms) + ' ms'],
+            [t('settings.advanced.background_processing.profile'), scheduler.status?.execution_profile],
+            [t('settings.advanced.background_processing.waitReason'), scheduler.status?.blocked_reason],
+            [t('settings.advanced.background_processing.pauses'), scheduler.status?.pauses?.total],
+            [t('settings.advanced.background_processing.yieldLatency'), scheduler.status?.pauses?.last_yield_ms == null ? '—' : Math.round(scheduler.status.pauses.last_yield_ms) + ' ms'],
           ]} />
-          <SettingsButton variant="ghost" icon={RefreshCw} onClick={r.refreshBackgroundSchedulerStatus}>{t('common.refresh')}</SettingsButton>
+          <SettingsButton variant="ghost" icon={RefreshCw} onClick={scheduler.refresh}>{t('common.refresh')}</SettingsButton>
         </SettingsDisclosure>
         <SettingsDivider />
         <SettingsDisclosure title={t('settings.advanced.classification_backend.title')}>
@@ -89,7 +88,7 @@ export default function AdvancedSection({ controller: r }) {
             [t('settings.advanced.classification_backend.last_elapsed'), classification?.last_elapsed_ms == null ? '—' : Math.round(classification.last_elapsed_ms) + ' ms'],
           ]} />
           {classification?.last_error && <p className="break-words text-xs text-ide-muted">{classification.last_error}</p>}
-          <SettingsButton variant="ghost" icon={RefreshCw} onClick={r.refreshSemanticStatus}>{t('common.refresh')}</SettingsButton>
+          <SettingsButton variant="ghost" icon={RefreshCw} onClick={indexes.refresh}>{t('common.refresh')}</SettingsButton>
         </SettingsDisclosure>
       </SettingsGroup>
     </SettingsSection>
