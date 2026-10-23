@@ -185,6 +185,22 @@ pub async fn recap_get_day(
     .map_err(|_| "RECAP_WORKER_FAILED")?
 }
 
+/// Authentication: required. Reads saved associations for one snapshot.
+#[tauri::command]
+pub async fn recap_get_snapshot_context(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    screenshot_id: i64,
+) -> Result<SnapshotRecapContext, String> {
+    check_auth_required(&credential_state)?;
+    let result =
+        tokio::task::spawn_blocking(move || recap::read_snapshot_context(&app, screenshot_id))
+            .await
+            .map_err(|_| "RECAP_WORKER_FAILED")?;
+    check_auth_required(&credential_state)?;
+    result
+}
+
 /// Authentication: required. Pages the filtered, revision-checked source directory.
 #[tauri::command]
 pub async fn recap_get_records(

@@ -3,6 +3,7 @@
     "emptyHint": "Select a screenshot from the timeline above, or search your history."
   },
   "recap": {
+    "snapshotActivity": "Record for the selected snapshot",
     "delete": "Delete recap",
     "deleteTitle": "Delete this day's recap?",
     "deleteMessage": "The recap and corrections for {{date}} will be permanently deleted. Original records will be kept. You can generate this recap again manually.",
@@ -1396,6 +1397,15 @@
     }
   },
   "sidebar": {
+    "recap": {
+      "title": "Recap event",
+      "loading": "Loading recap…",
+      "pending": "This period has no recap yet.",
+      "unmatched": "No associated event.",
+      "recordedTime": "Recorded {{time}}",
+      "recordedTimeHint": "The first and last snapshot times cited by this activity.",
+      "openDetails": "View in recap"
+    },
     "details": {
       "title": "Details"
     },

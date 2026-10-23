@@ -9,6 +9,7 @@ pub(crate) mod search;
 mod search_pages;
 mod search_progress;
 mod selection;
+mod snapshot;
 mod summary;
 pub mod types;
 mod unified;
@@ -23,6 +24,7 @@ pub use search::{
     RecapSearchQuery, RecapSearchResult, RecapSearchRuntime, RecapSearchStatus,
 };
 pub use search_progress::RecapIndexProgress;
+pub use snapshot::{read_snapshot_context, SnapshotRecapContext};
 pub use types::*;
 pub use unified::{search as search_unified, UnifiedSearchQuery, UnifiedSearchResult};
 pub(crate) use views::with_current_day;

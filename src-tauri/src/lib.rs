@@ -1307,6 +1307,7 @@ pub fn run() {
             commands::recap::recap_save_settings,
             commands::recap::recap_list_days,
             commands::recap::recap_get_day,
+            commands::recap::recap_get_snapshot_context,
             commands::recap::recap_get_records,
             commands::recap::recap_generate,
             commands::recap::recap_cancel,

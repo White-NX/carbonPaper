@@ -141,6 +141,10 @@ export default function MainArea({
   const [snapshotPreviewTabs, setSnapshotPreviewTabs] = useState([]);
   const [activeSnapshotPreviewKey, setActiveSnapshotPreviewKey] = useState(null);
   const [recapNavigation, setRecapNavigation] = useState(null);
+  const handleOpenRecap = useCallback((navigation) => {
+    setRecapNavigation({ ...navigation, token: Date.now() });
+    setActiveTab('recap');
+  }, [setActiveTab]);
   const snapshotPreviewTabsRef = useRef([]);
   const activeSnapshotPreviewKeyRef = useRef(null);
 
@@ -372,6 +376,9 @@ export default function MainArea({
           <DetailCard
             selectedEvent={selectedEvent}
             selectedDetails={selectedDetails}
+            active={activeTab === 'preview'}
+            isAuthenticated={isAuthenticated}
+            onOpenRecap={handleOpenRecap}
           />
 
           {/* OCR Content Panel */}
@@ -395,8 +402,7 @@ export default function MainArea({
             onTimelineSearchChange={onTimelineSearchChange}
             isAuthenticated={isAuthenticated}
             onOpenRecapDay={(date) => {
-              setRecapNavigation({ date, token: Date.now() });
-              setActiveTab('recap');
+              handleOpenRecap({ date });
             }}
           />
         </div>

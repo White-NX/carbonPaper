@@ -11,6 +11,14 @@
 @tailwind utilities;
 
 .recap-surface { container: recap / inline-size; }
+.snapshot-recap-title { color: color-mix(in srgb, var(--ide-muted) 85%, var(--ide-text)); }
+.snapshot-recap-details { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 220ms cubic-bezier(.2, .7, .2, 1); }
+.snapshot-recap-details[data-expanded="true"] { grid-template-rows: 1fr; }
+.snapshot-recap-details-body { padding-top: 5px; opacity: 0; transform: translateY(-5px); transition: opacity 220ms ease, transform 220ms cubic-bezier(.2, .7, .2, 1); }
+.snapshot-recap-details[data-expanded="true"] .snapshot-recap-details-body { opacity: 1; transform: translateY(0); }
+@media (prefers-reduced-motion: reduce) {
+  .snapshot-recap-details, .snapshot-recap-details-body { transition: none; }
+}
 /* Anchor day navigation to the right edge, independently of changing actions. */
 .recap-header { grid-template-columns: minmax(0, 1fr) auto auto; }
 .recap-focus:focus-visible, .recap-input:focus-visible {

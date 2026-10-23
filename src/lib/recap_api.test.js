@@ -1,11 +1,37 @@
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { correctRecap, deleteRecap, generateRecap, getRecapDay, getRecapRecords, getRecapProgress, getRecapUsage, groupRecapActivities, recapErrorKey, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex } from './recap_api';
+import { correctRecap, deleteRecap, generateRecap, getRecapDay, getSnapshotRecapContext, getRecapRecords, getRecapProgress, getRecapUsage, groupRecapActivities, recapErrorKey, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex, resolveRecapNavigation } from './recap_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((action) => action()) }));
 
 describe('recap API and occurrence display', () => {
+  it('reads snapshot associations without prompting or generating a recap', async () => {
+    const context = { status: 'ready', items: [] };
+    invoke.mockResolvedValueOnce(context);
+    expect(await getSnapshotRecapContext(42)).toEqual(context);
+    expect(invoke).toHaveBeenLastCalledWith('recap_get_snapshot_context', { screenshotId: 42 });
+    expect(withAuth).toHaveBeenLastCalledWith(expect.any(Function), { autoPrompt: false });
+  });
+
+  it('resolves a corrected activity by membership rather than its old task or time span', () => {
+    const day = { date: '2026-01-01', threads: [{ id: 'old' }, { id: 'corrected' }], batches: [{ activities: [
+      { id: 'old-activity', task_id: 'old', member_ids: [1], sources: [] },
+      { id: 'new-activity', task_id: 'corrected', start_ms: 100, end_ms: 100, member_ids: [42], sources: [] },
+    ] }] };
+    expect(resolveRecapNavigation(day, { date: day.date, activity_id: 'old-activity', task_id: 'old', screenshot_id: 42 }))
+      .toEqual({ taskId: 'corrected', activityId: 'new-activity' });
+    expect(resolveRecapNavigation(day, { date: 'other-date', screenshot_id: 42 })).toBeNull();
+    expect(resolveRecapNavigation(day, { date: day.date, task_id: 'old', screenshot_id: 999 })).toBeNull();
+  });
+
+  it('supports legacy citations and explicit task links', () => {
+    const day = { date: '2026-01-01', threads: [{ id: 'task' }], batches: [{ activities: [
+      { id: 'a', task_id: 'task', sources: [{ id: 42 }] },
+    ] }] };
+    expect(resolveRecapNavigation(day, { date: day.date, screenshot_id: 42 })).toEqual({ taskId: 'task', activityId: 'a' });
+    expect(resolveRecapNavigation(day, { date: day.date, task_id: 'task' })).toEqual({ taskId: 'task', activityId: null });
+  });
   it('reads usage through the authenticated lightweight command without prompting', async () => {
     const usage = { input_tokens: 1, output_tokens: 2, screening_input_tokens: 3, requests: 1 };
     invoke.mockResolvedValueOnce(usage);

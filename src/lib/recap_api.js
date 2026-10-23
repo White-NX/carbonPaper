@@ -9,6 +9,7 @@ export const getRecapUsage = () => read('recap_get_usage');
 export const saveRecapSettings = (settings) => write('recap_save_settings', { settings });
 export const listRecapDays = () => read('recap_list_days');
 export const getRecapDay = (date, options = {}) => read('recap_get_day', { date, ...options });
+export const getSnapshotRecapContext = (screenshotId) => read('recap_get_snapshot_context', { screenshotId });
 export const getRecapRecords = (date, batchStartMs = null, cursor = null) => read('recap_get_records', { date, batchStartMs, cursor });
 export const getRecapProgress = (date, options = {}) => read('recap_get_progress', { date, ...options });
 export const generateRecap = (date, force = false) => write('recap_generate', { date, force });
@@ -26,6 +27,22 @@ export function localDate(date = new Date()) {
 
 export function sourceResult(source) {
   return { screenshot_id: source.id, timestamp: source.timestamp_ms / 1000, process_name: source.process_name, window_title: source.window_title };
+}
+
+/** Rebind an activity deep link after corrections or regeneration. */
+export function resolveRecapNavigation(day, navigation) {
+  if (!day || day.date !== navigation?.date) return null;
+  const activities = (day.batches || []).flatMap((batch) => batch.activities || []);
+  const hasSnapshot = Number.isSafeInteger(navigation.screenshot_id) && navigation.screenshot_id > 0;
+  const belongs = (activity) => activity.member_ids?.includes(navigation.screenshot_id)
+    || activity.sources?.some((source) => source.id === navigation.screenshot_id);
+  let activity = activities.find((item) => item.id === navigation.activity_id && (!hasSnapshot || belongs(item)));
+  if (!activity && hasSnapshot) activity = activities.find(belongs);
+  if (activity) return { taskId: activity.task_id, activityId: activity.id };
+  if (!hasSnapshot && day.threads?.some((thread) => thread.id === navigation.task_id)) {
+    return { taskId: navigation.task_id, activityId: null };
+  }
+  return null;
 }
 
 export function recapErrorKey(error) {

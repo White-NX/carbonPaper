@@ -4,27 +4,27 @@ import { getRecapDay, getRecapSettings, listRecapDays } from '../lib/recap_api';
 
 const LIGHT_VIEW = { includeRecords: false, includeAttempts: false };
 
-export default function useRecapDay(date, active, authenticated) {
-  const [state, setState] = useState({ date, day: null, settings: null, days: [], error: '' });
+export default function useRecapDay(date, active, authenticated, readKey = null) {
+  const [state, setState] = useState({ date, readKey, day: null, settings: null, days: [], error: '' });
   const refreshRef = useRef(async () => {});
   const refresh = useCallback(() => refreshRef.current(), []);
   useEffect(() => {
     if (!authenticated) {
-      setState({ date, day: null, settings: null, days: [], error: '' });
+      setState({ date, readKey, day: null, settings: null, days: [], error: '' });
       return undefined;
     }
     if (!active) return undefined;
     let live = true;
     let inFlight = null;
     let pending = false;
-    setState((previous) => previous.date === date ? previous : { ...previous, date, day: null, error: '' });
+    setState((previous) => previous.date === date && previous.readKey === readKey ? previous : { ...previous, date, readKey, day: null, error: '' });
     const load = () => {
       if (!live || document.hidden) return Promise.resolve();
       if (inFlight) { pending = true; return inFlight; }
       inFlight = (async () => {
         try {
           const [day, settings, days] = await Promise.all([getRecapDay(date, LIGHT_VIEW), getRecapSettings(), listRecapDays()]);
-          if (live) setState({ date, day, settings, days, error: '' });
+          if (live) setState({ date, readKey, day, settings, days, error: '' });
         } catch (error) {
           if (live) setState((previous) => ({ ...previous, day: null, error: String(error) }));
         } finally {
@@ -48,6 +48,6 @@ export default function useRecapDay(date, active, authenticated) {
       document.removeEventListener('visibilitychange', load);
       subscription.then((unlisten) => unlisten()).catch(() => {});
     };
-  }, [date, active, authenticated]);
-  return { ...state, day: authenticated && state.date === date ? state.day : null, refresh };
+  }, [date, active, authenticated, readKey]);
+  return { ...state, day: authenticated && state.date === date && state.readKey === readKey ? state.day : null, refresh };
 }

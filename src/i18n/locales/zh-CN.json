@@ -3,6 +3,7 @@
     "emptyHint": "选择上方时间轴中的截图，或搜索历史内容"
   },
   "recap": {
+    "snapshotActivity": "当前快照所在的记录",
     "delete": "删除回顾",
     "deleteTitle": "删除当天的回顾？",
     "deleteMessage": "将永久删除 {{date}} 的回顾及修改内容，原始记录会保留。之后可手动重新生成当天的回顾。",
@@ -1396,6 +1397,15 @@
     }
   },
   "sidebar": {
+    "recap": {
+      "title": "回顾事件",
+      "loading": "正在读取回顾…",
+      "pending": "暂无回顾。",
+      "unmatched": "暂无关联事件。",
+      "recordedTime": "记录 {{time}}",
+      "recordedTimeHint": "此活动引用快照的首末记录时间。",
+      "openDetails": "在回顾中查看"
+    },
     "details": {
       "title": "详情"
     },

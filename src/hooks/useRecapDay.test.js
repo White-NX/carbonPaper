@@ -13,6 +13,18 @@ beforeEach(() => {
 });
 
 describe('recap reading lifecycle', () => {
+  it('waits for a fresh projection when a new deep link addresses the same date', async () => {
+    const { result, rerender } = renderHook(({ readKey }) => useRecapDay('2026-10-01', true, true, readKey), { initialProps: { readKey: 'first-link' } });
+    await waitFor(() => expect(result.current.day).not.toBeNull());
+    let resolve;
+    getRecapDay.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    rerender({ readKey: 'new-link' });
+    expect(result.current.day).toBeNull();
+    await waitFor(() => expect(getRecapDay).toHaveBeenCalledTimes(2));
+    await act(async () => resolve({ date: '2026-10-01', corrected: true }));
+    expect(result.current.day.corrected).toBe(true);
+  });
+
   it('clears a cached view when its source revision is invalidated', async () => {
     const { result } = renderHook(() => useRecapDay('2026-10-01', true, true));
     await waitFor(() => expect(result.current.day).not.toBeNull());

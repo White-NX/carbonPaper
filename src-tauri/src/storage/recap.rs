@@ -10,6 +10,13 @@ use crate::calendar::CalendarDay;
 const PAYLOAD_KEYS_SQL: &str =
     "SELECT key FROM recap_payloads WHERE kind=?1 AND day=?2 AND revision=?3 ORDER BY key";
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RecapSnapshotScope {
+    pub timestamp_ms: i64,
+    pub dates: Vec<String>,
+    pub only_deleted: bool,
+}
+
 impl StorageState {
     pub(super) fn init_recap_tables(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
@@ -459,6 +466,50 @@ impl StorageState {
         Ok(())
     }
 
+    /// Resolve a snapshot against saved calendars, including dates older than
+    /// the calendar picker limit. A read must not revive a deleted recap.
+    pub(crate) fn recap_snapshot_scope(
+        &self,
+        screenshot_id: i64,
+    ) -> Result<Option<RecapSnapshotScope>, String> {
+        let guard = self.get_connection_named("recap_snapshot_scope")?;
+        let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        let timestamp_ms = conn
+            .query_row(
+                "SELECT CAST(strftime('%s',created_at) AS INTEGER)*1000
+                 FROM screenshots WHERE id=?1 AND is_deleted=0",
+                [screenshot_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(timestamp_ms) = timestamp_ms else {
+            return Ok(None);
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.day,EXISTS(SELECT 1 FROM recap_deleted_days x WHERE x.day=d.day)
+                 FROM recap_days d WHERE d.start_ms<=?1 AND d.end_ms>?1 ORDER BY d.day",
+            )
+            .map_err(|e| e.to_string())?;
+        let days = stmt
+            .query_map([timestamp_ms], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let only_deleted = !days.is_empty() && days.iter().all(|(_, deleted)| *deleted);
+        Ok(Some(RecapSnapshotScope {
+            timestamp_ms,
+            dates: days
+                .into_iter()
+                .filter_map(|(date, deleted)| (!deleted).then_some(date))
+                .collect(),
+            only_deleted,
+        }))
+    }
+
     pub(crate) fn recap_list_days(&self) -> Result<Vec<String>, String> {
         let guard = self.get_connection_named("recap_list_days")?;
         let mut stmt = guard
@@ -829,6 +880,51 @@ mod tests {
         StorageState::init_recap_tables(&conn).unwrap();
         *storage.db.lock().unwrap() = Some(conn);
         (temp, storage)
+    }
+
+    #[test]
+    fn snapshot_recap_scope_uses_recorded_bounds_and_excludes_deleted_sources() {
+        let (_temp, s) = storage();
+        let timestamp_ms = 1_767_225_600_000_i64;
+        {
+            let guard = s.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute_batch(
+                "INSERT INTO screenshots(id,created_at,status) VALUES(1,'2026-01-01 00:00:00','ready');
+                 INSERT INTO screenshots(id,created_at,status,is_deleted) VALUES(2,'2026-01-01 00:00:00','ready',1);",
+            ).unwrap();
+            // The saved label need not be the snapshot's date in today's zone.
+            conn.execute(
+                "INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms)
+                 VALUES('2025-12-31',?1,?2,'privacy',?2)",
+                params![timestamp_ms - 1000, timestamp_ms + 1000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms)
+                 VALUES('2026-01-01',?1,?2,'privacy',?2)",
+                params![timestamp_ms - 2000, timestamp_ms],
+            )
+            .unwrap();
+        }
+        let scope = s.recap_snapshot_scope(1).unwrap().unwrap();
+        assert_eq!(scope.timestamp_ms, timestamp_ms);
+        assert_eq!(scope.dates, vec!["2025-12-31"]);
+        assert!(!scope.only_deleted);
+        assert!(s.recap_snapshot_scope(2).unwrap().is_none());
+        assert!(s.recap_snapshot_scope(999).unwrap().is_none());
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "INSERT INTO recap_deleted_days(day) VALUES('2025-12-31')",
+                [],
+            )
+            .unwrap();
+        let scope = s.recap_snapshot_scope(1).unwrap().unwrap();
+        assert!(scope.dates.is_empty());
+        assert!(scope.only_deleted);
     }
 
     #[test]
