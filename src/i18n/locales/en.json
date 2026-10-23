@@ -1386,23 +1386,7 @@
       "modelDownloadRunningTitle": "Downloading Model Files",
       "modelDownloadRunningDesc": "Downloading required model files in background, progress: {{progress}}%.",
       "stopTooltip": "Stop smart clustering",
-      "stop": "Stop",
-      "recapIndexTitle": "Recap search",
-      "recapIndexPreparing": "Preparing recap search",
-      "recapIndexQueued": "Recap search update queued",
-      "recapIndexWaitingForUnlock": "Unlock to continue updating recap search",
-      "recapIndexWaitingForVerification": "Verify your identity to continue updating recap search",
-      "recapIndexWaitingForIdle": "Waiting for your computer to be idle",
-      "recapIndexWaitingForOtherTask": "Waiting for other tasks to finish",
-      "recapIndexWaitingForPower": "Connect to power to continue",
-      "recapIndexWaitingForResources": "Waiting for computer load to decrease",
-      "recapIndexWaitingForMaintenance": "Waiting for maintenance to finish",
-      "recapIndexPaused": "Recap search update paused",
-      "recapIndexFailed": "Recap search update failed",
-      "recapIndexRetryWait": "Recap search update waiting to retry",
-      "recapIndexStopping": "Stopping recap search update",
-      "recapIndexRunningTitle": "Updating recap search",
-      "recapIndexProgress": "{{state}} · {{progress}}%"
+      "stop": "Stop"
     }
   },
   "sidebar": {

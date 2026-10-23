@@ -1,14 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image as ImageIcon, Type, Loader2, Clock3, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
+import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 import { ProgressBar } from './overlay/ProgressBlock';
-import { Banner } from './ui/Banner';
-
-function ActiveIndexIcon({ className, ...props }) {
-    return <Loader2 {...props} className={`${className || ''} animate-spin`} />;
-}
 
 export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
     const { t } = useTranslation();
@@ -40,10 +35,6 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         semanticIndexTaskLabel,
         hasClipIndexTask,
         clipIndexTaskLabel,
-        hasRecapIndexTask,
-        recapIndexActive,
-        recapIndexFailed,
-        recapIndexTaskLabel,
         showProgressBar,
         progressFillPercent,
         progressActive,
@@ -231,14 +222,6 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                 {clipIndexTaskLabel}
                             </div>
                         </div>
-                    )}
-                    {hasRecapIndexTask && (
-                        <Banner tone={recapIndexFailed ? 'error' : 'info'}
-                            title={t('search.task.recapIndexTitle')}
-                            icon={recapIndexActive ? ActiveIndexIcon : recapIndexFailed ? undefined : Clock3}
-                            className="shrink-0 rounded-none border-x-0 border-t-0 p-3">
-                            {recapIndexTaskLabel}
-                        </Banner>
                     )}
                     {isMigrating && (
                         <div className="p-3 bg-yellow-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">

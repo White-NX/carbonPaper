@@ -50,31 +50,6 @@ function indexRunPercent(run) {
   return Math.max(0, Math.min(100, (run.processed / run.total) * 100));
 }
 
-function recapTaskLabel(run, percent, t) {
-  const phase = {
-    preparing: 'Preparing', running: 'RunningTitle', stopping: 'Stopping',
-    waiting_for_unlock: 'WaitingForUnlock', waiting_for_verification: 'WaitingForVerification',
-    retry_wait: 'RetryWait', failed: 'Failed',
-  }[run.phase];
-  const waiting = {
-    waiting_for_idle: 'WaitingForIdle', waiting_for_evaluation: 'WaitingForIdle',
-    input_resumed: 'WaitingForIdle', waiting_for_resident_model: 'WaitingForIdle',
-    cost_overrun: 'WaitingForIdle', waiting_for_fullscreen: 'WaitingForIdle',
-    external_background_request: 'WaitingForOtherTask', foreground_request: 'WaitingForOtherTask',
-    semantic_worker_busy: 'WaitingForOtherTask', other_task: 'WaitingForOtherTask',
-    manual_request_pending: 'WaitingForOtherTask',
-    waiting_for_ac_power: 'WaitingForPower', maintenance: 'WaitingForMaintenance',
-    resource_pressure: 'WaitingForResources', waiting_for_memory: 'WaitingForResources',
-    waiting_for_disk: 'WaitingForResources', waiting_for_cpu: 'WaitingForResources',
-    resource_cooldown: 'WaitingForResources', resource_metrics_unavailable: 'WaitingForResources',
-    disabled: 'Paused',
-  }[run.wait_reason];
-  const state = t(`search.task.recapIndex${phase || waiting || 'Queued'}`);
-  return percent === null ? state : t('search.task.recapIndexProgress', {
-    state, progress: Math.round(percent),
-  });
-}
-
 function indexTaskLabel(run, percent, kind, t) {
   const state = {
     queued: 'Queued', waiting_for_unlock: 'WaitingForUnlock',
@@ -323,14 +298,9 @@ export function useSearchBoxController({
   const clipIndexPercent = indexRunPercent(backgroundIndex.clip);
   const semanticIndexTaskLabel = indexTaskLabel(backgroundIndex.semantic, semanticIndexPercent, 'semantic', t);
   const clipIndexTaskLabel = indexTaskLabel(backgroundIndex.clip, clipIndexPercent, 'clip', t);
-  const recapIndexFailed = backgroundIndex.recap.phase === 'failed';
-  const hasRecapIndexTask = isIndexTaskPending(backgroundIndex.recap) || recapIndexFailed;
-  const recapIndexActive = ['preparing', 'running'].includes(backgroundIndex.recap.phase);
-  const recapIndexPercent = indexRunPercent(backgroundIndex.recap);
-  const recapIndexTaskLabel = recapTaskLabel(backgroundIndex.recap, recapIndexPercent, t);
 
   const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels
-    || hasSemanticIndexTask || hasClipIndexTask || hasRecapIndexTask;
+    || hasSemanticIndexTask || hasClipIndexTask;
   const progressFillPercent = (() => {
     if (hasDeleteTask) return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
     if (hasClusterTask) return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
@@ -343,14 +313,13 @@ export function useSearchBoxController({
     if (hasSemanticIndexTask) {
       return semanticIndexPercent;
     }
-    if (hasRecapIndexTask) return recapIndexPercent;
     return 0;
   })();
   const progressActive = (() => {
     if (hasDeleteTask || hasClusterTask || isDownloadingModels) return true;
     if (hasClipIndexTask) return backgroundIndex.clip.running;
     if (hasSemanticIndexTask) return backgroundIndex.semantic.running;
-    return recapIndexActive;
+    return false;
   })();
 
   const taskSummaryPlaceholder = (() => {
@@ -369,7 +338,6 @@ export function useSearchBoxController({
     if (hasSemanticIndexTask) {
       return semanticIndexTaskLabel;
     }
-    if (hasRecapIndexTask) return recapIndexTaskLabel;
     return '';
   })();
 
@@ -504,11 +472,6 @@ export function useSearchBoxController({
     hasClipIndexTask,
     clipIndexPercent,
     clipIndexTaskLabel,
-    hasRecapIndexTask,
-    recapIndexActive,
-    recapIndexFailed,
-    recapIndexPercent,
-    recapIndexTaskLabel,
     showProgressBar,
     progressFillPercent,
     progressActive,
