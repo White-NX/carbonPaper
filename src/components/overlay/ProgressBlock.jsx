@@ -1,6 +1,26 @@
 import React from 'react';
 import { cn } from '../../lib/utils';
 
+/** Compact period progress; unknown totals use an indeterminate arc. */
+export function ProgressRing({ label, current, total, active = true, className }) {
+  const hasCount = Number.isFinite(current) && Number.isFinite(total) && total > 0;
+  const value = hasCount ? Math.min(total, Math.max(0, current)) : null;
+  const percent = hasCount ? value / total * 100 : 25;
+  return (
+    <span role="progressbar" aria-label={label} aria-valuemin={0}
+      aria-valuemax={hasCount ? total : undefined} aria-valuenow={value ?? undefined}
+      className={cn('inline-flex h-3.5 w-3.5 shrink-0', className)}>
+      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"
+        className={cn('h-full w-full -rotate-90', !hasCount && active && 'motion-safe:animate-spin')}>
+        <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="2" className="text-ide-border" />
+        <circle cx="8" cy="8" r="6" pathLength="100" stroke="currentColor" strokeWidth="2"
+          strokeDasharray={`${percent} 100`} strokeLinecap={value === 0 ? 'butt' : 'round'}
+          className={active ? 'text-ide-accent' : 'text-ide-muted'} />
+      </svg>
+    </span>
+  );
+}
+
 /** Shared counted/indeterminate bar, including the search field background. */
 export function ProgressBar({ label, percent, active = true, variant = 'default', className }) {
   const value = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : null;

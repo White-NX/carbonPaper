@@ -46,6 +46,12 @@
     "intro": "Review what happened throughout the day, follow related tasks, and return to the original records. Once enabled, new records are organized every four hours.",
     "configure": "Open settings",
     "generating": "Preparing your recap…",
+    "runStatus": {
+      "organizing": "Organizing",
+      "paused": "Waiting to resume",
+      "finishing": "Finishing",
+      "unavailable": "Status unavailable"
+    },
     "generate": "Complete recap",
     "regenerate": "Regenerate",
     "stop": "Stop",

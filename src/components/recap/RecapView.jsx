@@ -199,16 +199,15 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
       as="header"
       bordered
       flushBottom={Boolean(!task && showTabs)}
-      secondaryRow={!task && showTabs ? (
+      secondaryRowClassName="min-w-0 gap-3 empty:hidden"
+      secondaryRow={(
         <>
-          <RecapTabs tab={tab} onChange={setTab} />
-          {latest > 0 && (
-            <span className="ml-auto hidden text-[11px] text-ide-muted sm:block">
-              {t('recap.updated', { time: time(latest) })}
-            </span>
-          )}
+          {!task && showTabs && <RecapTabs tab={tab} onChange={setTab} />}
+          <RecapRunStatus key={date} date={date} active={active} pending={operation === 'generate' || Boolean(day?.running)}
+            updated={!task && showTabs && latest > 0 ? t('recap.updated', { time: time(latest) }) : null}
+            onRunning={setLiveRunning} onComplete={refresh} onDetails={() => setDiagnostics(true)} />
         </>
-      ) : undefined}
+      )}
     >
       <div className="recap-header grid min-w-0 flex-1 items-start gap-x-5 gap-y-2">
         <div className="flex h-10 min-w-0 items-center">
@@ -240,7 +239,6 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div>
       </div>
     </PageHeader>
-    <RecapRunStatus key={date} date={date} active={active} onRunning={setLiveRunning} onComplete={refresh} />
     {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
     {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
     {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}

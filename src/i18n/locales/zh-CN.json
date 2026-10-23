@@ -46,6 +46,12 @@
     "intro": "按时间回看做过的事情，串起同一件事的经过，随时打开当时的画面。",
     "configure": "前往设置",
     "generating": "正在整理回顾…",
+    "runStatus": {
+      "organizing": "整理中",
+      "paused": "等待继续",
+      "finishing": "收尾中",
+      "unavailable": "状态暂不可用"
+    },
     "generate": "补全回顾",
     "regenerate": "重新生成",
     "stop": "停止",
