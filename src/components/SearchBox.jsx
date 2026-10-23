@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
+import { ProgressBar } from './overlay/ProgressBlock';
 
 export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
     const { t } = useTranslation();
@@ -36,6 +37,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         clipIndexTaskLabel,
         showProgressBar,
         progressFillPercent,
+        progressActive,
         taskSummaryPlaceholder,
         isDownloadingModels,
         toggleMode,
@@ -64,11 +66,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             data-keep-selection="true"
         >
             <div className="relative flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm overflow-hidden">
-                {showProgressBar && (
-                    <div
-                        className="pointer-events-none absolute inset-y-0 left-0 bg-sky-500/35 dark:bg-sky-400/20 transition-all duration-500"
-                        style={{ width: `${progressFillPercent}%` }}
-                    />
+                {showProgressBar && (progressFillPercent !== null || progressActive) && (
+                    <ProgressBar variant="background" label={taskSummaryPlaceholder}
+                        percent={progressFillPercent} active={progressActive} />
                 )}
                 <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
                 <button

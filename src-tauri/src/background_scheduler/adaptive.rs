@@ -487,6 +487,7 @@ impl BackgroundSchedulerState {
             TASK_CLIP_INDEX,
             TASK_SMART_CLUSTER,
             TASK_ANN_BUILD,
+            TASK_RECAP_INDEX,
         ]
         .into_iter()
         .map(|task| {

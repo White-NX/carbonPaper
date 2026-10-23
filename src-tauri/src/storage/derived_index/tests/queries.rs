@@ -1,3 +1,4 @@
+use super::super::ann::visible_embedding_aggregate_sql;
 use super::*;
 
 #[test]
@@ -83,6 +84,112 @@ fn semantic_text_topk_ranks_visible_rows_by_cosine() {
     assert!(!storage
         .has_query_visible_embeddings(DerivedIndexKind::ClipImage)
         .unwrap());
+}
+
+#[test]
+fn visibility_metadata_reads_use_covering_indexes_after_schema_upgrade() {
+    let (_temp, storage) = test_storage();
+    let guard = storage.db.lock().unwrap();
+    let conn = guard.as_ref().unwrap();
+    // An existing archive gets the new indexes through the normal,
+    // idempotent startup schema path, without rebuilding its vectors.
+    conn.execute_batch(
+        "DROP INDEX idx_derived_embeddings_visibility;
+         DROP INDEX idx_derived_jobs_completed_visibility;",
+    )
+    .unwrap();
+    storage.init_tables(conn).unwrap();
+    storage.init_tables(conn).unwrap();
+    for sql in [
+        visible_embedding_count_sql(),
+        visible_embedding_exists_sql(),
+        visible_embedding_cache_stats_sql(),
+        visible_embedding_aggregate_sql(),
+    ] {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan = statement
+            .query_map([DerivedIndexKind::SemanticText.as_str()], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for index in [
+            "idx_derived_embeddings_visibility",
+            "idx_derived_jobs_completed_visibility",
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains(&format!("COVERING INDEX {index}"))),
+                "metadata must not read vector or job payload pages: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn visibility_metadata_preserves_every_model_and_source_contract_check() {
+    let (_temp, storage) = test_storage();
+    for id in 1..=7 {
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, &id.to_string()),
+            vec![0.6, 0.8],
+        )
+        .unwrap();
+    }
+    commit_vector(
+        &storage,
+        job(DerivedIndexKind::ClipImage, "other-kind"),
+        vec![0.6, 0.8],
+    )
+    .unwrap();
+    {
+        let guard = storage.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "UPDATE derived_index_jobs SET model_id='other-model'
+                WHERE index_kind='semantic_text' AND subject_key='2';
+             UPDATE derived_index_jobs SET model_revision='other-revision'
+                WHERE index_kind='semantic_text' AND subject_key='3';
+             UPDATE derived_index_jobs SET embedding_version=2
+                WHERE index_kind='semantic_text' AND subject_key='4';
+             UPDATE derived_index_jobs SET source_fingerprint='changed-source'
+                WHERE index_kind='semantic_text' AND subject_key='5';
+             UPDATE derived_index_jobs SET status='pending'
+                WHERE index_kind='semantic_text' AND subject_key='6';
+             UPDATE derived_index_jobs SET status='failed'
+                WHERE index_kind='semantic_text' AND subject_key='7';",
+        )
+        .unwrap();
+        let shape: (i64, i64, i64, i64) = conn
+            .query_row(
+                &visible_embedding_cache_stats_sql(),
+                [DerivedIndexKind::SemanticText.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(shape, (1, 2, 2, 1));
+    }
+    assert_eq!(
+        storage
+            .count_query_visible_embeddings(DerivedIndexKind::SemanticText)
+            .unwrap(),
+        1
+    );
+    assert!(storage
+        .has_query_visible_embeddings(DerivedIndexKind::SemanticText)
+        .unwrap());
+    let visible = storage
+        .list_query_visible_embeddings(DerivedIndexKind::SemanticText, 0, 10)
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].job.subject_key, "1");
+    let (_, row_count, _, dimensions, ..) = storage
+        .derived_index_snapshot_for_ann(DerivedIndexKind::SemanticText)
+        .unwrap();
+    assert_eq!(row_count, 1);
+    assert_eq!(dimensions, 2);
 }
 
 #[test]

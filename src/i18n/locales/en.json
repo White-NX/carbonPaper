@@ -3,6 +3,7 @@
     "emptyHint": "Select a screenshot from the timeline above, or search your history."
   },
   "recap": {
+    "snapshotActivity": "Record for the selected snapshot",
     "delete": "Delete recap",
     "deleteTitle": "Delete this day's recap?",
     "deleteMessage": "The recap and corrections for {{date}} will be permanently deleted. Original records will be kept. You can generate this recap again manually.",
@@ -46,6 +47,12 @@
     "intro": "Review what happened throughout the day, follow related tasks, and return to the original records. Once enabled, new records are organized every four hours.",
     "configure": "Open settings",
     "generating": "Preparing your recap…",
+    "runStatus": {
+      "organizing": "Organizing",
+      "paused": "Waiting to resume",
+      "finishing": "Finishing",
+      "unavailable": "Status unavailable"
+    },
     "generate": "Complete recap",
     "regenerate": "Regenerate",
     "stop": "Stop",
@@ -144,7 +151,7 @@
     },
     "settings": {
       "saved": "Saved",
-      "enabledHint": "Organize every four hours while unlocked, deferring while a fullscreen app blocks background tasks.",
+      "enabledHint": "Organize every four hours, pausing for fullscreen apps. Background organization keeps working after you close the window; protected processing also continues with new records after a restart.",
       "missingProvider": "Previous model service removed",
       "manageModels": "Manage model services",
       "title": "Daily recap settings",
@@ -170,7 +177,9 @@
       "model": "Screening model",
       "apiKey": "API key",
       "keySaved": "Saved; leave unchanged to keep the key",
-      "keyPlaceholder": "Enter an API key"
+      "keyPlaceholder": "Enter an API key",
+      "semanticSearch": "Enable recap semantic search",
+      "semanticSearchHint": "Prepare a local index automatically to find recaps by meaning. Keyword search remains available when disabled."
     },
     "errors": {
       "RECAP_INVALID_SUMMARY": "The period summary could not be generated. View activity details or try again.",
@@ -216,7 +225,18 @@
       "AI_BAD_REQUEST": "The model service rejected the generation request. Check the selected model and usage settings.",
       "AI_SERVER_ERROR": "The model service encountered an error. Please try again later.",
       "AI_INVALID_RESPONSE": "The model service returned an unreadable response. Retry or check its configuration.",
-      "AI_RATE_LIMITED": "The model service is busy. Please try again later."
+      "AI_RATE_LIMITED": "The model service is busy. Please try again later.",
+      "RECAP_INVALID_DETAIL": "Some key details have invalid sources. Try generating the recap again.",
+      "RECAP_INVALID_SEARCH": "Enter a query and check the search options.",
+      "RECAP_SEARCH_NOT_READY": "Semantic search is still being prepared. Keyword search is available.",
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search."
+    },
+    "keyDetails": "Key details",
+    "detailSources": "{{count}} sources",
+    "search": {
+      "sources": "{{count}} sources",
+      "activity": "Activity details",
+      "openDay": "Open daily recap"
     }
   },
   "appBound": {
@@ -1378,6 +1398,15 @@
     }
   },
   "sidebar": {
+    "recap": {
+      "title": "Recap event",
+      "loading": "Loading recap…",
+      "pending": "This period has no recap yet.",
+      "unmatched": "No associated event.",
+      "recordedTime": "Recorded {{time}}",
+      "recordedTimeHint": "The first and last snapshot times cited by this activity.",
+      "openDetails": "View in recap"
+    },
     "details": {
       "title": "Details"
     },
@@ -1470,13 +1499,15 @@
     "title": "Advanced search",
     "search": {
       "error": "Search failed: {{message}}",
-      "placeholder_ocr": "Search text that appeared on screen",
+      "placeholder_ocr": "Search snapshots and recaps",
+      "placeholder_snapshots": "Search text in snapshots",
+      "placeholder_recaps": "Search recaps",
       "placeholder_nl": "Describe the screen you are looking for",
       "go": "Search",
       "searching": "Searching...",
       "did_you_know": "Did you know: {{msg}}",
-      "no_results_for": "No screenshots contain \"{{query}}\"",
-      "no_results_filtered": "No screenshots match the current filters.",
+      "no_results_for": "No results found for \"{{query}}\"",
+      "no_results_filtered": "No results match the current filters.",
       "no_results_hint": "Widening the time range or dropping a filter often helps.",
       "try_visual": "Search by picture instead",
       "clear_filters": "Clear filters"
@@ -1486,7 +1517,7 @@
       "nl": "Picture",
       "ocr_full": "Text search",
       "nl_full": "Picture search",
-      "ocr_hint": "Match keywords in recognized text",
+      "ocr_hint": "Search snapshot text and recap activities",
       "nl_hint": "Match screen content with a description",
       "ai": "AI",
       "ai_hint": "Ask a question and let AI search your history for the answer"
@@ -1525,7 +1556,12 @@
       "elapsed_other": "took {{ms}} ms",
       "has_more": "scroll for more",
       "sort_time": "Newest first",
-      "sort_similarity": "By similarity"
+      "sort_similarity": "By similarity",
+      "sort_relevance": "By relevance",
+      "total": "{{count}} results",
+      "resultTypes": "{{snapshots}} snapshots · {{recaps}} recaps",
+      "categoryScope": "Categories filter snapshots",
+      "partial": "Showing some matches. Narrow the search for more precise results."
     },
     "group": {
       "expand": "{{count}} more from this window",
@@ -1551,7 +1587,25 @@
       "LLM-powered search will be added in the future!",
       "btw, I play arknights",
       "Amiya, hear me out, I really didn't favor Pelica..."
-    ]
+    ],
+    "targets": {
+      "label": "Search in",
+      "snapshots": "Snapshots only",
+      "mixed": "Snapshots and recaps",
+      "recaps": "Recaps only"
+    },
+    "recapSemantic": "Recap meaning search",
+    "recapSemanticHint": "Include recaps with a similar meaning and show their semantic relevance.",
+    "recapKeywordMatch": "Keyword match",
+    "recapApproximateKeywordMatch": "Approximate keyword match",
+    "recapRelevance": "Semantic relevance: {{score}}",
+    "recapRelevanceHint": "Higher values indicate a closer meaning to your search.",
+    "semanticUpdating": "Finding related recaps…",
+    "semanticFallback": "Showing keyword matches and available meaning matches.",
+    "resultTypes": {
+      "recap": "Recap"
+    },
+    "viewSource": "Open source snapshot"
   },
   "mask": {
     "model_download": {
@@ -1952,7 +2006,8 @@
       "screenshots": "Read {{count}} screenshots",
       "records": "Checked history {{count}} times",
       "archives": "Checked archives {{count}} times",
-      "separator": ", "
+      "separator": ", ",
+      "search_recaps": "Search recaps for “{{query}}”"
     },
     "setup": {
       "title": "Connect a model service first",

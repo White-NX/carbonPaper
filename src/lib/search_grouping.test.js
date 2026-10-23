@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import fixture from '../tests/fixtures/screenshot_contract_v3.json';
 import {
   captureDateOf,
   groupSearchResults,
@@ -42,6 +43,21 @@ describe('parseCreatedAt', () => {
 });
 
 describe('captureDateOf', () => {
+  it('reads the shared MCP/Agent fixture and the storage reference as the same capture', () => {
+    const storage = { timestamp: fixture.captured_at_ms / 1000, created_at: fixture.ocr_processed_at_utc };
+    const tool = { screenshot_id: fixture.screenshot_id, captured_at_ms: fixture.captured_at_ms, ocr_processed_at_ms: fixture.ocr_processed_at_ms };
+    expect(captureDateOf(tool)).toEqual(captureDateOf(storage));
+    expect(captureDateOf(tool).toISOString()).toBe(fixture.captured_at_utc.replace('Z', '.000Z'));
+    expect(captureDateOf({ captured_at_ms: 1000 }).getTime()).toBe(1000);
+    expect(captureDateOf({ captured_at_ms: 0 }).getTime()).toBe(0);
+  });
+
+  it('keeps explicit unknown times from falling back to OCR or legacy fields', () => {
+    for (const captured_at_ms of [null, NaN, Infinity, '1790785800000']) {
+      expect(captureDateOf({ captured_at_ms, timestamp: 1790905929, created_at: fixture.ocr_processed_at_utc })).toBeNull();
+    }
+  });
+
   it('prefers the numeric timestamp', () => {
     const item = { timestamp: BASE, screenshot_created_at: '2020-01-01T00:00:00Z' };
     expect(captureDateOf(item).getTime()).toBe(BASE * 1000);

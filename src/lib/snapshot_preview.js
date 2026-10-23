@@ -1,8 +1,35 @@
+import { captureDateOf } from './search_grouping';
+
 export const SNAPSHOT_PREVIEW_TAB_LIMIT = 8;
 export const SNAPSHOT_PREVIEW_WINDOW_LABEL = 'snapshot-preview';
 export const SNAPSHOT_PREVIEW_WINDOW_STATE_KEY = 'carbonpaper:snapshot-preview-window-state';
 
 const pickFirst = (...values) => values.find((value) => value !== undefined && value !== null) ?? null;
+
+/** The main preview and timeline consume milliseconds, including epoch zero. */
+export function searchResultToSnapshotEvent(item) {
+  const screenshotId = item?.screenshot_id ?? item?.metadata?.screenshot_id;
+  const path = item?.image_path || item?.metadata?.image_path;
+  if (screenshotId === undefined && !path) return null;
+  return {
+    id: screenshotId ?? -1,
+    path,
+    appName: item?.process_name || item?.metadata?.process_name,
+    windowTitle: item?.window_title || item?.metadata?.window_title,
+    timestamp: captureDateOf(item)?.getTime() ?? null,
+    _fromNlSearch: item?.similarity !== undefined || item?.distance !== undefined
+      || (item?.metadata?.screenshot_id !== undefined && item?.screenshot_id === undefined),
+  };
+}
+
+function previewCreatedAt(item) {
+  if (item?.captured_at_ms !== undefined) return captureDateOf(item)?.toISOString() ?? null;
+  return pickFirst(item?.screenshot_created_at, item?.metadata?.screenshot_created_at, item?.created_at, item?.metadata?.created_at);
+}
+
+function explicitCaptureTime(item) {
+  return item?.captured_at_ms === undefined ? {} : { captured_at_ms: captureDateOf(item)?.getTime() ?? null };
+}
 
 export function getSnapshotPreviewKey(item) {
   const id = item?.screenshot_id ?? item?.id ?? item?.metadata?.screenshot_id;
@@ -23,14 +50,11 @@ export function normalizeSnapshotPreviewItem(item, options = {}) {
   const imagePath = item?.image_path || item?.path || item?.metadata?.image_path;
   // screenshot_created_at 排在前面：搜索结果的 created_at 是 OCR 行的写入时间，
   // 晚于截图本身，拿它当截图时刻会偏。其他来源没有这个字段，自然落到 created_at。
-  const createdAt = item?.screenshot_created_at
-    || item?.metadata?.screenshot_created_at
-    || item?.created_at
-    || item?.metadata?.created_at
-    || null;
+  const createdAt = previewCreatedAt(item);
 
   return {
     ...item,
+    ...explicitCaptureTime(item),
     screenshot_id: screenshotId,
     id: screenshotId || item?.id,
     image_path: imagePath,
@@ -50,12 +74,7 @@ export function sanitizeSnapshotPreviewItem(item) {
   if (!item) return null;
   const screenshotId = pickFirst(item.screenshot_id, item.id, item.metadata?.screenshot_id);
   const imagePath = pickFirst(item.image_path, item.path, item.metadata?.image_path);
-  const createdAt = pickFirst(
-    item.screenshot_created_at,
-    item.metadata?.screenshot_created_at,
-    item.created_at,
-    item.metadata?.created_at,
-  );
+  const createdAt = previewCreatedAt(item);
 
   const metadata = {};
   const metadataFields = [
@@ -71,6 +90,7 @@ export function sanitizeSnapshotPreviewItem(item) {
   });
 
   return {
+    ...explicitCaptureTime(item),
     screenshot_id: screenshotId,
     id: screenshotId || item.id || null,
     image_path: imagePath,

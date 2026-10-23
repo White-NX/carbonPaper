@@ -12,6 +12,7 @@ import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
 import PreviewActionBar from './PreviewActionBar';
 import EmptyPreview from './EmptyPreview';
+import { captureDateOf } from '../lib/search_grouping';
 import {
   getSnapshotPreviewKey,
   normalizeSnapshotPreviewItem,
@@ -139,6 +140,11 @@ export default function MainArea({
   const [showOcrPanel, setShowOcrPanel] = useState(false);
   const [snapshotPreviewTabs, setSnapshotPreviewTabs] = useState([]);
   const [activeSnapshotPreviewKey, setActiveSnapshotPreviewKey] = useState(null);
+  const [recapNavigation, setRecapNavigation] = useState(null);
+  const handleOpenRecap = useCallback((navigation) => {
+    setRecapNavigation({ ...navigation, token: Date.now() });
+    setActiveTab('recap');
+  }, [setActiveTab]);
   const snapshotPreviewTabsRef = useRef([]);
   const activeSnapshotPreviewKeyRef = useRef(null);
 
@@ -307,6 +313,7 @@ export default function MainArea({
       window_title: selectedDetails?.record?.window_title || selectedEvent.windowTitle,
       category: selectedDetails?.record?.category || selectedEvent.category,
       created_at: selectedDetails?.record?.created_at || selectedEvent.timestamp,
+      captured_at_ms: captureDateOf(selectedDetails?.record)?.getTime() ?? selectedEvent.timestamp ?? null,
     }, {
       sourceLabel: t('snapshotPreview.sources.mainPreview'),
       sourceDetail: selectedDetails?.record?.window_title || selectedEvent.windowTitle || selectedEvent.appName || null,
@@ -369,6 +376,9 @@ export default function MainArea({
           <DetailCard
             selectedEvent={selectedEvent}
             selectedDetails={selectedDetails}
+            active={activeTab === 'preview'}
+            isAuthenticated={isAuthenticated}
+            onOpenRecap={handleOpenRecap}
           />
 
           {/* OCR Content Panel */}
@@ -390,6 +400,10 @@ export default function MainArea({
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
             onTimelineSearchChange={onTimelineSearchChange}
+            isAuthenticated={isAuthenticated}
+            onOpenRecapDay={(date) => {
+              handleOpenRecap({ date });
+            }}
           />
         </div>
 
@@ -410,7 +424,7 @@ export default function MainArea({
           onOpen={() => openStandaloneSnapshotPreview()}
           onClear={clearSnapshotPreviewTabs}
         />
-        <RecapView active={activeTab === 'recap'} isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} />
+        <RecapView active={activeTab === 'recap'} isAuthenticated={isAuthenticated} onSelectScreenshot={onAdvancedSelect} onOpenSnapshotPreview={openSnapshotPreview} navigation={recapNavigation} />
       </div>
     </section>
   );

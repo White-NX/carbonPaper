@@ -120,16 +120,18 @@ pub enum Consumer {
     MiniLm,
     Clip,
     SmartCluster,
+    Recap,
 }
 
 impl Consumer {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Classification,
         Self::MiniLm,
         Self::Clip,
         Self::SmartCluster,
+        Self::Recap,
     ];
-    pub const ALL_MASK: u8 = 0x0f;
+    pub const ALL_MASK: u8 = 0x1f;
     pub const LEGACY_MASK: u8 = 0x07;
 
     pub const fn bit(self) -> u8 {
@@ -138,6 +140,7 @@ impl Consumer {
             Self::MiniLm => 2,
             Self::Clip => 4,
             Self::SmartCluster => 8,
+            Self::Recap => 16,
         }
     }
     pub const fn name(self) -> &'static str {
@@ -146,6 +149,7 @@ impl Consumer {
             Self::MiniLm => "minilm",
             Self::Clip => "clip",
             Self::SmartCluster => "smart_cluster",
+            Self::Recap => "recap",
         }
     }
 }
@@ -221,9 +225,52 @@ pub struct TaskState {
     pub expires_at: i64,
 }
 
+/// Independently revocable recap input, configuration or derived context.
+/// Screenshot dependencies live in the protected ledger and become immutable
+/// on activation. Completing a capture consumer does not retire these objects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecapBinding {
+    pub object_id: String,
+    pub dataset_id: String,
+    pub slot: String,
+    pub payload_bytes: u64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecapObjectKey {
+    pub binding: RecapBinding,
+    pub key: TaskKey,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    PrepareRecapObject {
+        dataset_id: String,
+        slot: String,
+        payload_bytes: u64,
+    },
+    AddRecapSources {
+        object_id: String,
+        screenshot_ids: Vec<i64>,
+    },
+    ActivateRecapObject {
+        object_id: String,
+        ciphertext_digest: String,
+    },
+    AcquireRecapObject {
+        object_id: String,
+        ciphertext_digest: String,
+    },
+    RevokeRecap {},
+    RevokeRecapDay {
+        date: String,
+    },
+    RevokeRecapObjects {
+        object_ids: Vec<String>,
+    },
     Status {},
     AttachDataset {
         dataset_id: String,
@@ -287,6 +334,13 @@ pub enum Request {
 impl Request {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::PrepareRecapObject { .. } => "prepare_recap_object",
+            Self::AddRecapSources { .. } => "add_recap_sources",
+            Self::ActivateRecapObject { .. } => "activate_recap_object",
+            Self::AcquireRecapObject { .. } => "acquire_recap_object",
+            Self::RevokeRecap {} => "revoke_recap",
+            Self::RevokeRecapDay { .. } => "revoke_recap_day",
+            Self::RevokeRecapObjects { .. } => "revoke_recap_objects",
             Self::Status { .. } => "status",
             Self::AttachDataset { .. } => "attach_dataset",
             Self::SetPolicy { .. } => "set_policy",
@@ -312,6 +366,7 @@ impl Request {
                 | Self::InspectTask { .. }
                 | Self::RenewLease { .. }
                 | Self::ReleaseLease { .. }
+                | Self::AcquireRecapObject { .. }
         )
     }
 }
@@ -325,6 +380,7 @@ pub enum Response {
     Prepared(PreparedTask),
     Lease(TaskLease),
     Deadline(i64),
+    RecapKey(RecapObjectKey),
     Error(BrokerError),
 }
 
@@ -395,7 +451,7 @@ mod tests {
         current["supported_consumers"] = Consumer::ALL_MASK.into();
         let status: BrokerStatus = serde_json::from_value(current).unwrap();
         assert_eq!(status.supported_consumers, Consumer::ALL_MASK);
-        assert_eq!(Consumer::ALL.map(Consumer::bit), [1, 2, 4, 8]);
+        assert_eq!(Consumer::ALL.map(Consumer::bit), [1, 2, 4, 8, 16]);
         assert_eq!(
             Consumer::ALL.iter().fold(0, |mask, c| mask | c.bit()),
             Consumer::ALL_MASK

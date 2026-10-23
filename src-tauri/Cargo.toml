@@ -69,6 +69,8 @@ rusqlite = { version = "=0.40.2", default-features = false, features = [
 ] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 aes-gcm = "0.10"
 aho-corasick = "1"
 sha2 = "0.10"

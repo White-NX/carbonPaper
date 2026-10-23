@@ -2,7 +2,7 @@
 
 This feature lets an approved CarbonPaper runtime finish newly captured work
 after a restart, before the archive is unlocked. It covers pending classification,
-MiniLM and CLIP inputs. Existing screenshots and OCR rows keep their CNG
+MiniLM, CLIP, Smart Cluster and recap inputs. Existing screenshots and OCR rows keep their CNG
 encryption and authorization rules; keyword HMAC indexing resumes through the
 existing unlock path without waiting for an idle window.
 
@@ -44,13 +44,70 @@ Full screenshots remain in the existing archive. Staged plaintext and task-key
 buffers use `zeroize`; inference processes necessarily receive the particular
 plaintext input they are processing.
 
-Classification, MiniLM and CLIP have separate consumer bits and completion
+Classification, MiniLM, CLIP, Smart Cluster and Recap have separate consumer bits and completion
 states. Classification orchestration and BGE embeddings run in Rust. Capture
 classification uses the immediate scheduling policy and can run during user
 activity; bulk indexing remains idle-gated. Existing foreground and
 background-enable checks continue to control dispatch. Only staged inputs receive admission without archive
 authorization. History reads, search and manual archive operations retain their
 existing session checks.
+
+## Recap generation
+
+Recap generation uses the existing process-local background authorization after
+one successful unlock. Closing the window, UI locking and ordinary session
+expiry do not cancel generation while background organization remains enabled.
+Automatic generation requires that preference; manual generation can still run
+in an authenticated session. Fullscreen apps continue to defer new requests.
+
+The `Recap` consumer (bit `16`) additionally supports generation after a locked
+restart. At capture time the application stages OCR blocks, titles, process,
+timestamps and the recorded recap date. Browser URLs and Office document
+identities are staged while their new metadata is available in plaintext.
+The capture consumer is acknowledged only after a recap-only encrypted input
+has been stored. One capture lease is held at a time; lengthy model requests
+therefore do not hold every screenshot lease or consume another consumer's grant.
+
+Recap-only inputs, raw extraction checkpoints, summaries and corrections use
+independent service-owned `recap_objects` keys. Their authenticated binding names
+the dataset, object, logical slot, size and original expiry. The service keeps
+immutable screenshot dependencies after activation. Deleting a source retires
+dependent keys, even when the local queue has lost its rows; restoring a copied
+queue cannot restore those grants. A replacement retires the previous slot's
+key, and interrupted prepares are recovered before new work.
+
+The next period reads these protected checkpoints and applies the same user
+corrections and task-ID rules as ordinary generation. Raw batches are retained
+so corrections are not applied twice when returning to the unlocked path.
+Generated results retain public-key-wrapped row encryption in the archive;
+display, search, progress retrieval, correction and manual regeneration retain
+their session-authenticated command boundary. Protected writes also check
+dataset generation, day revision, privacy and source versions.
+Runs also fence model/settings and correction versions. Missing or stale
+protected corrections wait for an authorized resync instead of silently dropping
+the user's task associations; a settings or correction edit stops stale work
+before it can replace current results.
+
+Model configuration, the selected API key and optional screening credentials
+have a separate protected `config` object populated on unlock/settings changes.
+This explicit configuration grant lasts until replacement, disablement, dataset
+retirement or removal. Input/context grants retain the configured retention and
+share the staging capacity limit. The service does not receive model requests,
+archive keys or plaintext screenshot content. The existing remote-endpoint
+consent and request budgets remain required.
+
+Older services negotiate without the Recap bit, and immutable older capture
+bindings cannot gain it. Those inputs, expired inputs and periods with missing
+staged evidence wait for the normal unlock path. Missing input never establishes
+an empty period; later fully staged periods may still generate. Deleting a day
+revokes its protected objects and preserves the suppression of automatic
+regeneration. Disabling recap revokes only recap grants, while disabling protected
+processing retires all protected grants. No existing archive format is replaced.
+
+Implementation: [protected.rs](../src-tauri/src/ai/recap/protected.rs),
+[recap staging](../src-tauri/src/processing_stage/recap.rs),
+[service ledger](../src-tauri/app-bound/src/ledger/recap.rs), and
+[protected commits](../src-tauri/src/storage/recap_protected.rs).
 
 ## Trust boundary
 

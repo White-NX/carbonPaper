@@ -8,6 +8,7 @@
 mod ann_build;
 mod background_scheduler;
 mod blind_index;
+mod blind_search;
 mod classification;
 mod connection;
 pub(crate) mod database_snapshot;
@@ -23,12 +24,14 @@ mod policy;
 mod process;
 mod processing_stage;
 mod recap;
+mod recap_protected;
+mod recap_search;
 mod schema;
 mod screenshot;
 mod screenshot_reader;
 mod search;
-mod search_plan;
-mod search_rank;
+pub(crate) mod search_plan;
+pub(crate) mod search_rank;
 mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
@@ -465,6 +468,24 @@ impl StorageState {
         Ok(connection::IndependentReadConnection::new(conn, activity))
     }
 
+    /// Run a read without holding the primary connection's mutex. The
+    /// independent connection also participates in the maintenance gate.
+    pub(super) fn with_read_connection_named<T>(
+        &self,
+        caller: &'static str,
+        operation: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        // In-memory unit fixtures have no file to open. Initialized, file-backed
+        // tests exercise the same independent connection as production.
+        #[cfg(test)]
+        if !self.is_initialized() {
+            let guard = self.get_connection_named(caller)?;
+            return operation(guard.as_ref().ok_or("Database not initialized")?);
+        }
+        let conn = self.open_read_connection_named(caller)?;
+        operation(&conn)
+    }
+
     /// Returns whether the current credential session is unlocked/valid.
     pub fn is_session_valid(&self) -> bool {
         self.credential_state.is_session_valid()
@@ -791,6 +812,98 @@ mod tests {
             finished.expect("UI reads must not wait for the primary database mutex");
             write_result.expect("writer commits after concurrent reads");
             assert_read_fixture(&storage, "Updated");
+        }
+    }
+
+    #[test]
+    fn settings_statistics_finish_while_primary_writer_is_held() {
+        for policy in [
+            mode::DatabaseModePolicy::Wal,
+            mode::DatabaseModePolicy::Delete,
+        ] {
+            let (_temp, storage) = initialized_read_storage(policy);
+            {
+                let primary = storage
+                    .get_connection_named("seed_settings_statistics")
+                    .unwrap();
+                let conn = primary.as_ref().unwrap();
+                conn.execute_batch(
+                    "INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,
+                        vector_f32,model_id,model_revision,embedding_version,source_fingerprint)
+                     VALUES('semantic_text','1',2,X'0000803F00000000','model','rev',1,'source');
+                     INSERT INTO derived_index_jobs(index_kind,subject_key,status,
+                        model_id,model_revision,embedding_version,source_fingerprint)
+                     VALUES('semantic_text','1','completed','model','rev',1,'source');
+                     INSERT INTO smart_clusters(anchor_text,threshold,enabled)
+                     VALUES('Enabled',0.5,1),('Disabled',0.5,0);
+                     INSERT INTO smart_cluster_pending(screenshot_id,queued_at)
+                     VALUES(1,datetime('now')),(2,datetime('now','-31 days'));
+                     INSERT INTO recap_usage(day,role,run_id,input_tokens,output_tokens)
+                     VALUES('2026-10-01','generation','test',100,20),
+                           ('2026-10-01','screening','test',30,0);",
+                )
+                .unwrap();
+            }
+            let mut primary = storage
+                .get_connection_named("held_settings_writer")
+                .unwrap();
+            let tx = primary
+                .as_mut()
+                .unwrap()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute_batch(
+                "UPDATE derived_index_jobs SET status='pending' WHERE subject_key='1';
+                 UPDATE smart_clusters SET enabled=0;
+                 UPDATE recap_usage SET input_tokens=999;
+                 INSERT INTO screenshots(id,image_path,image_hash) VALUES(5,'new.enc','new');",
+            )
+            .unwrap();
+
+            let reader_storage = Arc::clone(&storage);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                let result = (|| {
+                    let screenshots = reader_storage.count_active_screenshots()?;
+                    let ocr_rows = reader_storage.count_active_ocr_rows()?;
+                    let vectors = reader_storage
+                        .count_query_visible_embeddings(DerivedIndexKind::SemanticText)?;
+                    let has_vectors = reader_storage
+                        .has_query_visible_embeddings(DerivedIndexKind::SemanticText)?;
+                    let clusters = reader_storage.get_smart_cluster_status()?;
+                    let usage = reader_storage.recap_usage("2026-10-01")?;
+                    Ok::<_, String>((screenshots, ocr_rows, vectors, has_vectors, clusters, usage))
+                })();
+                finished_tx.send(result).unwrap();
+            });
+            let finished = finished_rx.recv_timeout(THREAD_TIMEOUT);
+            // A regression must release the writer before reporting timeout,
+            // so its reader can finish and the suite never deadlocks.
+            tx.rollback().unwrap();
+            drop(primary);
+            reader.join().unwrap();
+            let (screenshots, ocr_rows, vectors, has_vectors, clusters, usage) = finished
+                .expect("settings statistics must not wait for the primary mutex")
+                .unwrap();
+            assert_eq!(
+                (screenshots, ocr_rows, vectors, has_vectors),
+                (3, 4, 1, true)
+            );
+            assert_eq!(clusters.pending_count, 1);
+            assert_eq!(clusters.enabled_cluster_count, 1);
+            assert_eq!(clusters.total_cluster_count, 2);
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.screening_input_tokens
+                ),
+                (100, 20, 30)
+            );
+            assert_eq!(usage.requests, 2);
+            assert!(storage
+                .try_database_maintenance("after_settings_statistics")
+                .is_some());
         }
     }
 

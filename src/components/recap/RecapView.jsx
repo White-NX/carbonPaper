@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, FileText, Merge, MoreHorizontal, Pencil, RefreshCw, Trash2, Undo2 } from 'lucide-react';
 import { grantAiRemoteConsent } from '../../lib/ai_api';
-import { cancelRecap, correctRecap, deleteRecap, generateRecap, localDate } from '../../lib/recap_api';
+import { calendarTimeFormatter } from '../../lib/calendar_time';
+import { cancelRecap, correctRecap, deleteRecap, generateRecap, localDate, resolveRecapNavigation } from '../../lib/recap_api';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { openSettingsWindow } from '../../lib/settings_api';
 import useRecapDay from '../../hooks/useRecapDay';
@@ -15,6 +16,7 @@ import { RecapTabs } from './RecapTabs';
 import RecapRecords from './RecapRecords';
 import RecapRunStatus from './RecapRunStatus';
 import RecapApps from './RecapApps';
+import RecapKeyDetails from './RecapKeyDetails';
 
 function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
   const [open, setOpen] = useState(false);
@@ -88,7 +90,7 @@ function Landing({ enabled, hasClosedPeriod, loading, error, onConfigure, onGene
   </div>;
 }
 
-export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview }) {
+export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview, navigation }) {
   const { t, i18n } = useTranslation();
   const [date, setDate] = useState(localDate);
   const [task, setTask] = useState(null);
@@ -102,35 +104,68 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   const [error, setError] = useState('');
   const [liveRunning, setLiveRunning] = useState(false);
   const [notice, setNotice] = useState('');
-  const { day, settings, days, error: loadError, refresh } = useRecapDay(date, active, isAuthenticated);
+  const [highlightedActivity, setHighlightedActivity] = useState(null);
+  const [navigationUnavailable, setNavigationUnavailable] = useState(false);
+  const { day, settings, days, error: loadError, refresh } = useRecapDay(date, active, isAuthenticated, navigation);
   const action = useRecapSourceAction(onSelectScreenshot, onOpenSnapshotPreview);
   const scroll = useRef(null);
   const positions = useRef({});
   const recordsPosition = useRef(0);
   const focusTask = useRef(null);
   const originEntry = useRef(null);
+  const pendingNavigation = useRef(null);
+  const targetScroll = useRef(null);
   const epoch = useRef(0);
-  const formatter = useMemo(() => new Intl.DateTimeFormat(i18n.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }), [i18n.language]);
-  const time = useCallback((ms) => formatter.format(new Date(ms)), [formatter]);
+  const time = useMemo(() => calendarTimeFormatter(i18n.language, day?.calendar), [i18n.language, day?.calendar]);
   const route = task ? `task:${task}` : tab;
   const batches = day?.batches || [];
   const activities = useMemo(() => (day?.batches || []).flatMap((batch) => batch.activities).filter((activity) => activity.task_id === task).sort((a, b) => a.start_ms - b.start_ms), [day, task]);
   const selected = day?.threads.find((thread) => thread.id === task);
   const loaded = Boolean(day);
   const hasContent = batches.some((batch) => batch.activities.length || batch.error || batch.summary || batch.summary_error);
+  const showTabs = Boolean(settings?.enabled || hasContent || days.length);
   const running = operation === 'generate' || liveRunning || Boolean(day?.running);
   const issue = error || loadError || day?.error;
   const consentNeeded = String(issue).includes('AI_REMOTE_CONSENT_REQUIRED') || batches.some((batch) => [batch.error, batch.summary_error].some((value) => value?.includes('AI_REMOTE_CONSENT_REQUIRED')));
   const latest = Math.max(0, ...batches.map((batch) => batch.updated_at_ms || 0));
-  const back = useCallback(() => { focusTask.current = { task, entry: originEntry.current }; setTask(null); }, [task]);
-  const enterTask = (id, start) => { originEntry.current = `${start}:${id}`; setTask(id); };
+  const back = useCallback(() => {
+    focusTask.current = { task, entry: originEntry.current };
+    targetScroll.current = null; setHighlightedActivity(null); setNavigationUnavailable(false); setTask(null);
+  }, [task]);
+  const enterTask = (id, start) => {
+    pendingNavigation.current = null; targetScroll.current = null; setHighlightedActivity(null);
+    setNavigationUnavailable(false);
+    originEntry.current = `${start}:${id}`; setTask(id);
+  };
 
   useEffect(() => {
     epoch.current += 1;
     setConfirmDelete(false);
     setTask(null); setEditing(null); setSources(null); setDiagnostics(false); setOperation(''); setError(''); setNotice(''); setLiveRunning(false);
+    setHighlightedActivity(null); targetScroll.current = null;
+    setNavigationUnavailable(false);
+    if (!isAuthenticated || pendingNavigation.current?.date !== date) pendingNavigation.current = null;
     setTab('recap'); setPeriod(''); positions.current = {}; recordsPosition.current = 0;
   }, [date, isAuthenticated]);
+  useEffect(() => {
+    if (!navigation?.date) return;
+    pendingNavigation.current = navigation.task_id || navigation.activity_id || navigation.screenshot_id ? navigation : null;
+    targetScroll.current = null; setHighlightedActivity(null);
+    setNavigationUnavailable(false);
+    setDate(navigation.date);
+    setTask(null); setTab('recap'); setPeriod(''); setNotice('');
+  }, [navigation]);
+  useEffect(() => {
+    const pending = pendingNavigation.current;
+    if (!active || !isAuthenticated || !pending || date !== pending.date || day?.date !== pending.date) return;
+    pendingNavigation.current = null;
+    const target = resolveRecapNavigation(day, pending);
+    if (!target) { setNavigationUnavailable(true); return; }
+    originEntry.current = null;
+    targetScroll.current = target.activityId;
+    setHighlightedActivity(target.activityId);
+    setTask(target.taskId);
+  }, [navigation, active, isAuthenticated, day, date, t]);
   useEffect(() => {
     if (!active) return undefined;
     const escape = (event) => {
@@ -141,6 +176,15 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   }, [active, task, editing, sources, diagnostics, back]);
   useLayoutEffect(() => {
     if (!active || !scroll.current) return;
+    if (task && targetScroll.current) {
+      const entry = [...scroll.current.querySelectorAll('[data-recap-activity]')].find((node) => node.dataset.recapActivity === targetScroll.current);
+      if (entry) {
+        scroll.current.scrollTop = Math.max(0, scroll.current.scrollTop + entry.getBoundingClientRect().top - scroll.current.getBoundingClientRect().top - 12);
+        positions.current[route] = scroll.current.scrollTop;
+        targetScroll.current = null;
+        return;
+      }
+    }
     scroll.current.scrollTop = positions.current[route] || 0;
     if (!task && focusTask.current) {
       const entries = [...scroll.current.querySelectorAll('[data-recap-task]')];
@@ -148,7 +192,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
       entry?.focus({ preventScroll: true });
       focusTask.current = null;
     }
-  }, [active, route, task, loaded]);
+  }, [active, route, task, loaded, activities, highlightedActivity]);
 
   const run = async (kind, work) => {
     if (operation) return;
@@ -191,17 +235,16 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
     <PageHeader
       as="header"
       bordered
-      flushBottom={Boolean(!task && settings?.enabled)}
-      secondaryRow={!task && settings?.enabled ? (
+      flushBottom={Boolean(!task && showTabs)}
+      secondaryRowClassName="min-w-0 gap-3 empty:hidden"
+      secondaryRow={(
         <>
-          <RecapTabs tab={tab} onChange={setTab} />
-          {latest > 0 && (
-            <span className="ml-auto hidden text-[11px] text-ide-muted sm:block">
-              {t('recap.updated', { time: time(latest) })}
-            </span>
-          )}
+          {!task && showTabs && <RecapTabs tab={tab} onChange={setTab} />}
+          <RecapRunStatus key={date} date={date} active={active} pending={operation === 'generate' || Boolean(day?.running)}
+            updated={!task && showTabs && latest > 0 ? t('recap.updated', { time: time(latest) }) : null}
+            onRunning={setLiveRunning} onComplete={refresh} onDetails={() => setDiagnostics(true)} />
         </>
-      ) : undefined}
+      )}
     >
       <div className="recap-header grid min-w-0 flex-1 items-start gap-x-5 gap-y-2">
         <div className="flex h-10 min-w-0 items-center">
@@ -233,22 +276,25 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div>
       </div>
     </PageHeader>
-    <RecapRunStatus key={date} date={date} active={active} onRunning={setLiveRunning} onComplete={refresh} />
     {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
     {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
     {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}
-    {!task && tab === 'records' && settings?.enabled ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
+    {navigationUnavailable && <div role="status" className="border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{t('recap.eventUnavailable')}</div>}
+    {!task && tab === 'records' && showTabs ? <div id="recap-panel-records" role="tabpanel" aria-labelledby="recap-tab-records" className="min-h-0 flex-1">
       <RecapRecords date={date} batches={batches} active={active} action={action} time={time} period={period} onPeriod={setPeriod} position={recordsPosition} />
-    </div> : <div ref={scroll} id="recap-panel-recap" role={!task ? 'tabpanel' : undefined} aria-labelledby={!task && settings?.enabled ? 'recap-tab-recap' : undefined}
+    </div> : <div ref={scroll} id="recap-panel-recap" role={!task ? 'tabpanel' : undefined} aria-labelledby={!task && showTabs ? 'recap-tab-recap' : undefined}
       className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-7" onScroll={(event) => { positions.current[route] = event.currentTarget.scrollTop; }}>
       <div className="mx-auto max-w-[1120px]">
         {task ? <div className="mx-auto max-w-[880px]">
           <div className="mb-8"><p className="mb-2 text-xs text-ide-muted">{date} · {t('recap.eventHistory')}</p><h1 className="break-words text-xl font-semibold leading-relaxed">{selected?.title || activities[0]?.task_title || t('recap.eventUnavailable')}</h1></div>
           {activities.length === 0 && <p className="text-sm text-ide-muted">{t('recap.eventEmpty')}</p>}
-          {activities.map((activity) => <article key={activity.id} className="border-t border-ide-border/70 py-6">
+          {activities.map((activity) => <article key={activity.id} data-recap-activity={activity.id}
+            className={`border-t border-ide-border/70 py-6 ${activity.id === highlightedActivity ? 'border-l-2 pl-4' : ''}`}>
+            {activity.id === highlightedActivity && <p className="mb-3 text-xs font-medium text-ide-muted">{t('recap.snapshotActivity')}</p>}
             <div className="mb-3 flex items-center justify-between gap-3"><time className="text-xs font-medium tabular-nums text-ide-muted">{time(activity.start_ms)}{activity.start_ms !== activity.end_ms && `–${time(activity.end_ms)}`}</time>
               <Button variant="ghost" icon={Pencil} onClick={() => setEditing({ ...activity, kind: 'move', epoch: epoch.current })}>{t('recap.adjust')}</Button></div>
             <p className="whitespace-pre-wrap break-words text-sm leading-7">{activity.text}</p>
+            <RecapKeyDetails details={activity.details} sources={activity.sources} onSources={setSources} />
             {activity.sources.length > 0 && <div className="mt-4"><div className="grid max-w-lg grid-cols-3 gap-3">{activity.sources.slice(0, 3).map((source) => <SourceThumbnail key={source.id} source={source} action={action} time={time} />)}</div>
               <button className="recap-focus mt-3 rounded text-xs text-ide-muted hover:text-ide-accent" onClick={() => setSources(activity.sources)}>{t('recap.viewSources', { count: activity.sources.length })}</button>
             </div>}

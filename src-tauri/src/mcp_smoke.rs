@@ -287,8 +287,8 @@ pub async fn run(port: u16, token: &str) -> McpSmokeReport {
             Some(json!({
                 "name": "get_snapshots_by_time_range",
                 "arguments": {
-                    "start_time": 0,
-                    "end_time": chrono::Utc::now().timestamp_millis(),
+                    "start_ms": 0,
+                    "end_ms": chrono::Utc::now().timestamp_millis(),
                     "max_records": 1
                 }
             })),
@@ -305,7 +305,7 @@ pub async fn run(port: u16, token: &str) -> McpSmokeReport {
             return runner.finish_failed("metadata_query", started, failure);
         }
     };
-    if !metadata_result_is_array(metadata_result) {
+    if !metadata_result_is_page(metadata_result) {
         return runner.finish_failed("metadata_query", started, SmokeFailure::ProtocolError);
     }
     runner.push_passed("metadata_query", started);
@@ -331,15 +331,21 @@ fn rpc_result(response: &Value) -> Result<&Value, SmokeFailure> {
         }
         return Err(SmokeFailure::ProtocolError);
     }
-    response.get("result").ok_or(SmokeFailure::ProtocolError)
+    let result = response.get("result").ok_or(SmokeFailure::ProtocolError)?;
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            classify_metadata_failure(response).unwrap_or(SmokeFailure::MetadataQueryFailed)
+        );
+    }
+    Ok(result)
 }
 
 fn classify_metadata_failure(response: &Value) -> Option<SmokeFailure> {
-    let message = response
-        .get("error")?
-        .get("message")?
-        .as_str()?
-        .to_ascii_lowercase();
+    let payload = response.get("result").and_then(tool_payload);
+    let error = response
+        .get("error")
+        .or_else(|| payload.as_ref()?.get("error"))?;
+    let message = format!("{} {}", error["code"], error["message"]).to_ascii_lowercase();
     if message.contains("privacy") || message.contains("sensitive") || message.contains("filter") {
         Some(SmokeFailure::PrivacyFilterError)
     } else if message.contains("auth_required") {
@@ -351,7 +357,16 @@ fn classify_metadata_failure(response: &Value) -> Option<SmokeFailure> {
     }
 }
 
-fn metadata_result_is_array(result: &Value) -> bool {
+fn metadata_result_is_page(result: &Value) -> bool {
+    result.get("isError").and_then(Value::as_bool) != Some(true)
+        && tool_payload(result).is_some_and(|value| {
+            value["items"].is_array()
+                && value["offset"].is_u64()
+                && value.get("next_offset").is_some()
+        })
+}
+
+fn tool_payload(result: &Value) -> Option<Value> {
     result
         .get("content")
         .and_then(Value::as_array)
@@ -359,7 +374,6 @@ fn metadata_result_is_array(result: &Value) -> bool {
         .and_then(|entry| entry.get("text"))
         .and_then(Value::as_str)
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .is_some_and(|value| value.is_array())
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -398,10 +412,33 @@ mod tests {
     }
 
     #[test]
-    fn metadata_result_requires_a_json_array_payload() {
-        let good = json!({ "content": [{ "type": "text", "text": "[]" }] });
+    fn metadata_result_requires_a_page_with_an_explicit_end_marker() {
+        let good = json!({ "content": [{ "type": "text", "text": json!({"items":[],"offset":0,"next_offset":null}).to_string() }] });
         let bad = json!({ "content": [{ "type": "text", "text": "{\"id\":1}" }] });
-        assert!(metadata_result_is_array(&good));
-        assert!(!metadata_result_is_array(&bad));
+        assert!(metadata_result_is_page(&good));
+        assert!(!metadata_result_is_page(&bad));
+        assert!(!metadata_result_is_page(
+            &json!({ "isError": true, "content": [{ "type": "text", "text": "[]" }] })
+        ));
+    }
+
+    #[test]
+    fn metadata_tool_errors_use_the_same_codes_as_the_agent() {
+        for (code, expected) in [
+            ("AUTH_REQUIRED", SmokeFailure::SessionLocked),
+            (
+                "MAINTENANCE_IN_PROGRESS",
+                SmokeFailure::MaintenanceInProgress,
+            ),
+            ("PRIVACY_REJECTED", SmokeFailure::PrivacyFilterError),
+            ("TOOL_FAILED", SmokeFailure::MetadataQueryFailed),
+        ] {
+            let response = json!({ "jsonrpc": "2.0", "id": 4, "result": {
+                "isError": true,
+                "content": [{ "type": "text", "text": mcp_contract::error_payload(code).to_string() }]
+            }});
+            assert_eq!(classify_metadata_failure(&response), Some(expected));
+            assert_eq!(rpc_result(&response), Err(expected));
+        }
     }
 }

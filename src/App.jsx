@@ -28,6 +28,7 @@ import { useCriticalErrors } from './hooks/useCriticalErrors';
 import { useMonitorLifecycle } from './hooks/useMonitorLifecycle';
 import { useRequiredModels } from './hooks/useRequiredModels';
 import { useSelectedSnapshot, normalizeTimestampToMs } from './hooks/useSelectedSnapshot';
+import { searchResultToSnapshotEvent } from './lib/snapshot_preview';
 import { useRequiredModelDownload } from './hooks/useRequiredModelDownload';
 import { useUpdateManager } from './hooks/useUpdateManager';
 import { useTauriEventListener } from './hooks/useTauriEventListener';
@@ -204,34 +205,12 @@ function App() {
   }, [highlightedEventId, setHighlightedEventId]);
 
   const selectSearchResult = useCallback((res) => {
-    const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
-    const imagePath = res.image_path || res.metadata?.image_path;
-    // screenshot_created_at 才是拍摄时刻；OCR 检索结果里的 created_at 是识别完成
-    // 的时间，晚于拍摄，只能当最后的退路。时间未知的向量命中会把 timestamp 写成
-    // 0，那要跳过而不是当成 1970 年。
-    const seconds = [res.timestamp, res.metadata?.timestamp]
-      .find((value) => typeof value === 'number' && value > 0);
-    const timestamp = seconds
-      ?? res.screenshot_created_at
-      ?? res.metadata?.screenshot_created_at
-      ?? res.created_at
-      ?? res.metadata?.created_at
-      ?? new Date().toISOString();
-    const isNl = res.similarity !== undefined || res.distance !== undefined || (res.metadata?.screenshot_id !== undefined && res.screenshot_id === undefined);
-    const timestampMs = normalizeTimestampToMs(timestamp);
-
-    if (screenshotId !== undefined || imagePath) {
-      setSelectedEvent({
-        id: screenshotId || -1,
-        path: imagePath,
-        appName: res.process_name || res.metadata?.process_name,
-        windowTitle: res.window_title || res.metadata?.window_title,
-        timestamp: timestampMs ?? Date.now(),
-        _fromNlSearch: isNl,
-      });
-      setHighlightedEventId(screenshotId || -1);
-      if (timestampMs) {
-        setTimelineJump({ time: timestampMs, ts: Date.now() });
+    const event = searchResultToSnapshotEvent(res);
+    if (event) {
+      setSelectedEvent(event);
+      setHighlightedEventId(event.id);
+      if (event.timestamp !== null) {
+        setTimelineJump({ time: event.timestamp, ts: Date.now() });
       }
     }
     setActiveTab('preview');

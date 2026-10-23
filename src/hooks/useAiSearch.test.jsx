@@ -75,12 +75,12 @@ describe('AI conversation', () => {
   it('sends previous completed turns for follow-ups and clears them for a new conversation', async () => {
     const { result } = await setup();
     act(() => { result.current.start('first'); });
-    await act(async () => finish({ answer: 'Found [#42]', snapshots: [{ id: 42 }] }));
+    await act(async () => finish({ answer: 'Found [#42]', snapshots: [{ screenshot_id: 42, captured_at_ms: null }] }));
     act(() => { result.current.start('what about that?'); });
     expect(runAiSearch.mock.lastCall[0]).toMatchObject({
       providerId: 'p', question: 'what about that?', history: [{ question: 'first', answer: 'Found [#42]' }],
     });
-    expect(result.current.turns[0].outcome.snapshots).toEqual([{ id: 42 }]);
+    expect(result.current.turns[0].outcome.snapshots).toEqual([{ screenshot_id: 42, captured_at_ms: null }]);
     await act(async () => finish({ answer: 'More', snapshots: [] }));
     act(() => result.current.reset());
     expect(result.current.turns).toEqual([]);
@@ -99,14 +99,14 @@ describe('AI conversation', () => {
     ];
     const timeContext = {
       started_at: '2026-09-27T23:59:00+08:00',
-      searched_ranges: [{ tool: 'search_ocr_text', start_time: 1790467200000, end_time: 1790553600000 }],
+      searched_ranges: [{ tool: 'search_ocr_text', start_ms: 1790467200000, end_ms: 1790553600000 }],
     };
     act(() => { result.current.start('today'); });
     act(() => {
       emit({ type: 'step_started', step: 1 });
       emit({ type: 'reasoning_delta', text: 'working' });
       emit({ type: 'tool_started', call_id: 'a', name: 'search_ocr_text', arguments: { query: 'invoice' } });
-      emit({ type: 'tool_finished', call_id: 'a', ok: true, snapshots: [{ id: 42 }] });
+      emit({ type: 'tool_finished', call_id: 'a', ok: true, snapshots: [{ screenshot_id: 42, captured_at_ms: null }] });
     });
     await act(async () => finish({ answer: 'Found [#42]', time_context: timeContext, messages }));
     act(() => { result.current.start('an hour earlier?'); });

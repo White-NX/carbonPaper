@@ -18,6 +18,9 @@ vi.mock('../../lib/settings_api', () => ({
 
 import { AiSearchPanel, Steps, Reasoning } from './AiSearchPanel';
 import { openSettingsWindow } from '../../lib/settings_api';
+import { captureDateOf } from '../../lib/search_grouping';
+import { searchResultToSnapshotEvent } from '../../lib/snapshot_preview';
+import fixture from '../../tests/fixtures/screenshot_contract_v3.json';
 
 const Header = ({ children, secondaryRow, as: Tag = 'div', onSubmit }) => (
   <Tag onSubmit={onSubmit}>{secondaryRow}{children}</Tag>
@@ -55,7 +58,7 @@ describe('AiSearchPanel', () => {
 
   it('renders answer tables with interactive citations and aligned cells', () => {
     const onSelectResult = vi.fn();
-    const snapshots = [{ id: 42, window_title: 'Paper' }];
+    const snapshots = [{ screenshot_id: 42, window_title: 'Paper' }];
     const c = controller({
       status: 'done', question: 'Publication years?',
       answer: '| Paper | Year | Source |\n| --- | ---: | :---: |\n| **RoleLLM** | 2023 | [#42] |',
@@ -114,7 +117,7 @@ describe('AiSearchPanel', () => {
 
   it('opens the cited screenshot with the metadata the tools reported', () => {
     const onSelectResult = vi.fn();
-    const snapshots = [{ id: 42, window_title: 'Invoice.pdf', timestamp: 1700000000 }];
+    const snapshots = [{ screenshot_id: 42, window_title: 'Invoice.pdf', captured_at_ms: 1700000000000 }];
     const c = controller({
       status: 'done',
       question: 'where is the invoice?',
@@ -129,6 +132,24 @@ describe('AiSearchPanel', () => {
     expect(screen.getByText('#7').closest('button')).toBeDisabled();
   });
 
+  it('renders a capture and opens its preview at the same instant despite delayed OCR', () => {
+    const onSelectResult = vi.fn();
+    const reference = { screenshot_id: fixture.screenshot_id, captured_at_ms: fixture.captured_at_ms };
+    const c = controller({
+      status: 'done', question: 'Find the save location', answer: `Found [#${fixture.screenshot_id}]`,
+      steps: [{ id: 'search', name: 'search_ocr_text', status: 'done', snapshots: [{ ...reference, captured_at_ms: null }] }],
+      outcome: { snapshots: [reference] },
+    });
+    render(<AiSearchPanel controller={c} header={Header} onSelectResult={onSelectResult} />);
+    expect(screen.getByText(new Date(fixture.captured_at_ms).toLocaleString())).toBeInTheDocument();
+    expect(screen.queryByText(new Date(fixture.ocr_processed_at_ms).toLocaleString())).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByText(`#${fixture.screenshot_id}`)[0]);
+    const selected = onSelectResult.mock.calls[0][0];
+    expect(selected.screenshot_id).toBe(fixture.screenshot_id);
+    expect(captureDateOf(selected).getTime()).toBe(fixture.captured_at_ms);
+    expect(searchResultToSnapshotEvent(selected).timestamp).toBe(fixture.captured_at_ms);
+  });
+
   it('turns the submit button into a stop button while running', () => {
     const c = controller({ status: 'running', question: 'q' });
     render(<AiSearchPanel controller={c} header={Header} />);
@@ -140,7 +161,7 @@ describe('AiSearchPanel', () => {
     const steps = [
       { id: 'a', name: 'search_nl', status: 'done', itemCount: 3 },
       { id: 'b', name: 'search_ocr_text', status: 'done', itemCount: 1 },
-      { id: 'c', name: 'get_snapshot_details', arguments: { id: 42 }, status: 'done' },
+      { id: 'c', name: 'get_snapshot_details', arguments: { screenshot_id: 42 }, status: 'done' },
       { id: 'd', name: 'get_snapshots_by_time_range', status: 'running' },
     ];
     const { rerender } = render(<Steps steps={steps} running t={t} />);
@@ -167,7 +188,7 @@ describe('AiSearchPanel', () => {
     const c = controller({
       status: 'done', question: 'follow-up', answer: 'Again [#42]',
       rounds: [{ id: 1, text: 'I will check.', reasoning: 'Plan' }, { id: 2, text: 'Again [#42]', reasoning: '' }],
-      turns: [{ status: 'done', question: 'first', answer: 'Found it.', steps: [], outcome: { snapshots: [{ id: 42, window_title: 'Invoice' }] } }],
+      turns: [{ status: 'done', question: 'first', answer: 'Found it.', steps: [], outcome: { snapshots: [{ screenshot_id: 42, window_title: 'Invoice' }] } }],
       reset: vi.fn(),
     });
     render(<AiSearchPanel controller={c} header={Header} onSelectResult={onSelectResult} />);
@@ -196,7 +217,7 @@ describe('AiSearchPanel', () => {
       steps: [
         { id: 's1', round: 1, name: 'search_nl', status: 'done' },
         { id: 's2', round: 1, name: 'search_ocr_text', status: 'done' },
-        { id: 's3', round: 1, name: 'get_snapshot_details', arguments: { id: 42 }, status: 'done' },
+        { id: 's3', round: 1, name: 'get_snapshot_details', arguments: { screenshot_id: 42 }, status: 'done' },
       ],
     });
     const { rerender } = render(<AiSearchPanel controller={c} header={Header} />);
@@ -246,10 +267,10 @@ describe('AiSearchPanel', () => {
   });
 
   it('highlights only the cited card footer on hover and keyboard focus, including citations beyond twelve', () => {
-    const snapshots = Array.from({ length: 13 }, (_, index) => ({ id: index + 1, window_title: `Window ${index + 1}` }));
+    const snapshots = Array.from({ length: 13 }, (_, index) => ({ screenshot_id: index + 1, window_title: `Window ${index + 1}` }));
     const onSelectResult = vi.fn();
     render(<AiSearchPanel controller={controller({
-      status: 'done', question: 'q', answer: snapshots.map(({ id }) => `[#${id}]`).join(' '), outcome: { snapshots },
+      status: 'done', question: 'q', answer: snapshots.map(({ screenshot_id }) => `[#${screenshot_id}]`).join(' '), outcome: { snapshots },
     })} header={Header} onSelectResult={onSelectResult} />);
     const cite = screen.getByRole('button', { name: '#13', exact: true });
     const footer = document.querySelector('[data-source-id="13"] [data-highlighted]');

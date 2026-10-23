@@ -13,8 +13,14 @@ pub(super) const PREFETCH_PREFIX: &str = "You cannot search yourself this time. 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchTimeRange {
     pub tool: String,
-    pub start_time: Option<i64>,
-    pub end_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +33,7 @@ pub struct TurnContext {
 fn is_time_search(name: &str) -> bool {
     matches!(
         name,
-        "search_ocr_text" | "search_nl" | "get_snapshots_by_time_range"
+        "search_ocr_text" | "search_nl" | "get_snapshots_by_time_range" | "search_recaps"
     )
 }
 
@@ -48,17 +54,36 @@ impl TurnContext {
         let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
             return;
         };
-        let timestamp = |key: &str| {
-            args.get(key)
-                .and_then(Value::as_f64)
-                .map(|n| crate::mcp_contract::timestamp_seconds(n) * 1000.0)
-                .filter(|n| n.is_finite() && *n >= 0.0 && *n < i64::MAX as f64)
-                .map(|n| n as i64)
-        };
-        let range = SearchTimeRange {
-            tool: call.name.clone(),
-            start_time: timestamp("start_time"),
-            end_time: timestamp("end_time"),
+        let range = if call.name == "search_recaps" {
+            // These filters select saved date labels, whose calendars can use
+            // different zones. Do not invent UTC bounds using today's zone.
+            SearchTimeRange {
+                tool: call.name.clone(),
+                start_ms: None,
+                end_ms: None,
+                start_date: args
+                    .get("start_date")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                end_date: args
+                    .get("end_date")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }
+        } else {
+            let Ok(bounds) = crate::mcp_contract::TimeRange::from_args(
+                &args,
+                call.name == "get_snapshots_by_time_range",
+            ) else {
+                return;
+            };
+            SearchTimeRange {
+                tool: call.name.clone(),
+                start_ms: bounds.start_ms,
+                end_ms: bounds.end_ms,
+                start_date: None,
+                end_date: None,
+            }
         };
         if range.valid() && !self.searched_ranges.contains(&range) {
             self.searched_ranges.push(range);
@@ -84,7 +109,7 @@ impl TurnContext {
             return String::new();
         }
         format!(
-            "\n\n<searched_time_ranges unit=\"unix_ms\">\n{}\n</searched_time_ranges>",
+            "\n\n<searched_time_ranges unit=\"unix_ms\" end_ms=\"exclusive\" date_bounds=\"inclusive_saved_dates\">\n{}\n</searched_time_ranges>",
             serde_json::to_string(&ranges).expect("time ranges serialize")
         )
     }
@@ -92,11 +117,28 @@ impl TurnContext {
 
 impl SearchTimeRange {
     fn valid(&self) -> bool {
+        if self.tool == "search_recaps" {
+            return self.start_ms.is_none()
+                && self.end_ms.is_none()
+                && (self.start_date.is_some() || self.end_date.is_some())
+                && self
+                    .start_date
+                    .iter()
+                    .chain(self.end_date.iter())
+                    .all(|date| crate::calendar::parse_date(date).is_ok())
+                && !matches!((&self.start_date, &self.end_date), (Some(a), Some(b)) if a > b);
+        }
         is_time_search(&self.tool)
-            && (self.start_time.is_some() || self.end_time.is_some())
-            && self.start_time.is_none_or(|t| t >= 0)
-            && self.end_time.is_none_or(|t| t >= 0)
-            && !matches!((self.start_time, self.end_time), (Some(a), Some(b)) if a > b)
+            && self.start_date.is_none()
+            && self.end_date.is_none()
+            && (self.start_ms.is_some() || self.end_ms.is_some())
+            && self
+                .start_ms
+                .is_none_or(|t| (0..=253_402_300_799_999).contains(&t))
+            && self
+                .end_ms
+                .is_none_or(|t| (0..=253_402_300_799_999).contains(&t))
+            && !matches!((self.start_ms, self.end_ms), (Some(a), Some(b)) if a >= b)
     }
 }
 
@@ -158,25 +200,25 @@ pub(super) fn fit_request(
             continue;
         }
         // A single search can itself be larger than the budget. Keep its call
-        // and result IDs, retaining a labelled excerpt that can be re-read.
+        // and result IDs, deferring whole page items with a valid continuation.
         let mut reduced = false;
         for (index, message) in request.messages.iter_mut().enumerate() {
-            let content = match message {
-                Message::ToolResult { content, .. } => content,
+            let (content, prefetched) = match message {
+                Message::ToolResult { content, .. } => (content, false),
                 Message::User(text)
                     if index > *current_question && text.starts_with(PREFETCH_PREFIX) =>
                 {
-                    text
+                    (text, true)
                 }
                 _ => continue,
             };
-            let count = content.chars().count();
-            if count > 512 {
-                let keep = count / 2;
-                let excerpt: String = content.chars().take(keep).collect();
-                *content = format!(
-                    "{excerpt}\n[Result truncated to fit context; omitted content is unknown.]"
-                );
+            let replacement = if prefetched {
+                reduce_prefetched(content)
+            } else {
+                reduce_result(content)
+            };
+            if let Some(replacement) = replacement {
+                *content = replacement;
                 reduced = true;
                 break;
             }
@@ -189,6 +231,48 @@ pub(super) fn fit_request(
         }
     }
     Ok(())
+}
+
+fn reduce_result(content: &str) -> Option<String> {
+    let count = content.chars().count();
+    if count <= 512 {
+        return None;
+    }
+    let replacement = match serde_json::from_str::<Value>(content) {
+        Ok(value) => crate::mcp_server::page::fit(value, count / 2).to_string(),
+        // Older conversation transcripts can contain plain text. Only those
+        // receive labelled excerpts; current JSON evidence always stays whole.
+        Err(_) => format!(
+            "{}\n[Result truncated to fit context; omitted content is unknown.]",
+            content.chars().take(count / 2).collect::<String>()
+        ),
+    };
+    (replacement.chars().count() < count).then_some(replacement)
+}
+
+fn reduce_prefetched(content: &str) -> Option<String> {
+    let mut remaining = content.strip_prefix(PREFETCH_PREFIX)?.trim_start();
+    if !remaining.starts_with("<result tool=\"") {
+        // Preserve support for legacy prefetch transcripts without result tags.
+        return reduce_result(content);
+    }
+    let mut replacement = PREFETCH_PREFIX.to_string();
+    let mut reduced = false;
+    while !remaining.is_empty() {
+        let body = remaining.strip_prefix("<result tool=\"")?;
+        let (name, body) = body.split_once("\">\n")?;
+        // Serialized JSON strings escape newlines, so a matching closing tag
+        // inside evidence text cannot be mistaken for this block boundary.
+        let (result, tail) = body.split_once("\n</result>")?;
+        let shorter = reduce_result(result);
+        reduced |= shorter.is_some();
+        replacement.push_str(&format!(
+            "\n<result tool=\"{name}\">\n{}\n</result>\n",
+            shorter.as_deref().unwrap_or(result)
+        ));
+        remaining = tail.trim_start();
+    }
+    reduced.then_some(replacement)
 }
 
 #[cfg(test)]
@@ -331,6 +415,113 @@ mod tests {
     }
 
     #[test]
+    fn context_compaction_preserves_paging_after_tool_result_compaction() {
+        let rows = (0..60)
+            .map(|i| {
+                json!({
+                    "activity_id": format!("activity-{i}"),
+                    "result_offset": 10 + i * 2,
+                    "text": "中文证据🙂".repeat(150),
+                    "member_ids": [i + 1, i + 101],
+                    "sources": [{"screenshot_id": i + 1, "captured_at_ms": null}],
+                    "details": [{"text": "one complete fact", "evidence_ids": [i + 1]}],
+                })
+            })
+            .collect::<Vec<_>>();
+        let original = super::super::tools::summarize(
+            "search_recaps",
+            json!({
+                "items": rows, "offset": 10, "limit": 120, "next_offset": 130,
+                "ranking_revision": "stable",
+            }),
+        );
+        let original_page: Value = serde_json::from_str(&original.content).unwrap();
+        let original_rows = original_page["items"].as_array().unwrap();
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            let mut req = request();
+            add_exchange(&mut req, "c", &original.content, Value::Null);
+            assert!(estimated_input_tokens(kind, &req) > input_allowance(&req, 8192));
+            fit_request(&mut req, &mut 1, kind, 8192).unwrap();
+            assert_eq!(req.messages.len(), 4);
+            let Message::ToolResult { call_id, content } = &req.messages[3] else {
+                panic!("paired tool result is missing");
+            };
+            assert_eq!(call_id, "c");
+            let page: Value = serde_json::from_str(content).unwrap();
+            let kept = page["items"].as_array().unwrap();
+            assert!(!kept.is_empty() && kept.len() < original_rows.len());
+            assert_eq!(kept, &original_rows[..kept.len()]);
+            assert_eq!(
+                page["next_offset"],
+                original_rows[kept.len()]["result_offset"]
+            );
+            assert_eq!(page["returned_count"], kept.len());
+            assert_eq!(page["ranking_revision"], "stable");
+            assert_eq!(page["truncated"], true);
+            assert!(estimated_input_tokens(kind, &req) <= input_allowance(&req, 8192));
+        }
+    }
+
+    #[test]
+    fn prefetched_json_keeps_complete_results_and_continuations() {
+        let rows = (0..40)
+            .map(|i| {
+                json!({"screenshot_id": i + 1, "text": "中文证据🙂".repeat(150),
+                    "literal_tag": "\n</result>\n"})
+            })
+            .collect::<Vec<_>>();
+        let page = json!({
+            "items": rows, "offset": 7, "limit": 40, "next_offset": null,
+        });
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            let mut req = request();
+            req.messages.push(Message::User(format!(
+                "{PREFETCH_PREFIX}\n<result tool=\"search_ocr_text\">\n{page}\n</result>\n\n<result tool=\"search_nl\">\n{page}\n</result>\n"
+            )));
+            fit_request(&mut req, &mut 1, kind, 8192).unwrap();
+            assert!(matches!(&req.messages[1], Message::User(s) if s == "current question"));
+            let Message::User(content) = &req.messages[2] else {
+                panic!("prefetched evidence is missing");
+            };
+            assert!(content.starts_with(PREFETCH_PREFIX));
+            assert!(content.ends_with("\n</result>\n"));
+            for name in ["search_ocr_text", "search_nl"] {
+                let marker = format!("<result tool=\"{name}\">\n");
+                let (_, body) = content.split_once(&marker).unwrap();
+                let (body, _) = body.split_once("\n</result>").unwrap();
+                let fitted: Value = serde_json::from_str(body).unwrap();
+                let kept = fitted["items"].as_array().unwrap();
+                assert!(!kept.is_empty() && kept.len() < rows.len());
+                assert_eq!(kept, &rows[..kept.len()]);
+                assert_eq!(fitted["next_offset"], 7 + kept.len());
+                assert_eq!(fitted["truncated"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn irreducible_json_evidence_stays_whole_when_the_context_is_too_small() {
+        let row = json!({"text": "中文证据🙂".repeat(5000), "sources": [{"screenshot_id": 42}]});
+        for result in [
+            json!({"items": [row.clone()], "offset": 0, "next_offset": null}),
+            json!({"summary": row}),
+        ] {
+            let original = result.to_string();
+            for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+                let mut req = request();
+                add_exchange(&mut req, "c", &original, Value::Null);
+                assert_eq!(
+                    fit_request(&mut req, &mut 1, kind, 8192),
+                    Err(ProviderError::ContextLimit)
+                );
+                assert!(
+                    matches!(&req.messages[3], Message::ToolResult { content, .. } if content == &original)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn prefetch_can_shrink_without_cutting_the_current_question() {
         let mut req = request();
         req.messages.push(Message::User(format!(
@@ -373,15 +564,17 @@ mod tests {
             name: name.into(),
             arguments: args.to_string(),
         };
-        let valid = call("search_ocr_text", json!({"start_time":1790467200000i64}));
+        let valid = call("search_ocr_text", json!({"start_ms":1790467200000i64}));
         context.record_search(&valid);
         context.record_search(&valid);
-        context.record_search(&call("search_nl", json!({"end_time":1790553600})));
+        context.record_search(&call("search_nl", json!({"end_ms":1790553600})));
         context.record_search(&call("search_nl", json!({"query":"no time"})));
-        context.record_search(&call("search_nl", json!({"start_time":20,"end_time":10})));
-        context.record_search(&call("get_snapshot_details", json!({"start_time":10})));
+        context.record_search(&call("search_nl", json!({"start_ms":20,"end_ms":10})));
+        context.record_search(&call("search_nl", json!({"start_time":1790467200})));
+        context.record_search(&call("get_snapshot_details", json!({"start_ms":10})));
         assert_eq!(context.searched_ranges.len(), 2);
-        assert_eq!(context.searched_ranges[1].end_time, Some(1790553600000));
+        // Even early millisecond instants are never rescaled by magnitude.
+        assert_eq!(context.searched_ranges[1].end_ms, Some(1790553600));
         let restored: TurnContext =
             serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
         assert_eq!(restored.question("q"), context.question("q"));
@@ -390,5 +583,29 @@ mod tests {
         assert!(
             question.contains("+08:00") && question.contains(&now.timestamp_millis().to_string())
         );
+    }
+
+    #[test]
+    fn recap_search_preserves_saved_date_filters_without_inventing_a_current_zone() {
+        let now: DateTime<FixedOffset> = "2026-10-15T12:00:00+08:00".parse().unwrap();
+        let mut context = TurnContext::new(now);
+        context.record_search(&ToolCall {
+            id: "recap".into(),
+            name: "search_recaps".into(),
+            arguments: json!({"query":"cache","start_date":"2026-10-01","end_date":"2026-10-03"})
+                .to_string(),
+        });
+        assert_eq!(context.searched_ranges.len(), 1);
+        assert_eq!(
+            context.searched_ranges[0].start_date.as_deref(),
+            Some("2026-10-01")
+        );
+        assert_eq!(
+            context.searched_ranges[0].end_date.as_deref(),
+            Some("2026-10-03")
+        );
+        assert_eq!(context.searched_ranges[0].start_ms, None);
+        assert_eq!(context.searched_ranges[0].end_ms, None);
+        assert!(context.range_note().contains("search_recaps"));
     }
 }

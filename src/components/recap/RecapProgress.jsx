@@ -2,6 +2,7 @@ import React, { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle2, ChevronRight, Circle, CircleAlert, Loader2, PauseCircle, Square } from 'lucide-react';
 import { recapErrorKey } from '../../lib/recap_api';
+import { calendarTimeFormatter } from '../../lib/calendar_time';
 import { recapAttemptStatus, recapDiagnosticOutcome, recapDiagnosticPeriods, recapRequestDuration } from '../../lib/recap_diagnostics';
 import { ProgressBlock } from '../overlay/ProgressBlock';
 import { Button } from '../ui/Button';
@@ -33,11 +34,11 @@ function duration(ms, t) {
     : t('recap.diagnostics.minutesSeconds', { minutes: Math.floor(seconds / 60), seconds: seconds % 60 });
 }
 
-export function DiagnosticError({ error, tone = 'error', message }) {
+export function DiagnosticError({ error, tone = 'error', message, action, className = '' }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const id = useId();
-  return <Banner tone={tone}>
+  return <Banner tone={tone} action={action} className={className}>
     <p>{message || t(recapErrorKey(error), { defaultValue: t('recap.errors.unknown') })}</p>
     {error && <>
       <Button variant="ghost" size="xs" className="mt-1 -ml-2" aria-expanded={open} aria-controls={id} onClick={() => setOpen(value => !value)}>{t('recap.errorDetails')}</Button>
@@ -107,12 +108,11 @@ function Attempt({ attempt, progress, now, onInspect }) {
   </li>;
 }
 
-function Period({ period, progress, now, automaticOpen }) {
-  const { t, i18n } = useTranslation();
+function Period({ period, progress, now, automaticOpen, time }) {
+  const { t } = useTranslation();
   const [chosenOpen, setChosenOpen] = useState(null);
   const id = useId();
   const open = chosenOpen ?? automaticOpen;
-  const time = ms => new Date(ms).toLocaleTimeString(i18n.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
   const range = Number.isFinite(period.end_ms) ? `${time(period.start_ms)}–${time(period.end_ms)}` : t('recap.diagnostics.periodFrom', { start: time(period.start_ms) });
   const attemptProgress = attempt => period.live.some(live => live.id === attempt.id) ? progress : null;
   const durations = period.attempts.map(attempt => recapRequestDuration(attempt, now, attemptProgress(attempt)));
@@ -138,8 +138,9 @@ function Period({ period, progress, now, automaticOpen }) {
   </li>;
 }
 
-export default function RecapProgress({ progress, batches = [], error }) {
-  const { t } = useTranslation();
+export default function RecapProgress({ progress, batches = [], error, calendar }) {
+  const { t, i18n } = useTranslation();
+  const time = useMemo(() => calendarTimeFormatter(i18n.language, calendar), [i18n.language, calendar]);
   const [now, setNow] = useState(Date.now);
   const running = progress != null && progress.finished_at_ms == null;
   const finishing = running && progress.total_batches > 0 && progress.completed_batches >= progress.total_batches;
@@ -166,7 +167,7 @@ export default function RecapProgress({ progress, batches = [], error }) {
       {runError && !['cancelled', 'paused'].includes(status) && <DiagnosticError error={runError} />}
     </div>
     <ol aria-label={t('recap.diagnostics.periods')}>
-      {periods.map(period => <Period key={period.start_ms} period={period} progress={progress} now={now} automaticOpen={current?.start_ms === period.start_ms} />)}
+      {periods.map(period => <Period key={period.start_ms} period={period} progress={progress} now={now} automaticOpen={current?.start_ms === period.start_ms} time={time} />)}
     </ol>
   </section>;
 }

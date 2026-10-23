@@ -283,8 +283,12 @@ pub async fn app_bound_set_policy(
     };
     limits.validate().map_err(|e| e.to_string())?;
     let storage = storage.inner().clone();
+    let recap_app = app.clone();
     tokio::task::spawn_blocking(move || {
         storage.processing_stage.set_policy(enabled, limits)?;
+        if enabled {
+            crate::ai::recap::protected::sync_after_unlock(&recap_app)?;
+        }
         storage.processing_stage.reconcile(&storage)
     })
     .await

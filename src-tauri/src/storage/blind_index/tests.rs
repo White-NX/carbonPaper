@@ -18,6 +18,44 @@ fn fixture() -> Connection {
     conn
 }
 
+#[test]
+fn recap_postings_share_promotion_mutation_and_probe_without_touching_ocr() {
+    let conn = fixture();
+    ensure_recap_schema(&conn).unwrap();
+    ensure_recap_schema(&conn).unwrap();
+    let original = large();
+    write(&conn, "shared-hash", &RoaringBitmap::from_iter([17]));
+    let tx = conn.unchecked_transaction().unwrap();
+    let recap = BlindIndex::recaps(&tx);
+    let mut stats = MutationStats::default();
+    recap.add("shared-hash", &original, &mut stats).unwrap();
+    let posting = recap.probe(&["shared-hash".into()]).unwrap().postings;
+    assert!(posting[0].chunked);
+    assert_eq!(posting[0].cardinality, Some(original.len()));
+    assert_eq!(
+        recap.read("shared-hash", true).unwrap().unwrap().bitmap,
+        original
+    );
+    // Clear every promoted chunk through the same mutation implementation.
+    recap.remove("shared-hash", &original, &mut stats).unwrap();
+    assert!(recap.read("shared-hash", true).unwrap().is_none());
+    assert!(recap
+        .probe(&["shared-hash".into()])
+        .unwrap()
+        .postings
+        .is_empty());
+    assert_eq!(
+        BlindIndex::open(&tx)
+            .unwrap()
+            .read("shared-hash", false)
+            .unwrap()
+            .unwrap()
+            .bitmap,
+        RoaringBitmap::from_iter([17])
+    );
+    tx.commit().unwrap();
+}
+
 fn large() -> RoaringBitmap {
     (0..70_000).map(|n| n * 37).collect()
 }

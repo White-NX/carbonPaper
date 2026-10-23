@@ -108,6 +108,15 @@ pub async fn credential_verify_user(
                     scheduler.wake();
                 }
                 storage.try_bitmap_index_migration();
+                let recap_app = app.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    crate::ai::recap::protected::sync_after_unlock(&recap_app)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+                {
+                    tracing::warn!("[RECAP] Protected configuration sync deferred: {}", error);
+                }
                 let mcp_state = app.state::<mcp_server::McpRuntimeState>();
                 if let Err(e) =
                     mcp_server::restore_if_enabled(app.clone(), &credentials, &storage, &mcp_state)

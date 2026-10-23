@@ -1,9 +1,9 @@
 //! SQLite manifests, retry state, publication and change tails for ANN sidecars.
 
 use super::{
-    decode_vector, read_derived_data_epoch, validate_required_text, DerivedAnnBuildFailureUpdate,
-    DerivedAnnBuildState, DerivedAnnGeneration, DerivedAnnTailRow, DerivedIndexKind, StorageState,
-    MAX_METADATA_BYTES, VISIBLE_EMBEDDING_SOURCE,
+    decode_vector, read_derived_data_epoch, validate_required_text,
+    visible_embedding_metadata_source, DerivedAnnBuildFailureUpdate, DerivedAnnBuildState,
+    DerivedAnnGeneration, DerivedAnnTailRow, DerivedIndexKind, StorageState, MAX_METADATA_BYTES,
 };
 #[cfg(test)]
 use super::{visible_embedding_page_sql, DerivedAnnSnapshotRow};
@@ -913,7 +913,8 @@ fn decode_ann_generation(
     })
 }
 
-fn visible_embedding_aggregate_sql() -> String {
+pub(super) fn visible_embedding_aggregate_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT COUNT(*),
@@ -922,7 +923,7 @@ fn visible_embedding_aggregate_sql() -> String {
                MIN(e.model_id), MAX(e.model_id),
                MIN(e.model_revision), MAX(e.model_revision),
                MIN(e.embedding_version), MAX(e.embedding_version)
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         "#
     )
 }

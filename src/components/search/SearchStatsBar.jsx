@@ -15,10 +15,15 @@ import { useTranslation } from 'react-i18next';
  * @param {boolean} props.hasMore 是否还有下一页
  * @param {'ocr'|'nl'} props.mode 当前检索模式，决定排序说明
  */
-export function SearchStatsBar({ count, elapsedMs, hasMore, mode }) {
+export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, mode, snapshotCount, recapCount, categoryScoped = false, complete = true }) {
   const { t } = useTranslation();
 
-  const parts = [t('advancedSearch.stats.loaded', { count })];
+  const parts = [t(totalKnown ? 'advancedSearch.stats.total' : 'advancedSearch.stats.loaded', { count })];
+  if (mode === 'ocr' && (recapCount > 0 || snapshotCount > 0)) {
+    parts.push(t('advancedSearch.stats.resultTypes', { snapshots: snapshotCount, recaps: recapCount }));
+  }
+  if (categoryScoped) parts.push(t('advancedSearch.stats.categoryScope'));
+  if (complete === false) parts.push(t('advancedSearch.stats.partial'));
   if (typeof elapsedMs === 'number') {
     parts.push(t('advancedSearch.stats.elapsed', { ms: Math.max(1, Math.round(elapsedMs)) }));
   }
@@ -26,14 +31,14 @@ export function SearchStatsBar({ count, elapsedMs, hasMore, mode }) {
     parts.push(t('advancedSearch.stats.has_more'));
   }
 
-  const SortIcon = mode === 'nl' ? Sparkles : Clock;
+  const SortIcon = mode === 'nl' || totalKnown ? Sparkles : Clock;
 
   return (
     <div className="flex shrink-0 items-center justify-between gap-4 border-b border-ide-border bg-ide-panel px-6 py-2 text-[11px] text-ide-muted">
       <span className="tabular-nums">{parts.join(' · ')}</span>
       <span className="flex shrink-0 items-center gap-1.5">
         <SortIcon className="h-3 w-3" />
-        {mode === 'nl' ? t('advancedSearch.stats.sort_similarity') : t('advancedSearch.stats.sort_time')}
+        {totalKnown ? t('advancedSearch.stats.sort_relevance') : mode === 'nl' ? t('advancedSearch.stats.sort_similarity') : t('advancedSearch.stats.sort_time')}
       </span>
     </div>
   );

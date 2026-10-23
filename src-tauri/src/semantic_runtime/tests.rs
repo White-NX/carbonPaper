@@ -521,6 +521,30 @@ async fn a_cancelled_queued_request_leaves_the_slot_available_to_its_successor()
     );
 }
 
+#[test]
+fn cold_start_allowance_keeps_the_original_clock_and_warm_deadline() {
+    let timeouts = SemanticTimeouts {
+        warm: Duration::from_secs(5),
+        cold: Duration::from_secs(20),
+    };
+    let started = Instant::now() - Duration::from_secs(6);
+    let runtime = SemanticRuntimeState::new();
+    assert!(RequestWatch::new(timeouts.deadline(started, true))
+        .check(&runtime)
+        .is_err());
+    assert!(RequestWatch::new(timeouts.deadline(started, false))
+        .check(&runtime)
+        .is_ok());
+    assert_eq!(
+        timeouts.deadline(started, false) - started,
+        Duration::from_secs(20)
+    );
+    let ordinary: SemanticTimeouts = Duration::from_secs(5).into();
+    assert!(RequestWatch::new(ordinary.deadline(started, false))
+        .check(&runtime)
+        .is_err());
+}
+
 #[tokio::test]
 async fn queued_capture_defers_on_power_change_without_interrupting_the_slot_owner() {
     let gate = tokio::sync::Mutex::new(());

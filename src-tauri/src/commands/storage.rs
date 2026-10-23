@@ -17,6 +17,17 @@ mod timeline_requests;
 static TIMELINE_REQUESTS: Lazy<timeline_requests::TimelineRequests> =
     Lazy::new(timeline_requests::TimelineRequests::default);
 
+/// Authentication: required. Fuses screenshot keywords and recap retrieval.
+#[tauri::command]
+pub async fn storage_search_unified(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    request: crate::ai::recap::UnifiedSearchQuery,
+) -> Result<crate::ai::recap::UnifiedSearchResult, String> {
+    check_auth_required(&credential_state)?;
+    crate::ai::recap::search_unified(app, request).await
+}
+
 #[derive(Default, Clone)]
 struct ThumbnailWarmupProgress {
     running: bool,
@@ -822,6 +833,7 @@ pub async fn storage_get_process_monthly_thumbnails(
     process_name: String,
     page: Option<i64>,
     page_size: Option<i64>,
+    time_zone: Option<String>,
 ) -> Result<storage::ProcessMonthlyThumbnailPage, String> {
     check_auth_required(&credential_state)?;
 
@@ -831,6 +843,7 @@ pub async fn storage_get_process_monthly_thumbnails(
             &process_name,
             page.unwrap_or(0),
             page_size.unwrap_or(60),
+            time_zone.as_deref(),
         )
     })
     .await
@@ -846,12 +859,13 @@ pub async fn storage_soft_delete(
     state: tauri::State<'_, Arc<StorageState>>,
     process_name: String,
     month: Option<String>,
+    time_zone: Option<String>,
 ) -> Result<storage::SoftDeleteResult, String> {
     check_auth_required(&credential_state)?;
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        state.soft_delete_process_month(&process_name, month.as_deref())
+        state.soft_delete_process_month(&process_name, month.as_deref(), time_zone.as_deref())
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?

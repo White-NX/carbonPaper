@@ -89,7 +89,7 @@ pub(super) async fn screen(
             ])
             .to_string(),
         );
-        if let Some(signal) = ctx.storage.recap_read("screen", &key, None)? {
+        if let Some(signal) = ctx.read("screen", &key, None)? {
             e.screening = signal;
         } else {
             pending.push((i, key));
@@ -165,8 +165,7 @@ pub(super) async fn screen(
             let signal = decode(
                 &json!({"category":answers.get(format!("s{j}_category")),"result":answers.get(format!("s{j}_result")),"relation":answers.get(format!("s{j}_relation")),"previous_id":previous[*i].as_ref().and_then(|p|p.get("id"))}),
             );
-            ctx.storage
-                .recap_write("screen", key, &ctx.day, -1, ctx.generation, &signal)?;
+            ctx.write("screen", key, &signal)?;
             records[*i].screening = signal;
         }
     }

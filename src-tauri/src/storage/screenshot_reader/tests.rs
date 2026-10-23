@@ -60,6 +60,10 @@ fn full_record_queries_share_the_projection_and_skip_deleted_rows() {
         reader.by_image_path(&first.image_path).unwrap().unwrap(),
         reader.by_image_path("memory://hash-one").unwrap().unwrap(),
         reader.in_time_range(START, END, Some(1)).unwrap().remove(0),
+        reader
+            .in_time_range_paged(START, END, 0, 1)
+            .unwrap()
+            .remove(0),
     ] {
         assert_eq!(
             serde_json::to_value(found).unwrap(),
@@ -98,6 +102,44 @@ fn range_queries_keep_inclusive_second_bounds_and_apply_the_limit() {
 }
 
 #[test]
+fn paged_range_queries_keep_stable_order_and_skip_deleted_rows() {
+    let (_directory, storage) = storage_fixture();
+    {
+        let guard = storage.db.lock().unwrap();
+        let connection = guard.as_ref().unwrap();
+        for id in [5, 4] {
+            connection
+                .execute(
+                    "INSERT INTO screenshots (id, image_path, image_hash, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        format!("{id}.enc"),
+                        format!("hash-{id}"),
+                        sqlite_datetime(START)
+                    ],
+                )
+                .unwrap();
+        }
+    }
+    let reader = storage.screenshots();
+    let page = |start, end, offset, limit| {
+        reader
+            .in_time_range_paged(start, end, offset, limit)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page(START, END, 0, 2), vec![1, 4]);
+    assert_eq!(page(START, END, 2, 2), vec![5, 2]);
+    assert!(page(START, END, 4, 2).is_empty());
+    assert!(page(START, END, 0, 0).is_empty());
+    assert_eq!(page(END, END, 0, 2), vec![2]);
+    assert!(page(END, START, 0, 2).is_empty());
+}
+
+#[test]
 fn row_decoding_failures_are_reported_instead_of_discarding_records() {
     let (_directory, storage) = storage_fixture();
     storage
@@ -117,6 +159,10 @@ fn row_decoding_failures_are_reported_instead_of_discarding_records() {
         "{error}"
     );
     assert!(storage.screenshots().by_id(1).is_err());
+    assert!(storage
+        .screenshots()
+        .in_time_range_paged(START, END, 0, 1)
+        .is_err());
 }
 
 #[test]

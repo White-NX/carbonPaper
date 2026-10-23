@@ -27,7 +27,7 @@ const MAX_CASE_FORMS_PER_CHAR: usize = 2;
 /// before bigrams are cut, on the write path as much as here. That is why the
 /// index holds cross-word bigrams — `Six Degrees` contributes `xD` — and why a
 /// phrase query is allowed to ask for them.
-pub(super) fn is_indexable(ch: char) -> bool {
+pub(crate) fn is_indexable(ch: char) -> bool {
     ch.is_alphanumeric() || StorageState::is_cjk(ch)
 }
 
@@ -61,7 +61,7 @@ fn case_forms(ch: char) -> Vec<char> {
 /// The spelling as typed comes first, so a caller that only wants one lookup
 /// still gets the most likely hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BigramGroup {
+pub(crate) struct BigramGroup {
     pub bigram: String,
     pub variants: Vec<String>,
 }
@@ -86,7 +86,7 @@ fn case_variants(first: char, second: char) -> Vec<String> {
 ///
 /// Order matters only for readability — every caller re-sorts by posting-list
 /// size before doing any work — but a stable order keeps tests legible.
-pub(super) fn bigram_groups(text: &str) -> Vec<BigramGroup> {
+pub(crate) fn bigram_groups(text: &str) -> Vec<BigramGroup> {
     let chars: Vec<char> = text.chars().filter(|ch| is_indexable(*ch)).collect();
     if chars.len() < 2 {
         return Vec::new();
@@ -112,7 +112,7 @@ pub(super) fn bigram_groups(text: &str) -> Vec<BigramGroup> {
 /// Both the query needles and the decrypted text run through this, so a match
 /// found here means the same thing the bitmap index meant: the characters are
 /// adjacent once spacing and punctuation are removed.
-pub(super) fn fold(text: &str) -> Vec<char> {
+pub(crate) fn fold(text: &str) -> Vec<char> {
     text.chars()
         .filter(|ch| is_indexable(*ch))
         .flat_map(|ch| ch.to_lowercase())
@@ -120,7 +120,7 @@ pub(super) fn fold(text: &str) -> Vec<char> {
 }
 
 /// A query broken into what the index can answer and what the reranker checks.
-pub(super) struct QueryPlan {
+pub(crate) struct QueryPlan {
     /// The whole query folded to a needle, used both as the phrase to look for
     /// in decrypted text and — for a one-word query — as the only keyword.
     pub phrase: Vec<char>,
@@ -137,7 +137,7 @@ pub(super) struct QueryPlan {
 }
 
 impl QueryPlan {
-    pub(super) fn build(query: &str) -> Self {
+    pub(crate) fn build(query: &str) -> Self {
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut keywords = Vec::with_capacity(words.len());
         let mut keyword_groups = Vec::with_capacity(words.len());
@@ -166,7 +166,7 @@ impl QueryPlan {
 
     /// Whether the index can be asked anything at all. A one-character query
     /// produces no bigram, and the index stores nothing else.
-    pub(super) fn has_index_terms(&self) -> bool {
+    pub(crate) fn has_index_terms(&self) -> bool {
         !self.phrase_groups.is_empty()
     }
 
@@ -174,7 +174,7 @@ impl QueryPlan {
     ///
     /// For a single-word query the two group sets are identical, so running
     /// both would be the same intersection twice.
-    pub(super) fn has_distinct_keyword_pass(&self) -> bool {
+    pub(crate) fn has_distinct_keyword_pass(&self) -> bool {
         self.keyword_groups.len() > 1
     }
 
@@ -183,7 +183,7 @@ impl QueryPlan {
     /// Intersecting this flat list is what lets the rarest bigram of *any*
     /// keyword narrow the candidate set first, instead of each keyword being
     /// resolved on its own and only then combined.
-    pub(super) fn flat_keyword_groups(&self) -> Vec<&BigramGroup> {
+    pub(crate) fn flat_keyword_groups(&self) -> Vec<&BigramGroup> {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut flat = Vec::new();
         for groups in &self.keyword_groups {

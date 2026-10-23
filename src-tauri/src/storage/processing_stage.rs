@@ -224,7 +224,7 @@ impl StorageState {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let sql = format!("SELECT EXISTS(SELECT 1 {} AND e.subject_key=?2
             AND e.model_id=?3 AND e.model_revision=?4 AND e.embedding_version=?5 AND e.source_fingerprint=?6)",
-            super::derived_index::VISIBLE_EMBEDDING_SOURCE);
+            super::derived_index::visible_embedding_source());
         let current: bool = tx
             .query_row(
                 &sql,

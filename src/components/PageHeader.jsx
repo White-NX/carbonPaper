@@ -1,4 +1,5 @@
 import React from 'react';
+import { cn } from '../lib/utils';
 
 /**
  * 主区域各页面共用的顶栏骨架。
@@ -19,6 +20,7 @@ import React from 'react';
  * @param {'div' | 'form'} [props.as] 渲染成什么元素，默认 div
  * @param {React.ReactNode} props.children 第一行内容
  * @param {React.ReactNode} [props.secondaryRow] 第二行内容
+ * @param {string} [props.secondaryRowClassName] 第二行的附加类名
  * @param {boolean} [props.bordered] 是否画出底部分隔线。下面紧跟着统计条时
  *   应当传 false，由统计条自己的上边界承担分隔
  * @param {boolean} [props.flushBottom] 第二行是否贴着顶栏下沿。选项卡那种
@@ -29,6 +31,7 @@ export function PageHeader({
   as: Tag = 'div',
   children,
   secondaryRow,
+  secondaryRowClassName,
   bordered = true,
   flushBottom = false,
   className = '',
@@ -43,7 +46,7 @@ export function PageHeader({
     >
       <div className="flex min-h-10 items-center gap-3">{children}</div>
       {secondaryRow !== undefined && (
-        <div className="mt-3.5 flex min-h-[34px] items-center gap-7">{secondaryRow}</div>
+        <div className={cn('mt-3.5 flex min-h-[34px] items-center gap-7', secondaryRowClassName)}>{secondaryRow}</div>
       )}
     </Tag>
   );

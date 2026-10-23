@@ -43,6 +43,35 @@ const CANCEL_GRACE: Duration = Duration::from_millis(500);
 /// work must not sit waiting on the cleanup.
 const UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Queue waits keep the warm deadline. Once the request owns the worker, a
+/// missing or evicted model may use the cold deadline, measured from the same
+/// start time. Provider fallback never resets either clock.
+#[derive(Clone, Copy)]
+pub struct SemanticTimeouts {
+    pub warm: Duration,
+    pub cold: Duration,
+}
+
+impl SemanticTimeouts {
+    fn deadline(self, started: Instant, resident: bool) -> Instant {
+        started
+            + if resident {
+                self.warm
+            } else {
+                self.cold.max(self.warm)
+            }
+    }
+}
+
+impl From<Duration> for SemanticTimeouts {
+    fn from(timeout: Duration) -> Self {
+        Self {
+            warm: timeout,
+            cold: timeout,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticRuntimeStatus {
     pub state: String,
@@ -401,12 +430,13 @@ impl SemanticRuntimeState {
         app: AppHandle,
         model: MlSemanticModel,
         texts: Vec<String>,
-        timeout: Duration,
+        timeout: impl Into<SemanticTimeouts>,
         prefer_directml: bool,
     ) -> Result<SemanticEmbeddingResult, TaskError> {
+        let timeout = timeout.into();
         let request = MlRequest::EmbedText {
             request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
-            timeout_ms: duration_ms(timeout),
+            timeout_ms: duration_ms(timeout.warm),
             model,
             texts,
         };
@@ -565,19 +595,20 @@ impl SemanticRuntimeState {
         app: AppHandle,
         request: MlRequest,
         body: Arc<Vec<u8>>,
-        timeout: Duration,
+        timeout: impl Into<SemanticTimeouts>,
         prefer_directml: bool,
     ) -> Result<MlResponse, TaskError> {
-        // One deadline spans the wait for the worker, provider selection, the
-        // first attempt, and any CPU fallback, so the caller never waits
-        // materially longer than its own timeout. It is computed before the gate
-        // is taken because the wait for the gate is the longest of those steps.
-        let deadline = Instant::now() + timeout;
-        let watch = RequestWatch::new(deadline);
+        let timeout = timeout.into();
+        let started = Instant::now();
+        let mut watch = RequestWatch::new(started + timeout.warm);
         watch.check(self)?;
         background_policy::check_current()?;
-        let _request_guard =
-            acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
+        let _request_guard = acquire_request_slot(
+            &self.request_gate,
+            started + timeout.warm,
+            request.request_id(),
+        )
+        .await?;
         // Re-read game mode after waiting for the single request slot. A BGE
         // chunk can queue while another model is running, and suppression may
         // begin during that wait. Using the earlier value here could start a
@@ -587,6 +618,31 @@ impl SemanticRuntimeState {
         let prefer_directml = background_policy::current_execution().is_none()
             && directml_allowed_for_request(&app, prefer_directml);
         let model = request_model(&request);
+        // Inspect residency while holding the request gate: checking before
+        // queuing would race a background model switch or an unload.
+        let resident = {
+            let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let provider = route_provider(
+                prefer_directml,
+                inner.directml_disabled_for_session,
+                model,
+                inner.directml_supported_models.as_deref(),
+            );
+            model.is_some()
+                && inner.loaded_model == model
+                && inner.process.as_ref().is_some_and(|process| {
+                    Some(process.provider) == provider && process.is_running()
+                })
+        };
+        let deadline = timeout.deadline(started, resident);
+        watch.deadline = deadline;
+        tracing::debug!(
+            request_id = request.request_id(),
+            resident,
+            queue_ms = started.elapsed().as_millis() as u64,
+            budget_ms = deadline.duration_since(started).as_millis() as u64,
+            "[ML:SEMANTIC] Request budget selected"
+        );
         let mut provider = match self
             .select_provider(&app, prefer_directml, model, &watch)
             .await
@@ -748,6 +804,14 @@ impl SemanticRuntimeState {
             watch.lease.as_ref().map(|_| CPU_RATE_PERCENT),
         )?;
         let request_model = request_model(&request);
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if request_model.is_some() && inner.loaded_model != request_model {
+                // The engine drops its previous model before loading another.
+                // A failed switch cannot leave the old model marked resident.
+                inner.loaded_model = None;
+            }
+        }
         if let Some(model) = request_model {
             if !process.supported_models.contains(&model) {
                 return Err(TaskError::worker(
@@ -1910,12 +1974,12 @@ impl IndexTaskProgress {
 pub struct BackgroundIndexProgress {
     pub semantic: IndexTaskProgress,
     pub clip: IndexTaskProgress,
+    pub recap: crate::ai::recap::RecapIndexProgress,
 }
 
-/// Read both manual index runs at once.
-///
-/// One command rather than two because the caller is a four-second poll loop and
-/// one IPC round trip is cheaper than two for data this small.
+/// Read manual screenshot indexing and automatic recap indexing together.
+/// Recap counts come from the existing authorized corpus scan; this poll only
+/// reconciles scheduling state and never decrypts or loads the recap corpus.
 ///
 /// Deliberately *not* session-guarded, for the same reason
 /// [`crate::clip_index::clip_index_stop_now`] is not: a CLIP backfill of a full
@@ -1924,16 +1988,24 @@ pub struct BackgroundIndexProgress {
 /// thing it exists to explain. It returns counters and no user data.
 #[tauri::command]
 pub async fn get_background_index_progress(
+    app: AppHandle,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
+    recap_run: tauri::State<'_, crate::ai::recap::RecapSearchRuntime>,
 ) -> Result<BackgroundIndexProgress, String> {
+    let recap_revision = recap_run.progress().run.revision;
     let read_storage = storage.inner().clone();
     let tasks = tokio::task::spawn_blocking(move || read_storage.background_scheduler_tasks())
         .await
         .map_err(|error| format!("Failed to read index task state: {error}"))??;
     let read_wait_reason = storage.silent_read_wait_reason();
+    let recap_task = tasks
+        .iter()
+        .find(|row| row.task_kind == crate::background_scheduler::TASK_RECAP_INDEX);
+    let recap = recap_run.sync_scheduler_progress(&app, recap_task, recap_revision);
     Ok(BackgroundIndexProgress {
+        recap,
         semantic: IndexTaskProgress::resolve(
             index_run.progress(),
             tasks

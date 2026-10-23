@@ -35,6 +35,56 @@ beforeEach(() => {
 });
 
 describe('daily recap page', () => {
+  it('opens a snapshot deep link on a different date and scrolls to that occurrence', async () => {
+    const original = day.batches[0].activities[0];
+    day.batches[0].activities.push({ ...original, id: 'a2', start_ms: original.start_ms + 60000,
+      end_ms: original.end_ms + 60000, sources: [{ ...original.sources[0], id: 43 }] });
+    const rectangles = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function () {
+      const top = this.dataset?.recapActivity === 'a2' ? 500 : 20;
+      return { top, bottom: top + 100, left: 0, right: 100, width: 100, height: 100, x: 0, y: top };
+    });
+    try {
+      render(<RecapView active isAuthenticated navigation={{ date: day.date, task_id: 'task', activity_id: 'a2', screenshot_id: 43 }} />);
+      const marker = await screen.findByText('recap.snapshotActivity');
+      expect(marker.closest('article')).toHaveAttribute('data-recap-activity', 'a2');
+      expect(document.getElementById('recap-panel-recap').scrollTop).toBe(468);
+      expect(api.getRecapDay).toHaveBeenLastCalledWith(day.date, { includeRecords: false, includeAttempts: false });
+      fireEvent.click(screen.getByRole('button', { name: 'recap.back' }));
+      expect(screen.queryByText('recap.snapshotActivity')).not.toBeInTheDocument();
+    } finally { rectangles.mockRestore(); }
+  });
+
+  it('opens a later deep link while the requested day is already loaded', async () => {
+    const { rerender } = render(<RecapView active isAuthenticated navigation={{ date: day.date }} />);
+    await screen.findByText('Inspected the form validation.');
+    rerender(<RecapView active isAuthenticated navigation={{ date: day.date, task_id: 'task', activity_id: 'a1', screenshot_id: 42 }} />);
+    expect((await screen.findByText('recap.snapshotActivity')).closest('article')).toHaveAttribute('data-recap-activity', 'a1');
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+  });
+
+  it('refreshes an inactive cached day before resolving a regenerated event', async () => {
+    const navigation = { date: day.date };
+    const { rerender } = render(<RecapView active isAuthenticated navigation={navigation} />);
+    await screen.findByText('Inspected the form validation.');
+    rerender(<RecapView active={false} isAuthenticated navigation={navigation} />);
+    day = { ...day, batches: [{ ...day.batches[0], activities: [{ ...day.batches[0].activities[0], id: 'fresh', task_id: 'new-task', task_title: 'Regenerated event' }] }],
+      threads: [{ id: 'new-task', title: 'Regenerated event', activity_ids: ['fresh'] }] };
+    api.getRecapDay.mockResolvedValue(day);
+    rerender(<RecapView active isAuthenticated navigation={{ date: day.date, task_id: 'new-task', activity_id: 'fresh', screenshot_id: 42 }} />);
+    expect((await screen.findByText('recap.snapshotActivity')).closest('article')).toHaveAttribute('data-recap-activity', 'fresh');
+  });
+
+  it('rebinds regenerated IDs through the selected snapshot and reports a removed association', async () => {
+    day.batches[0].activities[0] = { ...day.batches[0].activities[0], id: 'regenerated', task_id: 'corrected', task_title: 'Corrected event' };
+    day.threads = [{ id: 'corrected', title: 'Corrected event', activity_ids: ['regenerated'] }];
+    const { rerender } = render(<RecapView active isAuthenticated navigation={{ date: day.date, task_id: 'task', activity_id: 'a1', screenshot_id: 42 }} />);
+    expect((await screen.findByText('recap.snapshotActivity')).closest('article')).toHaveAttribute('data-recap-activity', 'regenerated');
+    rerender(<RecapView active isAuthenticated navigation={{ date: day.date, task_id: 'corrected', activity_id: 'regenerated', screenshot_id: 999 }} />);
+    expect(await screen.findByText('recap.eventUnavailable')).toBeInTheDocument();
+    expect(screen.queryByText('recap.snapshotActivity')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'recap.undo' })).not.toBeInTheDocument();
+  });
+
   it('uses the real settings destination for the initial page', async () => {
     settings.enabled = false;
     render(<RecapView active isAuthenticated />);
@@ -51,6 +101,87 @@ describe('daily recap page', () => {
   });
   const enterEvent = async () => fireEvent.click(await screen.findByRole('button', { name: /Review login flow/ }));
   const more = () => fireEvent.click(screen.getByRole('button', { name: 'recap.more' }));
+
+  it('keeps live progress in the header and opens details without refreshing the reading surface', async () => {
+    day.batches[0].updated_at_ms = day.batches[0].start_ms;
+    const progress = { run_id: 'run', version: 1, stage: 'writing', completed_batches: 3, total_batches: 4, finished_at_ms: null };
+    api.getRecapProgress.mockResolvedValue(progress);
+    render(<RecapView active isAuthenticated />);
+    await screen.findByText('Inspected the form validation.');
+    const header = within(document.querySelector('header'));
+    const status = await header.findByRole('status');
+    expect(status).toHaveTextContent('recap.runStatus.organizing · 3/4');
+    expect(header.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '3');
+    expect(header.getByRole('progressbar')).toHaveAttribute('aria-valuemax', '4');
+    expect(screen.queryByText('recap.updated')).not.toBeInTheDocument();
+    expect(api.getRecapProgress).toHaveBeenCalledWith(api.localDate(), { includeAttempts: false });
+    const dayReads = api.getRecapDay.mock.calls.length;
+    const notify = listen.mock.calls.find(([event]) => event === 'recap-progress')[1];
+    api.getRecapProgress.mockResolvedValue({ ...progress, version: 2, stage: 'summarizing' });
+    await act(async () => { await notify(); });
+    expect(api.getRecapDay).toHaveBeenCalledTimes(dayReads);
+    fireEvent.click(within(status).getByRole('button'));
+    expect(await screen.findByRole('dialog')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.close' }));
+    await enterEvent();
+    expect(header.getByRole('status')).toBe(status);
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.back' }));
+    fireEvent.click(screen.getByRole('button', { name: 'recap.stop' }));
+    expect(api.cancelRecap).toHaveBeenCalledOnce();
+  });
+
+  it('shows finishing until the run completes, then restores the update time and refreshes the day', async () => {
+    day.batches[0].updated_at_ms = day.batches[0].start_ms;
+    const progress = { run_id: 'run', version: 1, stage: 'writing', completed_batches: 3, total_batches: 4, finished_at_ms: null };
+    api.getRecapProgress.mockResolvedValue(progress);
+    render(<RecapView active isAuthenticated />);
+    await screen.findByText('Inspected the form validation.');
+    const header = within(document.querySelector('header'));
+    await header.findByRole('status');
+    const dayReads = api.getRecapDay.mock.calls.length;
+    const notify = listen.mock.calls.find(([event]) => event === 'recap-progress')[1];
+    api.getRecapProgress.mockResolvedValue({ ...progress, version: 2, stage: 'saving', completed_batches: 4 });
+    await act(async () => { await notify(); });
+    expect(header.getByRole('status')).toHaveTextContent('recap.runStatus.finishing · 4/4');
+    expect(header.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+    expect(api.getRecapDay).toHaveBeenCalledTimes(dayReads);
+    api.getRecapProgress.mockResolvedValue({ ...progress, version: 3, stage: 'ready', completed_batches: 4, finished_at_ms: Date.now() });
+    await act(async () => { await notify(); });
+    await waitFor(() => expect(api.getRecapDay).toHaveBeenCalledTimes(dayReads + 1));
+    expect(header.getByText('recap.updated')).toBeInTheDocument();
+    expect(header.queryByRole('status')).not.toBeInTheDocument();
+    expect(header.queryByRole('progressbar')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'recap.stop' })).not.toBeInTheDocument();
+  });
+
+  it('handles unknown totals and keeps the pause reason available with counted progress', async () => {
+    const progress = { run_id: 'run', version: 1, stage: 'preparing', completed_batches: 0, total_batches: 0, finished_at_ms: null };
+    api.getRecapProgress.mockResolvedValue(progress);
+    render(<RecapView active isAuthenticated />);
+    const header = within(document.querySelector('header'));
+    const status = await header.findByRole('status');
+    expect(status).toHaveTextContent('recap.runStatus.organizing');
+    expect(header.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+    expect(status).not.toHaveTextContent('0/0');
+    const notify = listen.mock.calls.find(([event]) => event === 'recap-progress')[1];
+    api.getRecapProgress.mockResolvedValue({ ...progress, version: 2, stage: 'paused', completed_batches: 3, total_batches: 4 });
+    await act(async () => { await notify(); });
+    expect(header.getByRole('status')).toHaveTextContent('recap.runStatus.paused · 3/4');
+    expect(header.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '3');
+    expect(within(header.getByRole('status')).getByRole('button')).toHaveAttribute('title', expect.stringContaining('recap.progress.stages.paused'));
+  });
+
+  it('keeps progress read errors compact and allows opening generation details', async () => {
+    api.getRecapProgress.mockRejectedValueOnce(new Error('AI_BUSY'));
+    render(<RecapView active isAuthenticated />);
+    const header = within(document.querySelector('header'));
+    const alert = await header.findByRole('alert');
+    expect(alert).toHaveTextContent('recap.runStatus.unavailable');
+    expect(within(alert).getByRole('button')).toHaveAttribute('title', 'recap.errors.AI_BUSY');
+    fireEvent.click(within(alert).getByRole('button'));
+    expect(await screen.findByRole('dialog')).toBeVisible();
+  });
 
   it('confirms deletion with the shared dialog and refreshes the day and date list', async () => {
     api.listRecapDays.mockResolvedValue([api.localDate()]);

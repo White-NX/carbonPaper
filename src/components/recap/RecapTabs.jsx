@@ -38,7 +38,9 @@ export function RecapTabs({ tab, onChange }) {
             onKeyDown={(event) => {
               if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
                 event.preventDefault();
-                const next = event.key === 'Home' ? 'recap' : event.key === 'End' ? 'records' : value === 'recap' ? 'records' : 'recap';
+                const index = tabs.findIndex((item) => item.value === value);
+                const next = tabs[event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+                  : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length].value;
                 onChange(next);
                 document.getElementById(`recap-tab-${next}`)?.focus();
               }

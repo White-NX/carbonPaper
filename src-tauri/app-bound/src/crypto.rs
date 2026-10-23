@@ -64,6 +64,55 @@ pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+pub fn encrypt_recap(
+    key: &TaskKey,
+    binding: &crate::protocol::RecapBinding,
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    if input.len() as u64 > MAX_INPUT_BYTES || binding.payload_bytes != input.len() as u64 + 28 {
+        return Err(BrokerError::LimitExceeded);
+    }
+    let aad = serde_json::to_vec(binding).map_err(|_| BrokerError::Integrity)?;
+    let cipher = Aes256Gcm::new_from_slice(&key.0).map_err(|_| BrokerError::Integrity)?;
+    let mut nonce = [0; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: input,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| BrokerError::Protection)?;
+    Ok([nonce.as_slice(), &encrypted].concat())
+}
+
+pub fn decrypt_recap(
+    key: &TaskKey,
+    binding: &crate::protocol::RecapBinding,
+    encrypted: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    if encrypted.len() < 28
+        || encrypted.len() as u64 != binding.payload_bytes
+        || encrypted.len() as u64 > MAX_INPUT_BYTES + 28
+    {
+        return Err(BrokerError::Integrity);
+    }
+    let aad = serde_json::to_vec(binding).map_err(|_| BrokerError::Integrity)?;
+    let cipher = Aes256Gcm::new_from_slice(&key.0).map_err(|_| BrokerError::Integrity)?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(&encrypted[..12]),
+            Payload {
+                msg: &encrypted[12..],
+                aad: &aad,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| BrokerError::Integrity)
+}
+
 /// Implemented by the service using user-context DPAPI followed by SYSTEM DPAPI.
 /// There is no exported interface for unwrapping a caller-supplied blob.
 pub trait KeyProtector {
@@ -97,5 +146,31 @@ mod tests {
         task.dataset_id = crate::protocol::random_id();
         assert!(decrypt_input(&key, &task, &encrypted).is_err());
         assert!(decrypt_input(&new_key(), &task, &encrypted).is_err());
+    }
+
+    #[test]
+    fn recap_ciphertext_authenticates_its_slot_dataset_and_original_expiry() {
+        let key = new_key();
+        let binding = crate::protocol::RecapBinding {
+            object_id: crate::protocol::random_id(),
+            dataset_id: crate::protocol::random_id(),
+            slot: "config".into(),
+            payload_bytes: 34,
+            expires_at: 99,
+        };
+        let encrypted = encrypt_recap(&key, &binding, b"secret").unwrap();
+        assert_eq!(
+            &**decrypt_recap(&key, &binding, &encrypted).unwrap(),
+            b"secret"
+        );
+        let mut altered = binding.clone();
+        altered.slot = "context".into();
+        assert!(decrypt_recap(&key, &altered, &encrypted).is_err());
+        altered = binding.clone();
+        altered.expires_at = 100;
+        assert!(decrypt_recap(&key, &altered, &encrypted).is_err());
+        altered = binding;
+        altered.dataset_id = crate::protocol::random_id();
+        assert!(decrypt_recap(&key, &altered, &encrypted).is_err());
     }
 }

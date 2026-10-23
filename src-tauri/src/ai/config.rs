@@ -114,7 +114,7 @@ pub struct ProviderInput {
 }
 
 /// Everything needed to send a request, with the key already decrypted.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ResolvedProvider {
     pub kind: ProviderKind,
     pub base_url: String,

@@ -8,14 +8,37 @@ the existing MCP bearer token and unlocked application session.
 - `get_recap_days`: optional inclusive `start_date` and `end_date` in local
   `YYYY-MM-DD`, `offset` (default 0), and `limit` (default 30, maximum 100).
   Returns dates newest first in `items`, plus `total`, `offset`, `limit` and
-  `next_offset`. Discovery uses the existing directory of the most recent 730
+  `next_offset`. `calendars[date]` records the time zone and absolute boundaries
+  saved with each date. Discovery uses the existing directory of the most recent 730
   non-deleted recap dates. A listed date can still contain pending periods.
 - `get_recap_day`: required local `date`, optional `batch_start_ms`, `offset`
   (default 0), and `limit` (default 10, maximum 50). Returns period status and
   overviews in `periods`, and corrected activities in chronological `items`.
   Each activity includes its task title, text, time bounds and `sources` with
-  `screenshot_id`, Unix-millisecond `timestamp`, application and window title.
+  `screenshot_id`, Unix-millisecond `captured_at_ms`, application and window title.
+  The top-level `calendar` supplies the saved date's time zone and day/period bounds.
   Use `get_snapshot_details` to examine the underlying screenshot text.
+- `search_recaps`: required `query`, optional `mode` (`keyword`, `semantic`,
+  or the default `hybrid`), inclusive `start_date` / `end_date`, `include_details`
+  (accepted for compatibility; always treated as true), `offset` and `limit`
+  (default 20, maximum 50). Searches corrected
+  activities across all saved dates, including independently cited key details.
+  Date filters select saved date labels; `calendars[date]` describes each result's
+  calendar. These dates are not reinterpreted in the current system time zone.
+  Keywords reuse the snapshot HMAC blind index and verify at most 800 candidate
+  activities. `complete: false` reports bounded retrieval; `total` counts the
+  retained matches, not every possible match in history. Hybrid adds up to 200
+  semantic candidates and preserves keywords when inference fails. Hits expose
+  `keyword_score`, `match_evidence`, and `semantic_score` (best positive cosine
+  similarity, or null without a vector match).
+  `semantic_status` reports index coverage or keyword fallback; keyword-only
+  execution reports `not_requested` when semantics are enabled, `disabled`
+  otherwise, and leaves `coverage`, `indexed_chunks` and `total_chunks` null.
+  Pass the returned `ranking_revision` when requesting another page;
+  restart at offset zero if
+  results change. Search prepares keyword documents only for changed dates;
+  it does not generate recaps or prepare embeddings. The shared scheduler
+  maintains vector indexing.
 
 Example MCP call:
 
@@ -44,7 +67,7 @@ and user-entered titles. Rejected activities are removed before pagination.
 Prompts, reasoning previews, provider errors, usage counters, icons and full
 record directories are excluded from tool results.
 
-The additive tool definitions are recorded in
-[`mcp-tool-contract-v2.json`](mcp-tool-contract-v2.json). Run
+The current tool definitions are recorded in
+[`mcp-tool-contract-v3.json`](mcp-tool-contract-v3.json). Run
 `npm run generate:mcp-contract` after changing the runtime catalog and
 `npm run test:mcp-contract` to check that the document matches it.

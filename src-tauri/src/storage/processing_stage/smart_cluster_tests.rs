@@ -96,7 +96,7 @@ fn assignment_count(storage: &StorageState) -> i64 {
 async fn smart_cluster_completes_after_other_consumers_on_a_locked_restart() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    let input = indexed_input(storage, 1, Consumer::ALL_MASK);
+    let input = indexed_input(storage, 1, Consumer::ALL_MASK & !Consumer::Recap.bit());
     let category = storage
         .processing_stage
         .claim(storage, Consumer::Classification)
@@ -191,7 +191,10 @@ async fn smart_cluster_completes_after_other_consumers_on_a_locked_restart() {
         panic!("expected task state")
     };
     assert!(state.retired);
-    assert_eq!(state.finished_consumers, Consumer::ALL_MASK);
+    assert_eq!(
+        state.finished_consumers,
+        Consumer::ALL_MASK & !Consumer::Recap.bit()
+    );
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
 }
 

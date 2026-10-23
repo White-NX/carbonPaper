@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use chrono::{Local, NaiveDate, TimeZone, Timelike};
+pub use crate::calendar::CalendarDay;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -11,6 +11,11 @@ pub struct RecapSettings {
     pub enabled_since: Option<String>,
     pub provider_id: Option<String>,
     pub language: String,
+    pub include_key_details: bool,
+    /// Enables the local MiniLM index used by semantic recap search. Keyword
+    /// search remains available when this is disabled.
+    #[serde(default = "default_semantic_search_enabled")]
+    pub semantic_search_enabled: bool,
     pub batch_input_tokens: u64,
     pub batch_output_tokens: u64,
     pub request_output_tokens: u32,
@@ -30,6 +35,8 @@ impl Default for RecapSettings {
             enabled_since: None,
             provider_id: None,
             language: "zh-CN".into(),
+            include_key_details: true,
+            semantic_search_enabled: true,
             batch_input_tokens: 36_000,
             batch_output_tokens: 64_000,
             request_output_tokens: 32_000,
@@ -41,6 +48,10 @@ impl Default for RecapSettings {
             screening: ScreeningSettings::default(),
         }
     }
+}
+
+fn default_semantic_search_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,6 +100,9 @@ impl RecapSettings {
     /// Upgrade only the complete, untouched legacy budget tuple. Explicitly
     /// customized limits remain authoritative, including small output budgets.
     pub fn current_defaults(mut self) -> Self {
+        // Key details are part of the searchable recap contract now. Older
+        // payloads may contain false, but reads and saves always normalize it.
+        self.include_key_details = true;
         if self.budget_version == 0 {
             if (
                 self.batch_input_tokens,
@@ -190,11 +204,19 @@ impl From<&Evidence> for SourceRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecapDetail {
+    pub text: String,
+    pub evidence_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecapActivity {
     pub id: String,
     pub task_id: String,
     pub task_title: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<RecapDetail>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub segments: Vec<String>,
@@ -331,6 +353,7 @@ pub struct RecapUsage {
 #[derive(Clone, Debug, Serialize)]
 pub struct RecapDay {
     pub date: String,
+    pub calendar: CalendarDay,
     pub batches: Vec<RecapBatch>,
     pub threads: Vec<TaskThread>,
     pub usage: RecapUsage,
@@ -345,6 +368,8 @@ pub struct DraftActivity {
     pub task_title: String,
     pub text: String,
     pub evidence_ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<RecapDetail>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -368,39 +393,8 @@ pub fn limited(text: &str, max: usize) -> String {
 }
 
 pub fn day_bounds(date: &str) -> Result<(i64, i64), String> {
-    let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| "RECAP_INVALID_DATE")?;
-    if day.to_string() != date {
-        return Err("RECAP_INVALID_DATE".into());
-    }
-    let next = day.succ_opt().ok_or("RECAP_INVALID_DATE")?;
-    let midnight = |d: NaiveDate| {
-        Local
-            .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
-            .earliest()
-            .map(|t| t.timestamp_millis())
-            .ok_or("RECAP_INVALID_DATE".to_string())
-    };
-    Ok((midnight(day)?, midnight(next)?))
-}
-
-pub fn batch_bounds(start: i64, end: i64, now: i64) -> Vec<(i64, i64)> {
-    // Calendar boundaries survive DST; a day's UTC length need not be 24 h.
-    let mut boundaries = vec![start];
-    if let Some(t) = Local.timestamp_millis_opt(start).single() {
-        for hour in [4, 8, 12, 16, 20] {
-            if let Some(t) = t.with_hour(hour) {
-                boundaries.push(t.timestamp_millis());
-            }
-        }
-    }
-    boundaries.push(end);
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .windows(2)
-        .filter(|w| w[1] <= now)
-        .map(|w| (w[0], w[1]))
-        .collect()
+    let calendar = CalendarDay::local(date)?;
+    Ok((calendar.start_ms, calendar.end_ms))
 }
 
 pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) -> Vec<TaskThread> {
@@ -450,6 +444,15 @@ pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) 
                     .max()
                     .unwrap_or(a.end_ms);
                 a.sources = sources;
+                // A fact requiring evidence from both corrected tasks cannot
+                // be attributed to either task on its own.
+                a.details.retain(|detail| {
+                    !detail.evidence_ids.is_empty()
+                        && detail
+                            .evidence_ids
+                            .iter()
+                            .all(|id| a.sources.iter().any(|s| s.id == *id))
+                });
                 if split {
                     a.member_ids.retain(|id| {
                         resolve(
@@ -493,6 +496,7 @@ mod tests {
             summary: None,
             summary_error: None,
             activities: vec![RecapActivity {
+                details: vec![],
                 id: "regenerated".into(),
                 task_id: "new-model-id".into(),
                 task_title: "Generated name".into(),
@@ -547,6 +551,54 @@ mod tests {
             .contains("private-test-key"));
     }
     #[test]
+    fn legacy_detail_opt_out_is_normalized_and_semantic_search_defaults_on() {
+        let settings: RecapSettings =
+            serde_json::from_str(r#"{"include_key_details":false}"#).unwrap();
+        assert!(settings.semantic_search_enabled);
+        assert!(settings.clone().current_defaults().include_key_details);
+        assert!(settings.view().include_key_details);
+        let disabled: RecapSettings =
+            serde_json::from_str(r#"{"semantic_search_enabled":false}"#).unwrap();
+        assert!(!disabled.current_defaults().semantic_search_enabled);
+    }
+
+    #[test]
+    fn corrected_splits_only_keep_facts_with_all_their_sources() {
+        let mut batch = batch();
+        batch.activities[0].details = vec![
+            RecapDetail {
+                text: "First source fact".into(),
+                evidence_ids: vec![1],
+            },
+            RecapDetail {
+                text: "Combined conclusion".into(),
+                evidence_ids: vec![1, 2],
+            },
+        ];
+        let mut corrections = Corrections::default();
+        corrections.assignments.insert(1, "first".into());
+        corrections.assignments.insert(2, "second".into());
+        let mut batches = vec![batch];
+        apply_corrections(&mut batches, &corrections);
+        assert_eq!(batches[0].activities[0].details.len(), 1);
+        assert_eq!(
+            batches[0].activities[0].details[0].text,
+            "First source fact"
+        );
+        assert!(batches[0].activities[1].details.is_empty());
+    }
+
+    #[test]
+    fn old_activities_and_settings_load_without_rewriting_history() {
+        let mut value = serde_json::to_value(&batch().activities[0]).unwrap();
+        value.as_object_mut().unwrap().remove("details");
+        let old: RecapActivity = serde_json::from_value(value).unwrap();
+        assert!(old.details.is_empty());
+        let settings: RecapSettings = serde_json::from_str("{\"enabled\":true}").unwrap();
+        assert!(settings.include_key_details);
+        assert_eq!(old.text, "Observed activity");
+    }
+    #[test]
     fn app_language_overrides_legacy_recap_language_without_changing_other_settings() {
         let app_language = crate::i18n::supported_locale(
             &crate::registry_config::get_string("language").unwrap_or_default(),
@@ -597,14 +649,15 @@ mod tests {
     }
     #[test]
     fn four_hour_windows_are_half_open_and_only_closed_windows_are_returned() {
-        let (start, end) = day_bounds("2026-01-01").unwrap();
-        let windows = batch_bounds(start, end, end);
+        let calendar = CalendarDay::in_zone("2026-01-01", chrono_tz::Asia::Shanghai).unwrap();
+        let (start, end) = (calendar.start_ms, calendar.end_ms);
+        let windows = calendar.closed_periods(end);
         assert_eq!(windows.len(), 6);
         assert_eq!(windows[0].0, start);
         assert_eq!(windows.last().unwrap().1, end);
         assert!(windows.windows(2).all(|w| w[0].1 == w[1].0));
-        assert_eq!(batch_bounds(start, end, windows[0].1 - 1).len(), 0);
-        assert_eq!(batch_bounds(start, end, windows[0].1).len(), 1);
+        assert_eq!(calendar.closed_periods(windows[0].1 - 1).len(), 0);
+        assert_eq!(calendar.closed_periods(windows[0].1).len(), 1);
         assert!(day_bounds("2026-02-30").is_err());
     }
 }

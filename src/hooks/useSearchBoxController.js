@@ -43,16 +43,10 @@ const EMPTY_CLUSTER_QUEUE_STATUS = {
   processed: 0,
 };
 
-/**
- * Percentage of one manual index run, or `null` while it is indeterminate.
- *
- * The backend reports the queue depth it started with, so this is a real ratio
- * rather than the peak-tracking estimate the delete and cluster queues need —
- * neither of those knows its own total. Clamped because a run that started while
- * captures were still arriving can process more than it counted.
- */
+/** Counted progress remains available while a task is waiting or has failed. */
 function indexRunPercent(run) {
-  if (!isIndexTaskPending(run) || !run.total) return null;
+  if (run.total_known === false || !Number.isFinite(run.total) || run.total <= 0
+    || !Number.isFinite(run.processed)) return null;
   return Math.max(0, Math.min(100, (run.processed / run.total) * 100));
 }
 
@@ -311,22 +305,21 @@ export function useSearchBoxController({
     if (hasDeleteTask) return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
     if (hasClusterTask) return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
     if (isDownloadingModels) return downloadProgress <= 0 ? 8 : Math.min(100, downloadProgress);
-    // The index runs come last so that this stays a pure addition to a chain
-    // that already worked. A backfill can run for hours, and letting it preempt
-    // the cleanup indicator for that long would trade one silent task for
-    // another. The dropdown cards are not ordered, so the reason a backfill
-    // stalls the rest of indexing stays visible either way.
+    // Cleanup and downloads take precedence over long index backfills; the
+    // dropdown still shows each pending task independently.
     if (hasClipIndexTask) {
-      return clipIndexPercent === null || clipIndexPercent <= 0
-        ? 8
-        : Math.min(100, clipIndexPercent);
+      return clipIndexPercent;
     }
     if (hasSemanticIndexTask) {
-      return semanticIndexPercent === null || semanticIndexPercent <= 0
-        ? 8
-        : Math.min(100, semanticIndexPercent);
+      return semanticIndexPercent;
     }
     return 0;
+  })();
+  const progressActive = (() => {
+    if (hasDeleteTask || hasClusterTask || isDownloadingModels) return true;
+    if (hasClipIndexTask) return backgroundIndex.clip.running;
+    if (hasSemanticIndexTask) return backgroundIndex.semantic.running;
+    return false;
   })();
 
   const taskSummaryPlaceholder = (() => {
@@ -481,6 +474,7 @@ export function useSearchBoxController({
     clipIndexTaskLabel,
     showProgressBar,
     progressFillPercent,
+    progressActive,
     taskSummaryPlaceholder,
     isDownloadingModels,
     toggleMode,

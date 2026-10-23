@@ -603,6 +603,7 @@ async fn process_nmh_request(
             if !extension_capture_allowed(&app_handle, &capture_state) {
                 return StorageResponse::error("Capture is paused or stopped");
             }
+            let recap_generation = storage.db_generation();
             match storage.save_screenshot_temp_bytes(&request, &jpeg_bytes) {
                 Ok(result) => {
                     if result.status == "duplicate" {
@@ -611,6 +612,15 @@ async fn process_nmh_request(
 
                     // Dispatch to OCR pipeline if we have a screenshot_id
                     if let Some(screenshot_id) = result.screenshot_id {
+                        if let Err(error) = storage.processing_stage.put_recap_metadata(
+                            &storage,
+                            screenshot_id,
+                            recap_generation,
+                            request.page_url.as_deref(),
+                            None,
+                        ) {
+                            tracing::warn!("[RECAP] Browser context staging deferred: {}", error);
+                        }
                         // Spawn async OCR task
                         let storage_arc = storage.clone();
                         let app_clone = app_handle.clone();

@@ -44,19 +44,6 @@ pub(super) struct CachedSummary {
     pub attempts: Vec<RecapAttempt>,
 }
 
-pub(super) fn read_cached(
-    storage: &crate::storage::StorageState,
-    key: &str,
-    revision: i64,
-) -> Result<Option<CachedSummary>, String> {
-    match storage.recap_read("summary", key, Some(revision)) {
-        // A derived cache from an incompatible version must not prevent the
-        // original activity details from loading. Auth/source failures propagate.
-        Err(error) if error == "RECAP_INVALID_CACHE" => Ok(None),
-        result => result,
-    }
-}
-
 pub(super) fn fingerprint(batch: &RecapBatch, language: &str) -> String {
     let mut activities = batch.activities.iter().collect::<Vec<_>>();
     activities.sort_by(|a, b| a.id.cmp(&b.id));
@@ -188,6 +175,7 @@ fn request(
                 json!({
                     "id": a.id, "task_id": a.task_id, "task_title": a.task_title,
                     "text": a.text, "first_observed_ms": a.start_ms, "last_observed_ms": a.end_ms,
+                    "key_details": a.details.iter().map(|d| &d.text).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();
@@ -221,7 +209,11 @@ fn single_activity_summary(batch: &RecapBatch) -> Option<RecapSummary> {
         return None;
     };
     let text = activity.text.trim();
-    if text.is_empty() || text.chars().count() > 600 || activity.sources.is_empty() {
+    if text.is_empty()
+        || text.chars().count() > 600
+        || activity.sources.is_empty()
+        || !activity.details.is_empty()
+    {
         return None;
     }
     Some(RecapSummary {
@@ -246,7 +238,10 @@ pub(super) async fn generate(
         ctx.check()?;
         let key = format!("{}:{}", ctx.day, batch.start_ms);
         let hash = fingerprint(batch, &ctx.settings.language);
-        let cached = read_cached(&ctx.storage, &key, ctx.revision)?;
+        let cached = match ctx.read("summary", &key, Some(ctx.revision)) {
+            Err(error) if error == "RECAP_INVALID_CACHE" => None,
+            result => result?,
+        };
         if !should_generate(
             cached.as_ref(),
             &hash,
@@ -335,14 +330,7 @@ pub(super) async fn generate(
                 .filter(|a| a.id.starts_with(&run))
                 .collect(),
         };
-        ctx.storage.recap_write(
-            "summary",
-            &key,
-            &ctx.day,
-            ctx.revision,
-            ctx.generation,
-            &value,
-        )?;
+        ctx.write("summary", &key, &value)?;
         let _ = ctx.app.emit("recap-changed", &ctx.day);
     }
     Ok(())
@@ -368,6 +356,7 @@ mod tests {
     }
     fn batch() -> RecapBatch {
         let activity = |id: &str, task: &str, time| RecapActivity {
+            details: vec![],
             id: id.into(),
             task_id: task.into(),
             task_title: format!("Task {task}"),

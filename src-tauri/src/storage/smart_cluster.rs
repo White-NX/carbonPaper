@@ -14,7 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::derived_index::{decode_vector, encode_vector};
-use super::StorageState;
+use super::{wire_time, StorageState};
 
 /// The identity of an anchor text, for deciding whether a stored encoding of it
 /// is still the encoding of *this* text.
@@ -99,6 +99,19 @@ pub struct SmartClusterRecord {
     pub summary: Option<SmartClusterSummaryRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SmartClusterStatus {
+    pub pending_count: i64,
+    pub enabled_cluster_count: i64,
+    pub total_cluster_count: i64,
+}
+
+const SMART_CLUSTER_STATUS_SQL: &str = "SELECT
+    (SELECT COUNT(*) FROM smart_cluster_pending
+     WHERE queued_at >= datetime('now', '-' || ?1 || ' days')),
+    COALESCE(SUM(CASE WHEN enabled THEN 1 ELSE 0 END), 0), COUNT(*)
+    FROM smart_clusters";
+
 /// The columns and joins every read of a cluster row shares.
 ///
 /// Column layout, which [`read_cluster_from_row`] depends on: `0..=6` the
@@ -145,11 +158,17 @@ fn read_cluster_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmartClust
         threshold: row.get(2)?,
         enabled: row.get::<_, i64>(3)? != 0,
         dominant_color: row.get(4)?,
-        created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-        updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        created_at: wire_time::from_sqlite_utc(
+            &row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        ),
+        updated_at: wire_time::from_sqlite_utc(
+            &row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        ),
         assignment_count: Some(row.get::<_, i64>(7)?),
         recent_assignment_count: Some(row.get::<_, i64>(21)?),
-        last_assigned_at: row.get(22)?,
+        last_assigned_at: row
+            .get::<_, Option<String>>(22)?
+            .map(|time| wire_time::from_sqlite_utc(&time)),
         last_process_name: row.get(23)?,
         last_window_title: row.get(24)?,
         summary: read_summary_from_row(row, 8)?,
@@ -325,12 +344,14 @@ fn read_summary_from_row(
             model_provider: row.get(start + 8)?,
             model_name: row.get(start + 9)?,
             prompt_version: row.get(start + 10)?,
-            created_at: row
-                .get::<_, Option<String>>(start + 11)?
-                .unwrap_or_default(),
-            updated_at: row
-                .get::<_, Option<String>>(start + 12)?
-                .unwrap_or_default(),
+            created_at: wire_time::from_sqlite_utc(
+                &row.get::<_, Option<String>>(start + 11)?
+                    .unwrap_or_default(),
+            ),
+            updated_at: wire_time::from_sqlite_utc(
+                &row.get::<_, Option<String>>(start + 12)?
+                    .unwrap_or_default(),
+            ),
         })),
         None => Ok(None),
     }
@@ -462,7 +483,7 @@ impl StorageState {
             .ok_or_else(|| "Database connection is None".to_string())?;
         let mut stmt = conn
             .prepare(&format!(
-                "{SMART_CLUSTER_PROJECTION} ORDER BY sc.updated_at DESC"
+                "{SMART_CLUSTER_PROJECTION} ORDER BY sc.updated_at DESC, sc.id ASC"
             ))
             .map_err(|e| format!("Failed to prepare list_smart_clusters: {}", e))?;
         let rows = stmt
@@ -473,6 +494,25 @@ impl StorageState {
             out.push(row.map_err(|e| format!("Failed to read smart cluster row: {}", e))?);
         }
         Ok(out)
+    }
+
+    /// Settings needs only counts, without assignment joins, summaries or
+    /// screenshot metadata. Keep this read off the primary connection mutex.
+    pub fn get_smart_cluster_status(&self) -> Result<SmartClusterStatus, String> {
+        self.with_read_connection_named("smart_cluster_status", |conn| {
+            conn.query_row(
+                SMART_CLUSTER_STATUS_SQL,
+                [Self::SMART_CLUSTER_PENDING_TTL_DAYS],
+                |row| {
+                    Ok(SmartClusterStatus {
+                        pending_count: row.get(0)?,
+                        enabled_cluster_count: row.get(1)?,
+                        total_cluster_count: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Failed to read smart cluster status: {error}"))
+        })
     }
 
     pub fn get_smart_cluster(&self, id: i64) -> Result<Option<SmartClusterRecord>, String> {
@@ -812,11 +852,19 @@ impl StorageState {
         page: i64,
         page_size: i64,
     ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
+        self.list_smart_cluster_assignments_offset(cluster_id, page * page_size, page_size)
+    }
+
+    fn list_smart_cluster_assignments_offset(
+        &self,
+        cluster_id: i64,
+        offset: i64,
+        page_size: i64,
+    ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
         let guard = self.get_connection_named("list_smart_cluster_assignments")?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
-        let offset = page * page_size;
         let mut stmt = conn
             .prepare(
                 "SELECT a.screenshot_id, a.rerank_score, s.image_path, s.process_name, \
@@ -824,7 +872,7 @@ impl StorageState {
                  FROM smart_cluster_assignments a \
                  JOIN screenshots s ON s.id = a.screenshot_id \
                  WHERE a.smart_cluster_id = ? AND s.is_deleted = 0 \
-                 ORDER BY a.rerank_score DESC \
+                 ORDER BY a.rerank_score DESC, a.screenshot_id ASC \
                  LIMIT ? OFFSET ?",
             )
             .map_err(|e| format!("Failed to prepare list assignments: {}", e))?;
@@ -836,9 +884,13 @@ impl StorageState {
                     image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     process_name: row.get(3)?,
                     window_title: row.get(4)?,
-                    created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    created_at: wire_time::from_sqlite_utc(
+                        &row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    ),
                     category: row.get(6)?,
-                    assigned_at: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    assigned_at: wire_time::from_sqlite_utc(
+                        &row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    ),
                 })
             })
             .map_err(|e| format!("Failed to query assignments: {}", e))?;
@@ -897,10 +949,11 @@ impl StorageState {
     pub fn list_smart_cluster_ocr_corpus_blocks(
         &self,
         cluster_id: i64,
-        page: i64,
+        offset: i64,
         page_size: i64,
     ) -> Result<Vec<(SmartClusterOcrCorpusItem, Vec<super::OcrResult>)>, String> {
-        let assignments = self.list_smart_cluster_assignments(cluster_id, page, page_size)?;
+        let assignments =
+            self.list_smart_cluster_assignments_offset(cluster_id, offset, page_size)?;
         let screenshot_ids: Vec<i64> = assignments.iter().map(|s| s.screenshot_id).collect();
         let blocks = self.get_ocr_blocks_by_screenshot_ids(&screenshot_ids)?;
         Ok(assignments
@@ -1086,7 +1139,7 @@ impl StorageState {
              AND EXISTS(SELECT 1 FROM smart_cluster_pending p JOIN screenshots s ON s.id=p.screenshot_id
                WHERE p.screenshot_id=CAST(e.subject_key AS INTEGER) AND s.is_deleted=0 AND s.status='committed'
                  AND p.queued_at>=datetime('now','-{} days'))",
-            super::derived_index::VISIBLE_EMBEDDING_SOURCE,
+            super::derived_index::visible_embedding_source(),
             Self::SMART_CLUSTER_PENDING_TTL_DAYS,
         )
     }
@@ -1304,6 +1357,89 @@ mod tests {
         (temp, storage)
     }
 
+    #[test]
+    fn status_counts_clusters_and_unexpired_pending_without_loading_details() {
+        let (_temp, storage) = test_storage();
+        assert_eq!(
+            storage.get_smart_cluster_status().unwrap(),
+            SmartClusterStatus {
+                pending_count: 0,
+                enabled_cluster_count: 0,
+                total_cluster_count: 0,
+            }
+        );
+        let enabled = insert_cluster(&storage, "Enabled");
+        let disabled = insert_cluster(&storage, "Disabled");
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute(
+                "UPDATE smart_clusters SET enabled=0 WHERE id=?1",
+                [disabled],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO screenshots(id,image_path,image_hash) VALUES
+                    (1,'one.enc','one'),(2,'two.enc','two'),(3,'expired.enc','expired');
+                 INSERT INTO smart_cluster_pending(screenshot_id,queued_at) VALUES
+                    (1,datetime('now')),(2,datetime('now','-1 day')),
+                    (3,datetime('now','-31 days'));",
+            )
+            .unwrap();
+            // Status must stay independent of summary parsing, assignment
+            // joins and screenshot metadata in the detailed list projection.
+            conn.execute(
+                "INSERT INTO smart_cluster_summaries(smart_cluster_id,key_points_json)
+                 VALUES(?1,'invalid-json')",
+                [enabled],
+            )
+            .unwrap();
+        }
+        let status = storage.get_smart_cluster_status().unwrap();
+        assert_eq!(
+            status.pending_count,
+            storage.count_smart_cluster_pending().unwrap()
+        );
+        assert_eq!(
+            status,
+            SmartClusterStatus {
+                pending_count: 2,
+                enabled_cluster_count: 1,
+                total_cluster_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn archive_records_and_assignments_export_unambiguous_utc_instants() {
+        let (_temp, storage) = test_storage();
+        let cluster = insert_cluster(&storage, "Save location");
+        {
+            let guard = storage.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute("INSERT INTO screenshots(id,image_path,image_hash,created_at,status) VALUES(83558,'fixture','fixture','2026-09-30 16:30:00','committed')", []).unwrap();
+            conn.execute("INSERT INTO smart_cluster_assignments(smart_cluster_id,screenshot_id,assigned_at) VALUES(?1,83558,'2026-10-02 01:52:09')", [cluster]).unwrap();
+            conn.execute("UPDATE smart_clusters SET created_at='2026-09-30 16:30:00', updated_at='2026-10-02 01:52:09' WHERE id=?1", [cluster]).unwrap();
+            conn.execute("INSERT INTO smart_cluster_summaries(smart_cluster_id,created_at,updated_at) VALUES(?1,'2026-09-30 16:30:00','2026-10-02 01:52:09')", [cluster]).unwrap();
+        }
+        let record = storage.get_smart_cluster(cluster).unwrap().unwrap();
+        assert_eq!(record.created_at, "2026-09-30T16:30:00Z");
+        assert_eq!(record.updated_at, "2026-10-02T01:52:09Z");
+        assert_eq!(
+            record.last_assigned_at.as_deref(),
+            Some("2026-10-02T01:52:09Z")
+        );
+        let summary = record.summary.unwrap();
+        assert_eq!(summary.created_at, "2026-09-30T16:30:00Z");
+        assert_eq!(summary.updated_at, "2026-10-02T01:52:09Z");
+        let assignments = storage
+            .list_smart_cluster_assignments(cluster, 0, 50)
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].created_at, "2026-09-30T16:30:00Z");
+        assert_eq!(assignments[0].assigned_at, "2026-10-02T01:52:09Z");
+    }
+
     /// Put the table back into the shape it had before the anchor cache
     /// existed, so the next `init_tables` is a migration rather than a create.
     fn drop_anchor_cache_columns(storage: &StorageState) {
@@ -1355,6 +1491,43 @@ mod tests {
             ],
         )
         .expect("insert screenshot");
+    }
+
+    #[test]
+    fn corpus_offsets_resume_inside_a_legacy_page_with_stable_score_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        crate::credential_manager::save_public_key_to_file(&credential, b"paging-test-public-key")
+            .unwrap();
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
+        storage.initialize().unwrap();
+        let cluster = insert_cluster(&storage, "Paging");
+        for id in [9, 3, 7, 1] {
+            insert_screenshot(&storage, id, "editor.exe", "Paging");
+            storage
+                .record_smart_cluster_assignment(cluster, id, 0.5)
+                .unwrap();
+        }
+        let first = storage
+            .list_smart_cluster_assignments(cluster, 0, 4)
+            .unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.screenshot_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 7, 9]
+        );
+        let resumed = storage
+            .list_smart_cluster_ocr_corpus_blocks(cluster, 2, 2)
+            .unwrap();
+        assert_eq!(
+            resumed
+                .iter()
+                .map(|(row, _)| row.screenshot_id)
+                .collect::<Vec<_>>(),
+            vec![7, 9]
+        );
     }
 
     #[test]
@@ -1648,7 +1821,7 @@ mod tests {
             .find(|assignment| assignment.screenshot_id == 1)
             .expect("rescored assignment");
         assert_eq!(rescored.rerank_score, Some(0.95));
-        assert_eq!(rescored.assigned_at, "2000-01-01 00:00:00");
+        assert_eq!(rescored.assigned_at, "2000-01-01T00:00:00Z");
 
         let record = storage
             .get_smart_cluster(cluster_id)
@@ -1657,7 +1830,7 @@ mod tests {
         assert_eq!(record.recent_assignment_count, Some(0));
         assert_eq!(
             record.last_assigned_at.as_deref(),
-            Some("2000-01-02 00:00:00")
+            Some("2000-01-02T00:00:00Z")
         );
         assert_eq!(record.last_process_name.as_deref(), Some("new.exe"));
         assert_eq!(record.last_window_title.as_deref(), Some("New source"));

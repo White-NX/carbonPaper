@@ -1,10 +1,11 @@
-import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback, useId } from 'react';
 import { Monitor, Clock, Globe, ExternalLink, Tag, Info } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { computeLinkScores, updateScreenshotCategory } from '../lib/monitor_api';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { CATEGORY_LIST, CATEGORY_COLORS } from '../lib/categories';
 import OfficeDocumentEntry from './OfficeDocumentEntry';
+import SnapshotRecap from './recap/SnapshotRecap';
 
 function getHostname(url) {
   try {
@@ -14,7 +15,7 @@ function getHostname(url) {
   }
 }
 
-export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange }) {
+export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange, active = true, isAuthenticated = false, onOpenRecap }) {
   const { t } = useTranslation();
   const [scoredLinks, setScoredLinks] = useState([]);
   const [editingCategory, setEditingCategory] = useState(false);
@@ -23,8 +24,13 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
   // Card visibility state
   const [isVisible, setIsVisible] = useState(false);
   const [isHoveringCard, setIsHoveringCard] = useState(false);
+  const [hasCardFocus, setHasCardFocus] = useState(false);
+  const [isRecapExpanded, setIsRecapExpanded] = useState(false);
   const timerRef = useRef(null);
   const cardRef = useRef(null);
+  const cardId = useId();
+  const selectedId = selectedEvent?.id;
+  const hasSelection = Boolean(selectedEvent);
 
   const iconSrc = useMemo(() => {
     const raw = selectedDetails?.record?.process_icon || selectedEvent?.processIcon || selectedDetails?.record?.page_icon;
@@ -54,7 +60,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
   const pageUrl = selectedDetails?.record?.page_url;
   const documentRef = selectedDetails?.document_ref || null;
-  const screenshotId = selectedDetails?.record?.id || selectedEvent?.id;
+  const screenshotId = selectedEvent?.id ?? selectedDetails?.record?.id;
   // Category state
   const currentCategory = localCategory ?? selectedDetails?.record?.category ?? selectedEvent?.category ?? null;
 
@@ -78,41 +84,31 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
     }, 5000);
   }, [clearTimer]);
 
-  // Show card when selectedEvent changes
+  // Show the selected frame, then let the interaction effect own its timer.
   useEffect(() => {
-    if (selectedEvent) {
-      setIsVisible(true);
-      startHideTimer();
-    } else {
-      setIsVisible(false);
+    setIsVisible(active && hasSelection);
+    setHasCardFocus(Boolean(cardRef.current?.contains(document.activeElement)));
+    return clearTimer;
+  }, [selectedId, active, hasSelection, clearTimer]);
+
+  // Reading an expanded recap or using the keyboard must not dismiss the card.
+  useEffect(() => {
+    if (!active || !isVisible || isHoveringCard || hasCardFocus || isRecapExpanded || editingCategory) {
       clearTimer();
+    } else {
+      startHideTimer();
     }
     return clearTimer;
-  }, [selectedEvent?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Pause timer while hovering
-  useEffect(() => {
-    if (isHoveringCard) {
-      clearTimer();
-    } else if (isVisible) {
-      startHideTimer();
-    }
-  }, [isHoveringCard]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedId, active, isVisible, isHoveringCard, hasCardFocus, isRecapExpanded, editingCategory, clearTimer, startHideTimer]);
 
   const handleMouseEnterCard = () => setIsHoveringCard(true);
   const handleMouseLeaveCard = () => setIsHoveringCard(false);
 
   // Called from parent when user hovers the edge zone
   const handleEdgeHover = useCallback(() => {
-    if (!selectedEvent) return;
+    if (!hasSelection) return;
     setIsVisible(true);
-    startHideTimer();
-  }, [selectedEvent, startHideTimer]);
-
-  // Expose the edge-hover handler via ref so parent can call it
-  // We use a different approach: parent passes a callback registration
-  // Instead, we export handleEdgeHover via a ref-forwarding pattern
-  // For simplicity, we'll use the onEdgeHover prop pattern in parent
+  }, [hasSelection]);
 
   const handleCategoryChange = async (newCategory) => {
     if (!selectedEvent?.id) return;
@@ -140,6 +136,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
       clearTimer();
       setIsHoveringCard(false);
+      setHasCardFocus(false);
       setIsVisible(false);
     };
 
@@ -154,17 +151,23 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
   return (
     <>
       {/* Collapsed indicator pill — hover to re-open */}
-      <div
+      <button
+        type="button"
+        aria-label={t('sidebar.details.title')}
+        aria-controls={cardId}
+        aria-expanded={isVisible}
+        aria-hidden={isVisible}
         className={`absolute top-4 left-4 z-20 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-ide-panel shadow cursor-pointer select-none transition-all duration-300 ${
           !isVisible
-            ? 'opacity-100 translate-x-0 pointer-events-auto'
-            : 'opacity-0 -translate-x-2 pointer-events-none'
+            ? 'visible opacity-100 translate-x-0 pointer-events-auto'
+            : 'invisible opacity-0 -translate-x-2 pointer-events-none'
         }`}
         onMouseEnter={handleEdgeHover}
+        onClick={handleEdgeHover}
       >
         <Info size={14} className="text-ide-accent shrink-0" />
         <span className="text-xs text-ide-muted whitespace-nowrap">{selectedDetails?.record?.process_name || selectedEvent.appName}</span>
-      </div>
+      </button>
 
       {/* Invisible left-edge hover zone to re-trigger card */}
       {!isVisible && (
@@ -177,18 +180,24 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
       {/* Detail card */}
       <div
         ref={cardRef}
+        id={cardId}
+        role="region"
+        aria-label={t('sidebar.details.title')}
+        aria-hidden={!isVisible}
         className={`absolute top-4 left-4 w-80 max-h-[calc(100%-2rem)] overflow-y-auto z-20 rounded-xl border border-ide-border bg-ide-panel shadow-lg transition-all duration-300 ${
           isVisible
-            ? 'opacity-100 translate-x-0 pointer-events-auto'
-            : 'opacity-0 -translate-x-4 pointer-events-none'
+            ? 'visible opacity-100 translate-x-0 pointer-events-auto'
+            : 'invisible opacity-0 -translate-x-4 pointer-events-none'
         }`}
         onMouseEnter={handleMouseEnterCard}
         onMouseLeave={handleMouseLeaveCard}
+        onFocusCapture={() => setHasCardFocus(true)}
+        onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setHasCardFocus(false); }}
       >
-        <div className="p-4 text-sm text-ide-muted space-y-3">
+        <div className="p-[18px] text-sm text-ide-muted space-y-4">
           {/* Process info */}
           <div>
-            <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.process')}</label>
+            <label className="text-xs font-medium text-ide-muted">{t('sidebar.labels.process')}</label>
             <div className="flex items-center gap-2 mt-1">
               <div className="w-8 h-8 rounded shrink-0 flex items-center justify-center overflow-hidden">
                 {iconSrc ? (
@@ -209,24 +218,24 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
           {/* Window title */}
           <div>
-            <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.window')}</label>
+            <label className="text-xs font-medium text-ide-muted">{t('sidebar.labels.window')}</label>
             <div className="mt-1 text-sm break-words opacity-80 line-clamp-2 select-text" title={selectedDetails?.record?.window_title || selectedEvent.windowTitle}>
               {selectedDetails?.record?.window_title || selectedEvent.windowTitle}
             </div>
           </div>
 
           {/* Timestamp */}
-          <div>
-            <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.time')}</label>
+          {Number.isFinite(selectedEvent.timestamp) && <div>
+            <label className="text-xs font-medium text-ide-muted">{t('sidebar.labels.time')}</label>
             <div className="flex items-center gap-2 mt-1 text-sm opacity-80">
               <Clock size={14} />
               {new Date(selectedEvent.timestamp).toLocaleString()}
             </div>
-          </div>
+          </div>}
 
           {/* Category */}
           <div>
-            <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category')}</label>
+            <label className="text-xs font-medium text-ide-muted">{t('sidebar.labels.category')}</label>
             <div className="mt-1">
               {editingCategory ? (
                 <div className="space-y-1 max-h-32 overflow-y-auto">
@@ -264,10 +273,13 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
             </div>
           </div>
 
+          <SnapshotRecap screenshotId={screenshotId} active={active} isAuthenticated={isAuthenticated}
+            onOpenRecap={onOpenRecap} onExpandedChange={setIsRecapExpanded} />
+
           {/* Links */}
           {(pageUrl || scoredLinks.length > 0) && (
-            <div>
-              <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.links.title')}</label>
+            <div className="border-t border-ide-border pt-3">
+              <label className="text-xs font-medium text-ide-muted">{t('sidebar.links.title')}</label>
               <div className="mt-1 space-y-1">
                 {pageUrl && (
                   <div
@@ -303,7 +315,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
           {documentRef && (
             <div>
-              <label className="text-xs text-ide-muted uppercase font-bold">
+              <label className="text-xs font-medium text-ide-muted">
                 {t('documentSource.title')}
               </label>
               <div className="mt-1">

@@ -3,6 +3,7 @@
     "emptyHint": "选择上方时间轴中的截图，或搜索历史内容"
   },
   "recap": {
+    "snapshotActivity": "当前快照所在的记录",
     "delete": "删除回顾",
     "deleteTitle": "删除当天的回顾？",
     "deleteMessage": "将永久删除 {{date}} 的回顾及修改内容，原始记录会保留。之后可手动重新生成当天的回顾。",
@@ -46,6 +47,12 @@
     "intro": "按时间回看做过的事情，串起同一件事的经过，随时打开当时的画面。",
     "configure": "前往设置",
     "generating": "正在整理回顾…",
+    "runStatus": {
+      "organizing": "整理中",
+      "paused": "等待继续",
+      "finishing": "收尾中",
+      "unavailable": "状态暂不可用"
+    },
     "generate": "补全回顾",
     "regenerate": "重新生成",
     "stop": "停止",
@@ -144,7 +151,7 @@
     },
     "settings": {
       "saved": "已保存",
-      "enabledHint": "解锁后每四小时自动整理一次，全屏应用运行时暂缓。",
+      "enabledHint": "每四小时自动整理一次，全屏应用运行时暂缓。开启后台自动整理后，关闭窗口也会继续；启用受保护处理后，重启也能继续整理新记录。",
       "missingProvider": "原模型服务已移除",
       "manageModels": "管理模型服务",
       "title": "每日回顾设置",
@@ -170,7 +177,9 @@
       "model": "筛查模型",
       "apiKey": "API key",
       "keySaved": "已保存，留空保持原值",
-      "keyPlaceholder": "输入 API key"
+      "keyPlaceholder": "输入 API key",
+      "semanticSearch": "启用回顾语义搜索",
+      "semanticSearchHint": "自动整理本地索引，按含义查找回顾。关闭后仍可按关键词查找。"
     },
     "errors": {
       "RECAP_INVALID_SUMMARY": "时段概述未能生成，可查看具体经过或重试。",
@@ -216,7 +225,18 @@
       "AI_BAD_REQUEST": "模型服务拒绝了生成请求，请检查所选模型和用量设置。",
       "AI_SERVER_ERROR": "模型服务发生错误，请稍后重试。",
       "AI_INVALID_RESPONSE": "模型服务返回了无法读取的响应，请重试或检查服务配置。",
-      "AI_RATE_LIMITED": "模型服务繁忙，请稍后重试。"
+      "AI_RATE_LIMITED": "模型服务繁忙，请稍后重试。",
+      "RECAP_INVALID_DETAIL": "部分关键细节缺少有效来源，请重试生成。",
+      "RECAP_INVALID_SEARCH": "请输入搜索内容，并检查搜索选项。",
+      "RECAP_SEARCH_NOT_READY": "语义搜索仍在准备中，可继续按关键词查找。",
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "暂时无法按含义查找，请稍后重试。关键词搜索仍可使用。"
+    },
+    "keyDetails": "关键细节",
+    "detailSources": "{{count}} 条来源",
+    "search": {
+      "sources": "{{count}} 条来源",
+      "activity": "活动详情",
+      "openDay": "查看当天回顾"
     }
   },
   "appBound": {
@@ -1378,6 +1398,15 @@
     }
   },
   "sidebar": {
+    "recap": {
+      "title": "回顾事件",
+      "loading": "正在读取回顾…",
+      "pending": "暂无回顾。",
+      "unmatched": "暂无关联事件。",
+      "recordedTime": "记录 {{time}}",
+      "recordedTimeHint": "此活动引用快照的首末记录时间。",
+      "openDetails": "在回顾中查看"
+    },
     "details": {
       "title": "详情"
     },
@@ -1470,13 +1499,15 @@
     "title": "高级搜索",
     "search": {
       "error": "搜索出错：{{message}}",
-      "placeholder_ocr": "搜索截图里出现过的文字",
+      "placeholder_ocr": "搜索快照与回顾",
+      "placeholder_snapshots": "搜索快照中的文字",
+      "placeholder_recaps": "搜索回顾",
       "placeholder_nl": "描述你想找的画面，比如「月亮」",
       "go": "搜索",
       "searching": "搜索中...",
       "did_you_know": "你知道吗：{{msg}}",
-      "no_results_for": "没有找到包含「{{query}}」的截图",
-      "no_results_filtered": "当前筛选条件下没有任何截图。",
+      "no_results_for": "没有找到与「{{query}}」相关的结果",
+      "no_results_filtered": "当前筛选条件下没有相关结果。",
       "no_results_hint": "尝试使用其他关键词或清除筛选条件。",
       "try_visual": "改用画面搜索",
       "clear_filters": "清除筛选条件"
@@ -1486,7 +1517,7 @@
       "nl": "画面",
       "ocr_full": "文字搜索",
       "nl_full": "画面搜索",
-      "ocr_hint": "在识别出的文字里找关键词",
+      "ocr_hint": "查找快照文字和回顾活动",
       "nl_hint": "用一句描述匹配画面内容",
       "ai": "AI",
       "ai_hint": "用一句话提问，由 AI 在记录里查找并回答"
@@ -1525,7 +1556,12 @@
       "elapsed_other": "用时 {{ms}} 毫秒",
       "has_more": "向下滚动还有更多",
       "sort_time": "按时间倒序",
-      "sort_similarity": "按相似度"
+      "sort_similarity": "按相似度",
+      "sort_relevance": "按相关程度",
+      "total": "{{count}} 条结果",
+      "resultTypes": "快照 {{snapshots}} · 回顾 {{recaps}}",
+      "categoryScope": "分类仅筛选快照",
+      "partial": "已显示部分匹配，缩小范围可找到更准确的结果"
     },
     "group": {
       "expand": "同一窗口另有 {{count}} 条",
@@ -1551,7 +1587,25 @@
       "使用 LLM 的搜索会在将来加入！",
       "我是皱皮",
       "阿米娅你听我解释，我真的没有偏向佩丽卡！"
-    ]
+    ],
+    "targets": {
+      "label": "搜索对象",
+      "snapshots": "仅快照",
+      "mixed": "快照与回顾",
+      "recaps": "仅回顾"
+    },
+    "recapSemantic": "回顾语义搜索",
+    "recapSemanticHint": "按含义补充相关回顾，并显示语义相关度。",
+    "recapKeywordMatch": "关键词匹配",
+    "recapApproximateKeywordMatch": "近似关键词匹配",
+    "recapRelevance": "语义相关度：{{score}}",
+    "recapRelevanceHint": "数值越高，含义越接近你的搜索内容。",
+    "semanticUpdating": "正在补充相关回顾…",
+    "semanticFallback": "已显示关键词及当前可用的语义匹配。",
+    "resultTypes": {
+      "recap": "回顾"
+    },
+    "viewSource": "查看来源快照"
   },
   "mask": {
     "model_download": {
@@ -1952,7 +2006,8 @@
       "screenshots": "阅读了 {{count}} 张截图",
       "records": "浏览了 {{count}} 次记录",
       "archives": "查看了 {{count}} 次归档",
-      "separator": "，"
+      "separator": "，",
+      "search_recaps": "查找回顾「{{query}}」"
     },
     "setup": {
       "title": "先连接一个模型服务",

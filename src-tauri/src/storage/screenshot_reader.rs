@@ -54,6 +54,44 @@ impl<'a> ScreenshotReader<'a> {
             .collect())
     }
 
+    /// Returns one deterministic page, with Unix-second bounds and SQL pagination.
+    /// Only the requested records are read and decrypted.
+    pub(crate) fn in_time_range_paged(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ScreenshotRecord>, String> {
+        let start_dt = sqlite_datetime(start_ts);
+        let end_dt = sqlite_datetime(end_ts);
+        let raw_rows =
+            self.storage
+                .with_read_connection_named("screenshots_in_time_range_paged", |conn| {
+                    let sql = format!(
+                        "{} WHERE s.is_deleted = 0 AND s.created_at BETWEEN ?1 AND ?2
+                     ORDER BY s.created_at ASC, s.id ASC LIMIT ?3 OFFSET ?4",
+                        RawScreenshotRow::SELECT,
+                    );
+                    let mut statement = conn.prepare(&sql).map_err(|error| {
+                        format!("Failed to prepare screenshot range query: {error}")
+                    })?;
+                    let rows = statement
+                        .query_map(
+                            params![start_dt, end_dt, limit, offset],
+                            RawScreenshotRow::from_row,
+                        )
+                        .map_err(|error| format!("Failed to query screenshot range: {error}"))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| format!("Failed to read screenshot range row: {error}"))?;
+                    Ok(rows)
+                })?;
+        Ok(raw_rows
+            .into_iter()
+            .map(|row| row.into_record(&self.storage.credential_state))
+            .collect())
+    }
+
     /// Lists recent captures without joining OCR rows, so each screenshot
     /// appears once and SQLite can stop at the indexed limit.
     pub(crate) fn recent(&self, limit: i64) -> Result<Vec<RecentCapture>, String> {

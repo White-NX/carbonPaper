@@ -2024,6 +2024,8 @@ pub(crate) async fn process_ocr_inner(
     let stage_hash = image_hash.to_string();
     let stage_title = window_title.to_string();
     let stage_process = process_name.to_string();
+    let stage_blocks = crate::processing_stage::recap::CaptureEvidence::from_blocks(&ocr_results);
+    let stage_app = app.clone();
     let staged = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         if !stage_storage.background_processing_enabled() {
             return Ok(false);
@@ -2036,7 +2038,7 @@ pub(crate) async fn process_ocr_inner(
         if !stage_storage.processing_stage.available() {
             return Ok(false);
         }
-        let (input, consumers) = crate::processing_stage::captured_input(
+        let (mut input, mut consumers) = crate::processing_stage::captured_input(
             screenshot_id,
             &stage_storage,
             &stage_hash,
@@ -2046,6 +2048,49 @@ pub(crate) async fn process_ocr_inner(
             joined_ocr,
             &stage_pixels,
         )?;
+        if let Some(config) = stage_storage
+            .processing_stage
+            .get_recap::<crate::processing_stage::recap::RecapConfig>(
+            &stage_storage,
+            "config",
+        )? {
+            if config.settings.enabled {
+                let mut recap = stage_blocks;
+                recap.date = chrono::DateTime::from_timestamp_millis(timestamp_ms)
+                    .ok_or("RECAP_INVALID_DATE")?
+                    .with_timezone(&chrono::Local)
+                    .date_naive()
+                    .to_string();
+                let (start, end) = crate::ai::recap::day_bounds(&recap.date)?;
+                stage_storage.recap_day_revision(
+                    &recap.date,
+                    start,
+                    end,
+                    &crate::ai::recap::PrivacyFingerprint::new(
+                        stage_app
+                            .state::<Arc<crate::sensitive_filter::SensitiveFilterState>>()
+                            .get_config(),
+                    )?,
+                )?;
+                if stage_storage.is_silent_read_authorized() {
+                    recap.page_url = stage_storage
+                        .recap_page_url(screenshot_id)
+                        .unwrap_or_default();
+                    recap.document_identity = stage_storage
+                        .get_screenshot_document_ref(screenshot_id)
+                        .ok()
+                        .flatten()
+                        .map(|d| {
+                            crate::ai::recap::digest(
+                                d.locator.as_deref().unwrap_or(&d.display_name),
+                            )
+                        })
+                        .unwrap_or_default();
+                }
+                input.recap = Some(recap);
+                consumers |= carbonpaper_app_bound::protocol::Consumer::Recap.bit();
+            }
+        }
         stage_storage
             .processing_stage
             .stage(screenshot_id, &input, consumers)

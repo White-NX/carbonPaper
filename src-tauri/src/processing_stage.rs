@@ -29,6 +29,8 @@ pub const STAGING_FILE: &str = "processing-staging.db";
 const CLIP_SIZE: u32 = 224;
 const MAX_ATTEMPTS: i64 = 5;
 
+pub(crate) mod recap;
+
 pub(crate) trait Broker: Send + Sync {
     fn call(&self, request: Request) -> protocol::Result<Response>;
     fn installed(&self) -> protocol::Result<bool>;
@@ -72,6 +74,8 @@ pub(crate) struct ProcessingInput {
     pub ocr_text: String,
     pub source_revision: i64,
     pub clip: Option<ClipInput>,
+    #[serde(default)]
+    pub recap: Option<recap::CaptureEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +147,7 @@ pub(crate) struct ProcessingStaging {
     issued: Mutex<HashMap<String, IssuedReceipt>>,
     scan_cursor: Mutex<String>,
     capture_lock: Mutex<()>,
+    recap_ingest_lock: Mutex<()>,
 }
 
 impl ProcessingStaging {
@@ -156,6 +161,7 @@ impl ProcessingStaging {
             issued: Mutex::new(HashMap::new()),
             scan_cursor: Mutex::new(String::new()),
             capture_lock: Mutex::new(()),
+            recap_ingest_lock: Mutex::new(()),
         }
     }
 
@@ -203,6 +209,7 @@ impl ProcessingStaging {
             );
             CREATE INDEX IF NOT EXISTS staged_work_ready ON staged_work(consumer,state,next_attempt);")
             .map_err(|e|e.to_string())?;
+        recap::initialize(&connection, &dataset_id)?;
         // A restored archive cannot attach inputs from the previous dataset.
         connection
             .execute(
@@ -387,7 +394,7 @@ impl ProcessingStaging {
                 .map_err(|_| "staging lock poisoned")?
                 .clear();
             self.with_store(|s|s.connection.execute_batch("UPDATE staged_work SET state='waiting_for_auth',lease_id=NULL WHERE state!='completed';
-                UPDATE staged_inputs SET payload=NULL,state='retired';").map_err(|e|e.to_string()))?;
+                UPDATE staged_inputs SET payload=NULL,state='retired'; DELETE FROM recap_objects;").map_err(|e|e.to_string()))?;
         }
         self.refresh()?;
         if enabled {
@@ -506,13 +513,18 @@ impl ProcessingStaging {
             let usage = self.with_store(|s| {
                 s.connection
                     .query_row(
-                        "SELECT COALESCE(SUM(length(payload)),0) FROM staged_inputs",
+                        "SELECT COALESCE(SUM(length(payload)),0) FROM (SELECT payload FROM staged_inputs UNION ALL SELECT payload FROM recap_objects)",
                         [],
                         |r| r.get::<_, i64>(0).map(|v| v as u64),
                     )
                     .map_err(|e| e.to_string())
             })?;
             if usage.saturating_add(incoming) <= capacity {
+                return Ok(());
+            }
+            let _ = self.make_recap_room(incoming)?;
+            let after=self.with_store(|s|s.connection.query_row("SELECT COALESCE(SUM(length(payload)),0) FROM (SELECT payload FROM staged_inputs UNION ALL SELECT payload FROM recap_objects)",[],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string()))? as u64;
+            if after.saturating_add(incoming) <= capacity {
                 return Ok(());
             }
             let tasks=self.with_store(|s| {
@@ -942,7 +954,7 @@ impl ProcessingStaging {
         if self.initialized() {
             self.with_store(|s| {
                 s.connection
-                    .execute("DELETE FROM staged_inputs", [])
+                    .execute_batch("DELETE FROM staged_inputs; DELETE FROM recap_objects;")
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             })?;
@@ -1090,6 +1102,7 @@ impl ProcessingStaging {
         }
         let mut processed = 0u64;
         storage.finish_staged_deletions()?;
+        self.reconcile_recap()?;
         self.renew_live_leases()?;
         let preparing = self.with_store(|s| {
             let mut stmt = s
@@ -1379,6 +1392,7 @@ pub(crate) fn captured_input(
             ocr_text,
             source_revision: storage.staged_source_revision(screenshot_id)?,
             clip,
+            recap: None,
         },
         mask,
     ))
@@ -1477,7 +1491,7 @@ async fn encode_staged(
             )
         }
         Consumer::Clip => (crate::clip_contract::clip_job_spec(&input.image_hash), None),
-        Consumer::Classification | Consumer::SmartCluster => {
+        Consumer::Classification | Consumer::SmartCluster | Consumer::Recap => {
             return Err("invalid model consumer".into())
         }
     };

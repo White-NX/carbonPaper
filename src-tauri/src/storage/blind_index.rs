@@ -3,6 +3,7 @@
 
 use roaring::RoaringBitmap;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::borrow::Cow;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::time::{Duration, Instant};
 
@@ -194,9 +195,38 @@ pub(super) fn ensure_schema(conn: &Connection) -> Result<(), String> {
     result
 }
 
+pub(super) fn ensure_recap_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recap_blind_bitmap_inline (
+            token_hash TEXT PRIMARY KEY, postings_blob BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS recap_blind_bitmap_directory (
+                token_hash TEXT PRIMARY KEY,
+                payload_bytes INTEGER NOT NULL CHECK(payload_bytes >= 0),
+                containers INTEGER NOT NULL CHECK(containers > 0),
+                run_containers INTEGER NOT NULL CHECK(run_containers >= 0 AND run_containers <= containers),
+                cardinality INTEGER NOT NULL CHECK(cardinality > 0)
+             );
+             CREATE TABLE IF NOT EXISTS recap_blind_bitmap_chunks (
+                token_hash TEXT NOT NULL,
+                shard_id INTEGER NOT NULL CHECK(shard_id >= 0 AND shard_id <= 4095),
+                postings_blob BLOB NOT NULL,
+                PRIMARY KEY(token_hash, shard_id),
+                FOREIGN KEY(token_hash) REFERENCES recap_blind_bitmap_directory(token_hash) ON DELETE CASCADE
+             );
+             CREATE TRIGGER IF NOT EXISTS recap_blind_inline_excludes_chunks BEFORE INSERT ON recap_blind_bitmap_inline
+             WHEN EXISTS(SELECT 1 FROM recap_blind_bitmap_directory WHERE token_hash=NEW.token_hash)
+             BEGIN SELECT RAISE(ABORT, 'blind posting already uses chunks'); END;
+             CREATE TRIGGER IF NOT EXISTS recap_blind_chunks_exclude_inline BEFORE INSERT ON recap_blind_bitmap_directory
+             WHEN EXISTS(SELECT 1 FROM recap_blind_bitmap_inline WHERE token_hash=NEW.token_hash)
+             BEGIN SELECT RAISE(ABORT, 'blind posting still uses inline storage'); END;
+"
+    ).map_err(|e| error("create recap postings", e))
+}
+
 pub(super) struct BlindIndex<'a> {
     conn: &'a Connection,
     v2: bool,
+    recap: bool,
 }
 
 impl<'a> BlindIndex<'a> {
@@ -204,11 +234,34 @@ impl<'a> BlindIndex<'a> {
     /// branch also supports old snapshots and focused storage fixtures.
     pub fn open(conn: &'a Connection) -> Result<Self, String> {
         match object(conn, "blind_bitmap_index")? {
-            Some((kind, _)) if kind == "table" => Ok(Self { conn, v2: false }),
-            Some((kind, sql)) if kind == "view" && sql.contains(LEGACY_GUARD) => {
-                Ok(Self { conn, v2: true })
-            }
+            Some((kind, _)) if kind == "table" => Ok(Self {
+                conn,
+                v2: false,
+                recap: false,
+            }),
+            Some((kind, sql)) if kind == "view" && sql.contains(LEGACY_GUARD) => Ok(Self {
+                conn,
+                v2: true,
+                recap: false,
+            }),
             _ => Err("Unsupported blind index layout".into()),
+        }
+    }
+
+    pub fn recaps(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            v2: true,
+            recap: true,
+        }
+    }
+
+    // The two corpora share the complete posting format and mutation logic.
+    fn sql<'s>(&self, sql: &'s str) -> Cow<'s, str> {
+        if self.recap {
+            Cow::Owned(sql.replace("blind_bitmap_", "recap_blind_bitmap_"))
+        } else {
+            Cow::Borrowed(sql)
         }
     }
 
@@ -244,7 +297,7 @@ impl<'a> BlindIndex<'a> {
             }
             let mut statement = self
                 .conn
-                .prepare(&sql)
+                .prepare(&self.sql(&sql))
                 .map_err(|e| error("prepare probe", e))?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
@@ -290,7 +343,7 @@ impl<'a> BlindIndex<'a> {
             }
             let mut statement = self
                 .conn
-                .prepare(&sql)
+                .prepare(&self.sql(&sql))
                 .map_err(|e| error("prepare cardinalities", e))?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(batch.iter()), |r| {
@@ -323,7 +376,7 @@ impl<'a> BlindIndex<'a> {
         };
         let blob: Option<Vec<u8>> = timed(&mut stats.read, || {
             self.conn
-                .prepare_cached(sql)?
+                .prepare_cached(&self.sql(sql))?
                 .query_row([hash], |r| r.get(0))
                 .optional()
         })
@@ -337,7 +390,7 @@ impl<'a> BlindIndex<'a> {
             return Ok(None);
         }
         timed(&mut stats.read, || {
-            self.conn.prepare_cached("SELECT payload_bytes, containers, run_containers, cardinality FROM blind_bitmap_directory WHERE token_hash=?1")?
+            self.conn.prepare_cached(&self.sql("SELECT payload_bytes, containers, run_containers, cardinality FROM blind_bitmap_directory WHERE token_hash=?1"))?
                 .query_row([hash], |r| Ok(Metrics { payload: r.get(0)?, containers: r.get(1)?, runs: r.get(2)?, cardinality: r.get(3)? })).optional()
         }).map_err(|e| error("read directory", e))
     }
@@ -346,7 +399,7 @@ impl<'a> BlindIndex<'a> {
         if !self.v2 {
             return Ok(None);
         }
-        let mut statement = self.conn.prepare_cached("SELECT shard_id, postings_blob FROM blind_bitmap_chunks WHERE token_hash=?1 ORDER BY shard_id")
+        let mut statement = self.conn.prepare_cached(&self.sql("SELECT shard_id, postings_blob FROM blind_bitmap_chunks WHERE token_hash=?1 ORDER BY shard_id"))
             .map_err(|e| error("prepare chunks", e))?;
         let mut rows = statement
             .query([hash])
@@ -393,11 +446,11 @@ impl<'a> BlindIndex<'a> {
         }
         let mut statement = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&self.sql(
                 "SELECT 0, NULL, postings_blob FROM blind_bitmap_inline WHERE token_hash=?1
              UNION ALL SELECT 1, c.shard_id, c.postings_blob FROM blind_bitmap_directory d
              LEFT JOIN blind_bitmap_chunks c ON c.token_hash=d.token_hash WHERE d.token_hash=?1",
-            )
+            ))
             .map_err(|e| error("prepare posting fallback", e))?;
         let mut rows = statement
             .query([hash])
@@ -446,7 +499,7 @@ impl<'a> BlindIndex<'a> {
         };
         timed(&mut stats.write, || {
             self.conn
-                .prepare_cached(sql)?
+                .prepare_cached(&self.sql(sql))?
                 .execute(params![hash, &bytes])
         })
         .map_err(|e| error("write inline posting", e))?;
@@ -462,7 +515,7 @@ impl<'a> BlindIndex<'a> {
             "DELETE FROM blind_bitmap_index WHERE token_hash=?1"
         };
         timed(&mut stats.write, || {
-            self.conn.prepare_cached(sql)?.execute([hash])
+            self.conn.prepare_cached(&self.sql(sql))?.execute([hash])
         })
         .map_err(|e| error("delete inline posting", e))?;
         Ok(())
@@ -482,10 +535,8 @@ impl<'a> BlindIndex<'a> {
         {
             return Err("Invalid blind index directory metrics".into());
         }
-        timed(&mut stats.write, || self.conn.prepare_cached(
-            "INSERT INTO blind_bitmap_directory(token_hash,payload_bytes,containers,run_containers,cardinality) VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(token_hash) DO UPDATE SET payload_bytes=excluded.payload_bytes,containers=excluded.containers,run_containers=excluded.run_containers,cardinality=excluded.cardinality"
-        )?.execute(params![hash,metrics.payload,metrics.containers,metrics.runs,metrics.cardinality]))
+        timed(&mut stats.write, || self.conn.prepare_cached(&self.sql("INSERT INTO blind_bitmap_directory(token_hash,payload_bytes,containers,run_containers,cardinality) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(token_hash) DO UPDATE SET payload_bytes=excluded.payload_bytes,containers=excluded.containers,run_containers=excluded.run_containers,cardinality=excluded.cardinality"))?.execute(params![hash,metrics.payload,metrics.containers,metrics.runs,metrics.cardinality]))
             .map_err(|e| error("write directory", e))?;
         Ok(())
     }
@@ -497,9 +548,7 @@ impl<'a> BlindIndex<'a> {
         bytes: &[u8],
         stats: &mut MutationStats,
     ) -> Result<(), String> {
-        timed(&mut stats.write, || self.conn.prepare_cached(
-            "INSERT INTO blind_bitmap_chunks(token_hash,shard_id,postings_blob) VALUES(?1,?2,?3) ON CONFLICT(token_hash,shard_id) DO UPDATE SET postings_blob=excluded.postings_blob"
-        )?.execute(params![hash,shard,bytes])).map_err(|e| error("write chunk", e))?;
+        timed(&mut stats.write, || self.conn.prepare_cached(&self.sql("INSERT INTO blind_bitmap_chunks(token_hash,shard_id,postings_blob) VALUES(?1,?2,?3) ON CONFLICT(token_hash,shard_id) DO UPDATE SET postings_blob=excluded.postings_blob"))?.execute(params![hash,shard,bytes])).map_err(|e| error("write chunk", e))?;
         stats.bytes_written += bytes.len();
         stats.fragments_written += 1;
         Ok(())
@@ -508,10 +557,12 @@ impl<'a> BlindIndex<'a> {
     fn clear_chunks(&self, hash: &str, stats: &mut MutationStats) -> Result<(), String> {
         timed(&mut stats.write, || -> rusqlite::Result<()> {
             self.conn
-                .prepare_cached("DELETE FROM blind_bitmap_chunks WHERE token_hash=?1")?
+                .prepare_cached(&self.sql("DELETE FROM blind_bitmap_chunks WHERE token_hash=?1"))?
                 .execute([hash])?;
             self.conn
-                .prepare_cached("DELETE FROM blind_bitmap_directory WHERE token_hash=?1")?
+                .prepare_cached(
+                    &self.sql("DELETE FROM blind_bitmap_directory WHERE token_hash=?1"),
+                )?
                 .execute([hash])?;
             Ok(())
         })
@@ -625,9 +676,7 @@ impl<'a> BlindIndex<'a> {
         let mut changed = false;
         for (shard, delta) in split(ids) {
             let old: Option<Vec<u8>> = timed(&mut stats.read, || {
-                self.conn.prepare_cached(
-                "SELECT postings_blob FROM blind_bitmap_chunks WHERE token_hash=?1 AND shard_id=?2"
-            )?.query_row(params![hash,shard], |r| r.get(0)).optional()
+                self.conn.prepare_cached(&self.sql("SELECT postings_blob FROM blind_bitmap_chunks WHERE token_hash=?1 AND shard_id=?2"))?.query_row(params![hash,shard], |r| r.get(0)).optional()
             })
             .map_err(|e| error("read writable chunk", e))?;
             if remove && old.is_none() {
@@ -659,9 +708,9 @@ impl<'a> BlindIndex<'a> {
             if bitmap.is_empty() {
                 timed(&mut stats.write, || {
                     self.conn
-                        .prepare_cached(
+                        .prepare_cached(&self.sql(
                             "DELETE FROM blind_bitmap_chunks WHERE token_hash=?1 AND shard_id=?2",
-                        )?
+                        ))?
                         .execute(params![hash, shard])
                 })
                 .map_err(|e| error("delete empty chunk", e))?;
@@ -694,7 +743,7 @@ impl<'a> BlindIndex<'a> {
         }
         sql.push_str(" ORDER BY token_hash LIMIT ?2");
         self.conn
-            .prepare(&sql)
+            .prepare(&self.sql(&sql))
             .map_err(|e| error("prepare token scan", e))?
             .query_map(params![after, limit], |r| r.get(0))
             .map_err(|e| error("scan tokens", e))?
@@ -711,7 +760,7 @@ impl<'a> BlindIndex<'a> {
             sql.push_str(" + (SELECT COUNT(*) FROM blind_bitmap_directory WHERE token_hash>?1)");
         }
         self.conn
-            .query_row(&sql, [after], |r| r.get(0))
+            .query_row(&self.sql(&sql), [after], |r| r.get(0))
             .map_err(|e| error("count tokens", e))
     }
 }

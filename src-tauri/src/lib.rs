@@ -16,6 +16,7 @@ mod background_policy;
 mod background_resources;
 mod background_scheduler;
 mod blind_index_repair;
+mod calendar;
 mod capture;
 mod classification;
 mod classification_runtime;
@@ -870,6 +871,7 @@ pub fn run() {
         .manage(MonitorState::new())
         .manage(ai::AiRuntimeState::default())
         .manage(ai::recap::RecapRuntime::default())
+        .manage(ai::recap::RecapSearchRuntime::default())
         .manage(settings_window::SettingsWindowState::default())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
@@ -1260,6 +1262,7 @@ pub fn run() {
             commands::storage::storage_cancel_timeline,
             commands::storage::storage_get_timeline_density,
             commands::storage::storage_search,
+            commands::storage::storage_search_unified,
             commands::storage::storage_list_recent_screenshots,
             commands::storage::storage_get_image,
             commands::storage::storage_get_thumbnail,
@@ -1302,9 +1305,15 @@ pub fn run() {
             commands::ai::ai_search,
             commands::ai::ai_search_cancel,
             commands::recap::recap_get_settings,
+            commands::recap::recap_get_usage,
+            commands::recap::recap_search,
+            commands::recap::recap_search_status,
+            commands::recap::recap_prepare_search,
+            commands::recap::recap_cancel_search_index,
             commands::recap::recap_save_settings,
             commands::recap::recap_list_days,
             commands::recap::recap_get_day,
+            commands::recap::recap_get_snapshot_context,
             commands::recap::recap_get_records,
             commands::recap::recap_generate,
             commands::recap::recap_cancel,

@@ -298,6 +298,17 @@ impl StorageState {
             CREATE INDEX IF NOT EXISTS idx_derived_index_jobs_status
                 ON derived_index_jobs(index_kind, status, next_retry_at, updated_at);
 
+            -- Count/existence/cache-shape reads must not visit vector BLOB
+            -- pages or the completed job payloads for every historical row.
+            CREATE INDEX IF NOT EXISTS idx_derived_embeddings_visibility
+                ON derived_embeddings(index_kind, subject_key, model_id,
+                                      model_revision, embedding_version,
+                                      source_fingerprint, dimensions);
+            CREATE INDEX IF NOT EXISTS idx_derived_jobs_completed_visibility
+                ON derived_index_jobs(index_kind, status, subject_key, model_id,
+                                      model_revision, embedding_version, source_fingerprint)
+                WHERE status = 'completed';
+
             -- Monotonic query-visible content epoch for each derived index.
             -- Only mutations that can change the completed embedding join advance
             -- this value, allowing sidecar publication to ignore ledger-only churn.

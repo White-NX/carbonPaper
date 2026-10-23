@@ -8,6 +8,45 @@ use crate::{
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
+/// Authentication: required. Searches saved, corrected activities across dates.
+#[tauri::command]
+pub async fn recap_search(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    request: RecapSearchQuery,
+) -> Result<RecapSearchResult, String> {
+    check_auth_required(&credential_state)?;
+    recap::search_activities(app, request).await
+}
+
+/// Authentication: required. Reports local search coverage without loading a model.
+#[tauri::command]
+pub async fn recap_search_status(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<RecapSearchStatus, String> {
+    check_auth_required(&credential_state)?;
+    tokio::task::spawn_blocking(move || recap::search_status(&app))
+        .await
+        .map_err(|_| "RECAP_WORKER_FAILED")?
+}
+
+/// Authentication: required. Builds resumable local embeddings for saved recaps.
+#[tauri::command]
+pub async fn recap_prepare_search(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+    recap::prepare_search(app).await
+}
+
+/// Authentication: not required. Stops local preparation without returning data.
+#[tauri::command]
+pub fn recap_cancel_search_index(runtime: tauri::State<'_, RecapSearchRuntime>) -> bool {
+    runtime.cancel()
+}
+
 /// Authentication: required. API keys are omitted from the returned settings.
 #[tauri::command]
 pub async fn recap_get_settings(
@@ -15,11 +54,41 @@ pub async fn recap_get_settings(
     storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<RecapSettings, String> {
     check_auth_required(&credential_state)?;
-    Ok(storage_state
-        .recap_read::<RecapSettings>("settings", "settings", None)?
-        .unwrap_or_default()
-        .with_app_language()
-        .view())
+    let storage = storage_state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        Ok(storage
+            .recap_read::<RecapSettings>("settings", "settings", None)?
+            .unwrap_or_default()
+            .current_defaults()
+            .with_app_language()
+            .view())
+    })
+    .await
+    .map_err(|_| "RECAP_WORKER_FAILED")?
+}
+
+/// Authentication: required. Today's request usage without reading saved
+/// activities, source records, corrections or application icons.
+#[tauri::command]
+pub async fn recap_get_usage(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<RecapUsage, String> {
+    check_auth_required(&credential_state)?;
+    let credentials = credential_state.inner().clone();
+    let storage = storage_state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        check_auth_required(&credentials)?;
+        let generation = storage.db_generation();
+        let usage = storage.recap_usage(&chrono::Local::now().date_naive().to_string())?;
+        check_auth_required(&credentials)?;
+        if generation != storage.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        Ok(usage)
+    })
+    .await
+    .map_err(|_| "RECAP_WORKER_FAILED")?
 }
 
 /// Authentication: required. A missing screening key preserves the saved key.
@@ -57,7 +126,29 @@ pub async fn recap_save_settings(
     });
     settings.validate()?;
     app.state::<RecapRuntime>().cancel();
+    if !settings.semantic_search_enabled {
+        app.state::<RecapSearchRuntime>().cancel();
+        storage_state.park_background_task(
+            crate::background_scheduler::TASK_RECAP_INDEX,
+            "feature_disabled",
+        )?;
+    }
     storage_state.recap_write("settings", "settings", "", -1, generation, &settings)?;
+    if let Err(error) = crate::ai::recap::protected::sync_after_unlock(&app) {
+        tracing::warn!("[RECAP] Protected settings sync deferred: {}", error);
+    }
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        if settings.semantic_search_enabled {
+            scheduler.enqueue(
+                &app,
+                crate::background_scheduler::BackgroundTaskKind::RecapIndex,
+                false,
+            )?;
+        }
+        scheduler.wake();
+    }
     let _ = app.emit("recap-changed", ());
     Ok(settings.view())
 }
@@ -92,6 +183,22 @@ pub async fn recap_get_day(
     })
     .await
     .map_err(|_| "RECAP_WORKER_FAILED")?
+}
+
+/// Authentication: required. Reads saved associations for one snapshot.
+#[tauri::command]
+pub async fn recap_get_snapshot_context(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    screenshot_id: i64,
+) -> Result<SnapshotRecapContext, String> {
+    check_auth_required(&credential_state)?;
+    let result =
+        tokio::task::spawn_blocking(move || recap::read_snapshot_context(&app, screenshot_id))
+            .await
+            .map_err(|_| "RECAP_WORKER_FAILED")?;
+    check_auth_required(&credential_state)?;
+    result
 }
 
 /// Authentication: required. Pages the filtered, revision-checked source directory.
@@ -138,7 +245,11 @@ pub async fn recap_generate(
     force: Option<bool>,
 ) -> Result<RecapDay, String> {
     check_auth_required(&credential_state)?;
-    recap::generate(app, date, force.unwrap_or(false), false).await
+    let result = recap::generate(app, date, force.unwrap_or(false), false).await;
+    // The generation may keep running after the initiating window locks.
+    // Its private result must still wait for a fresh authenticated UI read.
+    check_auth_required(&credential_state)?;
+    result
 }
 
 /// Authentication: required. Deletes this day's recap and suppresses automatic regeneration.
@@ -156,6 +267,8 @@ pub async fn recap_delete(
     }
     app.state::<RecapRuntime>()
         .delete_day(&storage_state, &date)?;
+    storage_state.processing_stage.revoke_recap_day(&date)?;
+    recap::search::schedule_index(&app);
     let _ = app.emit("recap-changed", ());
     let _ = app.emit("recap-progress", ());
     Ok(())
@@ -284,6 +397,10 @@ pub async fn recap_correct(
     }
     // The storage trigger queues summary updates in the same transaction.
     storage_state.recap_write("corrections", &date, &date, -1, generation, &history)?;
+    if let Err(error) = crate::ai::recap::protected::sync_day(&app, &date) {
+        tracing::warn!("[RECAP] Protected correction sync deferred: {}", error);
+    }
+    recap::search::schedule_index(&app);
     let _ = app.emit("recap-changed", &date);
     recap::read_day(&app, &date)
 }

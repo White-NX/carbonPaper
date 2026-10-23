@@ -1,13 +1,13 @@
 import React from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { getRecapDay, getRecapSettings, saveRecapSettings } from '../../lib/recap_api';
+import { getRecapDay, getRecapSettings, getRecapUsage, saveRecapSettings } from '../../lib/recap_api';
 import { openSettingsWindow } from '../../lib/settings_api';
 import { SettingsActivityProvider, useSettingsWindowActivity } from './SettingsActivityContext';
 import RecapSection from './RecapSection';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
-vi.mock('../../lib/recap_api', () => ({ getRecapSettings: vi.fn(), getRecapDay: vi.fn(), saveRecapSettings: vi.fn(), localDate: () => '2026-10-01', recapErrorKey: () => 'error' }));
+vi.mock('../../lib/recap_api', () => ({ getRecapSettings: vi.fn(), getRecapUsage: vi.fn(), getRecapDay: vi.fn(), saveRecapSettings: vi.fn(), recapErrorKey: () => 'error' }));
 vi.mock('../../lib/ai_api', () => ({ getAiSettings: vi.fn(async () => ({ providers: [{ id: 'p', name: 'Local model' }] })) }));
 vi.mock('../../lib/settings_api', () => ({ openSettingsWindow: vi.fn(async () => {}) }));
 let settings;
@@ -16,7 +16,7 @@ beforeEach(() => {
     daily_input_tokens: 432000, daily_output_tokens: 384000, screening_input_tokens: 2000000,
     screening: { enabled: false, base_url: 'https://example.com/v1', model: 'screen', has_api_key: true } };
   getRecapSettings.mockResolvedValue(settings);
-  getRecapDay.mockResolvedValue({ usage: { input_tokens: 1, output_tokens: 2, screening_input_tokens: 3 } });
+  getRecapUsage.mockResolvedValue({ input_tokens: 1, output_tokens: 2, screening_input_tokens: 3 });
   saveRecapSettings.mockImplementation(async (value) => {
     const screening = { ...value.screening, has_api_key: Boolean(value.screening.api_key || value.screening.has_api_key) };
     delete screening.api_key;
@@ -27,10 +27,46 @@ function Activity() { const { dirty, busy } = useSettingsWindowActivity(); retur
 function Host({ enabled = true }) { return <SettingsActivityProvider enabled={enabled}><Activity /><RecapSection /></SettingsActivityProvider>; }
 
 describe('daily recap in the settings window', () => {
+  it('defaults semantic search on and saves disabling it without a key detail switch', async () => {
+    render(<Host />);
+    const control = await screen.findByRole('switch', { name: 'recap.settings.semanticSearch' });
+    expect(control).toBeChecked();
+    expect(screen.queryByRole('switch', { name: 'recap.settings.keyDetails' })).not.toBeInTheDocument();
+    fireEvent.click(control);
+    await waitFor(() => expect(saveRecapSettings).toHaveBeenCalledWith(expect.objectContaining({ semantic_search_enabled: false })));
+  });
   it('still allows configuration when the usage summary cannot be read', async () => {
-    getRecapDay.mockRejectedValueOnce(new Error('RECAP_INVALID_CACHE'));
+    getRecapUsage.mockRejectedValueOnce(new Error('RECAP_STORAGE_UNAVAILABLE'));
     render(<Host />);
     expect(await screen.findByRole('switch', { name: 'recap.settings.enabled' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+  it('displays and saves settings while usage is pending without loading a recap day', async () => {
+    let resolveUsage;
+    getRecapUsage.mockImplementationOnce(() => new Promise((done) => { resolveUsage = done; }));
+    render(<Host />);
+    const control = await screen.findByRole('switch', { name: 'recap.settings.enabled' });
+    expect(getRecapUsage).toHaveBeenCalledTimes(1);
+    expect(getRecapDay).not.toHaveBeenCalled();
+    expect(screen.queryByText('recap.settings.usage')).not.toBeInTheDocument();
+    fireEvent.click(control);
+    await screen.findByText('clean');
+    expect(saveRecapSettings).toHaveBeenCalledWith(expect.objectContaining({ enabled: true }));
+    await act(async () => resolveUsage({ input_tokens: 1, output_tokens: 2, screening_input_tokens: 3 }));
+    expect(screen.getByText('recap.settings.usage')).toBeInTheDocument();
+  });
+  it('ignores usage from a read started before locking and reloading settings', async () => {
+    let resolveUsage;
+    getRecapUsage.mockImplementationOnce(() => new Promise((done) => { resolveUsage = done; }));
+    getRecapUsage.mockRejectedValueOnce(new Error('RECAP_STORAGE_UNAVAILABLE'));
+    const { rerender } = render(<Host />);
+    await screen.findByRole('switch', { name: 'recap.settings.enabled' });
+    rerender(<Host enabled={false} />);
+    rerender(<Host />);
+    await screen.findByRole('switch', { name: 'recap.settings.enabled' });
+    await act(async () => resolveUsage({ input_tokens: 100, output_tokens: 200, screening_input_tokens: 300 }));
+    expect(screen.queryByText('recap.settings.usage')).not.toBeInTheDocument();
+    expect(getRecapUsage).toHaveBeenCalledTimes(2);
   });
   it('automatically saves switches without footer actions or a separate language setting', async () => {
     render(<Host />);

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { CalendarDays } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { getAiSettings } from '../../lib/ai_api';
-import { getRecapDay, getRecapSettings, localDate, recapErrorKey, saveRecapSettings } from '../../lib/recap_api';
+import { getRecapSettings, getRecapUsage, recapErrorKey, saveRecapSettings } from '../../lib/recap_api';
 import { openSettingsWindow } from '../../lib/settings_api';
 import { useSettingsActive, useSettingsActivity, useSettingsWindowActivity } from './SettingsActivityContext';
 import { SettingsButton, SettingsSelect, SettingsSwitch } from './SettingsControls';
@@ -58,6 +58,7 @@ export default function RecapSection() {
   const pendingSave = useRef(null);
   const epoch = useRef(0);
   const readSequence = useRef(0);
+  const usageReadSequence = useRef(0);
   useEffect(() => () => { epoch.current += 1; }, []);
   useSettingsActivity('daily-recap', { dirty, busy });
   useEffect(() => {
@@ -71,11 +72,18 @@ export default function RecapSection() {
   const load = useCallback(async () => {
     const token = epoch.current;
     const request = ++readSequence.current;
+    const usageRequest = ++usageReadSequence.current;
+    // Usage is optional and cannot delay displaying or editing settings.
+    getRecapUsage().then((usage) => {
+      if (token === epoch.current && usageRequest === usageReadSequence.current) setUsage(usage);
+    }).catch(() => {
+      if (token === epoch.current && usageRequest === usageReadSequence.current) setUsage(null);
+    });
     try {
-      const [settings, ai, day] = await Promise.all([getRecapSettings(), getAiSettings(), getRecapDay(localDate(), { includeRecords: false, includeAttempts: false }).catch(() => null)]);
+      const [settings, ai] = await Promise.all([getRecapSettings(), getAiSettings()]);
       if (token !== epoch.current || request !== readSequence.current) return;
       if (!dirtyRef.current && !savingRef.current) { savedRef.current = draftRef.current = settings; setSaved(settings); setDraft(settings); }
-      setProviders(ai.providers || []); setUsage(day?.usage || null); setError('');
+      setProviders(ai.providers || []); setError('');
     } catch (cause) { if (token === epoch.current && request === readSequence.current) setError(String(cause)); }
   }, []);
   useEffect(() => {
@@ -123,8 +131,12 @@ export default function RecapSection() {
   return <SettingsSection id="daily-recap" icon={CalendarDays} title={t('recap.title')} description={t('recap.settings.description')}>
     {error && <SettingsErrorBanner>{t(recapErrorKey(error))}<SettingsButton disabled={busy} onClick={() => draft ? save() : load()}>{t('common.retry')}</SettingsButton></SettingsErrorBanner>}
     {!draft ? <SettingsStatus>{t('recap.loading')}</SettingsStatus> : <SettingsGroup aria-label={t('recap.settings.title')}>
-        <SettingsRow label={t('recap.settings.enabled')} description={t('recap.settings.enabledHint')}
-          control={<SettingsSwitch checked={draft.enabled} onChange={(value) => update('enabled', value)} />} />
+        <div className="space-y-4">
+          <SettingsRow label={t('recap.settings.enabled')} description={t('recap.settings.enabledHint')}
+            control={<SettingsSwitch checked={draft.enabled} onChange={(value) => update('enabled', value)} />} />
+          <SettingsRow label={t('recap.settings.semanticSearch')} description={t('recap.settings.semanticSearchHint')}
+            control={<SettingsSwitch checked={draft.semantic_search_enabled ?? true} onChange={(value) => update('semantic_search_enabled', value)} />} />
+        </div>
         <SettingsDivider />
         <div className="space-y-5">
           <SettingsRow label={t('recap.settings.provider')} control={<SettingsSelect value={draft.provider_id || ''}

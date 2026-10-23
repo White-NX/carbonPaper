@@ -3,7 +3,7 @@ import { Search, X, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { ThumbnailCard } from './ThumbnailCard';
 import { SearchModeTabs } from './search/SearchModeTabs';
-import { TimeRangeChip, ProcessChip, CategoryChip } from './search/SearchFilters';
+import { TimeRangeChip, ProcessChip, CategoryChip, SearchTargetChip, RecapSemanticToggle } from './search/SearchFilters';
 import { SearchStatsBar } from './search/SearchStatsBar';
 import { SearchResultRow } from './search/SearchResultRow';
 import { SearchLanding, SearchNoResults } from './search/SearchLanding';
@@ -13,6 +13,8 @@ import { PageHeader } from './PageHeader';
 import { useAdvancedSearchController } from '../hooks/useAdvancedSearchController';
 import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
 import { buildSearchTimelineMarkers, searchResultMarkerId } from '../lib/timeline_search';
+import { RecapSearchResultDetails, RecapSearchResultRow } from './search/RecapSearchResult';
+import { useRecapSourceAction } from './recap/RecapSources';
 
 export function AdvancedSearch({
   active,
@@ -22,6 +24,8 @@ export function AdvancedSearch({
   searchMode,
   onSearchModeChange,
   onTimelineSearchChange,
+  onOpenRecapDay,
+  isAuthenticated = true,
 }) {
   const { t } = useTranslation();
   const {
@@ -61,8 +65,17 @@ export function AdvancedSearch({
     clearFilters,
     searchSourceDetail,
     resultSetKey,
+    totals,
+    unified,
+    semanticUpdating,
+    semanticStatus,
+    searchTarget,
+    setSearchTarget,
+    recapSemantic,
+    setRecapSemantic,
+    useRecapSemantic,
   } = useAdvancedSearchController({
-    active,
+    active: active && isAuthenticated,
     searchParams,
     searchMode,
     onSearchModeChange,
@@ -77,6 +90,14 @@ export function AdvancedSearch({
   };
   const tabs = <SearchModeTabs mode={aiActive ? 'ai' : mode} onChange={handleTabChange} />;
   const [hoveredMarkerIds, setHoveredMarkerIds] = React.useState([]);
+  const [selectedRecap, setSelectedRecap] = React.useState(null);
+  const currentRecap = selectedRecap && results.find((item) => item.kind === 'recap'
+    && item.recap.date === selectedRecap.date && item.recap.activity_id === selectedRecap.activity_id)?.recap;
+  React.useEffect(() => {
+    if (selectedRecap && !currentRecap) setSelectedRecap(null);
+  }, [selectedRecap, currentRecap]);
+  const recapAction = useRecapSourceAction(onSelectResult, onOpenSnapshotPreview);
+  const recapTime = React.useCallback((ms) => new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(ms)), []);
 
   const hasResults = results.length > 0;
   const showStats = hasResults && !loading;
@@ -180,7 +201,11 @@ export function AdvancedSearch({
 
     return (
       <div className="flex flex-col gap-0.5 px-4 py-2">
-        {groupedResults.map((group, index) => (
+        {groupedResults.map((group, index) => group.primary.kind === 'recap' ? (
+          <RecapSearchResultRow key={`recap:${group.primary.recap.date}:${group.primary.recap.activity_id}`}
+            item={group.primary.recap} queryTokens={queryTokens} time={recapTime} action={recapAction}
+            onDetails={() => setSelectedRecap(group.primary.recap)} onOpenDay={onOpenRecapDay} />
+        ) : (
           <SearchResultRow
             key={`${group.primary.id || group.primary.image_path || index}-${index}`}
             group={group}
@@ -232,10 +257,14 @@ export function AdvancedSearch({
         bordered={!showStats}
         flushBottom
         secondaryRow={(
-          <>
+          <div className="flex w-full flex-wrap items-center gap-x-7 gap-y-2">
             {tabs}
 
-            <div className="flex flex-1 flex-wrap items-center gap-2">
+            <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:flex-1">
+              {mode === 'ocr' && <>
+                <SearchTargetChip value={searchTarget} onChange={setSearchTarget} />
+                {searchTarget !== 'snapshots' && <RecapSemanticToggle checked={recapSemantic} onChange={setRecapSemantic} />}
+              </>}
               <TimeRangeChip
                 preset={rangePreset}
                 startDate={startDate}
@@ -247,7 +276,7 @@ export function AdvancedSearch({
                 selected={selectedProcesses}
                 onChange={setSelectedProcesses}
               />
-              {mode === 'ocr' && (
+              {mode === 'ocr' && searchTarget !== 'recaps' && (
                 <CategoryChip
                   categories={categoryOptions}
                   selected={selectedCategories}
@@ -265,7 +294,7 @@ export function AdvancedSearch({
                 </button>
               )}
             </div>
-          </>
+          </div>
         )}
       >
         <div className="flex h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
@@ -273,7 +302,7 @@ export function AdvancedSearch({
             type="text"
             className="min-w-0 flex-1 bg-transparent text-sm text-ide-text outline-none placeholder:text-ide-muted"
             placeholder={mode === 'ocr'
-              ? t('advancedSearch.search.placeholder_ocr')
+              ? t(searchTarget === 'mixed' ? 'advancedSearch.search.placeholder_ocr' : `advancedSearch.search.placeholder_${searchTarget}`)
               : t('advancedSearch.search.placeholder_nl')}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
@@ -300,8 +329,12 @@ export function AdvancedSearch({
       </PageHeader>
 
       {showStats && (
-        <SearchStatsBar count={results.length} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode} />
+      <SearchStatsBar count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode}
+        snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
+        categoryScoped={mode === 'ocr' && searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />
       )}
+      {unified && semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticUpdating')}</p>}
+      {unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
 
       {mode === 'nl' && !isLanding && (
         <p className="shrink-0 border-b border-ide-border bg-ide-panel px-6 pb-2 text-[11px] leading-relaxed text-ide-muted">
@@ -328,6 +361,8 @@ export function AdvancedSearch({
           {!loadingMore && !hasMore && hasResults && <span>{t('advancedSearch.no_more')}</span>}
         </div>
       </div>
+      {currentRecap && active && isAuthenticated && <RecapSearchResultDetails item={currentRecap} action={recapAction} time={recapTime}
+        onClose={() => setSelectedRecap(null)} onOpenDay={(date) => { setSelectedRecap(null); onOpenRecapDay?.(date); }} />}
     </div>
   );
 }

@@ -982,16 +982,16 @@ impl StorageState {
         &self,
         index_kind: DerivedIndexKind,
     ) -> Result<u64, String> {
-        let guard = self.get_connection_named("count_query_visible_embeddings")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        let count: i64 = conn
-            .query_row(
-                &visible_embedding_count_sql(),
-                [index_kind.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Failed to count query-visible embeddings: {error}"))?;
-        u64::try_from(count).map_err(|_| "Invalid query-visible embedding count".to_string())
+        self.with_read_connection_named("count_query_visible_embeddings", |conn| {
+            let count: i64 = conn
+                .query_row(
+                    &visible_embedding_count_sql(),
+                    [index_kind.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Failed to count query-visible embeddings: {error}"))?;
+            u64::try_from(count).map_err(|_| "Invalid query-visible embedding count".to_string())
+        })
     }
 
     /// Whether at least one embedding is query-visible for an index kind.
@@ -1004,16 +1004,16 @@ impl StorageState {
         &self,
         index_kind: DerivedIndexKind,
     ) -> Result<bool, String> {
-        let guard = self.get_connection_named("has_query_visible_embeddings")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        conn.query_row(
-            &visible_embedding_exists_sql(),
-            [index_kind.as_str()],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map(|value| value.is_some())
-        .map_err(|error| format!("Failed to check query-visible embeddings: {error}"))
+        self.with_read_connection_named("has_query_visible_embeddings", |conn| {
+            conn.query_row(
+                &visible_embedding_exists_sql(),
+                [index_kind.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(|error| format!("Failed to check query-visible embeddings: {error}"))
+        })
     }
 
     /// Exact-scan cosine top-K over the query-visible `semantic_text`
@@ -1269,7 +1269,7 @@ impl StorageState {
                         MIN(CASE WHEN {CLAIMABLE_JOB_PREDICATE} THEN updated_at END)
                     )) * 86400 AS INTEGER)
                 FROM derived_index_jobs
-                WHERE index_kind = ?1
+                WHERE index_kind = ?1 AND status IN ('pending', 'waiting_for_auth', 'failed')
                 "#
             ),
             params![index_kind.as_str(), max_attempts],
@@ -1857,24 +1857,42 @@ pub(super) fn read_derived_data_epoch(
 /// Single definition of "query-visible": a completed ledger row whose model
 /// contract and fingerprint still match the stored vector. Every projection
 /// below shares it so the resident cache cannot drift from the SQL readers.
-pub(super) const VISIBLE_EMBEDDING_SOURCE: &str = r#"
-        FROM derived_embeddings e
-        INNER JOIN derived_index_jobs j
+fn visible_embedding_source_with_indexes(embedding_index: &str, job_index: &str) -> String {
+    format!(
+        r#"
+        FROM derived_embeddings e {embedding_index}
+        INNER JOIN derived_index_jobs j {job_index}
           ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
         WHERE e.index_kind = ?1 AND j.status = 'completed'
           AND j.model_id = e.model_id
           AND j.model_revision = e.model_revision
           AND j.embedding_version = e.embedding_version
           AND j.source_fingerprint = e.source_fingerprint
-"#;
+"#
+    )
+}
+
+pub(super) fn visible_embedding_source() -> String {
+    visible_embedding_source_with_indexes("", "")
+}
+
+fn visible_embedding_metadata_source() -> String {
+    // Both sides are covering: even COUNT(*) otherwise reads the embedding
+    // table's large vector records to compare their model/fingerprint fields.
+    visible_embedding_source_with_indexes(
+        "INDEXED BY idx_derived_embeddings_visibility",
+        "INDEXED BY idx_derived_jobs_completed_visibility",
+    )
+}
 
 fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
+    let source = visible_embedding_source();
     format!(
         r#"
         SELECT e.subject_key, e.dimensions, e.vector_f32, e.model_id,
                e.model_revision, e.embedding_version, e.source_fingerprint,
                e.updated_at
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
           {predicate} {suffix}
         "#
     )
@@ -1897,10 +1915,11 @@ fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
 /// walks the `(index_kind, subject_key)` primary-key index directly, so no page
 /// costs a temporary sort.
 pub(super) fn visible_embedding_page_sql() -> String {
+    let source = visible_embedding_source();
     format!(
         r#"
         SELECT e.subject_key, e.dimensions, e.vector_f32
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
           AND e.subject_key > ?2
         ORDER BY e.subject_key
         LIMIT ?3
@@ -1917,30 +1936,33 @@ pub(super) fn visible_embedding_page_sql() -> String {
 /// statement is dropped before the vector pages are opened so a writer is not
 /// held behind one long read transaction.
 pub(super) fn visible_embedding_cache_stats_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT COUNT(*), MIN(e.dimensions), MAX(e.dimensions),
                COALESCE(SUM(LENGTH(CAST(e.subject_key AS BLOB))), 0)
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         "#
     )
 }
 
 fn visible_embedding_exists_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT 1
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         LIMIT 1
         "#
     )
 }
 
 fn visible_embedding_count_sql() -> String {
+    let source = visible_embedding_metadata_source();
     format!(
         r#"
         SELECT COUNT(*)
-        {VISIBLE_EMBEDDING_SOURCE}
+        {source}
         "#
     )
 }
