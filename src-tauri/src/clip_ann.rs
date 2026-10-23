@@ -1681,7 +1681,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn disarm_prevents_an_old_startup_token_from_installing() {
         let temp = tempfile::tempdir().unwrap();

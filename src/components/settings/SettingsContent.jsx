@@ -13,7 +13,7 @@ import FeaturesSection from './FeaturesSection';
 import RecapSection from './RecapSection';
 import LanguageSection from './LanguageSection';
 import BrowserExtensionSection from './BrowserExtensionSection';
-import AiEmbeddingSection from './AiEmbeddingSection';
+import AgentAccessSection from './agent-access/AgentAccessSection';
 import AiProvidersSection from './ai/AiProvidersSection';
 import ProtectedProcessingCard from './advanced/ProtectedProcessingCard';
 import { BackgroundSchedulerCard } from './advanced/InferenceCards';
@@ -70,7 +70,7 @@ export default function SettingsContent({
   const restart = async () => {
     setRestarting(true);
     try {
-      if (await c.handleRestartMonitor()) { runtime.clearCpuChanged(); runtime.clearDmlChanged(); }
+      if (await c.handleRestartMonitor()) { runtime.preferences.clearCpuChanged(); runtime.preferences.clearDmlChanged(); }
     } finally { setRestarting(false); }
   };
   const page = (tab) => {
@@ -78,7 +78,7 @@ export default function SettingsContent({
       case 'general': return <>
         <LanguageSection />
         <MonitorServiceSection monitorStatus={c.monitorStatus} onStart={async () => {
-          if (await c.handleStartMonitor()) { runtime.clearCpuChanged(); runtime.clearDmlChanged(); }
+          if (await c.handleStartMonitor()) { runtime.preferences.clearCpuChanged(); runtime.preferences.clearDmlChanged(); }
         }} onStop={c.handleStopMonitor}
           onPause={c.handlePauseMonitor} onResume={c.handleResumeMonitor} onRestart={restart}
           autoStartMonitor={autoStartMonitor} onAutoStartMonitorChange={onAutoStartMonitorChange}
@@ -98,24 +98,24 @@ export default function SettingsContent({
       case 'privacy': return <>
         <SecuritySection sessionTimeout={sessionTimeout} onSessionTimeoutChange={onSessionTimeoutChange}
           isSessionValid={isSessionValid} onLockSession={onLockSession} />
-        <BackgroundSchedulerCard enabled={runtime.backgroundProcessingEnabled} saving={runtime.backgroundProcessingSaving}
-          status={runtime.backgroundSchedulerStatus} onChange={runtime.handleBackgroundProcessingChange} onRefresh={runtime.refreshBackgroundSchedulerStatus} />
-        <ProtectedProcessingCard backgroundEnabled={runtime.backgroundProcessingEnabled} />
+        <BackgroundSchedulerCard enabled={runtime.scheduler.enabled} saving={runtime.scheduler.saving}
+          status={runtime.scheduler.status} onChange={runtime.scheduler.setEnabled} onRefresh={runtime.scheduler.refresh} />
+        <ProtectedProcessingCard backgroundEnabled={runtime.scheduler.enabled} />
         <SettingsSection title={t('settings.advanced.network.title')}>
           <SettingsGroup><SettingsRow label={t('settings.advanced.network.label')} description={t('settings.advanced.network.description')}
-            control={<SettingsSwitch checked={runtime.config?.network_enabled === true} disabled={!runtime.config || runtime.configSaving}
-              onChange={() => runtime.handleToggle('network_enabled')} />} /></SettingsGroup>
+            control={<SettingsSwitch checked={runtime.preferences.config?.network_enabled === true} disabled={!runtime.preferences.config || runtime.preferences.configSaving}
+              onChange={() => runtime.preferences.handleToggle('network_enabled')} />} /></SettingsGroup>
         </SettingsSection>
       </>;
       case 'ai': return <>
         <AiProvidersSection />
-        <AiEmbeddingSection />
+        <AgentAccessSection />
       </>;
       case 'maintenance': return <StorageManagementSection storageSegments={segments} totalStorage={c.storage?.total_bytes || 0}
         storage={c.storage} loading={c.analysisLoading} refreshing={c.analysisRefreshing} error={c.analysisError} onRefresh={c.handleRefreshAnalysis}
-        maintenance={<IndexMaintenanceSection controller={runtime} />}
+        maintenance={<IndexMaintenanceSection indexes={runtime.indexes} thumbnails={runtime.thumbnails} vacuum={runtime.vacuum} />}
         cleanup={<QuickDeleteSection onDelete={c.handleQuickDelete} isDeleting={c.isDeleting} deleteMessage={c.deleteMessage} deleteMessageType={c.deleteMessageType} />} />;
-      case 'advanced': return <AdvancedSection controller={runtime} />;
+      case 'advanced': return <AdvancedSection preferences={runtime.preferences} ocr={runtime.ocr} indexes={runtime.indexes} scheduler={runtime.scheduler} />;
       case 'about': return <AboutSection checking={c.checkingUpdate} upToDate={c.upToDate} onCheckUpdate={c.handleCheckUpdate}
         updateInfo={c.updateInfo} updateError={c.updateError} downloading={c.downloading} downloadProgress={c.downloadProgress} onDownloadUpdate={c.handleDownloadUpdate} />;
       default: return null;
@@ -149,11 +149,11 @@ export default function SettingsContent({
             </div>
           </SettingsPageContext.Provider>
         </div>)}
-        {(preferenceError || c.monitorError || (runtimeActive && (runtime.configError || runtime.runtimeError))) && <div className="shrink-0 px-6 py-3"><SettingsErrorBanner>
-          {preferenceError || c.monitorError || runtime.configError || runtime.runtimeError}
-          {runtime.configError && !runtime.config && <SettingsButton onClick={runtime.loadConfig}>{t('common.retry')}</SettingsButton>}
+        {(preferenceError || c.monitorError || (runtimeActive && (runtime.preferences.configError || runtime.error))) && <div className="shrink-0 px-6 py-3"><SettingsErrorBanner>
+          {preferenceError || c.monitorError || runtime.preferences.configError || runtime.error}
+          {runtime.preferences.configError && !runtime.preferences.config && <SettingsButton onClick={runtime.preferences.loadConfig}>{t('common.retry')}</SettingsButton>}
         </SettingsErrorBanner></div>}
-        {(runtime.cpuChanged || runtime.dmlChanged) && <div className="shrink-0 border-t border-ide-border px-6 py-3">
+        {(runtime.preferences.cpuChanged || runtime.preferences.dmlChanged) && <div className="shrink-0 border-t border-ide-border px-6 py-3">
           <SettingsWarningBanner><div className="flex flex-wrap items-center justify-between gap-3">
             <span>{t('settings.feedback.savedPendingRestart')}</span>
             <SettingsButton disabled={restarting || c.monitorStatus !== 'running'} onClick={restart}>{t('settings.advanced.quick_restart')}</SettingsButton>

@@ -69,12 +69,6 @@ impl StorageState {
         result
     }
 
-    /// Read an encrypted image file and return raw image bytes.
-    pub fn read_image_bytes(&self, path: &str) -> Result<(Vec<u8>, String), String> {
-        self.read_image_bytes_with_mode(path, false)
-            .map_err(|error| error.to_string())
-    }
-
     /// Read image bytes for unattended work without allowing CNG to display UI.
     pub(crate) fn read_image_bytes_silent(
         &self,
@@ -86,23 +80,11 @@ impl StorageState {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
-        self.read_image_bytes_with_mode(path, true)
-    }
-
-    fn read_image_bytes_with_mode(
-        &self,
-        path: &str,
-        silent: bool,
-    ) -> Result<(Vec<u8>, String), BackgroundReadError> {
         let diag_start = std::time::Instant::now();
 
         let (key_enc, abs_path) = {
             let guard = self
-                .get_connection_named(if silent {
-                    "read_image_bytes_silent"
-                } else {
-                    "read_image_bytes"
-                })
+                .get_connection_named("read_image_bytes_silent")
                 .map_err(BackgroundReadError::Other)?;
             let conn = guard.as_ref().unwrap();
 
@@ -141,20 +123,16 @@ impl StorageState {
         let encrypted_key = key_enc.as_ref().ok_or_else(|| {
             BackgroundReadError::Other("Failed to unwrap image row key".to_string())
         })?;
-        if silent && !self.is_silent_read_authorized() {
+        if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
-        let mut row_key = if silent {
-            decrypt_row_key_with_cng_silent(&self.credential_state, encrypted_key)
-        } else {
-            decrypt_row_key_with_cng(&self.credential_state, encrypted_key)
-        }
-        .map_err(|error| match error {
-            CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
-            other => {
-                BackgroundReadError::Other(format!("Failed to unwrap image row key: {}", other))
-            }
-        })?;
+        let mut row_key = decrypt_row_key_with_cng_silent(&self.credential_state, encrypted_key)
+            .map_err(|error| match error {
+                CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+                other => {
+                    BackgroundReadError::Other(format!("Failed to unwrap image row key: {}", other))
+                }
+            })?;
 
         let abs_path_str = abs_path.to_string_lossy().to_string();
         let result =
@@ -162,7 +140,7 @@ impl StorageState {
         Self::zeroize_bytes(&mut row_key);
         if diag_start.elapsed().as_secs() >= 5 {
             tracing::warn!(
-                "[DIAG:DB] read_image_bytes({}) query {:?}, total {:?}",
+                "[DIAG:DB] read_image_bytes_silent({}) query {:?}, total {:?}",
                 path,
                 query_elapsed,
                 diag_start.elapsed()

@@ -77,7 +77,7 @@ describe('useAdvancedSectionController', () => {
       t,
     }));
 
-    await waitFor(() => expect(first.result.current.clipIndexRunning).toBe(true));
+    await waitFor(() => expect(first.result.current.indexes.clip.running).toBe(true));
     first.unmount();
 
     const reopened = renderHook(() => useAdvancedSectionController({
@@ -85,22 +85,22 @@ describe('useAdvancedSectionController', () => {
       t,
     }));
 
-    await waitFor(() => expect(reopened.result.current.clipIndexRunning).toBe(true));
-    expect(reopened.result.current.clipIndexProgress.processed).toBe(3);
+    await waitFor(() => expect(reopened.result.current.indexes.clip.running).toBe(true));
+    expect(reopened.result.current.indexes.clip.progress.processed).toBe(3);
 
     await act(async () => {
-      await reopened.result.current.handleStopClipIndex();
+      await reopened.result.current.indexes.clip.stop();
     });
     expect(invoke).toHaveBeenCalledWith('clip_index_stop_now');
-    expect(reopened.result.current.clipIndexStopping).toBe(true);
+    expect(reopened.result.current.indexes.clip.stopping).toBe(true);
 
     clipRunActive = false;
     await act(async () => {
-      await reopened.result.current.refreshSemanticStatus();
+      await reopened.result.current.indexes.refresh();
     });
 
-    expect(reopened.result.current.clipIndexRunning).toBe(false);
-    expect(reopened.result.current.clipIndexStopping).toBe(false);
+    expect(reopened.result.current.indexes.clip.running).toBe(false);
+    expect(reopened.result.current.indexes.clip.stopping).toBe(false);
     expect(invoke).toHaveBeenCalledWith('storage_is_startup_vacuum_in_progress');
     expect(invoke).not.toHaveBeenCalledWith('storage_get_startup_vacuum_status');
     expect(invoke).toHaveBeenCalledWith('get_ml_semantic_status', {
@@ -177,16 +177,16 @@ describe('useAdvancedSectionController', () => {
       t,
     }));
 
-    await waitFor(() => expect(hook.result.current.config).toEqual({}));
+    await waitFor(() => expect(hook.result.current.preferences.config).toEqual({}));
     await act(async () => {
-      await hook.result.current.handleRetryClipAnn();
+      await hook.result.current.indexes.ann.retry();
     });
 
     expect(invoke).toHaveBeenCalledWith('clip_ann_retry_now');
     expect(invoke).toHaveBeenCalledWith('get_ml_semantic_status', {
       refreshDiagnostics: true,
     });
-    expect(hook.result.current.clipAnnRetrying).toBe(false);
+    expect(hook.result.current.indexes.ann.retrying).toBe(false);
   });
 
   it('keeps a queued CLIP drain stoppable while the scheduler owns it', async () => {
@@ -222,13 +222,13 @@ describe('useAdvancedSectionController', () => {
       t,
     }));
 
-    await waitFor(() => expect(hook.result.current.config).toEqual({}));
+    await waitFor(() => expect(hook.result.current.preferences.config).toEqual({}));
     await act(async () => {
-      await hook.result.current.handleRunClipIndexNow();
+      await hook.result.current.indexes.clip.run();
     });
 
-    expect(hook.result.current.clipIndexRunning).toBe(true);
-    expect(hook.result.current.clipIndexRun).toEqual({ queued: true });
+    expect(hook.result.current.indexes.clip.running).toBe(true);
+    expect(hook.result.current.indexes.clip.summary).toEqual({ queued: true });
   });
 
   it('maps a manual scheduler retry wait to a non-running phase', async () => {
@@ -260,14 +260,14 @@ describe('useAdvancedSectionController', () => {
       monitorStatus: 'stopped',
       t,
     }));
-    await waitFor(() => expect(hook.result.current.config).toEqual({}));
-    await waitFor(() => expect(hook.result.current.semanticIndexPhase).toBe('retry_wait'));
-    expect(hook.result.current.semanticIndexRunning).toBe(false);
-    expect(hook.result.current.semanticIndexRetryAt).toBe(1_800_000_000_000);
+    await waitFor(() => expect(hook.result.current.preferences.config).toEqual({}));
+    await waitFor(() => expect(hook.result.current.indexes.semantic.phase).toBe('retry_wait'));
+    expect(hook.result.current.indexes.semantic.running).toBe(false);
+    expect(hook.result.current.indexes.semantic.retryAt).toBe(1_800_000_000_000);
     await act(async () => {
-      await hook.result.current.refreshSemanticStatus();
+      await hook.result.current.indexes.refresh();
     });
-    expect(hook.result.current.semanticIndexPhase).toBe('retry_wait');
+    expect(hook.result.current.indexes.semantic.phase).toBe('retry_wait');
   });
 
   it('does not let diagnostics or scheduler polls overwrite the authoritative waiting phase', async () => {
@@ -279,10 +279,10 @@ describe('useAdvancedSectionController', () => {
       return original(command, ...args);
     });
     const hook = renderHook(() => useAdvancedSectionController({ monitorStatus: 'stopped', t }));
-    await waitFor(() => expect(hook.result.current.clipIndexPhase).toBe('waiting_for_unlock'));
-    await act(async () => { await hook.result.current.refreshSemanticStatus(); });
-    expect(hook.result.current.clipIndexPhase).toBe('waiting_for_unlock');
-    expect(hook.result.current.clipIndexRunning).toBe(false);
-    expect(hook.result.current.clipIndexProgress.processed).toBe(4);
+    await waitFor(() => expect(hook.result.current.indexes.clip.phase).toBe('waiting_for_unlock'));
+    await act(async () => { await hook.result.current.indexes.refresh(); });
+    expect(hook.result.current.indexes.clip.phase).toBe('waiting_for_unlock');
+    expect(hook.result.current.indexes.clip.running).toBe(false);
+    expect(hook.result.current.indexes.clip.progress.processed).toBe(4);
   });
 });

@@ -6,9 +6,7 @@
 //! Manual indexing can drain the same queue while yielding to foreground
 //! searches.
 
-use crate::background_scheduler::{
-    AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
-};
+use crate::background_scheduler::{AutomaticSliceContext, ScheduledSliceResult};
 use crate::credential_manager::CredentialManagerState;
 pub use crate::index_pipeline::IndexRunSummary as SemanticIndexRunSummary;
 pub(crate) use crate::index_pipeline::MAX_ATTEMPTS;
@@ -238,77 +236,25 @@ pub async fn run_scheduled_slice(
         .await;
     }
     if !manual && quantum.is_some() {
-        return run_automatic_quantum(app, quantum.expect("quantum context")).await;
+        return index_pipeline::run_automatic_quantum::<MinilmPipeline>(
+            app,
+            quantum.expect("quantum context"),
+        )
+        .await;
     }
     run_scheduled_request(app, manual, true, None).await
 }
 
-async fn run_automatic_quantum(
-    app: &AppHandle,
-    quantum: &AutomaticSliceContext,
-) -> Result<ScheduledSliceResult, TaskError> {
-    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
-    let mut batches = 0u32;
-    let mut has_more = true;
-    let mut run_maintenance = !crate::background_policy::is_background();
-    loop {
-        if let Some(reason) = quantum.stop_reason(&semantic, batches > 0) {
-            if batches == 0 {
-                return Ok(
-                    if reason == AutomaticSliceStopReason::ManualRequestPending {
-                        ScheduledSliceResult::complete(true)
-                    } else {
-                        ScheduledSliceResult::skipped(reason.as_str())
-                    },
-                );
-            }
-            tracing::info!(
-                "[SCHEDULER] automatic model quantum yielded task=semantic_index batches={} elapsed_ms={} reason={}",
-                batches,
-                quantum.elapsed().as_millis(),
-                reason.as_str(),
-            );
-            return Ok(ScheduledSliceResult::complete(has_more));
-        }
+impl index_pipeline::AutomaticIndex for MinilmPipeline {
+    const TASK: crate::background_scheduler::BackgroundTaskKind =
+        crate::background_scheduler::BackgroundTaskKind::SemanticIndex;
 
-        // Admission can span many requests. A settings change must stop the
-        // next batch and park the durable task even after earlier progress.
-        if !crate::background_scheduler::task_feature_enabled(
-            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
-            false,
-        ) {
-            return Ok(ScheduledSliceResult::skipped("disabled"));
-        }
-        let result =
-            run_scheduled_request(app, false, run_maintenance, Some((quantum, batches > 0))).await;
-        run_maintenance = false;
-        let result = result?;
-        if let Some(reason) = result.skipped_reason {
-            return if batches == 0 {
-                Ok(
-                    if reason == AutomaticSliceStopReason::ManualRequestPending.as_str() {
-                        ScheduledSliceResult::complete(true)
-                    } else {
-                        ScheduledSliceResult::skipped(reason)
-                    },
-                )
-            } else {
-                Ok(ScheduledSliceResult::complete(has_more))
-            };
-        }
-        batches = batches.saturating_add(1);
-        has_more = result.has_more;
-        if crate::background_policy::is_background() {
-            return Ok(ScheduledSliceResult::complete(has_more));
-        }
-        if !has_more {
-            tracing::info!(
-                "[SCHEDULER] automatic model quantum completed task=semantic_index batches={} elapsed_ms={}",
-                batches,
-                quantum.elapsed().as_millis(),
-            );
-            return Ok(ScheduledSliceResult::complete(false));
-        }
+    async fn run_request<'a>(
+        app: &'a AppHandle,
+        run_maintenance: bool,
+        context: (&'a AutomaticSliceContext, bool),
+    ) -> Result<ScheduledSliceResult, TaskError> {
+        run_scheduled_request(app, false, run_maintenance, Some(context)).await
     }
 }
 
