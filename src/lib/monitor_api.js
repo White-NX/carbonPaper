@@ -405,7 +405,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
  *
  * 与 searchScreenshots('') 分开是有原因的：空查询会落进搜索的回退路径，
  * 那条路径连接 ocr_results，数的是文本块而不是截图，而且排序键跨两张表用不上
- * 索引。详见 storage/screenshot.rs::list_recent_screenshots。
+ * 索引。详见 storage/screenshot_reader.rs::ScreenshotReader::recent。
  *
  * @param {number} [limit] 取多少条，交给调用方折叠采样后再展示
  * @returns {Promise<object[]>} 按时间倒序的截图列表，失败时返回空数组

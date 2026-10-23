@@ -1720,7 +1720,7 @@ pub async fn run_capture_loop(
                     match resp.screenshot_id {
                         Some(id) => id,
                         None => {
-                            tracing::error!("save_screenshot_temp returned no ID");
+                            tracing::error!("save_screenshot_temp_bytes returned no ID");
                             last_capture_time = std::time::Instant::now();
                             last_window_fingerprint = Some(current_window_fingerprint);
                             continue;
@@ -1728,7 +1728,7 @@ pub async fn run_capture_loop(
                     }
                 }
                 Err(e) => {
-                    tracing::error!("save_screenshot_temp failed: {}", e);
+                    tracing::error!("save_screenshot_temp_bytes failed: {}", e);
                     last_capture_time = std::time::Instant::now();
                     last_window_fingerprint = Some(current_window_fingerprint);
                     continue;

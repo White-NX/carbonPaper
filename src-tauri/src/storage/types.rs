@@ -128,8 +128,7 @@ pub struct RecentCapture {
 }
 
 /// Raw `screenshots` row backing [`RecentCapture`], read without decryption so
-/// the DB mutex is released before any CNG call — the same two-phase shape
-/// `screenshot.rs::query_time_range` uses.
+/// the DB mutex is released before any CNG call, as in the full-record reader.
 pub(super) struct RawRecentCaptureRow {
     pub(super) id: i64,
     pub(super) image_path: String,
@@ -255,6 +254,21 @@ pub(super) struct RawScreenshotRow {
 }
 
 impl RawScreenshotRow {
+    /// Full screenshot projection and joins, in the order decoded by `from_row`.
+    pub(super) const SELECT: &'static str = "SELECT
+        s.id, s.image_path, s.image_hash, s.width, s.height,
+        s.window_title, s.process_name, s.metadata,
+        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+        s.content_key_encrypted,
+        strftime('%s', s.created_at) AS timestamp, s.created_at,
+        s.source, s.page_url_enc,
+        pi.icon_enc, pi.icon_key_encrypted,
+        ls.links_enc, ls.links_key_encrypted,
+        s.category, s.category_confidence
+        FROM screenshots s
+        LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+        LEFT JOIN link_sets ls ON s.link_set_id = ls.id";
+
     /// Decrypt encrypted fields and produce a ScreenshotRecord.
     /// CNG decryption happens here, outside of the DB mutex.
     pub(super) fn into_record(self, credential: &CredentialManagerState) -> ScreenshotRecord {
@@ -322,7 +336,7 @@ impl RawScreenshotRow {
     }
 
     /// Extract raw data from a rusqlite Row without any decryption.
-    /// Column order must match the standard SELECT used in get_screenshots_by_time_range / get_screenshot_by_id.
+    /// Column order matches `Self::SELECT` above.
     pub(super) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let timestamp_str: Option<String> = row.get(12)?;
         let timestamp = timestamp_str.and_then(|s| s.parse::<i64>().ok());

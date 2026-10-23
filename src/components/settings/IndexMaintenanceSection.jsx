@@ -6,46 +6,47 @@ import { SettingsDisclosure, SettingsDivider, SettingsRow, SettingsStatus } from
 import { SettingsButton } from './SettingsControls';
 import { ProgressBlock } from '../overlay/ProgressBlock';
 
-export default function IndexMaintenanceSection({ controller: r }) {
+export default function IndexMaintenanceSection({ indexes, thumbnails, vacuum }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const needsAttention = [r.semanticIndexPhase, r.clipIndexPhase].some((phase) => ['running', 'queued', 'stopping', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait', 'failed'].includes(phase))
-    || (r.semanticStatus?.backend?.index_stalled ?? 0) > 0 || (r.semanticStatus?.clip_backend?.index_stalled ?? 0) > 0
-    || ['backoff', 'circuit_open'].includes(r.semanticStatus?.clip_backend?.ann_build_state);
+  const needsAttention = [indexes.semantic.phase, indexes.clip.phase].some((phase) => ['running', 'queued', 'stopping', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait', 'failed'].includes(phase))
+    || (indexes.status?.backend?.index_stalled ?? 0) > 0 || (indexes.status?.clip_backend?.index_stalled ?? 0) > 0
+    || ['backoff', 'circuit_open'].includes(indexes.status?.clip_backend?.ann_build_state);
   useEffect(() => { if (needsAttention) setOpen(true); }, [needsAttention]);
   return <>
     <SettingsDivider />
     <SettingsDisclosure title={t('settings.maintenance.manageIndexes')} open={open} onOpenChange={setOpen}>
-      <SemanticBackendCard status={r.semanticStatus} statusLoading={r.semanticStatusLoading} onRefresh={r.refreshSemanticStatus}
-        onRunIndexNow={r.handleRunSemanticIndexNow} onStopIndexNow={r.handleStopSemanticIndex}
-        indexRunning={r.semanticIndexRunning} indexPhase={r.semanticIndexPhase} indexRetryAt={r.semanticIndexRetryAt}
-        indexStopping={r.semanticIndexStopping} indexProgress={r.semanticIndexProgress} indexRun={r.semanticIndexRun} indexError={r.semanticIndexError} />
+      <SemanticBackendCard status={indexes.status} statusLoading={indexes.statusLoading} onRefresh={indexes.refresh}
+        onRunIndexNow={indexes.semantic.run} onStopIndexNow={indexes.semantic.stop}
+        indexRunning={indexes.semantic.running} indexPhase={indexes.semantic.phase} indexRetryAt={indexes.semantic.retryAt}
+        indexStopping={indexes.semantic.stopping} indexProgress={indexes.semantic.progress} indexRun={indexes.semantic.summary} indexError={indexes.semantic.error} />
       <SettingsDivider />
-      <ClipBackendCard status={r.semanticStatus} statusLoading={r.semanticStatusLoading} onRefresh={r.refreshSemanticStatus}
-        onRunIndexNow={r.handleRunClipIndexNow} onStopIndexNow={r.handleStopClipIndex} onRetryAnn={r.handleRetryClipAnn} annRetrying={r.clipAnnRetrying}
-        indexRunning={r.clipIndexRunning} indexPhase={r.clipIndexPhase} indexRetryAt={r.clipIndexRetryAt} indexStopping={r.clipIndexStopping}
-        indexProgress={r.clipIndexProgress} indexRun={r.clipIndexRun} indexError={r.clipIndexError} backfill={r.clipBackfill} backfillBusy={r.clipBackfillBusy} onBackfillDecision={r.handleClipBackfillDecision} />
+      <ClipBackendCard status={indexes.status} statusLoading={indexes.statusLoading} onRefresh={indexes.refresh}
+        onRunIndexNow={indexes.clip.run} onStopIndexNow={indexes.clip.stop} onRetryAnn={indexes.ann.retry} annRetrying={indexes.ann.retrying}
+        indexRunning={indexes.clip.running} indexPhase={indexes.clip.phase} indexRetryAt={indexes.clip.retryAt} indexStopping={indexes.clip.stopping}
+        indexProgress={indexes.clip.progress} indexRun={indexes.clip.summary} indexError={indexes.clip.error}
+        backfill={indexes.backfill.offer} backfillBusy={indexes.backfill.busy} onBackfillDecision={indexes.backfill.setDecision} />
     </SettingsDisclosure>
-    {(r.thumbnailWarmup?.running || r.thumbnailWarmup?.cancel_requested || r.thumbnailWarmupError) && <>
+    {(thumbnails.status?.running || thumbnails.status?.cancel_requested || thumbnails.error) && <>
       <SettingsDivider />
       <SettingsRow label={t('settings.maintenance.thumbnails.title')} description={t('settings.maintenance.thumbnails.description')}
-        control={<SettingsButton onClick={r.handleThumbnailWarmup}
-          disabled={r.thumbnailWarmupBusy || (r.thumbnailWarmup?.running && r.thumbnailWarmup.cancel_requested)}>
-          {t(r.thumbnailWarmup?.running ? 'settings.maintenance.thumbnails.stop' : 'settings.maintenance.thumbnails.resume')}
+        control={<SettingsButton onClick={thumbnails.toggle}
+          disabled={thumbnails.busy || (thumbnails.status?.running && thumbnails.status.cancel_requested)}>
+          {t(thumbnails.status?.running ? 'settings.maintenance.thumbnails.stop' : 'settings.maintenance.thumbnails.resume')}
         </SettingsButton>}>
-        {r.thumbnailWarmup?.running
-          ? <ProgressBlock current={r.thumbnailWarmup.processed} total={r.thumbnailWarmup.total}
-            label={t(r.thumbnailWarmup.cancel_requested ? 'settings.maintenance.thumbnails.stopping' : 'settings.maintenance.thumbnails.running')} />
-          : r.thumbnailWarmup?.cancel_requested && <SettingsStatus>{t('settings.maintenance.thumbnails.stopped')}</SettingsStatus>}
-        {r.thumbnailWarmupError && <SettingsStatus tone="error">{r.thumbnailWarmupError}</SettingsStatus>}
+        {thumbnails.status?.running
+          ? <ProgressBlock current={thumbnails.status.processed} total={thumbnails.status.total}
+            label={t(thumbnails.status.cancel_requested ? 'settings.maintenance.thumbnails.stopping' : 'settings.maintenance.thumbnails.running')} />
+          : thumbnails.status?.cancel_requested && <SettingsStatus>{t('settings.maintenance.thumbnails.stopped')}</SettingsStatus>}
+        {thumbnails.error && <SettingsStatus tone="error">{thumbnails.error}</SettingsStatus>}
       </SettingsRow>
     </>}
     <SettingsDivider />
     <SettingsRow label={t('settings.advanced.vacuum.label')} description={t('settings.advanced.vacuum.description')}
-      control={<SettingsButton onClick={r.handleManualVacuum} disabled={r.vacuumRunning}
-        icon={r.vacuumRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : undefined}>
-        {t(r.vacuumRunning ? 'settings.advanced.vacuum.running' : 'settings.advanced.vacuum.action')}
+      control={<SettingsButton onClick={vacuum.run} disabled={vacuum.running}
+        icon={vacuum.running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : undefined}>
+        {t(vacuum.running ? 'settings.advanced.vacuum.running' : 'settings.advanced.vacuum.action')}
       </SettingsButton>} />
-    {r.vacuumMessage && <SettingsStatus>{r.vacuumMessage}</SettingsStatus>}
+    {vacuum.message && <SettingsStatus>{vacuum.message}</SettingsStatus>}
   </>;
 }

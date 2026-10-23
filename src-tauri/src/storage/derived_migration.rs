@@ -78,39 +78,6 @@ impl StorageState {
         Ok(())
     }
 
-    pub fn update_derived_migration_run(
-        &self,
-        run: &DerivedMigrationRunRecord,
-    ) -> Result<(), String> {
-        validate_run_record(run)?;
-        let guard = self.get_connection_named("update_derived_migration_run")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        let changed = conn
-            .execute(
-                r#"
-                UPDATE derived_migration_runs SET
-                    index_kind = ?2, mode = ?3, vector_space_revision = ?4,
-                    status = ?5, phase = ?6, export_id = ?7, export_cursor = ?8,
-                    chroma_total = ?9, chroma_processed = ?10,
-                    migrated = ?11, legacy_unverified = ?12,
-                    already_current = ?13, failed = ?14, discarded = ?15,
-                    unmappable = ?16, removed_extra = ?17,
-                    publish_current = ?18, publish_total = ?19,
-                    required_free_bytes = ?20, available_free_bytes = ?21,
-                    monitor_was_running = ?22, monitor_was_paused = ?23,
-                    last_error = ?24, started_at = ?25, heartbeat_at = ?26,
-                    updated_at = ?27, finished_at = ?28
-                WHERE run_id = ?1
-                "#,
-                run_params(run),
-            )
-            .map_err(|error| format!("Failed to update derived migration run: {error}"))?;
-        if changed == 0 {
-            return Err("Derived migration run no longer exists".to_string());
-        }
-        Ok(())
-    }
-
     /// Most recently updated run **of one kind**. A CLIP run must not be
     /// mistaken for a MiniLM one when either decides whether to resume.
     pub fn get_latest_derived_migration_run(
@@ -129,23 +96,6 @@ impl StorageState {
         )
         .optional()
         .map_err(|error| format!("Failed to read latest derived migration run: {error}"))?
-        .map(decode_migration_run)
-        .transpose()
-    }
-
-    pub fn get_derived_migration_run(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<DerivedMigrationRunRecord>, String> {
-        let guard = self.get_connection_named("get_derived_migration_run")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        conn.query_row(
-            &format!("{} AND run_id = ?1", migration_run_select_sql()),
-            [run_id],
-            map_migration_run,
-        )
-        .optional()
-        .map_err(|error| format!("Failed to read derived migration run: {error}"))?
         .map(decode_migration_run)
         .transpose()
     }

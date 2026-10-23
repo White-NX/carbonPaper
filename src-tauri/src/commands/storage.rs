@@ -315,7 +315,7 @@ pub async fn storage_get_timeline_density(
 /// Separate from [`storage_search`] on purpose: an empty search query reaches a
 /// fallback that joins `ocr_results`, which counts text blocks rather than
 /// screenshots and cannot use an index for its ordering. See
-/// `storage/screenshot.rs::list_recent_screenshots`.
+/// `storage/screenshot_reader.rs::ScreenshotReader::recent`.
 #[tauri::command]
 pub async fn storage_list_recent_screenshots(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -326,7 +326,7 @@ pub async fn storage_list_recent_screenshots(
 
     let state = state.inner().clone();
     let limit = limit.unwrap_or(60);
-    tokio::task::spawn_blocking(move || state.list_recent_screenshots(limit))
+    tokio::task::spawn_blocking(move || state.screenshots().recent(limit))
         .await
         .map_err(|e| format!("Task join error: {:?}", e))?
 }
@@ -386,7 +386,7 @@ pub async fn storage_get_image(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let image_path = if let Some(id) = id {
-            let record = state.get_screenshot_by_id(id)?;
+            let record = state.screenshots().by_id(id)?;
             record.map(|r| r.image_path)
         } else {
             path
@@ -424,7 +424,7 @@ pub async fn storage_get_thumbnail(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let image_path = if let Some(id) = id {
-            let record = state.get_screenshot_by_id(id)?;
+            let record = state.screenshots().by_id(id)?;
             record.map(|r| r.image_path)
         } else {
             path
@@ -688,9 +688,9 @@ pub async fn storage_get_screenshot_details(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let record = if let Some(id) = id {
-            state.get_screenshot_by_id(id)?
+            state.screenshots().by_id(id)?
         } else if let Some(ref p) = path {
-            state.get_screenshot_by_image_path(p)?
+            state.screenshots().by_image_path(p)?
         } else {
             return Err("Either id or path must be provided".into());
         };

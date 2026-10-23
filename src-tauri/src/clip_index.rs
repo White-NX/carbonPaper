@@ -3,9 +3,7 @@
 //! Enqueues captured screenshot images for CLIP vector indexing, manages
 //! background/foreground index workers, and performs periodic repair scans.
 
-use crate::background_scheduler::{
-    AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
-};
+use crate::background_scheduler::{AutomaticSliceContext, ScheduledSliceResult};
 use crate::clip_contract::{clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector};
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
@@ -339,89 +337,30 @@ pub async fn run_scheduled_slice(
         .await;
     }
     if !manual && quantum.is_some() {
-        return run_automatic_quantum(app, quantum.expect("quantum context")).await;
-    }
-    run_scheduled_request(app, manual, true, true, None).await
-}
-
-async fn run_automatic_quantum(
-    app: &AppHandle,
-    quantum: &AutomaticSliceContext,
-) -> Result<ScheduledSliceResult, TaskError> {
-    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
-    let mut batches = 0u32;
-    let mut has_more = true;
-    let mut run_maintenance = !crate::background_policy::is_background();
-    loop {
-        if let Some(reason) = quantum.stop_reason(&semantic, batches > 0) {
-            if batches == 0 {
-                return Ok(
-                    if reason == AutomaticSliceStopReason::ManualRequestPending {
-                        ScheduledSliceResult::complete(true)
-                    } else {
-                        ScheduledSliceResult::skipped(reason.as_str())
-                    },
-                );
-            }
-            tracing::info!(
-                "[SCHEDULER] automatic model quantum yielded task=clip_index batches={} elapsed_ms={} reason={}",
-                batches,
-                quantum.elapsed().as_millis(),
-                reason.as_str(),
-            );
-            finish_automatic_quantum(app, quantum).await;
-            return Ok(ScheduledSliceResult::complete(has_more));
-        }
-
-        let result = run_scheduled_request(
+        return index_pipeline::run_automatic_quantum::<ClipPipeline>(
             app,
-            false,
-            run_maintenance,
-            false,
-            Some((quantum, batches > 0)),
+            quantum.expect("quantum context"),
         )
         .await;
-        run_maintenance = false;
-        let result = result?;
-        if let Some(reason) = result.skipped_reason {
-            if batches == 0 {
-                return Ok(
-                    if reason == AutomaticSliceStopReason::ManualRequestPending.as_str() {
-                        ScheduledSliceResult::complete(true)
-                    } else {
-                        ScheduledSliceResult::skipped(reason)
-                    },
-                );
-            } else {
-                // The current batch refused admission or yielded. Its earlier
-                // commits remain valid, but maintenance must wait for a later
-                // idle admission too.
-                return Ok(ScheduledSliceResult::complete(has_more));
-            }
-        }
-        batches = batches.saturating_add(1);
-        has_more = result.has_more;
-        if crate::background_policy::is_background() {
-            return Ok(ScheduledSliceResult::complete(has_more));
-        }
-        if !has_more {
-            tracing::info!(
-                "[SCHEDULER] automatic model quantum completed task=clip_index batches={} elapsed_ms={}",
-                batches,
-                quantum.elapsed().as_millis(),
-            );
-            let maintained = finish_automatic_quantum(app, quantum).await;
-            // Keep the task queued if its final encode lost admission. The
-            // deferred ANN check still needs an idle turn even with no images
-            // left to encode.
-            return Ok(ScheduledSliceResult::complete(!maintained));
-        }
     }
+    run_scheduled_request(app, manual, true, None).await
 }
 
-async fn finish_automatic_quantum(app: &AppHandle, _quantum: &AutomaticSliceContext) -> bool {
-    rebuild_ann(app).await;
-    true
+impl index_pipeline::AutomaticIndex for ClipPipeline {
+    const TASK: crate::background_scheduler::BackgroundTaskKind =
+        crate::background_scheduler::BackgroundTaskKind::ClipIndex;
+
+    async fn run_request<'a>(
+        app: &'a AppHandle,
+        run_maintenance: bool,
+        context: (&'a AutomaticSliceContext, bool),
+    ) -> Result<ScheduledSliceResult, TaskError> {
+        run_scheduled_request(app, false, run_maintenance, Some(context)).await
+    }
+
+    async fn finish(app: &AppHandle) {
+        rebuild_ann(app).await;
+    }
 }
 
 async fn rebuild_ann(app: &AppHandle) {
@@ -434,7 +373,6 @@ async fn run_scheduled_request(
     app: &AppHandle,
     manual: bool,
     run_maintenance: bool,
-    _run_ann_maintenance: bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<ScheduledSliceResult, TaskError> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
@@ -444,8 +382,8 @@ async fn run_scheduled_request(
     }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     if manual {
-        // See the MiniLM counterpart: a click that arrived during an earlier
-        // slice must still clear failures produced after that click.
+        // A click received during an earlier slice must also clear failures
+        // produced after that click when the pending request is admitted.
         let reset_storage = storage.clone();
         tokio::task::spawn_blocking(move || {
             reset_storage.reset_derived_index_retries(DerivedIndexKind::ClipImage)

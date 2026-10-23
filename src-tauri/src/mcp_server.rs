@@ -934,11 +934,10 @@ async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Resul
 
     let records: Vec<_> = tokio::task::spawn_blocking(move || {
         let mode = filter.mode();
-        let records = storage.get_screenshots_by_time_range_limited(
-            start_ts,
-            end_ts,
-            max_records.or(Some(500)),
-        )?;
+        let records =
+            storage
+                .screenshots()
+                .in_time_range(start_ts, end_ts, max_records.or(Some(500)))?;
         // Metadata only: a flagged title or URL is replaced, or the record is
         // withheld in reject mode.
         let records: Vec<_> = records
@@ -1006,7 +1005,7 @@ async fn tool_get_snapshot_details(
     let filter = filter.inner().clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let Some(mut r) = storage.get_screenshot_by_id(id)? else {
+        let Some(mut r) = storage.screenshots().by_id(id)? else {
             return Ok(None);
         };
         r.metadata = None;
