@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
+use super::protected::{self, ProtectedRun};
 use super::{progress::ProgressState, screening, selection, summary, types::*, PrivacyFingerprint};
 use crate::ai::{
     config::{is_local_url, AiSettings, ResolvedProvider},
@@ -14,6 +15,7 @@ use crate::ai::{
 use crate::credential_manager::CredentialManagerState;
 use crate::sensitive_filter::SensitiveFilterState;
 use crate::storage::StorageState;
+use serde::{de::DeserializeOwned, Serialize};
 
 #[derive(Default)]
 pub struct RecapRuntime {
@@ -97,20 +99,115 @@ pub(super) struct RunContext {
     pub storage: Arc<StorageState>,
     pub settings: RecapSettings,
     pub generation: u64,
+    pub config_revision: i64,
+    pub correction_version: i64,
+    pub ai_hash: String,
     pub day: String,
     pub revision: i64,
     pub privacy: String,
     pub cancel: Arc<Cancellation>,
     pub automatic: bool,
+    pub protected: Option<Arc<ProtectedRun>>,
 }
 impl RunContext {
+    pub(super) fn read<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        key: &str,
+        revision: Option<i64>,
+    ) -> Result<Option<T>, String> {
+        if let Some(run) = &self.protected {
+            run.read(&self.storage, kind, key, revision, &self.privacy)
+        } else {
+            self.storage.recap_read_background(kind, key, revision)
+        }
+    }
+
+    pub(super) fn write<T: Serialize>(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<(), String> {
+        self.check()?;
+        if let Some(run) = &self.protected {
+            run.write(
+                &self.storage,
+                kind,
+                key,
+                self.revision,
+                &self.privacy,
+                value,
+            )?;
+            self.storage.recap_commit_protected(
+                run,
+                kind,
+                key,
+                &self.day,
+                self.revision,
+                self.generation,
+                value,
+            )
+        } else {
+            self.storage.recap_write_background_checked(
+                kind,
+                key,
+                &self.day,
+                self.revision,
+                self.generation,
+                value,
+                |conn| {
+                    self.storage.recap_check_run_versions_on_connection(
+                        conn,
+                        &self.day,
+                        self.config_revision,
+                        self.correction_version,
+                    )
+                },
+            )?;
+            // A checkpoint for each completed stage preserves paid extraction
+            // when the process restarts during later summarization.
+            if self
+                .storage
+                .processing_stage
+                .supports(carbonpaper_app_bound::protocol::Consumer::Recap)
+            {
+                let current = self.read_day()?;
+                let mut sources = current
+                    .batches
+                    .iter()
+                    .flat_map(|b| b.records.iter().map(|s| s.id))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .map(|id| {
+                        self.storage.staged_source_revision(id).map(|revision| {
+                            crate::processing_stage::recap::SourceVersion { id, revision }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                sources.sort_by_key(|source| source.id);
+                protected::mirror(
+                    &self.storage,
+                    &self.day,
+                    kind,
+                    key,
+                    self.revision,
+                    &self.privacy,
+                    &sources,
+                    value,
+                )?;
+            }
+            Ok(())
+        }
+    }
+
     pub(super) fn read_day(&self) -> Result<RecapDay, String> {
         self.check()?;
         let day = self.storage.recap_read_at_revision(
             &self.day,
             self.revision,
             self.generation,
-            || read_day(&self.app, &self.day),
+            || read_day_impl(&self.app, &self.day, Some(self)),
         )?;
         self.check()?;
         Ok(day)
@@ -148,11 +245,12 @@ impl RunContext {
         if self.cancel.is_cancelled() {
             return Err("AI_CANCELLED".into());
         }
-        if !self
-            .app
-            .state::<Arc<CredentialManagerState>>()
-            .is_session_valid()
-        {
+        if self.automatic && !self.storage.background_processing_enabled() {
+            return Err("RECAP_DISABLED".into());
+        }
+        if let Some(run) = &self.protected {
+            run.check(&self.storage)?;
+        } else if !self.storage.is_silent_read_authorized() {
             return Err("AUTH_REQUIRED".into());
         }
         if crate::maintenance::is_active() {
@@ -160,6 +258,10 @@ impl RunContext {
         }
         if self.generation != self.storage.db_generation()
             || self.privacy != privacy_hash(&self.app)?
+            || self.config_revision != self.storage.recap_config_revision()?
+            || self.correction_version != self.storage.recap_correction_version(&self.day)?
+            || self.ai_hash
+                != crate::processing_stage::recap::ai_hash(&AiSettings::load(&self.storage)?)?
         {
             return Err("RECAP_SOURCE_CHANGED".into());
         }
@@ -226,7 +328,6 @@ pub fn read_progress(app: &tauri::AppHandle, date: &str) -> Result<Option<RecapP
         .state::<Arc<CredentialManagerState>>()
         .is_session_valid()
     {
-        *runtime.progress.lock().unwrap_or_else(|e| e.into_inner()) = ProgressState::default();
         return Err("AUTH_REQUIRED".into());
     }
     let (snapshot, generation, revision, privacy) = {
@@ -256,13 +357,41 @@ pub fn read_progress(app: &tauri::AppHandle, date: &str) -> Result<Option<RecapP
 }
 
 pub fn read_day(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> {
-    let storage = app.state::<Arc<StorageState>>();
     if !app
         .state::<Arc<CredentialManagerState>>()
         .is_session_valid()
     {
         return Err("AUTH_REQUIRED".into());
     }
+    read_day_background(app, date)
+}
+
+pub(crate) fn read_day_background(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> {
+    if !app.state::<Arc<StorageState>>().is_silent_read_authorized() {
+        return Err("AUTH_REQUIRED".into());
+    }
+    read_day_impl(app, date, None)
+}
+
+fn read_payload<T: DeserializeOwned>(
+    storage: &StorageState,
+    ctx: Option<&RunContext>,
+    kind: &str,
+    key: &str,
+    revision: Option<i64>,
+) -> Result<Option<T>, String> {
+    match ctx {
+        Some(ctx) => ctx.read(kind, key, revision),
+        None => storage.recap_read_background(kind, key, revision),
+    }
+}
+
+fn read_day_impl(
+    app: &tauri::AppHandle,
+    date: &str,
+    ctx: Option<&RunContext>,
+) -> Result<RecapDay, String> {
+    let storage = app.state::<Arc<StorageState>>();
     if crate::maintenance::is_active() {
         return Err("MAINTENANCE_IN_PROGRESS".into());
     }
@@ -275,38 +404,41 @@ pub fn read_day(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> 
     for (a, b) in calendar.closed_periods(chrono::Utc::now().timestamp_millis()) {
         let key = format!("{date}:{a}");
         batches.push(
-            storage
-                .recap_read("batch", &key, Some(revision))?
-                .unwrap_or(RecapBatch {
-                    start_ms: a,
-                    end_ms: b,
-                    updated_at_ms: 0,
-                    status: "pending".into(),
-                    activities: vec![],
-                    records: storage
-                        .recap_read("index", &key, Some(revision))?
-                        .unwrap_or_default(),
-                    coverage: 0,
-                    error: None,
-                    attempts: vec![],
-                    summary: None,
-                    summary_error: None,
-                }),
+            read_payload(&storage, ctx, "batch", &key, Some(revision))?.unwrap_or(RecapBatch {
+                start_ms: a,
+                end_ms: b,
+                updated_at_ms: 0,
+                status: "pending".into(),
+                activities: vec![],
+                records: read_payload(&storage, ctx, "index", &key, Some(revision))?
+                    .unwrap_or_default(),
+                coverage: 0,
+                error: None,
+                attempts: vec![],
+                summary: None,
+                summary_error: None,
+            }),
         );
     }
-    let corrections: CorrectionHistory = storage
-        .recap_read("corrections", date, None)?
-        .unwrap_or_default();
+    let corrections: CorrectionHistory =
+        read_payload(&storage, ctx, "corrections", date, None)?.unwrap_or_default();
     let threads = apply_corrections(&mut batches, &corrections.current);
-    let settings: RecapSettings = storage
-        .recap_read::<RecapSettings>("settings", "settings", None)?
-        .unwrap_or_default()
-        .with_app_language();
+    let settings: RecapSettings = if let Some(ctx) = ctx {
+        ctx.settings.clone()
+    } else {
+        storage
+            .recap_read_background::<RecapSettings>("settings", "settings", None)?
+            .unwrap_or_default()
+            .with_app_language()
+    };
     for batch in &mut batches {
         let key = format!("{date}:{}", batch.start_ms);
         summary::attach(
             batch,
-            summary::read_cached(&storage, &key, revision)?,
+            match read_payload(&storage, ctx, "summary", &key, Some(revision)) {
+                Err(error) if error == "RECAP_INVALID_CACHE" => None,
+                result => result?,
+            },
             &settings.language,
         );
     }
@@ -333,6 +465,17 @@ pub fn read_day(app: &tauri::AppHandle, date: &str) -> Result<RecapDay, String> 
 
 fn read_evidence(ctx: &RunContext, ids: &[i64]) -> Result<Vec<Evidence>, String> {
     ctx.check()?;
+    if let Some(run) = &ctx.protected {
+        let ids = ids.iter().copied().collect::<HashSet<_>>();
+        let mut out = run
+            .evidence
+            .iter()
+            .filter(|s| ids.contains(&s.evidence.id))
+            .map(|s| s.evidence.clone())
+            .collect::<Vec<_>>();
+        out.sort_by_key(|e| (e.timestamp_ms, e.id));
+        return Ok(out);
+    }
     let summaries = ctx
         .storage
         .get_screenshot_summaries_by_ids_silent(ids)
@@ -393,6 +536,17 @@ fn read_evidence(ctx: &RunContext, ids: &[i64]) -> Result<Vec<Evidence>, String>
 async fn collect(ctx: &RunContext, start: i64, end: i64) -> Result<Vec<Evidence>, String> {
     let ctx = ctx.clone();
     tokio::task::spawn_blocking(move || {
+        if let Some(run) = &ctx.protected {
+            ctx.check()?;
+            let mut evidence = run
+                .evidence
+                .iter()
+                .filter(|s| s.evidence.timestamp_ms >= start && s.evidence.timestamp_ms < end)
+                .map(|s| s.evidence.clone())
+                .collect::<Vec<_>>();
+            selection::prepare(&mut evidence);
+            return Ok(evidence);
+        }
         let mut cursor = (String::new(), 0);
         let mut evidence = Vec::new();
         loop {
@@ -467,7 +621,7 @@ fn evidence_value(e: &Evidence, cap: usize) -> Value {
     json!({"id":e.id,"time_ms":e.timestamp_ms,"segment":e.segment,"application":e.process_name,"title":e.window_title,"page":e.page_url,"text":text,"possibly_related_source":e.screening.related_previous})
 }
 
-fn initial_request(
+pub(crate) fn initial_request(
     records: &[Evidence],
     prior: &RecapDay,
     settings: &RecapSettings,
@@ -592,13 +746,7 @@ pub(super) async fn complete(
         max_output = req.max_tokens, "[RECAP] Request started");
     let response = guarded(ctx, async {
         let mut sink = |event| {
-            if ctx
-                .app
-                .state::<Arc<CredentialManagerState>>()
-                .is_session_valid()
-            {
-                ctx.progress(false, |p| p.stream(event));
-            }
+            ctx.progress(false, |p| p.stream(event));
         };
         tokio::time::timeout(
             Duration::from_secs(600),
@@ -790,14 +938,7 @@ async fn generate_batch(
         summary: None,
         summary_error: None,
     };
-    ctx.storage.recap_write(
-        "index",
-        &format!("{}:{start}", ctx.day),
-        &ctx.day,
-        ctx.revision,
-        ctx.generation,
-        &batch.records,
-    )?;
+    ctx.write("index", &format!("{}:{start}", ctx.day), &batch.records)?;
     if records.is_empty() {
         return Ok(batch);
     }
@@ -1145,14 +1286,25 @@ async fn generate_inner(
 ) -> Result<RecapDay, String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let generation = storage.db_generation();
+    let config_revision = storage.recap_config_revision()?;
+    let correction_version = storage.recap_correction_version(&date)?;
     if automatic && storage.recap_is_deleted(&date)? {
-        return read_day(&app, &date);
+        return read_day_background(&app, &date);
     }
-    let settings = storage
-        .recap_read::<RecapSettings>("settings", "settings", None)?
-        .unwrap_or_default()
-        .current_defaults()
-        .with_app_language();
+    let protected = if !storage.is_silent_read_authorized() {
+        protected::prepare(&app, &date)?.map(Arc::new)
+    } else {
+        None
+    };
+    let settings = if let Some(run) = &protected {
+        run.config.settings.clone()
+    } else {
+        storage
+            .recap_read_background::<RecapSettings>("settings", "settings", None)?
+            .unwrap_or_default()
+            .current_defaults()
+            .with_app_language()
+    };
     settings.validate()?;
     if !settings.enabled {
         return Err("RECAP_DISABLED".into());
@@ -1163,8 +1315,15 @@ async fn generate_inner(
         .as_deref()
         .or_else(|| ai.effective_default_id())
         .ok_or("AI_NO_PROVIDER")?;
-    let provider = ai.resolve(&app.state::<Arc<CredentialManagerState>>(), id)?;
-    if !ai.remote_consent && !is_local_url(&provider.base_url) {
+    let provider = if let Some(run) = &protected {
+        run.config.provider.clone()
+    } else {
+        ai.resolve(&app.state::<Arc<CredentialManagerState>>(), id)?
+    };
+    let remote_consent = protected
+        .as_ref()
+        .map_or(ai.remote_consent, |run| run.config.remote_consent);
+    if !remote_consent && !is_local_url(&provider.base_url) {
         return Err("AI_REMOTE_CONSENT_REQUIRED".into());
     }
     let privacy = privacy_fingerprint(&app)?;
@@ -1176,13 +1335,50 @@ async fn generate_inner(
         storage: storage.clone(),
         settings,
         generation,
+        config_revision,
+        correction_version,
+        ai_hash: crate::processing_stage::recap::ai_hash(&ai)?,
         day: date.clone(),
         revision,
         privacy: privacy.as_str().to_owned(),
         cancel,
         automatic,
+        protected,
     };
     ctx.check()?;
+    if ctx.protected.is_some() {
+        let recovered = ctx.read_day()?;
+        for batch in &recovered.batches {
+            if batch.status != "pending" {
+                let key = format!("{date}:{}", batch.start_ms);
+                let Some(raw) = ctx.read::<RecapBatch>("batch", &key, Some(revision))? else {
+                    continue;
+                };
+                storage.recap_commit_protected(
+                    ctx.protected.as_ref().unwrap(),
+                    "batch",
+                    &key,
+                    &date,
+                    revision,
+                    generation,
+                    &raw,
+                )?;
+                if let Some(summary) =
+                    ctx.read::<summary::CachedSummary>("summary", &key, Some(revision))?
+                {
+                    storage.recap_commit_protected(
+                        ctx.protected.as_ref().unwrap(),
+                        "summary",
+                        &key,
+                        &date,
+                        revision,
+                        generation,
+                        &summary,
+                    )?;
+                }
+            }
+        }
+    }
     let bounds = calendar.closed_periods(chrono::Utc::now().timestamp_millis());
     if !automatic {
         storage.recap_allow_generation(&date, generation)?;
@@ -1197,7 +1393,14 @@ async fn generate_inner(
     for (a, b) in bounds {
         ctx.check()?;
         let key = format!("{date}:{a}");
-        let cached: Option<RecapBatch> = storage.recap_read("batch", &key, Some(revision))?;
+        let cached: Option<RecapBatch> = ctx.read("batch", &key, Some(revision))?;
+        if let Some(run) = &ctx.protected {
+            // An unavailable/expired historical input cannot be interpreted as
+            // an empty period. Later fully staged periods can still progress.
+            if cached.is_none() && !run.covers_period(&storage, a, b)? {
+                continue;
+            }
+        }
         if !force
             && cached.as_ref().is_some_and(|c| {
                 let renewed_budget = c.error.as_deref() == Some("RECAP_BUDGET_EXHAUSTED")
@@ -1245,9 +1448,7 @@ async fn generate_inner(
                         updated_at_ms: chrono::Utc::now().timestamp_millis(),
                         status: "failed".into(),
                         activities: vec![],
-                        records: storage
-                            .recap_read("index", &key, Some(revision))?
-                            .unwrap_or_default(),
+                        records: ctx.read("index", &key, Some(revision))?.unwrap_or_default(),
                         coverage: 0,
                         error: Some(error),
                         attempts: vec![],
@@ -1262,7 +1463,7 @@ async fn generate_inner(
         // Cached fallbacks may carry a previously attached derived view.
         batch.summary = None;
         batch.summary_error = None;
-        storage.recap_write("batch", &key, &date, revision, generation, &batch)?;
+        ctx.write("batch", &key, &batch)?;
         ctx.progress(true, |p| p.completed_batches += 1);
         tracing::info!(target: "recap", day = %date, start_ms = a, status = %batch.status,
             records = batch.records.len(), activities = batch.activities.len(),
@@ -1270,6 +1471,9 @@ async fn generate_inner(
         let _ = app.emit("recap-changed", &date);
     }
     summary::generate(&ctx, &provider, force).await?;
+    if ctx.protected.is_none() {
+        protected::sync_day(&app, &date)?;
+    }
     ctx.read_day()
 }
 
@@ -1289,23 +1493,73 @@ fn summary_update_finished(day: &RecapDay) -> bool {
 }
 
 pub fn start_scheduler(app: tauri::AppHandle) {
+    let ingest_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if crate::maintenance::is_active() {
+                continue;
+            }
+            let app = ingest_app.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || protected::ingest(&app))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            {
+                log_failure("", "", "protected_ingest", &error);
+            }
+        }
+    });
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut cleanup_due = std::time::Instant::now();
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if crate::maintenance::is_active()
-                || !app
-                    .state::<Arc<CredentialManagerState>>()
-                    .is_session_valid()
                 || check_background_gate(true, &app.state::<Arc<crate::idle::IdleState>>()).is_err()
             {
                 continue;
             }
             let storage = app.state::<Arc<StorageState>>();
-            let Ok(Some(settings)) =
-                storage.recap_read::<RecapSettings>("settings", "settings", None)
-            else {
+            let credentials = app.state::<Arc<CredentialManagerState>>();
+            if cleanup_due.elapsed() >= Duration::from_secs(3600) {
+                let cleanup = storage.inner().clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    cleanup.processing_stage.reap_recap_objects(&cleanup)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+                {
+                    log_failure("", "", "protected_cleanup", &error);
+                }
+                cleanup_due = std::time::Instant::now();
+            }
+            if !storage.background_processing_enabled() {
+                continue;
+            }
+            if storage.is_silent_read_authorized() {
+                if let Err(error) =
+                    crate::processing_stage::recap::sync_config(&storage, &credentials)
+                {
+                    log_failure("", "", "protected_config", &error);
+                }
+            }
+            let settings = if storage.is_silent_read_authorized() {
+                storage
+                    .recap_read_background::<RecapSettings>("settings", "settings", None)
+                    .ok()
+                    .flatten()
+            } else {
+                storage
+                    .processing_stage
+                    .get_recap::<crate::processing_stage::recap::RecapConfig>(&storage, "config")
+                    .ok()
+                    .flatten()
+                    .map(|c| c.settings)
+            };
+            let Some(settings) = settings else {
                 continue;
             };
             if !settings.enabled {
@@ -1313,10 +1567,22 @@ pub fn start_scheduler(app: tauri::AppHandle) {
             }
             let today = Local::now().date_naive();
             let generation = storage.db_generation();
-            let Ok(pending) = storage.recap_pending_summaries() else {
-                continue;
+            let pending = if storage.is_silent_read_authorized() {
+                match storage.recap_pending_summaries() {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        log_failure("", "", "summary_queue", &error);
+                        continue;
+                    }
+                }
+            } else {
+                HashMap::new()
             };
             let mut dates = pending.keys().cloned().collect::<HashSet<_>>();
+            match protected::dates(&storage) {
+                Ok(staged) => dates.extend(staged),
+                Err(error) => log_failure("", "", "protected_dates", &error),
+            }
             dates.extend([
                 today.pred_opt().unwrap_or(today).to_string(),
                 today.to_string(),
@@ -1324,6 +1590,9 @@ pub fn start_scheduler(app: tauri::AppHandle) {
             let mut dates = dates.into_iter().collect::<Vec<_>>();
             dates.sort();
             for date in dates {
+                if storage.recap_is_deleted(&date).unwrap_or(true) {
+                    continue;
+                }
                 if settings
                     .enabled_since
                     .as_ref()

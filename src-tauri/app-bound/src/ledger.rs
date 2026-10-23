@@ -6,6 +6,8 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+mod recap;
+
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub sid: String,
@@ -71,6 +73,7 @@ impl Ledger {
         if schema != 1 {
             return Err(BrokerError::VersionMismatch);
         }
+        Self::init_recap(&conn)?;
         Ok(Self { conn })
     }
 
@@ -98,6 +101,8 @@ impl Ledger {
 
     pub fn unregister_owner(&mut self, sid: &str) -> Result<()> {
         let tx = db(self.conn.transaction())?;
+        db(tx.execute("DELETE FROM recap_objects WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revoked_sources WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM tasks WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM owners WHERE sid=?1", [sid]))?;
         db(tx.commit())
@@ -202,6 +207,18 @@ impl Ledger {
         dataset: Option<String>,
         protector: &dyn KeyProtector,
     ) -> Result<Response> {
+        if let Some(response) = Self::dispatch_recap(
+            conn,
+            who,
+            &request,
+            now,
+            enabled,
+            limits,
+            dataset.as_deref(),
+            protector,
+        )? {
+            return Ok(response);
+        }
         match request {
             Request::Status {} => return Ok(Response::Status(Self::status(conn, who)?)),
             Request::InspectTask { task_id } => {
@@ -217,6 +234,8 @@ impl Ledger {
             }
             Request::SetPolicy { enabled, limits } => {
                 limits.validate()?;
+                db(conn.execute("UPDATE recap_objects SET expires=MIN(expires,created+?2) WHERE owner=?1 AND slot!='config'",
+                    params![who.sid,i64::from(limits.retention_days)*DAY_SECS]))?;
                 db(conn.execute(
                     "UPDATE owners SET enabled=?2,retention_days=?3,capacity_bytes=?4 WHERE sid=?1",
                     params![
@@ -283,6 +302,7 @@ impl Ledger {
                 // Deletion is scoped by the protected ledger, never by a
                 // possibly rolled-back or missing user-writable queue row.
                 for id in screenshot_ids {
+                    Self::revoke_recap_source(conn, &who.sid, &dataset_id, id)?;
                     db(conn.execute("UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3",
                         params![who.sid,dataset_id,id]))?;
                     db(conn.execute("DELETE FROM leases WHERE task IN (SELECT id FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)",
@@ -590,19 +610,23 @@ impl Ledger {
 
     fn usage(conn: &Connection, sid: &str) -> Result<(u64, u64)> {
         db(conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM tasks WHERE owner=?1 AND state!='retired'",
+            "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
+                SELECT bytes FROM tasks WHERE owner=?1 AND state!='retired'
+                UNION ALL SELECT bytes FROM recap_objects WHERE owner=?1 AND state!='retired')",
             [sid],
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
         ))
     }
 
     fn retire_where(conn: &Connection, sid: &str, dataset: Option<&str>) -> Result<()> {
+        Self::retire_recap(conn, sid, dataset)?;
         db(conn.execute("UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND (?2 IS NULL OR dataset=?2)", params![sid,dataset]))?;
         db(conn.execute("DELETE FROM leases WHERE task IN (SELECT id FROM tasks WHERE owner=?1 AND (?2 IS NULL OR dataset=?2))", params![sid,dataset]))?;
         Ok(())
     }
 
     fn reap(conn: &Connection, sid: &str, now: i64, limits: Limits) -> Result<()> {
+        Self::reap_recap(conn, sid, now)?;
         db(conn.execute(
             "UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND state!='retired'
             AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))",
@@ -663,10 +687,20 @@ impl Ledger {
             {
                 return Ok(());
             }
-            let id: Option<String> = db(conn.query_row("SELECT id FROM tasks WHERE owner=?1 AND state!='retired' ORDER BY created,id LIMIT 1", [sid], |r| r.get(0)).optional())?;
-            let Some(id) = id else {
+            let oldest: Option<(String, bool)> = db(conn.query_row("SELECT id,is_recap FROM (
+                SELECT id,created,0 AS is_recap FROM tasks WHERE owner=?1 AND state!='retired'
+                UNION ALL SELECT id,created,1 AS is_recap FROM recap_objects WHERE owner=?1 AND state!='retired' AND slot!='config'
+                ) ORDER BY created,id LIMIT 1", [sid], |r| Ok((r.get(0)?,r.get(1)?))).optional())?;
+            let Some((id, is_recap)) = oldest else {
                 return Err(BrokerError::LimitExceeded);
             };
+            if is_recap {
+                db(conn.execute(
+                    "UPDATE recap_objects SET state='retired',key_blob=NULL WHERE id=?1",
+                    [&id],
+                ))?;
+                continue;
+            }
             db(conn.execute(
                 "UPDATE tasks SET state='retired',key_blob=NULL WHERE id=?1",
                 [&id],
@@ -677,9 +711,13 @@ impl Ledger {
 }
 
 #[cfg(test)]
+#[path = "ledger/recap_tests.rs"]
+mod recap_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    struct TestProtection;
+    pub(super) struct TestProtection;
     impl KeyProtector for TestProtection {
         fn protect(&self, key: &TaskKey) -> Result<Vec<u8>> {
             Ok(key.0.iter().map(|b| b ^ 0xa5).collect())
@@ -688,7 +726,7 @@ mod tests {
             Ok(TaskKey(blob.iter().map(|b| b ^ 0xa5).collect()))
         }
     }
-    fn fixture() -> (Ledger, Principal, String) {
+    pub(super) fn fixture() -> (Ledger, Principal, String) {
         let mut ledger = Ledger::from_connection(Connection::open_in_memory().unwrap()).unwrap();
         let who = Principal {
             sid: "user-a".into(),
@@ -711,7 +749,7 @@ mod tests {
             .unwrap();
         (ledger, who, dataset)
     }
-    fn prepare(
+    pub(super) fn prepare(
         ledger: &mut Ledger,
         who: &Principal,
         dataset: &str,
@@ -747,7 +785,7 @@ mod tests {
             .unwrap();
         prepared
     }
-    fn acquire(
+    pub(super) fn acquire(
         ledger: &mut Ledger,
         who: &Principal,
         id: &str,
@@ -768,7 +806,7 @@ mod tests {
             _ => panic!(),
         }
     }
-    fn finish(
+    pub(super) fn finish(
         ledger: &mut Ledger,
         who: &Principal,
         lease: &TaskLease,
@@ -862,7 +900,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds,
                         screenshot_id: 2,
-                        consumers: 16,
+                        consumers: 32,
                         payload_bytes: 100,
                     },
                     104,

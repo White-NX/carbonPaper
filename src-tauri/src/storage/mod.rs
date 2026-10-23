@@ -24,6 +24,7 @@ mod policy;
 mod process;
 mod processing_stage;
 mod recap;
+mod recap_protected;
 mod recap_search;
 mod schema;
 mod screenshot;

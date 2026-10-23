@@ -36,6 +36,7 @@ pub async fn ai_save_provider(
     let mut settings = AiSettings::load(&storage_state)?;
     settings.upsert(&credential_state, provider)?;
     settings.save(&storage_state)?;
+    sync_recap_config(&storage_state, &credential_state);
     Ok(settings.view())
 }
 
@@ -50,6 +51,7 @@ pub async fn ai_delete_provider(
     let mut settings = AiSettings::load(&storage_state)?;
     settings.remove(&id)?;
     settings.save(&storage_state)?;
+    sync_recap_config(&storage_state, &credential_state);
     Ok(settings.view())
 }
 
@@ -64,6 +66,7 @@ pub async fn ai_set_default_provider(
     let mut settings = AiSettings::load(&storage_state)?;
     settings.set_default(&id)?;
     settings.save(&storage_state)?;
+    sync_recap_config(&storage_state, &credential_state);
     Ok(settings.view())
 }
 
@@ -92,6 +95,7 @@ pub async fn ai_test_provider(
         if unchanged {
             latest.set_tool_calling(&id, result.tool_calling);
             latest.save(&storage_state)?;
+            sync_recap_config(&storage_state, &credential_state);
         }
     }
     Ok(result)
@@ -108,10 +112,16 @@ pub async fn ai_grant_remote_consent(
     let mut settings = AiSettings::load(&storage_state)?;
     settings.remote_consent = true;
     settings.save(&storage_state)?;
+    sync_recap_config(&storage_state, &credential_state);
     Ok(settings.view())
 }
 
 const MAX_QUESTION_CHARS: usize = 4_000;
+fn sync_recap_config(storage: &StorageState, credentials: &CredentialManagerState) {
+    if let Err(error) = crate::processing_stage::recap::sync_config(storage, credentials) {
+        tracing::warn!("[RECAP] Model configuration sync deferred: {}", error);
+    }
+}
 /// Wall-clock cap for one AI search, including every model call and tool.
 const SEARCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 

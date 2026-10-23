@@ -411,6 +411,26 @@ function checkRecapToolGuards() {
 }
 
 checkRecapToolGuards();
+function checkProtectedRecapBoundary() {
+  const source = read('src-tauri/src/storage/recap.rs');
+  for (const name of ['recap_read', 'recap_write']) {
+    const body = source.slice(source.indexOf(`fn ${name}<`));
+    const end = body.indexOf('\n    }');
+    if (!body.slice(0, end).includes('if !self.is_session_valid()')) {
+      throw new Error(`${name} must retain its public session gate`);
+    }
+  }
+  const commit = read('src-tauri/src/storage/recap_protected.rs');
+  if (!commit.includes('authorization.check(self)?') || !commit.includes('check_sources_on_connection')) {
+    throw new Error('Protected recap commits must validate service authorization and transactional source fences');
+  }
+  const runner = read('src-tauri/src/ai/recap/runner.rs');
+  const check = runner.slice(runner.indexOf('pub fn check(&self)'));
+  if (!check.slice(0, check.indexOf('\n    }')).includes('is_silent_read_authorized()')) {
+    throw new Error('Recap generation must retain the process background authorization gate');
+  }
+}
+checkProtectedRecapBoundary();
 checkCommandPolicies();
 checkCommandGuardImplementations();
 checkRuntimeControlInvariants();

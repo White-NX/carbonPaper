@@ -1762,7 +1762,7 @@ pub fn save_public_key_to_file(
 }
 
 #[cfg(all(test, windows))]
-mod cng_tests;
+pub(crate) mod cng_tests;
 
 #[cfg(test)]
 mod tests {

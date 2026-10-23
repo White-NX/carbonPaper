@@ -36,6 +36,13 @@ impl StorageState {
              CREATE TABLE IF NOT EXISTS recap_summary_jobs (
                 day TEXT PRIMARY KEY, version INTEGER NOT NULL,
                 completed_version INTEGER NOT NULL DEFAULT 0);
+             INSERT OR IGNORE INTO app_metadata(key,value) VALUES('recap_config_revision','0');
+             CREATE TRIGGER IF NOT EXISTS recap_config_insert AFTER INSERT ON recap_payloads
+                WHEN NEW.kind='settings' BEGIN
+                UPDATE app_metadata SET value=CAST(value AS INTEGER)+1 WHERE key='recap_config_revision'; END;
+             CREATE TRIGGER IF NOT EXISTS recap_config_update AFTER UPDATE ON recap_payloads
+                WHEN NEW.kind='settings' BEGIN
+                UPDATE app_metadata SET value=CAST(value AS INTEGER)+1 WHERE key='recap_config_revision'; END;
              CREATE TRIGGER IF NOT EXISTS recap_correction_insert AFTER INSERT ON recap_payloads
                 WHEN NEW.kind='corrections' BEGIN
                 INSERT INTO recap_summary_jobs(day,version) VALUES(NEW.day,1)
@@ -284,7 +291,7 @@ impl StorageState {
     }
 
     pub(crate) fn recap_pending_summaries(&self) -> Result<HashMap<String, i64>, String> {
-        if !self.is_session_valid() {
+        if !self.is_silent_read_authorized() {
             return Err("AUTH_REQUIRED".into());
         }
         let guard = self.get_connection_named("recap_pending_summaries")?;
@@ -308,7 +315,7 @@ impl StorageState {
         version: i64,
         generation: u64,
     ) -> Result<(), String> {
-        if !self.is_session_valid() {
+        if !self.is_silent_read_authorized() {
             return Err("AUTH_REQUIRED".into());
         }
         let guard = self.get_connection_named("recap_finish_summary_update")?;
@@ -333,6 +340,19 @@ impl StorageState {
         revision: Option<i64>,
     ) -> Result<Option<T>, String> {
         if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        self.recap_read_background(kind, key, revision)
+    }
+
+    /// Internal generation path. Public commands retain their session gate.
+    pub(crate) fn recap_read_background<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        key: &str,
+        revision: Option<i64>,
+    ) -> Result<Option<T>, String> {
+        if !self.is_silent_read_authorized() {
             return Err("AUTH_REQUIRED".into());
         }
         let generation = self.db_generation();
@@ -369,6 +389,49 @@ impl StorageState {
         if !self.is_session_valid() {
             return Err("AUTH_REQUIRED".into());
         }
+        self.recap_write_background(kind, key, day, revision, generation, value)
+    }
+
+    pub(crate) fn recap_write_background<T: Serialize>(
+        &self,
+        kind: &str,
+        key: &str,
+        day: &str,
+        revision: i64,
+        generation: u64,
+        value: &T,
+    ) -> Result<(), String> {
+        self.recap_write_background_checked(kind, key, day, revision, generation, value, |_| Ok(()))
+    }
+
+    pub(crate) fn recap_write_background_checked<T: Serialize>(
+        &self,
+        kind: &str,
+        key: &str,
+        day: &str,
+        revision: i64,
+        generation: u64,
+        value: &T,
+        check: impl FnOnce(&Connection) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.is_silent_read_authorized() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        self.recap_commit_payload_checked(kind, key, day, revision, generation, value, check)
+    }
+
+    /// Encryption needs only the public key. The protected caller must validate
+    /// its independent service-owned authorization before entering this writer.
+    pub(super) fn recap_commit_payload_checked<T: Serialize>(
+        &self,
+        kind: &str,
+        key: &str,
+        day: &str,
+        revision: i64,
+        generation: u64,
+        value: &T,
+        check: impl FnOnce(&Connection) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut bytes = serde_json::to_vec(value).map_err(|_| "RECAP_INVALID_CACHE")?;
         let encrypted = self.encrypt_payload_with_row_key(&bytes);
         Self::zeroize_bytes(&mut bytes);
@@ -378,6 +441,7 @@ impl StorageState {
             return Err("RECAP_SOURCE_CHANGED".into());
         }
         let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        check(conn)?;
         if revision >= 0
             && !conn
                 .query_row(
@@ -758,7 +822,8 @@ mod tests {
         let credentials = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credentials);
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE screenshots(id INTEGER PRIMARY KEY,created_at TEXT,status TEXT,is_deleted INTEGER DEFAULT 0,window_title TEXT,metadata TEXT);
+        conn.execute_batch("CREATE TABLE app_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE screenshots(id INTEGER PRIMARY KEY,created_at TEXT,status TEXT,is_deleted INTEGER DEFAULT 0,window_title TEXT,metadata TEXT);
             CREATE TABLE ocr_results(id INTEGER PRIMARY KEY,screenshot_id INTEGER,text TEXT);
             CREATE TABLE screenshot_document_refs(screenshot_id INTEGER PRIMARY KEY,ref_enc BLOB,updated_at TEXT);").unwrap();
         StorageState::init_recap_tables(&conn).unwrap();

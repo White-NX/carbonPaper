@@ -134,6 +134,9 @@ pub async fn recap_save_settings(
         )?;
     }
     storage_state.recap_write("settings", "settings", "", -1, generation, &settings)?;
+    if let Err(error) = crate::ai::recap::protected::sync_after_unlock(&app) {
+        tracing::warn!("[RECAP] Protected settings sync deferred: {}", error);
+    }
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {
@@ -226,7 +229,11 @@ pub async fn recap_generate(
     force: Option<bool>,
 ) -> Result<RecapDay, String> {
     check_auth_required(&credential_state)?;
-    recap::generate(app, date, force.unwrap_or(false), false).await
+    let result = recap::generate(app, date, force.unwrap_or(false), false).await;
+    // The generation may keep running after the initiating window locks.
+    // Its private result must still wait for a fresh authenticated UI read.
+    check_auth_required(&credential_state)?;
+    result
 }
 
 /// Authentication: required. Deletes this day's recap and suppresses automatic regeneration.
@@ -244,6 +251,7 @@ pub async fn recap_delete(
     }
     app.state::<RecapRuntime>()
         .delete_day(&storage_state, &date)?;
+    storage_state.processing_stage.revoke_recap_day(&date)?;
     recap::search::schedule_index(&app);
     let _ = app.emit("recap-changed", ());
     let _ = app.emit("recap-progress", ());
@@ -373,6 +381,9 @@ pub async fn recap_correct(
     }
     // The storage trigger queues summary updates in the same transaction.
     storage_state.recap_write("corrections", &date, &date, -1, generation, &history)?;
+    if let Err(error) = crate::ai::recap::protected::sync_day(&app, &date) {
+        tracing::warn!("[RECAP] Protected correction sync deferred: {}", error);
+    }
     recap::search::schedule_index(&app);
     let _ = app.emit("recap-changed", &date);
     recap::read_day(&app, &date)

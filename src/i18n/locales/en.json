@@ -144,7 +144,7 @@
     },
     "settings": {
       "saved": "Saved",
-      "enabledHint": "Organize every four hours while unlocked, deferring while a fullscreen app blocks background tasks.",
+      "enabledHint": "Organize every four hours, pausing for fullscreen apps. Background organization keeps working after you close the window; protected processing also continues with new records after a restart.",
       "missingProvider": "Previous model service removed",
       "manageModels": "Manage model services",
       "title": "Daily recap settings",

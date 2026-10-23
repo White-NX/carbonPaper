@@ -59,6 +59,22 @@ impl StorageState {
             params![screenshot_id, ref_enc, content_key_encrypted],
         )
         .map_err(|error| format!("Failed to save Office document reference: {error}"))?;
+        drop(guard);
+        let identity = crate::ai::recap::digest(
+            reference
+                .locator
+                .as_deref()
+                .unwrap_or(&reference.display_name),
+        );
+        if let Err(error) = self.processing_stage.put_recap_metadata(
+            self,
+            screenshot_id,
+            expected_generation,
+            None,
+            Some(&identity),
+        ) {
+            tracing::warn!("[RECAP] Office context staging deferred: {}", error);
+        }
         Ok(())
     }
 

@@ -2,6 +2,7 @@
 pub(crate) mod activity_contract;
 mod privacy;
 mod progress;
+pub(crate) mod protected;
 mod runner;
 mod screening;
 pub(crate) mod search;
@@ -14,6 +15,8 @@ mod unified;
 mod views;
 
 pub(crate) use privacy::PrivacyFingerprint;
+#[cfg(test)]
+pub(crate) use runner::initial_request;
 pub use runner::{generate, read_day, read_progress, start_scheduler, RecapRuntime};
 pub use search::{
     prepare as prepare_search, search as search_activities, status as search_status,

@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "recap_tests.rs"]
+mod recap_tests;
 #[path = "smart_cluster_tests.rs"]
 mod smart_cluster_tests;
 use crate::{
@@ -178,6 +180,7 @@ fn insert_input(storage: &StorageState, id: i64, consumers: u8) -> ProcessingInp
         ocr_text: format!("private captured input {id}"),
         source_revision: storage.staged_source_revision(id).unwrap(),
         clip: None,
+        recap: None,
     };
     assert!(storage
         .processing_stage

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use windows::Win32::Security::Cryptography::NCryptExportKey;
 
-fn storage_credentials(data_dir: PathBuf) -> Arc<CredentialManagerState> {
+pub(crate) fn storage_credentials(data_dir: PathBuf) -> Arc<CredentialManagerState> {
     let state = authorized_state();
     state.set_data_dir(data_dir);
     let key = ephemeral_key();
@@ -424,6 +424,11 @@ fn correction_jobs_survive_restart_and_only_acknowledge_the_processed_version() 
         .unwrap();
     assert_eq!(reopened.recap_pending_summaries().unwrap()[date], 3);
     credentials.invalidate_session();
+    assert_eq!(reopened.recap_pending_summaries().unwrap()[date], 3);
+    reopened
+        .recap_finish_summary_update(date, 3, generation)
+        .unwrap();
+    credentials.revoke_background_lease();
     assert_eq!(
         reopened.recap_pending_summaries().unwrap_err(),
         "AUTH_REQUIRED"
