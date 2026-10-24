@@ -59,29 +59,29 @@ export function useSelectedSnapshot() {
       setSelectedDetails(null);
       setSelectedImageSrc(null);
       setLastError(null);
+      setIsLoadingDetails(false);
       return;
     }
 
     setIsLoadingDetails(true);
     setLastError(null);
     setSelectedImageSrc(null);
+    setSelectedDetails(null);
 
     let cancelled = false;
 
-    const loadData = async () => {
+    const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
+    const targetPath = selectedEvent.path || selectedEvent.image_path;
+    const reportError = (err) => {
+      if (cancelled) return;
+      console.error('Failed to load snapshot', err);
+      setLastError(err?.message || 'Failed to load image details');
+    };
+
+    const loadDetails = async () => {
       try {
-        const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
-        const targetPath = selectedEvent.path || selectedEvent.image_path;
-
-
-        const [det, img] = await Promise.all([
-          getScreenshotDetails(targetId, targetPath),
-          fetchImage(targetId, targetPath),
-        ]);
-
+        const det = await getScreenshotDetails(targetId, targetPath);
         if (cancelled) return;
-
-
         if (det && det.error) {
           throw new Error(det.error);
         }
@@ -96,22 +96,28 @@ export function useSelectedSnapshot() {
             }
           }
         }
+      } catch (err) {
+        reportError(err);
+      }
+    };
 
-
+    const loadImage = async () => {
+      try {
+        const img = await fetchImage(targetId, targetPath);
+        if (cancelled) return;
         if (!img) {
           console.warn('Image fetch returned null for ID:', selectedEvent.id);
         }
         setSelectedImageSrc(img);
-        setIsLoadingDetails(false);
       } catch (err) {
-        if (cancelled) return;
-        console.error('Failed to load details', err);
-        setLastError(err.message || 'Failed to load image details');
-        setIsLoadingDetails(false);
+        reportError(err);
       }
     };
 
-    loadData();
+    // Each result paints when ready; OCR/metadata never delays the image.
+    void Promise.all([loadDetails(), loadImage()]).then(() => {
+      if (!cancelled) setIsLoadingDetails(false);
+    });
 
     return () => {
       cancelled = true;

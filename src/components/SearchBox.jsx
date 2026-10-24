@@ -4,6 +4,7 @@ import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLe
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 import { ProgressBar } from './overlay/ProgressBlock';
+import { OriginalSearchImage } from './search/OriginalSearchImage';
 
 export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
     const { t } = useTranslation();
@@ -281,15 +282,16 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
     const [loadFailed, setLoadFailed] = useState(false);
 
     useEffect(() => {
+        if (mode === 'nl') return;
         if (preloadedSrc) {
             setImgSrc(preloadedSrc);
             setLoadFailed(false);
         }
-    }, [preloadedSrc]);
+    }, [preloadedSrc, mode]);
 
     // Fallback: individually fetch if batch didn't provide a thumbnail
     useEffect(() => {
-        if (imgSrc || loadFailed) return;
+        if (mode === 'nl' || imgSrc || loadFailed) return;
         let active = true;
         const timer = setTimeout(async () => {
             const screenshotId = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
@@ -348,7 +350,9 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
             onClick={(e) => { e.stopPropagation(); onClick(); }}
         >
             <div className="w-28 h-20 flex-shrink-0 bg-ide-bg rounded-md overflow-hidden border border-ide-border shadow-sm relative group-hover:border-ide-accent transition-colors">
-                {imgSrc ? (
+                {mode === 'nl' ? (
+                    <OriginalSearchImage item={item} placeholder={<ImageIcon size={16} className="text-ide-muted opacity-50" />} />
+                ) : imgSrc ? (
                     <img src={imgSrc} alt="" className="w-full h-full object-cover" />
                 ) : loadFailed ? (
                     <div className="w-full h-full flex items-center justify-center">

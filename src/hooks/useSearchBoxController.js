@@ -150,7 +150,7 @@ export function useSearchBoxController({
   }, [debouncedQuery, mode]);
 
   useEffect(() => {
-    if (!results.length) {
+    if (!results.length || mode === 'nl') {
       setThumbCache({});
       return undefined;
     }

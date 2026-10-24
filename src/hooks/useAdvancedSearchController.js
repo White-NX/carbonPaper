@@ -335,6 +335,8 @@ export function useAdvancedSearchController({
   }, [active, isLanding, reloadToken]);
 
   useEffect(() => {
+    // Picture results load originals at the card; landing captures keep thumbnails.
+    if (mode === 'nl' && !isLanding) return undefined;
     const source = results.length > 0 ? results : landingCaptures;
     if (source.length === 0) return;
     let activeBatch = true;
@@ -350,7 +352,7 @@ export function useAdvancedSearchController({
       }
     })();
     return () => { activeBatch = false; };
-  }, [results, landingCaptures]);
+  }, [results, landingCaptures, mode, isLanding]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore || loading || semanticUpdating) return;

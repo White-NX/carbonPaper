@@ -13,6 +13,34 @@ pub fn new_key() -> TaskKey {
     TaskKey(key)
 }
 
+/// Storage format: a fresh 12-byte nonce, ciphertext, and a 16-byte GCM tag.
+/// Keep the concrete AES hot path in this crate's optimized compilation unit.
+#[inline(never)]
+pub fn encrypt_storage_bytes(key: &[u8], plaintext: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|error| format!("Failed to create cipher: {error}"))?;
+    let nonce_bytes: [u8; 12] = rand::random();
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|error| format!("Encryption failed: {error}"))?;
+    let mut output = Vec::with_capacity(12 + ciphertext.len());
+    output.extend_from_slice(&nonce_bytes);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
+}
+
+#[inline(never)]
+pub fn decrypt_storage_bytes(key: &[u8], encrypted: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    if encrypted.len() < 28 {
+        return Err("Invalid encrypted data".into());
+    }
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|error| format!("Failed to create cipher: {error}"))?;
+    cipher
+        .decrypt(Nonce::from_slice(&encrypted[..12]), &encrypted[12..])
+        .map_err(|error| format!("Decryption failed: {error}"))
+}
+
 pub fn encrypt_input(key: &TaskKey, binding: &TaskBinding, input: &[u8]) -> Result<Vec<u8>> {
     if input.len() as u64 > MAX_INPUT_BYTES || binding.payload_bytes != input.len() as u64 + 28 {
         return Err(BrokerError::LimitExceeded);
@@ -123,6 +151,52 @@ pub trait KeyProtector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_decrypts_the_existing_nonce_ciphertext_tag_format() {
+        // AES-256-GCM known-answer vector: zero key/nonce and 16 zero bytes.
+        let encrypted = hex::decode(concat!(
+            "000000000000000000000000",
+            "cea7403d4d606b6e074ec5d3baf39d18",
+            "d0d1c8a799996bf0265b98b5d48ab919"
+        ))
+        .unwrap();
+        assert_eq!(
+            decrypt_storage_bytes(&[0; 32], &encrypted).unwrap(),
+            [0; 16]
+        );
+        assert!(decrypt_storage_bytes(&[1; 32], &encrypted).is_err());
+        for index in [0, 12, encrypted.len() - 1] {
+            let mut changed = encrypted.clone();
+            changed[index] ^= 1;
+            assert!(decrypt_storage_bytes(&[0; 32], &changed).is_err());
+        }
+        for length in 0..28 {
+            assert!(decrypt_storage_bytes(&[0; 32], &encrypted[..length]).is_err());
+        }
+        assert!(decrypt_storage_bytes(&[0; 31], &encrypted).is_err());
+    }
+
+    #[test]
+    fn storage_encrypts_with_fresh_nonces_and_legacy_reader_compatibility() {
+        let key = [7; 32];
+        let legacy_cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        for plaintext in [b"".as_slice(), b"screenshot bytes".as_slice()] {
+            let first = encrypt_storage_bytes(&key, plaintext).unwrap();
+            let second = encrypt_storage_bytes(&key, plaintext).unwrap();
+            assert_eq!(first.len(), plaintext.len() + 28);
+            assert_ne!(&first[..12], &second[..12]);
+            assert_eq!(
+                legacy_cipher
+                    .decrypt(Nonce::from_slice(&first[..12]), &first[12..])
+                    .unwrap(),
+                plaintext
+            );
+            assert_eq!(decrypt_storage_bytes(&key, &first).unwrap(), plaintext);
+        }
+        assert!(encrypt_storage_bytes(&[0; 31], b"bytes").is_err());
+    }
+
     #[test]
     fn input_is_bound_to_the_exact_task_and_dataset() {
         let key = new_key();

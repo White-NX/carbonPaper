@@ -1,13 +1,20 @@
 /** One active read and one latest pending viewport. An abort does not free the
  * slot until the backend acknowledges it by settling the read promise. */
-export function createTimelineRequestQueue(load, { onResult, onError }) {
+export function createTimelineRequestQueue(load, { onResult, onError, onBusyChange }) {
   let active = null;
   let pending = null;
+  let busy = false;
   const sameRange = (a, b) => a.start === b.start && a.end === b.end && a.sampleMs === b.sampleMs;
+  const setBusy = (value) => {
+    if (busy === value) return;
+    busy = value;
+    onBusyChange?.(value);
+  };
 
   const run = async (range) => {
     const request = { range, controller: new AbortController() };
     active = request;
+    setBusy(true);
     try {
       const records = await load(range, request.controller.signal);
       if (!request.controller.signal.aborted) onResult(records, range);
@@ -18,6 +25,7 @@ export function createTimelineRequestQueue(load, { onResult, onError }) {
       const next = pending;
       pending = null;
       if (next) void run(next);
+      else setBusy(false);
     }
   };
 

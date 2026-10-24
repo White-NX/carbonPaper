@@ -1,7 +1,7 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 
 vi.mock('react-i18next', () => ({
@@ -28,6 +28,7 @@ vi.mock('../lib/monitor_api', () => ({
   })),
   fetchThumbnail: vi.fn(async () => null),
   fetchImage: vi.fn(async () => null),
+  fetchSearchImage: vi.fn(async () => 'data:image/jpeg;base64,original'),
   getBackgroundIndexProgress: vi.fn(async () => ({
     semantic: { running: false, processed: 0, indexed: 0, total: 0 },
     clip: { running: false, processed: 0, indexed: 0, total: 0 },
@@ -35,6 +36,9 @@ vi.mock('../lib/monitor_api', () => ({
 }));
 
 import { SearchBox } from './SearchBox';
+import { fetchSearchImage, fetchThumbnail, fetchThumbnailBatch, searchScreenshots } from '../lib/monitor_api';
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe('SearchBox', () => {
   beforeEach(() => {
@@ -71,6 +75,36 @@ describe('SearchBox', () => {
     );
 
     expect(screen.getByPlaceholderText('search.placeholder.nl')).toBeInTheDocument();
+  });
+
+  it('loads visible picture-search results as originals without requesting thumbnails', async () => {
+    const observers = [];
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(callback) { observers.push(callback); }
+      observe() {}
+      disconnect() {}
+    });
+    searchScreenshots.mockResolvedValueOnce([{ metadata: { screenshot_id: 42, process_name: 'picture-source' } }]);
+    const { container } = render(<SearchBox mode="nl" onSelectResult={vi.fn()} />);
+    await userEvent.type(screen.getByPlaceholderText('search.placeholder.nl'), 'moon');
+    await screen.findByText('picture-source');
+    expect(fetchSearchImage).not.toHaveBeenCalled();
+    expect(fetchThumbnailBatch).not.toHaveBeenCalled();
+    await act(async () => observers.forEach((observer) => observer([{ isIntersecting: true }])));
+    expect(fetchSearchImage).toHaveBeenCalledWith(42, null, { signal: expect.any(AbortSignal) });
+    expect(container.querySelector('img')).toHaveAttribute('src', 'data:image/jpeg;base64,original');
+    expect(fetchThumbnail).not.toHaveBeenCalled();
+  });
+
+  it('keeps text-search results on their existing thumbnail batch', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ screenshot_id: 43, process_name: 'text-source' }]);
+    fetchThumbnailBatch.mockResolvedValueOnce({ 43: 'data:image/jpeg;base64,thumbnail' });
+    const { container } = render(<SearchBox onSelectResult={vi.fn()} />);
+    await userEvent.type(screen.getByPlaceholderText('search.placeholder.ocr'), 'invoice');
+    await screen.findByText('text-source');
+    await waitFor(() => expect(container.querySelector('img')).toHaveAttribute('src', 'data:image/jpeg;base64,thumbnail'));
+    expect(fetchThumbnailBatch).toHaveBeenCalledWith([43]);
+    expect(fetchSearchImage).not.toHaveBeenCalled();
   });
 
   it('displays search error message when search fails', async () => {

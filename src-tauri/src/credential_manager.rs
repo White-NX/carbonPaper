@@ -9,10 +9,6 @@
 //! `NCRYPT_UI_POLICY` to high protection, exports only the public blob for writes, and
 //! keeps decrypted master-key material in the bounded authenticated session cache.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -589,24 +585,8 @@ pub fn encrypt_with_master_key(
     master_key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CredentialError> {
-    let cipher = Aes256Gcm::new_from_slice(master_key)
-        .map_err(|e| CredentialError::CryptoError(format!("Failed to create cipher: {}", e)))?;
-
-    // Generate a fresh nonce for every encryption.
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    // Authenticate and encrypt the plaintext.
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| CredentialError::CryptoError(format!("Encryption failed: {}", e)))?;
-
-    // Prefix the nonce so decryption can reconstruct the AEAD input.
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-
-    Ok(result)
+    carbonpaper_app_bound::crypto::encrypt_storage_bytes(master_key, plaintext)
+        .map_err(CredentialError::CryptoError)
 }
 
 /// Decrypts and authenticates data encrypted with the master key.
@@ -614,23 +594,8 @@ pub fn decrypt_with_master_key(
     master_key: &[u8],
     encrypted: &[u8],
 ) -> Result<Vec<u8>, CredentialError> {
-    if encrypted.len() < 12 + 16 {
-        return Err(CredentialError::CryptoError(
-            "Invalid encrypted data".to_string(),
-        ));
-    }
-
-    let cipher = Aes256Gcm::new_from_slice(master_key)
-        .map_err(|e| CredentialError::CryptoError(format!("Failed to create cipher: {}", e)))?;
-
-    // Split the nonce prefix from ciphertext and authentication tag.
-    let nonce = Nonce::from_slice(&encrypted[..12]);
-    let ciphertext = &encrypted[12..];
-
-    // Reject modified data through AES-GCM authentication.
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| CredentialError::CryptoError(format!("Decryption failed: {}", e)))
+    carbonpaper_app_bound::crypto::decrypt_storage_bytes(master_key, encrypted)
+        .map_err(CredentialError::CryptoError)
 }
 
 /// Encrypts data and encodes it as Base64 for text-only storage fields.

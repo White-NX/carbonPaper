@@ -417,6 +417,31 @@ impl StorageState {
         })
     }
 
+    /// Use the resident connection only when it is immediately available.
+    /// Image reads fall back to an independent handle while metadata owns it.
+    fn try_get_connection_named(
+        &self,
+        caller: &'static str,
+    ) -> Result<Option<NamedConnectionGuard<'_>>, String> {
+        let guard = match self.db.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        if guard.is_none() {
+            return Err("Database not initialized".into());
+        }
+        if let Ok(mut holder) = self.lock_holder.lock() {
+            *holder = caller;
+        }
+        Ok(Some(NamedConnectionGuard {
+            guard,
+            lock_holder: &self.lock_holder,
+            caller,
+            acquired_at: std::time::Instant::now(),
+        }))
+    }
+
     /// Open an independent SQLCipher read-only connection for read-heavy paths.
     ///
     /// The database key is derived from the public key, matching initialize().
