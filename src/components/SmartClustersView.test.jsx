@@ -95,6 +95,17 @@ describe('SmartClustersView deletion confirmation', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
+  it('uses the existing confirmation for deletion from the selected-cluster toolbar', async () => {
+    const user = userEvent.setup();
+    renderView();
+    await user.click(await screen.findByRole('button', { name: 'Research notes' }));
+    await user.click(screen.getByRole('button', { name: 'clusterCard.actionDelete' }));
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(deleteSmartCluster).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'common.cancel' }));
+    expect(deleteSmartCluster).not.toHaveBeenCalled();
+  });
+
   it('keeps the confirmation locked while deletion is in progress', async () => {
     let resolveDelete;
     deleteSmartCluster.mockImplementation(() => new Promise((resolve) => {

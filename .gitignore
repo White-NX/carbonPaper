@@ -15,6 +15,9 @@ wgc_test
 *.local
 coverage
 
+# Local UI review previews and browser profiles
+/work/ui-layout-review/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

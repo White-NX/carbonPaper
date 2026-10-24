@@ -19,7 +19,7 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
       }`}
     >
       {/* Navigation icons */}
-      <nav className="flex-1 flex flex-col pt-1">
+      <nav className="flex-1 flex flex-col">
         {NAV_ITEMS.map(({ id, icon: Icon, i18nKey }) => {
           const isActive = activeTab === id;
           const label = t(i18nKey);
@@ -28,6 +28,8 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
               key={id}
               type="button"
               data-tauri-drag-region="false"
+              aria-label={label}
+              aria-current={isActive ? 'page' : undefined}
               onClick={() => setActiveTab(id)}
               title={!expanded ? label : undefined}
               className={`relative flex items-center gap-3 h-10 cursor-pointer transition-colors overflow-hidden ${
@@ -58,6 +60,7 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
           data-tauri-drag-region="false"
           onClick={onToggleExpand}
           title={expanded ? t('activityBar.collapse') : t('activityBar.expand')}
+          aria-label={expanded ? t('activityBar.collapse') : t('activityBar.expand')}
           className={`flex items-center gap-3 h-10 w-full cursor-pointer text-ide-muted hover:text-ide-text hover:bg-ide-hover transition-colors ${
             expanded ? 'px-3' : 'px-0 justify-center'
           }`}

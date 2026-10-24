@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Focus, Play } from 'lucide-react';
+import { ChevronDown, ChevronUp, Focus, Play } from 'lucide-react';
+import { Button } from './ui/Button';
 import { getTimeline, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
 import {
   aggregateAppDistribution,
@@ -35,8 +36,12 @@ const DAY = 86400000;
 const OVERVIEW_HEIGHT = 20;
 const SESSION_HEIGHT = 30;
 const DETAIL_HEIGHT = 58;
+const COMPACT_DETAIL_HEIGHT = 20;
 const AXIS_HEIGHT = 18;
+const COMPACT_AXIS_HEIGHT = 16;
+const COMPACT_CONTROLS_HEIGHT = 28;
 const TIMELINE_HEIGHT = OVERVIEW_HEIGHT + SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT;
+const COMPACT_TIMELINE_HEIGHT = COMPACT_DETAIL_HEIGHT + COMPACT_AXIS_HEIGHT + COMPACT_CONTROLS_HEIGHT;
 
 /** Tier threshold boundaries for detail track. */
 const FRAME_TIER_MAX_SPAN = 30 * MINUTE;
@@ -154,12 +159,17 @@ const Timeline = ({
   jumpTimestamp,
   highlightedEventId,
   refreshKey,
-  sqlPaused,
+  sqlPaused: windowSqlPaused = false,
   searchState,
   onSelectSearchResult,
+  active = true,
+  compact = false,
+  onToggleCompact,
 }) => {
   const { t } = useTranslation();
   const containerRef = useRef(null);
+  // Compact search draws the already-loaded result markers without reading screenshot history.
+  const sqlPaused = windowSqlPaused || !active || compact;
 
   const [width, setWidth] = useState(0);
   const [events, setEvents] = useState([]);
@@ -244,14 +254,17 @@ const Timeline = ({
   const tickStepMs = useMemo(() => getTickStep(zoom), [zoom]);
 
   useEffect(() => {
-    if (!containerRef.current) return undefined;
-    setWidth(containerRef.current.clientWidth);
+    if (!active || !containerRef.current) return undefined;
+    const measuredWidth = containerRef.current.clientWidth;
+    if (measuredWidth > 0) setWidth(measuredWidth);
     const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) setWidth(entry.contentRect.width);
+      for (const entry of entries) {
+        if (entry.contentRect.width > 0) setWidth(entry.contentRect.width);
+      }
     });
     observer.observe(containerRef.current);
     return () => observer.disconnect();
-  }, []);
+  }, [active]);
 
   // ── Camera ─────────────────────────────────────────────────
 
@@ -298,6 +311,16 @@ const Timeline = ({
     onCommit: handleCameraCommit,
     onFrame: handleCameraFrame,
   });
+
+  useEffect(() => {
+    if (active) return;
+    const view = camera.read();
+    camera.jumpTo(view.center, view.zoom);
+    isDraggingRef.current = false;
+    setIsDragging(false);
+    setOverviewInteracting(false);
+    if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
+  }, [active, camera]);
 
   // Recenter the overview band once the viewport has drifted too far across it.
   // Suspended mid-flight, where the centre is passing through values nobody is
@@ -551,8 +574,14 @@ const Timeline = ({
       requestEvents.cancel();
       eventRequests.cancel();
       requestedEventsRef.current = null;
+      requestDensity.cancel();
+      requestedDensityRef.current = null;
+      densityEpochRef.current += 1;
+      requestOverview.cancel();
+      requestedOverviewRef.current = null;
+      overviewEpochRef.current += 1;
     }
-  }, [sqlPaused, requestEvents, eventRequests]);
+  }, [sqlPaused, requestEvents, requestDensity, requestOverview, eventRequests]);
 
   // ── Thumbnail Loading ──────────────────────────────────────
 
@@ -610,12 +639,12 @@ const Timeline = ({
   );
 
   useEffect(() => {
-    loadThumbnailsRef.current = requestThumbnails;
+    loadThumbnailsRef.current = sqlPaused ? null : requestThumbnails;
     return () => {
       loadThumbnailsRef.current = null;
       requestThumbnails.cancel();
     };
-  }, [requestThumbnails]);
+  }, [sqlPaused, requestThumbnails]);
 
   useEffect(() => {
     if (sqlPaused || tier !== 'frame') return;
@@ -732,13 +761,12 @@ const Timeline = ({
   }, [searchState?.markers, width, flyTo, resetImagePipeline]);
 
   useEffect(() => {
+    if (!active || !width || containerRef.current?.clientWidth !== width) return;
     if (!searchState?.fitKey || !searchState.markers?.length) {
       searchFitKeyRef.current = null;
       searchFitSuspendedRef.current = false;
       return;
     }
-    if (!width) return;
-
     const isNewSearch = searchFitKeyRef.current !== searchState.fitKey;
     if (isNewSearch) {
       searchFitKeyRef.current = searchState.fitKey;
@@ -746,7 +774,7 @@ const Timeline = ({
     }
 
     if (isNewSearch && !searchFitSuspendedRef.current) fitSearchMarkers();
-  }, [searchState?.fitKey, searchState?.markers, width, fitSearchMarkers]);
+  }, [active, searchState?.fitKey, searchState?.markers, width, fitSearchMarkers]);
 
   const zoomToSpan = useCallback((spanMs) => {
     if (!width) return;
@@ -768,22 +796,23 @@ const Timeline = ({
   // Guarded by the token rather than by the dependency list, because `flyTo`
   // changes identity whenever the track is resized and must not replay a jump.
   useEffect(() => {
-    if (!jumpTimestamp?.time || jumpTokenRef.current === jumpTimestamp) return;
+    if (!active || !width || !jumpTimestamp?.time || jumpTokenRef.current === jumpTimestamp) return;
     jumpTokenRef.current = jumpTimestamp;
     setIsFollowingNow(false);
     flyTo(jumpTimestamp.time, Math.max(camera.read().zoom, 0.005));
     resetImagePipeline();
-  }, [jumpTimestamp, camera, flyTo, resetImagePipeline]);
+  }, [active, width, jumpTimestamp, camera, flyTo, resetImagePipeline]);
 
   useEffect(() => {
-    camera.setLive(isFollowingNow);
-  }, [camera, isFollowingNow]);
+    camera.setLive(active && isFollowingNow);
+  }, [active, camera, isFollowingNow]);
 
   useEffect(() => {
+    if (!active) return undefined;
     const handleKeyDown = (event) => {
-      if (event.ctrlKey || event.altKey || event.metaKey) return;
+      if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return;
       const target = event.target;
-      if (target?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+      if (target?.closest?.('input, textarea, select, [contenteditable="true"], [role="dialog"], [role="alertdialog"], [inert]')) return;
 
       switch (event.key) {
         case '1': zoomToSpan(DAY); break;
@@ -797,7 +826,7 @@ const Timeline = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [zoomToSpan, jumpToNow]);
+  }, [active, zoomToSpan, jumpToNow]);
 
   // ── Pointer Interaction ─────────────────────────────────────
 
@@ -907,15 +936,21 @@ const Timeline = ({
     { key: 'week', span: 7 * DAY, label: t('timeline.week'), title: t('timeline.zoomWeek'), shortcut: '2' },
     { key: 'month', span: 30 * DAY, label: t('timeline.month'), title: t('timeline.zoomMonth'), shortcut: '3' },
   ];
+  const sessionHeight = compact ? 0 : SESSION_HEIGHT;
+  const detailHeight = compact ? COMPACT_DETAIL_HEIGHT : DETAIL_HEIGHT;
+  const axisHeight = compact ? COMPACT_AXIS_HEIGHT : AXIS_HEIGHT;
 
   return (
     <div
       ref={containerRef}
-      className="relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border"
-      style={{ height: TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
+      role="region"
+      aria-label={t('timeline.label')}
+      hidden={!active}
+      className={`relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border ${active ? '' : 'hidden'}`}
+      style={{ height: compact ? COMPACT_TIMELINE_HEIGHT : TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
       data-keep-selection="true"
     >
-      <OverviewBand
+      {!compact && <OverviewBand
         width={width}
         height={OVERVIEW_HEIGHT}
         buckets={overviewBuckets}
@@ -929,11 +964,11 @@ const Timeline = ({
         onInteractingChange={setOverviewInteracting}
         searchMarkers={searchState?.markers || []}
         hoveredSearchMarkerIds={searchState?.hoveredIds || []}
-      />
+      />}
 
       <div
         className={`relative ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-        style={{ height: SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT }}
+        style={{ height: sessionHeight + detailHeight + axisHeight }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={endDrag}
@@ -941,7 +976,7 @@ const Timeline = ({
         onWheel={handleWheel}
         onClick={handleBackgroundClick}
       >
-        <SessionBand
+        {!compact && <SessionBand
           blocks={sessionBlocks}
           timeToX={timeToX}
           width={width}
@@ -952,9 +987,9 @@ const Timeline = ({
           activeId={activeSessionId}
           onSelect={handleSelectSession}
           onZoomTo={handleZoomToSession}
-        />
+        />}
 
-        <DetailTrack
+        {!compact && <DetailTrack
           tier={tier}
           events={events}
           buckets={densityBuckets}
@@ -970,15 +1005,17 @@ const Timeline = ({
           onSelectEvent={handleSelectFrame}
           onSeek={seekTo}
           onVisibleFramesChange={handleVisibleFramesChange}
-        />
+        />}
 
-        <div className="pointer-events-none absolute inset-x-0" style={{ top: SESSION_HEIGHT, height: DETAIL_HEIGHT }}>
+        {compact && <div style={{ height: detailHeight }} />}
+
+        <div className="pointer-events-none absolute inset-x-0" style={{ top: sessionHeight, height: detailHeight }}>
           <SearchMarkerLayer
             markers={searchState?.markers || []}
             hoveredIds={searchState?.hoveredIds || []}
             timeToX={timeToX}
             width={width}
-            height={DETAIL_HEIGHT}
+            height={detailHeight}
             overscanPx={overscanPx}
             stageRef={markerStageRef}
             onSelectMarker={(marker) => {
@@ -987,7 +1024,7 @@ const Timeline = ({
           />
         </div>
 
-        <div className="relative" style={{ height: AXIS_HEIGHT }}>
+        <div className="relative" style={{ height: axisHeight }}>
           <div ref={axisRef} className="absolute inset-0">
             {ticks.map((tick) => (
               <div
@@ -1011,7 +1048,22 @@ const Timeline = ({
         />
       </div>
 
-      <div className="absolute bottom-1.5 right-2 z-40 flex items-center gap-1">
+      <div className={`absolute right-2 z-40 flex items-center gap-1 ${compact ? 'bottom-0 h-7' : 'bottom-1.5'}`}>
+        {onToggleCompact && (
+          <Button
+            variant="secondary"
+            size="xs"
+            icon={compact ? ChevronDown : ChevronUp}
+            aria-expanded={!compact}
+            data-tauri-drag-region="false"
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCompact();
+            }}
+          >
+            {compact ? t('timeline.expand') : t('timeline.collapse')}
+          </Button>
+        )}
         {searchState?.markers?.length > 0 && (
           <button
             type="button"

@@ -28,7 +28,7 @@ export default function SearchMarkerLayer({
   if (clusters.length === 0) return null;
 
   return (
-    <div className="pointer-events-none absolute inset-x-0 top-0 z-[25] overflow-hidden" style={{ height }} aria-hidden="true">
+    <div className="pointer-events-none absolute inset-x-0 top-0 z-[25] overflow-hidden" style={{ height }} aria-hidden={compact ? true : undefined}>
       <div
         ref={stageRef}
         className="absolute inset-0"
