@@ -393,6 +393,38 @@ describe('AdvancedSearch', () => {
     expect(fetchThumbnailBatch).not.toHaveBeenCalled();
   });
 
+  it('clears picture cards when leaving the search page', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(23), similarity: 0.8 }]);
+    const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
+    const { rerender } = render(<AdvancedSearch active {...props} />);
+    await screen.findByRole('button', { name: '23' });
+    rerender(<AdvancedSearch active={false} {...props} />);
+    expect(screen.queryByRole('button', { name: '23' })).not.toBeInTheDocument();
+  });
+
+  it('clears picture cards immediately when their query is emptied', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(24), similarity: 0.8 }]);
+    render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
+    await screen.findByRole('button', { name: '24' });
+    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl'), { target: { value: '' } });
+    expect(screen.queryByRole('button', { name: '24' })).not.toBeInTheDocument();
+  });
+
+  it.each(['leave', 'clear'])('ignores late picture results after %s', async (action) => {
+    let finishSearch;
+    searchScreenshots.mockImplementationOnce(() => new Promise((resolve) => { finishSearch = resolve; }));
+    const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
+    const { rerender } = render(<AdvancedSearch active {...props} />);
+    await waitFor(() => expect(finishSearch).toEqual(expect.any(Function)));
+    if (action === 'leave') {
+      rerender(<AdvancedSearch active={false} {...props} />);
+    } else {
+      fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl'), { target: { value: '' } });
+    }
+    await act(async () => finishSearch([{ ...makeOcrResult(25), similarity: 0.8 }]));
+    expect(screen.queryByRole('button', { name: '25' })).not.toBeInTheDocument();
+  });
+
   it('shows no-result state when query exists but no matches', async () => {
     searchSnapshotsAndRecaps.mockResolvedValueOnce(response([]));
 

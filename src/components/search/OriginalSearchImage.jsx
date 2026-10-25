@@ -3,7 +3,7 @@ import { Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { fetchSearchImage } from '../../lib/monitor_api';
 
-/** Keep original image data only while its search card is near the viewport. */
+/** Load on first visibility and retain the original for this search result's lifetime. */
 export function OriginalSearchImage({ item, placeholder }) {
   const { t } = useTranslation();
   const ref = useRef(null);
@@ -19,16 +19,11 @@ export function OriginalSearchImage({ item, placeholder }) {
     if (!id && !path) return undefined;
 
     let disposed = false;
-    let visible = false;
+    let started = false;
     let controller = null;
-    const updateVisibility = (nextVisible) => {
-      if (disposed || visible === nextVisible) return;
-      visible = nextVisible;
-      controller?.abort();
-      controller = null;
-      setImage({ key, src: null, loading: true });
-      if (!visible) return;
-
+    const load = () => {
+      if (disposed || started) return;
+      started = true;
       const request = new AbortController();
       controller = request;
       fetchSearchImage(id, path, { signal: request.signal })
@@ -42,10 +37,13 @@ export function OriginalSearchImage({ item, placeholder }) {
 
     let observer;
     if (typeof IntersectionObserver === 'undefined') {
-      updateVisibility(true);
+      load();
     } else {
       observer = new IntersectionObserver((entries) => {
-        updateVisibility(Boolean(entries[entries.length - 1]?.isIntersecting));
+        if (entries.some((entry) => entry.isIntersecting)) {
+          load();
+          observer.disconnect();
+        }
       }, { rootMargin: '200px' });
       observer.observe(ref.current);
     }

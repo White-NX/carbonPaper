@@ -41,37 +41,42 @@ it('loads the original only near the viewport and does not repeat a visible requ
   expect(container.querySelector('img')).toHaveAttribute('src', 'data:image/jpeg;base64,original');
 });
 
-it('releases an offscreen original and reloads it when the card returns', async () => {
+it('retains an offscreen original and reuses it when the card returns', async () => {
   const { container } = render(<OriginalSearchImage item={{ screenshot_id: 13 }} />);
   intersect(true);
   await act(async () => requests[0].resolve('original'));
   expect(container.querySelector('img')).toBeInTheDocument();
   intersect(false);
-  expect(requests[0].signal.aborted).toBe(true);
-  expect(container.querySelector('img')).not.toBeInTheDocument();
+  expect(requests[0].signal.aborted).toBe(false);
+  expect(container.querySelector('img')).toHaveAttribute('src', 'original');
   intersect(true);
-  expect(requests).toHaveLength(2);
-  await act(async () => requests[1].resolve('reloaded'));
-  expect(container.querySelector('img')).toHaveAttribute('src', 'reloaded');
+  expect(requests).toHaveLength(1);
+  expect(container.querySelector('img')).toHaveAttribute('src', 'original');
 });
 
-it('discards cancelled results across scrolling, selection changes and unmounting', async () => {
-  const { container, rerender, unmount } = render(<OriginalSearchImage item={{ screenshot_id: 14 }} />);
+it('lets the first read finish offscreen without restarting when the card returns', async () => {
+  const { container } = render(<OriginalSearchImage item={{ screenshot_id: 14 }} />);
   intersect(true);
   intersect(false);
+  expect(requests[0].signal.aborted).toBe(false);
+  await act(async () => requests[0].resolve('offscreen result'));
   intersect(true);
-  await act(async () => requests[0].resolve('late offscreen result'));
-  expect(container.querySelector('img')).not.toBeInTheDocument();
+  expect(requests).toHaveLength(1);
+  expect(container.querySelector('img')).toHaveAttribute('src', 'offscreen result');
+});
+
+it('discards late reads after the result changes or the search closes', async () => {
+  const { container, rerender, unmount } = render(<OriginalSearchImage item={{ screenshot_id: 14 }} />);
+  intersect(true);
   rerender(<OriginalSearchImage item={{ screenshot_id: 15 }} />);
-  expect(requests[1].signal.aborted).toBe(true);
-  await act(async () => requests[1].resolve('late previous screenshot'));
+  expect(requests[0].signal.aborted).toBe(true);
+  await act(async () => requests[0].resolve('late previous screenshot'));
   expect(container.querySelector('img')).not.toBeInTheDocument();
   intersect(true);
-  await act(async () => requests[2].resolve('current screenshot'));
-  expect(container.querySelector('img')).toHaveAttribute('src', 'current screenshot');
   unmount();
-  expect(requests[2].signal.aborted).toBe(true);
-  expect(observers.every((observer) => observer.disconnect.mock.calls.length === 1)).toBe(true);
+  expect(requests[1].signal.aborted).toBe(true);
+  await act(async () => requests[1].resolve('late closed search'));
+  expect(observers.every((observer) => observer.disconnect.mock.calls.length >= 1)).toBe(true);
 });
 
 it('keeps a loaded image when only the result object identity changes', async () => {
