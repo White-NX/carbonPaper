@@ -2,8 +2,8 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { listen } from '@tauri-apps/api/event';
 import {
-  Sparkles, Plus, Loader2, RefreshCw, AlertCircle, X,
-  Zap, Clock, FileText, CircleDot, PauseCircle, Inbox,
+  Sparkles, Plus, Loader2, AlertCircle, X,
+  Clock, FileText, Pause, Play, Trash2,
 } from 'lucide-react';
 import {
   listSmartClusters, deleteSmartCluster, renameSmartCluster,
@@ -14,8 +14,10 @@ import {
 import { fetchThumbnailBatch, getSmartClusterWorkerStatus } from '../lib/monitor_api';
 import { ThumbnailCard } from './ThumbnailCard';
 import ClusterRow, { formatRelativeStamp } from './cluster/ClusterRow';
+import ClusterListHeader from './cluster/ClusterListHeader';
 import SmartClusterCreateView from './SmartClusterCreateView';
-import { PageHeader, StatusChip } from './PageHeader';
+import ResizableSplitPane from './ResizableSplitPane';
+import { Button } from './ui/Button';
 import { ConfirmDialog } from './ConfirmDialog';
 
 function clusterName(cluster) {
@@ -679,77 +681,6 @@ export default function SmartClustersView({
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      <PageHeader>
-        <button
-          type="button"
-          onClick={() => setCreating(true)}
-          className="flex h-[34px] shrink-0 items-center gap-1.5 rounded-md bg-ide-accent px-3.5 text-xs font-medium text-white transition hover:brightness-110"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          {t('smartClusters.newCluster')}
-        </button>
-
-        <span className="mx-1 h-5 w-px shrink-0 bg-ide-border" aria-hidden="true" />
-
-        <StatusChip icon={<CircleDot className="h-3 w-3" />} tone="accent">
-          {t('smartClusters.chipRunning', {
-            count: statusData?.enabled_cluster_count ?? activeCount,
-          })}
-        </StatusChip>
-        {pausedCount > 0 && (
-          <StatusChip icon={<PauseCircle className="h-3 w-3" />}>
-            {t('smartClusters.chipPaused', { count: pausedCount })}
-          </StatusChip>
-        )}
-        {pendingCount > 0 && (
-          <StatusChip
-            icon={<Inbox className="h-3 w-3" />}
-            title={t('smartClusters.idleWarning')}
-            action={isDraining ? (
-              <button
-                type="button"
-                onClick={handleStopDrain}
-                title={t('smartClusters.stopDrainTooltip')}
-                className="flex h-[22px] items-center gap-1 rounded-full bg-ide-hover px-2 text-[11px] text-ide-muted transition-colors hover:text-ide-text"
-              >
-                <X className="h-2.5 w-2.5" />
-                {t('smartClusters.stopDrain')}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handleDrainNow}
-                title={t('smartClusters.processNowTooltip')}
-                className="flex h-[22px] items-center gap-1 rounded-full bg-ide-hover px-2 text-[11px] text-ide-muted transition-colors hover:text-ide-text disabled:opacity-40"
-              >
-                <Zap className="h-2.5 w-2.5" />
-                {drainFailed
-                  ? t('smartClusters.retryFailed')
-                  : t('smartClusters.processNow')}
-              </button>
-            )}
-          >
-            {t('smartClusters.chipPending', { count: pendingCount })}
-          </StatusChip>
-        )}
-
-        {drainFailed && (
-          <StatusChip icon={<AlertCircle className="h-3 w-3" />}>
-            {t('smartClusters.processingFailed')}
-          </StatusChip>
-        )}
-
-        <button
-          type="button"
-          onClick={loadClusters}
-          title={t('smartClusters.refresh')}
-          aria-label={t('smartClusters.refresh')}
-          className="ml-auto grid h-[30px] w-[30px] shrink-0 place-items-center rounded-md text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-        </button>
-      </PageHeader>
-
       {unverifiableCount > 0 && (
         <div className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
           <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
@@ -785,335 +716,372 @@ export default function SmartClustersView({
       )}
 
       {/* Content */}
-      <div className="flex-1 flex min-h-0 overflow-hidden">
-        {/* List pane */}
-        <div className="w-80 shrink-0 overflow-y-auto border-r border-ide-border custom-scrollbar">
-          {loading && !clusters.length ? (
-            <div className="flex h-32 items-center justify-center">
-              <Loader2 className="h-5 w-5 animate-spin text-ide-muted" />
-            </div>
-          ) : !clusters.length ? (
-            <p className="px-6 py-8 text-center text-[11.5px] leading-relaxed text-ide-muted">
-              {t('smartClusters.noClustersHint')}
-            </p>
-          ) : (
-            <>
-              {activeClusters.map((c) => (
-                <ClusterRow
-                  key={c.id}
-                  id={c.id}
-                  title={clusterName(c)}
-                  subtitle={clusterSubtitle(c)}
-                  stamp={formatRelativeStamp(c.last_assigned_at || c.updated_at)}
-                  accentColor={c.dominant_color || '#6b7280'}
-                  count={c.assignment_count ?? 0}
-                  recentCount={c.recent_assignment_count ?? 0}
-                  selected={selectedId === c.id}
-                  onSelect={setSelectedId}
-                  onRename={handleRename}
-                  onDelete={handleDelete}
-                  onTogglePause={handleTogglePause}
-                />
-              ))}
-
-              {pausedClusters.length > 0 && (
-                <>
-                  <div className="px-3 pt-3 pb-1 text-[11px] font-medium text-ide-muted">
-                    {t('smartClusters.pausedGroup', { count: pausedClusters.length })}
+      <ResizableSplitPane
+        storageKey="smartClusterListWidth"
+        separatorLabel={t('smartClusters.resizeList')}
+        active={active && !creating}
+        left={(
+          <>
+            <ClusterListHeader
+              activeCount={statusData?.enabled_cluster_count ?? activeCount}
+              pausedCount={pausedCount}
+              pendingCount={pendingCount}
+              isDraining={isDraining}
+              drainFailed={drainFailed}
+              loading={loading}
+              onCreate={() => setCreating(true)}
+              onRefresh={loadClusters}
+              onProcessNow={handleDrainNow}
+              onStopProcessing={handleStopDrain}
+            />
+            <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
+                {loading && !clusters.length ? (
+                  <div className="flex h-32 items-center justify-center">
+                    <Loader2 className="h-5 w-5 animate-spin text-ide-muted" />
                   </div>
-                  {pausedClusters.map((c) => (
-                    <ClusterRow
-                      key={c.id}
-                      id={c.id}
-                      title={clusterName(c)}
-                      subtitle={clusterSubtitle(c)}
-                      stamp={formatRelativeStamp(c.last_assigned_at || c.updated_at)}
-                      accentColor={c.dominant_color || '#6b7280'}
-                      count={c.assignment_count ?? 0}
-                      recentCount={c.recent_assignment_count ?? 0}
-                      paused
-                      selected={selectedId === c.id}
-                      onSelect={setSelectedId}
-                      onRename={handleRename}
-                      onDelete={handleDelete}
-                      onTogglePause={handleTogglePause}
+                ) : !clusters.length ? (
+                  <p className="px-6 py-8 text-center text-[11.5px] leading-relaxed text-ide-muted">
+                    {t('smartClusters.noClustersHint')}
+                  </p>
+                ) : (
+                  <>
+                    {activeClusters.map((c) => (
+                      <ClusterRow
+                        key={c.id}
+                        id={c.id}
+                        title={clusterName(c)}
+                        subtitle={clusterSubtitle(c)}
+                        stamp={formatRelativeStamp(c.last_assigned_at || c.updated_at)}
+                        accentColor={c.dominant_color || '#6b7280'}
+                        count={c.assignment_count ?? 0}
+                        recentCount={c.recent_assignment_count ?? 0}
+                        selected={selectedId === c.id}
+                        onSelect={setSelectedId}
+                        onRename={handleRename}
+                        onDelete={handleDelete}
+                        onTogglePause={handleTogglePause}
+                      />
+                    ))}
+
+                    {pausedClusters.length > 0 && (
+                      <>
+                        <div className="px-3 pt-3 pb-1 text-[11px] font-medium text-ide-muted">
+                          {t('smartClusters.pausedGroup', { count: pausedClusters.length })}
+                        </div>
+                        {pausedClusters.map((c) => (
+                          <ClusterRow
+                            key={c.id}
+                            id={c.id}
+                            title={clusterName(c)}
+                            subtitle={clusterSubtitle(c)}
+                            stamp={formatRelativeStamp(c.last_assigned_at || c.updated_at)}
+                            accentColor={c.dominant_color || '#6b7280'}
+                            count={c.assignment_count ?? 0}
+                            recentCount={c.recent_assignment_count ?? 0}
+                            paused
+                            selected={selectedId === c.id}
+                            onSelect={setSelectedId}
+                            onRename={handleRename}
+                            onDelete={handleDelete}
+                            onTogglePause={handleTogglePause}
+                          />
+                        ))}
+                      </>
+                    )}
+                  </>
+                )}
+            </div>
+          </>
+        )}
+      >
+
+        {/* Detail pane */}
+        {selected && (
+          <header className="flex min-h-14 shrink-0 items-center gap-3 border-b border-ide-border bg-ide-panel px-4 py-2">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 text-sm font-medium text-ide-text">
+                <span
+                  className="h-2 w-2 rounded-[3px]"
+                  style={{ backgroundColor: selected.dominant_color || '#6b7280' }}
+                  aria-hidden="true"
+                />
+                <span className="truncate" title={clusterName(selected)}>{clusterName(selected)}</span>
+                {!selected.enabled && (
+                  <span className="rounded border border-ide-border bg-ide-bg px-1.5 py-0.5 text-[10px] text-ide-muted">
+                    {t('smartClusters.paused')}
+                  </span>
+                )}
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ide-muted">
+                <span>
+                  {t('smartClusters.archived')}
+                  <span className="mx-1 font-mono text-ide-text">{selected.assignment_count ?? 0}</span>
+                  {t('smartClusters.snapshotsCount')}
+                </span>
+                {selected.display_name && selected.display_name !== selected.anchor_text && (
+                  <span className="truncate" title={selected.anchor_text}>
+                    {t('smartClusters.collecting', { text: selected.anchor_text })}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              <Button
+                variant="ghost"
+                size="xs"
+                icon={selected.enabled ? Pause : Play}
+                onClick={() => handleTogglePause(selected.id)}
+                title={selected.enabled ? t('clusterCard.actionPause') : t('clusterCard.actionResume')}
+                aria-label={selected.enabled ? t('clusterCard.actionPause') : t('clusterCard.actionResume')}
+              />
+              <Button
+                variant="ghost"
+                size="xs"
+                icon={Trash2}
+                onClick={() => handleDelete(selected.id)}
+                title={t('clusterCard.actionDelete')}
+                aria-label={t('clusterCard.actionDelete')}
+              />
+            </div>
+          </header>
+        )}
+        <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
+          {selected ? (
+            <div className="p-4 space-y-3">
+
+              {selectedSummary && (
+                <section className="rounded-md border border-ide-border bg-ide-panel/60 p-4 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-[15px] font-bold leading-6 text-ide-text">
+                        <FileText className="w-4 h-4 text-ide-accent" />
+                        <span>{selectedSummary.title || t('smartClusters.aiSummary')}</span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-ide-muted">
+                        {selectedSummary.model_name && (
+                          <span>{selectedSummary.model_provider ? `${selectedSummary.model_provider} · ` : ''}{selectedSummary.model_name}</span>
+                        )}
+                        {selectedSummary.source_snapshot_count !== null && selectedSummary.source_snapshot_count !== undefined && (
+                          <span>{t('smartClusters.summarySources', { count: selectedSummary.source_snapshot_count })}</span>
+                        )}
+                        {selectedSummary.updated_at && (
+                          <span>{t('smartClusters.summaryUpdatedAt', { time: formatTimestamp(selectedSummary.updated_at) })}</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {selectedSummary.summary && (
+                    <MarkdownText
+                      text={selectedSummary.summary}
+                      evidenceItems={selectedEvidence}
+                      onOpenCitation={handleOpenSummaryEvidence}
+                      className="space-y-2.5 text-[13px] font-normal leading-[1.65] text-ide-text/90"
+                    />
+                  )}
+
+                  {selectedSummary.ocr_summary && (
+                    <div className="space-y-2">
+                      <div className="text-xs font-semibold text-ide-muted">
+                        {t('smartClusters.ocrSummary')}
+                      </div>
+                      <MarkdownText
+                        text={selectedSummary.ocr_summary}
+                        evidenceItems={selectedEvidence}
+                        onOpenCitation={handleOpenSummaryEvidence}
+                        className="space-y-2.5 text-[13px] font-normal leading-[1.65] text-ide-text/85"
+                      />
+                    </div>
+                  )}
+
+                  {selectedKeyPoints.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="text-xs font-semibold text-ide-muted">
+                        {t('smartClusters.keyPoints')}
+                      </div>
+                      <ul className="space-y-1.5 text-[13px] font-normal leading-[1.6] text-ide-text/85">
+                        {selectedKeyPoints.map((item, idx) => {
+                          const text = formatKeyPoint(item);
+                          return text ? (
+                            <li key={idx} className="flex gap-2">
+                              <span className="mt-2.5 h-1.5 w-1.5 shrink-0 rounded-full bg-ide-muted/70" />
+                              <span className="min-w-0 break-words">
+                                <MarkdownInline text={text} evidenceItems={selectedEvidence} onOpenCitation={handleOpenSummaryEvidence} />
+                              </span>
+                            </li>
+                          ) : null;
+                        })}
+                      </ul>
+                    </div>
+                  )}
+
+                  {selectedEvidence.length > 0 && (
+                    <details className="group">
+                      <summary className="cursor-pointer select-none text-xs font-semibold text-ide-muted hover:text-ide-text">
+                        {t('smartClusters.evidence')}
+                      </summary>
+                      <ul className="mt-2 space-y-1 text-[11px] text-ide-muted">
+                        {selectedEvidence.map((item, idx) => {
+                          const evidence = formatEvidenceItem(item, idx);
+                          const label = evidence.text || t('smartClusters.evidenceSnapshot');
+                          const content = (
+                            <>
+                              <span className="inline-flex h-4 min-w-4 items-center justify-center rounded border border-ide-border bg-ide-bg px-1 text-[10px] text-ide-muted">
+                                {evidence.ref}
+                              </span>
+                              {evidence.snapshotId && (
+                                <span className="font-mono text-ide-accent">#{evidence.snapshotId}</span>
+                              )}
+                              <span className="min-w-0 break-words">{label}</span>
+                            </>
+                          );
+                          return (
+                            <li key={idx}>
+                              {evidence.payload ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenSummaryEvidence(item, idx)}
+                                  className="flex w-full items-start gap-2 rounded px-1 py-0.5 text-left hover:bg-ide-hover/30 hover:text-ide-text"
+                                  title={evidence.snapshotId ? `#${evidence.snapshotId}` : undefined}
+                                >
+                                  {content}
+                                </button>
+                              ) : (
+                                <div className="flex items-start gap-2 px-1 py-0.5">
+                                  {content}
+                                </div>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </details>
+                  )}
+                </section>
+              )}
+
+              {/* Assignments */}
+              {assignments.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-40 text-sm text-ide-muted gap-2">
+                  <Clock className="w-6 h-6 opacity-40" />
+                  <span>{t('smartClusters.noAssignments')}</span>
+                  <span className="text-[11px] opacity-70">
+                    {t('smartClusters.idleProcessingHint')}
+                  </span>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                  {assignments.map((s) => (
+                    <ThumbnailCard
+                      key={s.screenshot_id}
+                      sourceType="clusters"
+                      item={{
+                        screenshot_id: s.screenshot_id,
+                        image_path: s.image_path,
+                        process_name: s.process_name,
+                        window_title: s.window_title,
+                        category: s.category,
+                        created_at: s.created_at,
+                        assigned_at: s.assigned_at,
+                      }}
+                      preloadedSrc={thumbnailCache[s.screenshot_id] || null}
+                      onSelect={(payload) => {
+                        onSelectScreenshot?.({ ...payload, assigned_at: s.assigned_at });
+                      }}
+                      onOpenFloatingPreview={onOpenSnapshotPreview
+                        ? (payload) => {
+                          onOpenSnapshotPreview({ ...payload, assigned_at: s.assigned_at }, {
+                            thumbnailSrc: thumbnailCache[s.screenshot_id] || null,
+                            sourceLabel: t('smartClusters.title'),
+                            sourceDetail: clusterName(selected),
+                            sourceType: 'smart-cluster',
+                          });
+                        }
+                        : undefined}
+                      footerPersistent={false}
                     />
                   ))}
-                </>
+                </div>
               )}
-            </>
+            </div>
+          ) : (
+            <div className="flex h-full items-center justify-center px-8">
+              <div className="w-full max-w-md">
+                {clusters.length === 0 ? (
+                  <div className="text-center">
+                    <Sparkles className="mx-auto h-9 w-9 text-ide-muted/40" />
+                    <p className="mt-4 text-sm font-medium text-ide-text">
+                      {t('smartClusters.noClusters')}
+                    </p>
+                    <p className="mx-auto mt-2 max-w-xs text-[12px] leading-relaxed text-ide-muted">
+                      {t('smartClusters.overviewEmptyHint')}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setCreating(true)}
+                      className="mx-auto mt-5 flex h-[34px] items-center gap-1.5 rounded-md bg-ide-accent px-4 text-xs font-medium text-white transition hover:brightness-110"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      {t('smartClusters.newCluster')}
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-baseline gap-2">
+                      <span className="font-mono text-[34px] leading-none tabular-nums text-ide-text">
+                        {overview.total}
+                      </span>
+                      <span className="text-[12px] text-ide-muted">
+                        {t('smartClusters.overviewTotal', {
+                          count: clusters.length,
+                        })}
+                      </span>
+                    </div>
+
+                    <dl className="mt-6 space-y-3 border-t border-ide-border pt-4 text-[12px]">
+                      <div className="flex items-baseline justify-between gap-4">
+                        <dt className="text-ide-muted">{t('smartClusters.overviewRecent')}</dt>
+                        <dd className="font-mono tabular-nums text-ide-text">{overview.recent}</dd>
+                      </div>
+                      {overview.latest && (
+                        <div className="flex items-baseline justify-between gap-4">
+                          <dt className="shrink-0 text-ide-muted">
+                            {t('smartClusters.overviewLatest')}
+                          </dt>
+                          <dd className="flex min-w-0 items-center gap-2 text-ide-text">
+                            <span
+                              className="h-2 w-2 shrink-0 rounded-[3px]"
+                              style={{ backgroundColor: overview.latest.dominant_color || '#6b7280' }}
+                              aria-hidden="true"
+                            />
+                            <span className="truncate" title={clusterName(overview.latest)}>
+                              {clusterName(overview.latest)}
+                            </span>
+                            <span className="shrink-0 font-mono text-[11px] text-ide-muted">
+                              {formatRelativeStamp(overview.latest.last_assigned_at)}
+                            </span>
+                          </dd>
+                        </div>
+                      )}
+                      {pendingCount > 0 && (
+                        <div className="flex items-baseline justify-between gap-4">
+                          <dt className="text-ide-muted">{t('smartClusters.overviewPending')}</dt>
+                          <dd className="font-mono tabular-nums text-ide-text">{pendingCount}</dd>
+                        </div>
+                      )}
+                    </dl>
+
+                    <p className="mt-6 text-[12px] text-ide-muted">
+                      {t('smartClusters.selectClusterToView')}
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
           )}
         </div>
 
-        {/* Detail pane */}
-        <div className="relative flex-1 min-h-0 overflow-hidden">
-          <div className="h-full overflow-y-auto">
-            {selected ? (
-              <div className="p-4 space-y-3">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 text-sm font-medium text-ide-text">
-                      <span
-                        className="h-2 w-2 rounded-[3px]"
-                        style={{ backgroundColor: selected.dominant_color || '#6b7280' }}
-                        aria-hidden="true"
-                      />
-                      <span className="truncate">{clusterName(selected)}</span>
-                      {!selected.enabled && (
-                        <span className="rounded border border-ide-border bg-ide-bg px-1.5 py-0.5 text-[10px] text-ide-muted">
-                          {t('smartClusters.paused')}
-                        </span>
-                      )}
-                    </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ide-muted">
-                      <span>
-                        {t('smartClusters.archived')}
-                        <span className="mx-1 font-mono text-ide-text">{selected.assignment_count ?? 0}</span>
-                        {t('smartClusters.snapshotsCount')}
-                      </span>
-                      {selected.display_name && selected.display_name !== selected.anchor_text && (
-                        <span className="truncate" title={selected.anchor_text}>
-                          {t('smartClusters.collecting', { text: selected.anchor_text })}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {selectedSummary && (
-                  <section className="rounded-md border border-ide-border bg-ide-panel/60 p-4 space-y-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2 text-[15px] font-bold leading-6 text-ide-text">
-                          <FileText className="w-4 h-4 text-ide-accent" />
-                          <span>{selectedSummary.title || t('smartClusters.aiSummary')}</span>
-                        </div>
-                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-ide-muted">
-                          {selectedSummary.model_name && (
-                            <span>{selectedSummary.model_provider ? `${selectedSummary.model_provider} · ` : ''}{selectedSummary.model_name}</span>
-                          )}
-                          {selectedSummary.source_snapshot_count !== null && selectedSummary.source_snapshot_count !== undefined && (
-                            <span>{t('smartClusters.summarySources', { count: selectedSummary.source_snapshot_count })}</span>
-                          )}
-                          {selectedSummary.updated_at && (
-                            <span>{t('smartClusters.summaryUpdatedAt', { time: formatTimestamp(selectedSummary.updated_at) })}</span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {selectedSummary.summary && (
-                      <MarkdownText
-                        text={selectedSummary.summary}
-                        evidenceItems={selectedEvidence}
-                        onOpenCitation={handleOpenSummaryEvidence}
-                        className="space-y-2.5 text-[13px] font-normal leading-[1.65] text-ide-text/90"
-                      />
-                    )}
-
-                    {selectedSummary.ocr_summary && (
-                      <div className="space-y-2">
-                        <div className="text-xs font-semibold text-ide-muted">
-                          {t('smartClusters.ocrSummary')}
-                        </div>
-                        <MarkdownText
-                          text={selectedSummary.ocr_summary}
-                          evidenceItems={selectedEvidence}
-                          onOpenCitation={handleOpenSummaryEvidence}
-                          className="space-y-2.5 text-[13px] font-normal leading-[1.65] text-ide-text/85"
-                        />
-                      </div>
-                    )}
-
-                    {selectedKeyPoints.length > 0 && (
-                      <div className="space-y-2">
-                        <div className="text-xs font-semibold text-ide-muted">
-                          {t('smartClusters.keyPoints')}
-                        </div>
-                        <ul className="space-y-1.5 text-[13px] font-normal leading-[1.6] text-ide-text/85">
-                          {selectedKeyPoints.map((item, idx) => {
-                            const text = formatKeyPoint(item);
-                            return text ? (
-                              <li key={idx} className="flex gap-2">
-                                <span className="mt-2.5 h-1.5 w-1.5 shrink-0 rounded-full bg-ide-muted/70" />
-                                <span className="min-w-0 break-words">
-                                  <MarkdownInline text={text} evidenceItems={selectedEvidence} onOpenCitation={handleOpenSummaryEvidence} />
-                                </span>
-                              </li>
-                            ) : null;
-                          })}
-                        </ul>
-                      </div>
-                    )}
-
-                    {selectedEvidence.length > 0 && (
-                      <details className="group">
-                        <summary className="cursor-pointer select-none text-xs font-semibold text-ide-muted hover:text-ide-text">
-                          {t('smartClusters.evidence')}
-                        </summary>
-                        <ul className="mt-2 space-y-1 text-[11px] text-ide-muted">
-                          {selectedEvidence.map((item, idx) => {
-                            const evidence = formatEvidenceItem(item, idx);
-                            const label = evidence.text || t('smartClusters.evidenceSnapshot');
-                            const content = (
-                              <>
-                                <span className="inline-flex h-4 min-w-4 items-center justify-center rounded border border-ide-border bg-ide-bg px-1 text-[10px] text-ide-muted">
-                                  {evidence.ref}
-                                </span>
-                                {evidence.snapshotId && (
-                                  <span className="font-mono text-ide-accent">#{evidence.snapshotId}</span>
-                                )}
-                                <span className="min-w-0 break-words">{label}</span>
-                              </>
-                            );
-                            return (
-                              <li key={idx}>
-                                {evidence.payload ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenSummaryEvidence(item, idx)}
-                                    className="flex w-full items-start gap-2 rounded px-1 py-0.5 text-left hover:bg-ide-hover/30 hover:text-ide-text"
-                                    title={evidence.snapshotId ? `#${evidence.snapshotId}` : undefined}
-                                  >
-                                    {content}
-                                  </button>
-                                ) : (
-                                  <div className="flex items-start gap-2 px-1 py-0.5">
-                                    {content}
-                                  </div>
-                                )}
-                              </li>
-                            );
-                          })}
-                        </ul>
-                      </details>
-                    )}
-                  </section>
-                )}
-
-                {/* Assignments */}
-                {assignments.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center h-40 text-sm text-ide-muted gap-2">
-                    <Clock className="w-6 h-6 opacity-40" />
-                    <span>{t('smartClusters.noAssignments')}</span>
-                    <span className="text-[11px] opacity-70">
-                      {t('smartClusters.idleProcessingHint')}
-                    </span>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                    {assignments.map((s) => (
-                      <ThumbnailCard
-                        key={s.screenshot_id}
-                        sourceType="clusters"
-                        item={{
-                          screenshot_id: s.screenshot_id,
-                          image_path: s.image_path,
-                          process_name: s.process_name,
-                          window_title: s.window_title,
-                          category: s.category,
-                          created_at: s.created_at,
-                          assigned_at: s.assigned_at,
-                        }}
-                        preloadedSrc={thumbnailCache[s.screenshot_id] || null}
-                        onSelect={(payload) => {
-                          onSelectScreenshot?.({ ...payload, assigned_at: s.assigned_at });
-                        }}
-                        onOpenFloatingPreview={onOpenSnapshotPreview
-                          ? (payload) => {
-                            onOpenSnapshotPreview({ ...payload, assigned_at: s.assigned_at }, {
-                              thumbnailSrc: thumbnailCache[s.screenshot_id] || null,
-                              sourceLabel: t('smartClusters.title'),
-                              sourceDetail: clusterName(selected),
-                              sourceType: 'smart-cluster',
-                            });
-                          }
-                          : undefined}
-                        footerPersistent={false}
-                      />
-                    ))}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="flex h-full items-center justify-center px-8">
-                <div className="w-full max-w-md">
-                  {clusters.length === 0 ? (
-                    <div className="text-center">
-                      <Sparkles className="mx-auto h-9 w-9 text-ide-muted/40" />
-                      <p className="mt-4 text-sm font-medium text-ide-text">
-                        {t('smartClusters.noClusters')}
-                      </p>
-                      <p className="mx-auto mt-2 max-w-xs text-[12px] leading-relaxed text-ide-muted">
-                        {t('smartClusters.overviewEmptyHint')}
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => setCreating(true)}
-                        className="mx-auto mt-5 flex h-[34px] items-center gap-1.5 rounded-md bg-ide-accent px-4 text-xs font-medium text-white transition hover:brightness-110"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        {t('smartClusters.newCluster')}
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex items-baseline gap-2">
-                        <span className="font-mono text-[34px] leading-none tabular-nums text-ide-text">
-                          {overview.total}
-                        </span>
-                        <span className="text-[12px] text-ide-muted">
-                          {t('smartClusters.overviewTotal', {
-                            count: clusters.length,
-                          })}
-                        </span>
-                      </div>
-
-                      <dl className="mt-6 space-y-3 border-t border-ide-border pt-4 text-[12px]">
-                        <div className="flex items-baseline justify-between gap-4">
-                          <dt className="text-ide-muted">{t('smartClusters.overviewRecent')}</dt>
-                          <dd className="font-mono tabular-nums text-ide-text">{overview.recent}</dd>
-                        </div>
-                        {overview.latest && (
-                          <div className="flex items-baseline justify-between gap-4">
-                            <dt className="shrink-0 text-ide-muted">
-                              {t('smartClusters.overviewLatest')}
-                            </dt>
-                            <dd className="flex min-w-0 items-center gap-2 text-ide-text">
-                              <span
-                                className="h-2 w-2 shrink-0 rounded-[3px]"
-                                style={{ backgroundColor: overview.latest.dominant_color || '#6b7280' }}
-                                aria-hidden="true"
-                              />
-                              <span className="truncate" title={clusterName(overview.latest)}>
-                                {clusterName(overview.latest)}
-                              </span>
-                              <span className="shrink-0 font-mono text-[11px] text-ide-muted">
-                                {formatRelativeStamp(overview.latest.last_assigned_at)}
-                              </span>
-                            </dd>
-                          </div>
-                        )}
-                        {pendingCount > 0 && (
-                          <div className="flex items-baseline justify-between gap-4">
-                            <dt className="text-ide-muted">{t('smartClusters.overviewPending')}</dt>
-                            <dd className="font-mono tabular-nums text-ide-text">{pendingCount}</dd>
-                          </div>
-                        )}
-                      </dl>
-
-                      <p className="mt-6 text-[12px] text-ide-muted">
-                        {t('smartClusters.selectClusterToView')}
-                      </p>
-                    </>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-        </div>
-      </div>
+      </ResizableSplitPane>
       <ConfirmDialog
         isOpen={Boolean(pendingDeleteId)}
         onCancel={handleCancelDelete}

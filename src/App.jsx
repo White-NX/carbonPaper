@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
-import Timeline from './components/Timeline';
+import WorkspaceTimelines from './components/WorkspaceTimelines';
 import { useSettingsHost } from './hooks/useSettingsHost';
 import { useSavedCaptureFilters } from './components/settings/hooks/useSavedCaptureFilters';
 import Mask from './components/Mask';
@@ -310,21 +310,7 @@ function App() {
 
         <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings} />
 
-        <Timeline
-          onSelectEvent={(evt) => {
-            setSelectedEvent(evt);
-            setHighlightedEventId(evt?.id ?? null);
-          }}
-          onClearHighlight={() => setHighlightedEventId(null)}
-          jumpTimestamp={timelineJump}
-          highlightedEventId={highlightedEventId}
-          refreshKey={timelineRefreshKey}
-          sqlPaused={!windowFocused}
-          searchState={activeTab === 'advanced-search' ? timelineSearch : null}
-          onSelectSearchResult={selectSearchResult}
-        />
-
-        <main className="flex-1 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
+        <main className="flex-1 min-h-0 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
           <ActivityBar
             activeTab={activeTab}
             setActiveTab={setActiveTab}
@@ -332,45 +318,62 @@ function App() {
             onToggleExpand={() => setSidebarExpanded((prev) => !prev)}
           />
 
-          <MainArea
-            activeTab={activeTab}
-            setActiveTab={setActiveTab}
-            selectedImageSrc={selectedImageSrc}
-            isLoadingDetails={isLoadingDetails}
-            selectedEvent={selectedEvent}
-            selectedDetails={selectedDetails}
-            lastError={lastError}
-            ocrBoxes={ocrBoxes}
-            advancedSearchParams={advancedSearchParams}
-            searchMode={searchMode}
-            onSearchModeChange={setSearchMode}
-            isAuthenticated={isAuthenticated}
-            onTimelineSearchChange={setTimelineSearch}
-            onAdvancedSelect={selectSearchResult}
-            onInspectorBoxClick={(box) => handleCopyText(box.label)}
-            onDeleteRecord={async (id) => {
-              try {
-                await deleteScreenshot(id);
-                clearSelection();
-                bumpTimelineRefresh();
-              } catch (e) {
-                console.error('Failed to delete record', e);
-              }
-            }}
-            onDeleteNearbyRecords={async (timestamp, minutes) => {
-              try {
-                const ts = normalizeTimestampToMs(timestamp);
-                if (ts) {
-                  await deleteRecordsByTimeRange(minutes, ts);
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            <WorkspaceTimelines
+              activeTab={activeTab}
+              onSelectEvent={(evt) => {
+                setSelectedEvent(evt);
+                setHighlightedEventId(evt?.id ?? null);
+              }}
+              onClearHighlight={() => setHighlightedEventId(null)}
+              jumpTimestamp={timelineJump}
+              highlightedEventId={highlightedEventId}
+              refreshKey={timelineRefreshKey}
+              sqlPaused={!windowFocused}
+              searchState={timelineSearch}
+              onSelectSearchResult={selectSearchResult}
+            />
+
+            <MainArea
+              activeTab={activeTab}
+              setActiveTab={setActiveTab}
+              selectedImageSrc={selectedImageSrc}
+              isLoadingDetails={isLoadingDetails}
+              selectedEvent={selectedEvent}
+              selectedDetails={selectedDetails}
+              lastError={lastError}
+              ocrBoxes={ocrBoxes}
+              advancedSearchParams={advancedSearchParams}
+              searchMode={searchMode}
+              onSearchModeChange={setSearchMode}
+              isAuthenticated={isAuthenticated}
+              onTimelineSearchChange={setTimelineSearch}
+              onAdvancedSelect={selectSearchResult}
+              onInspectorBoxClick={(box) => handleCopyText(box.label)}
+              onDeleteRecord={async (id) => {
+                try {
+                  await deleteScreenshot(id);
+                  clearSelection();
+                  bumpTimelineRefresh();
+                } catch (e) {
+                  console.error('Failed to delete record', e);
                 }
-                clearSelection();
-                bumpTimelineRefresh();
-              } catch (e) {
-                console.error('Failed to delete nearby records', e);
-              }
-            }}
-            onCopyText={handleCopyText}
-          />
+              }}
+              onDeleteNearbyRecords={async (timestamp, minutes) => {
+                try {
+                  const ts = normalizeTimestampToMs(timestamp);
+                  if (ts) {
+                    await deleteRecordsByTimeRange(minutes, ts);
+                  }
+                  clearSelection();
+                  bumpTimelineRefresh();
+                } catch (e) {
+                  console.error('Failed to delete nearby records', e);
+                }
+              }}
+              onCopyText={handleCopyText}
+            />
+          </div>
         </main>
       </div>
 
