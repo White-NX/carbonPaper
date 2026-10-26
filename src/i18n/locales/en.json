@@ -1441,6 +1441,7 @@
     "confirmDeleteTitle": "Delete smart cluster?",
     "confirmDelete": "Delete this smart cluster? Assigned snapshots will not be deleted.",
     "newCluster": "New smart cluster",
+    "resizeList": "Resize cluster list",
     "processNowTooltip": "Process pending snapshots queue now",
     "processNow": "Process Now",
     "retryFailed": "Retry",
@@ -1707,6 +1708,9 @@
     "zoomToday": "Zoom to today",
     "jumpToNow": "Jump to Now",
     "fitSearchResults": "Fit loaded search results",
+    "label": "Screenshot timeline",
+    "collapse": "Collapse timeline",
+    "expand": "Expand timeline",
     "duration": {
       "seconds": "{{seconds}}s",
       "minutes": "{{minutes}}m",

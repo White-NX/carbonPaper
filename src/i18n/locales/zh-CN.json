@@ -1441,6 +1441,7 @@
     "confirmDeleteTitle": "删除智能聚类？",
     "confirmDelete": "确定删除此智能聚类？已归档的快照不会被删除。",
     "newCluster": "新建智能聚类",
+    "resizeList": "调整聚类列表宽度",
     "processNowTooltip": "立即处理待归档快照队列",
     "processNow": "立即处理",
     "retryFailed": "重试",
@@ -1707,6 +1708,9 @@
     "zoomToday": "缩放到当日",
     "jumpToNow": "跳转到现在",
     "fitSearchResults": "缩放到已加载的搜索结果",
+    "label": "截图时间线",
+    "collapse": "收起时间线",
+    "expand": "展开时间线",
     "duration": {
       "seconds": "{{seconds}}秒",
       "minutes": "{{minutes}}分",
