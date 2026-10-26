@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next';
 import { ChevronDown, ChevronUp, Focus, Play } from 'lucide-react';
 import { Button } from './ui/Button';
-import { getTimeline, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
+import { getTimeline, getTimelineDetails, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
 import {
   aggregateAppDistribution,
   buildSessions,
@@ -27,6 +27,7 @@ import DetailTrack from './timeline/DetailTrack';
 import SearchMarkerLayer from './timeline/SearchMarkerLayer';
 import { getSearchMarkerFitRange } from '../lib/timeline_search';
 import { createTimelineRequestQueue } from '../lib/timeline_requests';
+import { createTimelineBatchQueue } from '../lib/timeline_batch_queue';
 
 const MINUTE = 60000;
 const HOUR = 3600000;
@@ -72,7 +73,6 @@ const OVERVIEW_REFETCH_MARGIN_RATIO = 0.1;
 const EVENT_FETCH_INTERVAL_MS = 300;
 const DENSITY_FETCH_INTERVAL_MS = 350;
 const OVERVIEW_FETCH_INTERVAL_MS = 500;
-const THUMBNAIL_BATCH_INTERVAL_MS = 250;
 
 /** Density bars aimed for across one screen width, and across the overview band. */
 const DENSITY_BUCKETS_PER_SCREEN = 120;
@@ -106,8 +106,6 @@ function localBucketOffsetMs() {
 
 const TIMELINE_IMAGE_CACHE_LIMIT = 800;
 const timelineImageCache = new Map();
-/** Ids the backend holds no thumbnail for, so a batch is not asked for them forever. */
-const timelineImageMissing = new Set();
 
 function setTimelineImageCache(key, dataUrl) {
   if (key === null || key === undefined || !dataUrl) return;
@@ -116,14 +114,6 @@ function setTimelineImageCache(key, dataUrl) {
     timelineImageCache.delete(oldestKey);
   }
   timelineImageCache.set(key, dataUrl);
-}
-
-/** Record a missing thumbnail, evicting the oldest so the set stays bounded. */
-function markTimelineImageMissing(key) {
-  if (!timelineImageMissing.has(key) && timelineImageMissing.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
-    timelineImageMissing.delete(timelineImageMissing.values().next().value);
-  }
-  timelineImageMissing.add(key);
 }
 
 function getTickStep(zoom) {
@@ -173,6 +163,7 @@ const Timeline = ({
 
   const [width, setWidth] = useState(0);
   const [events, setEvents] = useState([]);
+  const [rangePending, setRangePending] = useState(false);
   const [densityBuckets, setDensityBuckets] = useState([]);
   const [overviewBuckets, setOverviewBuckets] = useState([]);
   const [imageEpoch, setImageEpoch] = useState(0);
@@ -211,8 +202,13 @@ const Timeline = ({
   const liveViewRef = useRef({ center: 0, span: 0 });
   const overviewViewRef = useRef({ anchor: 0, span: 0 });
   const zoomLevelRef = useRef(null);
-  const thumbnailInFlightRef = useRef(false);
-  const loadThumbnailsRef = useRef(null);
+  const syncLoadersRef = useRef(null);
+  const detailsCacheRef = useRef(new Map());
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const pipelinePausedRef = useRef(true);
+  pipelinePausedRef.current = Boolean(sqlPaused) || rangePending;
+  const frameTierRef = useRef(false);
 
   /** Elements the camera moves, and the axis it repositions label by label. */
   const sessionStageRef = useRef(null);
@@ -234,6 +230,75 @@ const Timeline = ({
     : visibleSpan <= SESSION_TIER_MAX_SPAN
       ? 'session'
       : 'day';
+  frameTierRef.current = tier === 'frame';
+
+  const imageQueue = useMemo(() => createTimelineBatchQueue(fetchThumbnailBatch, {
+    batchSize: 6,
+    isLoaded: (id) => timelineImageCache.has(id),
+    onResult: (batch, ids) => {
+      const added = [];
+      for (const id of ids) {
+        if (batch?.[id]) {
+          setTimelineImageCache(id, batch[id]);
+          added.push(id);
+        }
+      }
+      if (added.length) setImageEpoch((prev) => prev + 1);
+      return added;
+    },
+    onError: (error) => console.error('[Timeline] Batch thumbnail load error:', error),
+    onSettled: () => syncLoadersRef.current?.(),
+  }), []);
+
+  const detailsQueue = useMemo(() => createTimelineBatchQueue(getTimelineDetails, {
+    batchSize: 12,
+    isLoaded: (id) => detailsCacheRef.current.has(id),
+    onResult: (records, ids) => {
+      const current = new Set(eventsRef.current.map((event) => event.id));
+      const requested = new Set(ids);
+      const accepted = [];
+      for (const record of records || []) {
+        if (!current.has(record.id) || !requested.has(record.id)) continue;
+        detailsCacheRef.current.set(record.id, {
+          appName: record.process_name,
+          windowTitle: record.window_title,
+          processIcon: record.process_icon || null,
+          processPath: record.process_path || null,
+        });
+        accepted.push(record.id);
+      }
+      if (accepted.length) setEvents((prev) => prev.map((event) => ({
+        ...event, ...detailsCacheRef.current.get(event.id),
+      })));
+      return accepted;
+    },
+    onError: (error) => console.error('[Timeline] Detail load error:', error),
+  }), []);
+
+  const syncLoaders = useCallback(() => {
+    const paused = pipelinePausedRef.current;
+    const currentIds = eventsRef.current.map((event) => event.id);
+    const current = new Set(currentIds);
+    const visible = frameTierRef.current
+      ? pendingImageIdsRef.current.filter((id) => current.has(id)) : [];
+    // Let visible images finish before labels compete for the same CNG handle.
+    detailsQueue.setIds([...visible, ...currentIds], { paused: paused || imageQueue.isBusy(visible) });
+    imageQueue.setIds(visible, { paused });
+  }, [imageQueue, detailsQueue]);
+
+  useEffect(() => {
+    syncLoadersRef.current = syncLoaders;
+    syncLoaders();
+    return () => {
+      syncLoadersRef.current = null;
+      imageQueue.setPaused(true);
+      detailsQueue.setPaused(true);
+      imageQueue.reset();
+      detailsQueue.reset();
+    };
+  }, [syncLoaders, imageQueue, detailsQueue]);
+
+  useEffect(() => { syncLoaders(); }, [events, sqlPaused, rangePending, tier, syncLoaders]);
 
   // Snapped so the band, and the fetch behind it, hold still inside a zoom level
   const overviewSpan = Math.max(
@@ -335,8 +400,10 @@ const Timeline = ({
   // ── Data Fetching ──────────────────────────────────────────
 
   const eventRequests = useMemo(() => createTimelineRequestQueue(
-    ({ start, end }, signal) => getTimeline(start, end, TIMELINE_SAMPLE_LIMIT, { signal }),
-    { onResult: (records, { start, end, sampleMs }) => {
+    ({ start, end }, signal) => getTimeline(start, end, TIMELINE_SAMPLE_LIMIT, { signal, includeDetails: false }),
+    { onBusyChange: (pending) => {
+      if (syncLoadersRef.current) setRangePending(pending);
+    }, onResult: (records, { start, end, sampleMs }) => {
       const mapped = (records || [])
         .filter((record) => record.timestamp != null)
         .map((record) => {
@@ -351,6 +418,7 @@ const Timeline = ({
             processIcon: record.process_icon || null,
             processPath: record.process_path || null,
             category: record.category || null,
+            ...detailsCacheRef.current.get(record.id),
           };
         })
         .filter((event) => !Number.isNaN(event.timestamp));
@@ -363,9 +431,14 @@ const Timeline = ({
       const sameFidelity = loadedSampleMsRef.current === sampleMs;
       loadedSampleMsRef.current = sampleMs;
 
-      setEvents((prev) => (sameFidelity
-        ? pruneEvents(mergeSortedEvents(prev, mapped), start, end)
-        : mapped));
+      setEvents((prev) => {
+        const next = sameFidelity ? pruneEvents(mergeSortedEvents(prev, mapped), start, end) : mapped;
+        const live = new Set(next.map((event) => event.id));
+        for (const id of detailsCacheRef.current.keys()) {
+          if (!live.has(id)) detailsCacheRef.current.delete(id);
+        }
+        return next;
+      });
     }, onError: (error, range) => {
       console.error('[Timeline] Fetch error:', error);
       // Forget the request so the range guard tries again rather than believing
@@ -526,7 +599,9 @@ const Timeline = ({
   useEffect(() => {
     if (refreshKey === undefined || !width) return;
     setEvents([]);
-    timelineImageMissing.clear();
+    detailsCacheRef.current.clear();
+    imageQueue.reset();
+    detailsQueue.reset();
     requestedEventsRef.current = null;
     requestedDensityRef.current = null;
     requestedOverviewRef.current = null;
@@ -587,69 +662,8 @@ const Timeline = ({
 
   const handleVisibleFramesChange = useCallback((ids) => {
     pendingImageIdsRef.current = ids;
+    syncLoadersRef.current?.();
   }, []);
-
-  /**
-   * Load thumbnails for whatever is on screen right now.
-   *
-   * Only one batch is in flight at a time, and a successful batch immediately
-   * asks for another round, so a drag keeps filling in frames instead of waiting
-   * for the pointer to be released.
-   */
-  const loadVisibleThumbnails = useCallback(() => {
-    if (thumbnailInFlightRef.current) return;
-
-    const ids = pendingImageIdsRef.current;
-    if (!ids || ids.length === 0) return;
-
-    const wanted = ids.filter(
-      (id) => !timelineImageCache.has(id) && !timelineImageMissing.has(id),
-    );
-    if (wanted.length === 0) return;
-
-    thumbnailInFlightRef.current = true;
-    fetchThumbnailBatch(wanted)
-      .then((batch) => {
-        let added = 0;
-        for (const id of wanted) {
-          const dataUrl = batch?.[id];
-          if (dataUrl) {
-            setTimelineImageCache(id, dataUrl);
-            added += 1;
-          } else {
-            // Remember the gap, otherwise these ids are asked for on every round
-            markTimelineImageMissing(id);
-          }
-        }
-        if (added > 0) setImageEpoch((prev) => prev + 1);
-
-        thumbnailInFlightRef.current = false;
-        // A round may have been skipped while this batch was in flight
-        loadThumbnailsRef.current?.();
-      })
-      .catch((error) => {
-        thumbnailInFlightRef.current = false;
-        console.error('[Timeline] Batch thumbnail load error:', error);
-      });
-  }, []);
-
-  const requestThumbnails = useMemo(
-    () => createThrottle(loadVisibleThumbnails, THUMBNAIL_BATCH_INTERVAL_MS),
-    [loadVisibleThumbnails],
-  );
-
-  useEffect(() => {
-    loadThumbnailsRef.current = sqlPaused ? null : requestThumbnails;
-    return () => {
-      loadThumbnailsRef.current = null;
-      requestThumbnails.cancel();
-    };
-  }, [sqlPaused, requestThumbnails]);
-
-  useEffect(() => {
-    if (sqlPaused || tier !== 'frame') return;
-    requestThumbnails();
-  }, [centerTime, zoom, width, events, sqlPaused, tier, requestThumbnails]);
 
   // ── Derived Data ───────────────────────────────────────────
 

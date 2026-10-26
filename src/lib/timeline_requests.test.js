@@ -10,7 +10,9 @@ function fixture() {
   }));
   const onResult = vi.fn();
   const onError = vi.fn();
-  return { calls, load, onResult, onError, queue: createTimelineRequestQueue(load, { onResult, onError }) };
+  const onBusyChange = vi.fn();
+  return { calls, load, onResult, onError, onBusyChange,
+    queue: createTimelineRequestQueue(load, { onResult, onError, onBusyChange }) };
 }
 
 describe('timeline request scheduling', () => {
@@ -22,12 +24,14 @@ describe('timeline request scheduling', () => {
     expect(f.calls[0].signal.aborted).toBe(true);
     f.calls[0].resolve(['stale']);
     await flush();
+    expect(f.onBusyChange.mock.calls).toEqual([[true]]);
     expect(f.onResult).not.toHaveBeenCalled();
     expect(f.calls).toHaveLength(2);
     expect(f.calls[1].viewport).toEqual(range(30));
     f.calls[1].resolve(['latest']);
     await flush();
     expect(f.onResult).toHaveBeenCalledWith(['latest'], range(30));
+    expect(f.onBusyChange.mock.calls).toEqual([[true], [false]]);
   });
 
   it('coalesces repeated refreshes without aborting or starving a useful result', async () => {

@@ -94,6 +94,7 @@ export function useSearchBoxController({
   const wasPausedRef = useRef(null);
   const handleResumeMonitorRef = useRef(handleResumeMonitor);
   const mode = controlledMode ?? localMode;
+  const pictureQuery = mode === 'nl' ? query.trim() : null;
   const setMode = onModeChange ?? setLocalMode;
   const isMigrating = useHmacMigrationStatus();
 
@@ -111,13 +112,15 @@ export function useSearchBoxController({
   }, []);
 
   useEffect(() => {
-    if (debouncedQuery.trim().length === 0) {
+    if (debouncedQuery.trim().length === 0 || pictureQuery === '') {
       setResults([]);
       setError(null);
       setLoading(false);
       setShowResults(false);
       return;
     }
+    // Clearing a picture query cancels immediately; edits wait for the debounce.
+    if (pictureQuery !== null && pictureQuery !== debouncedQuery.trim()) return;
 
     let active = true;
     const doSearch = async () => {
@@ -147,10 +150,10 @@ export function useSearchBoxController({
     return () => {
       active = false;
     };
-  }, [debouncedQuery, mode]);
+  }, [debouncedQuery, mode, pictureQuery]);
 
   useEffect(() => {
-    if (!results.length) {
+    if (!results.length || mode === 'nl') {
       setThumbCache({});
       return undefined;
     }

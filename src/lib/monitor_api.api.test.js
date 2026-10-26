@@ -12,6 +12,7 @@ vi.mock('./auth_api', () => ({
 import { withAuth } from './auth_api';
 import {
   fetchImage,
+  fetchSearchImage,
   fetchThumbnail,
   fetchTimelineImage,
   REQUEST_DEADLINES,
@@ -21,6 +22,8 @@ import {
   resumeOfficeDocument,
   updateMonitorFilters,
   getTimeline,
+  getTimelineDetails,
+  fetchThumbnailBatch,
 } from './monitor_api';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -73,6 +76,69 @@ describe('monitor_api command wrappers', () => {
     controller.abort();
     await expect(getTimeline(100, 200, 500, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('requests lightweight timeline headers only when the caller opts in', async () => {
+    invoke.mockResolvedValue([]);
+    await getTimeline(100, 200);
+    expect(invoke.mock.calls[0][1]).not.toHaveProperty('includeDetails');
+    await getTimeline(100, 200, 500, { includeDetails: false });
+    expect(invoke).toHaveBeenLastCalledWith('storage_get_timeline', {
+      startTime: 100, endTime: 200, maxRecords: 500, includeDetails: false,
+      requestId: expect.any(String),
+    });
+    expectWithAuth(2);
+  });
+
+  it('cancels deferred timeline details and discards results after backend acknowledgement', async () => {
+    let finish;
+    invoke.mockImplementation((command) => command === 'storage_get_timeline_details'
+      ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
+    const controller = new AbortController();
+    const request = getTimelineDetails([12, 34], { signal: controller.signal });
+    const assertion = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    const params = invoke.mock.calls[0][1];
+    expect(params).toEqual({ ids: [12, 34], requestId: expect.any(String) });
+    expectWithAuth(1);
+    controller.abort();
+    expect(invoke).toHaveBeenCalledWith('storage_cancel_timeline', { requestId: params.requestId });
+    finish([{ id: 12 }]);
+    await assertion;
+  });
+
+  it('does not admit deferred details or thumbnails with an already cancelled signal', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(getTimelineDetails([1], { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(fetchThumbnailBatch([1], { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('waits for thumbnail IPC to settle before rejecting a cancelled batch', async () => {
+    let finish;
+    invoke.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const settled = vi.fn();
+    const request = fetchThumbnailBatch([1, 2], { signal: controller.signal }).catch(settled);
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    finish({ results: { 1: { status: 'success', data: 'stale' } } });
+    await request;
+    expect(settled.mock.calls[0][0].name).toBe('AbortError');
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps successful thumbnail entries while retaining partial batch results', async () => {
+    invoke.mockResolvedValue({ results: {
+      1: { status: 'success', data: 'first' },
+      2: { status: 'error', error: 'unavailable' },
+      3: { status: 'success', mime_type: 'image/png', data: 'third' },
+    } });
+    await expect(fetchThumbnailBatch([1, 2, 3])).resolves.toEqual({
+      1: 'data:image/jpeg;base64,first', 3: 'data:image/png;base64,third',
+    });
+    expectWithAuth(1);
   });
 
   it('calls Rust visual search with the stable command payload', async () => {
@@ -180,6 +246,56 @@ describe('monitor_api command wrappers', () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith('storage_get_image', { id: 42, path: null });
     expectWithAuth(1);
+  });
+
+  it('loads picture-search originals through the authenticated image command', async () => {
+    invoke.mockResolvedValue({ status: 'success', data: 'original', mime_type: 'image/jpeg' });
+    await expect(fetchSearchImage(42)).resolves.toBe('data:image/jpeg;base64,original');
+    expect(invoke).toHaveBeenCalledWith('storage_get_image', { id: 42, path: null });
+    expectWithAuth(1);
+    invoke.mockResolvedValue({ status: 'success', data: 'legacy' });
+    await expect(fetchSearchImage(null, 'memory://hash')).resolves.toBe('data:image/png;base64,legacy');
+    expect(invoke).toHaveBeenLastCalledWith('storage_get_image', { id: null, path: 'memory://hash' });
+  });
+
+  it('does not load cancelled originals before admission or after waiting for authentication', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(fetchSearchImage(1, null, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(withAuth).not.toHaveBeenCalled();
+    const waiting = new AbortController();
+    withAuth.mockImplementationOnce(async (fn) => { waiting.abort(); return fn(); });
+    await expect(fetchSearchImage(2, null, { signal: waiting.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('limits search originals to two active reads, skips cancelled queued cards and keeps previews available', async () => {
+    const finishes = new Map();
+    invoke.mockImplementation((_command, { id }) => new Promise((resolve) => finishes.set(id, resolve)));
+    const firstController = new AbortController();
+    const thirdController = new AbortController();
+    const first = fetchSearchImage(1, null, { signal: firstController.signal });
+    const second = fetchSearchImage(2);
+    const third = fetchSearchImage(3, null, { signal: thirdController.signal });
+    const fourth = fetchSearchImage(4);
+    const firstAssertion = expect(first).rejects.toMatchObject({ name: 'AbortError' });
+    const thirdAssertion = expect(third).rejects.toMatchObject({ name: 'AbortError' });
+    expect([...finishes.keys()]).toEqual([1, 2]);
+    firstController.abort();
+    thirdController.abort();
+    await Promise.resolve();
+    expect([...finishes.keys()]).toEqual([1, 2]);
+    const preview = fetchImage(5);
+    expect(finishes.has(5)).toBe(true);
+    finishes.get(1)({ status: 'success', data: 'discarded' });
+    await firstAssertion;
+    await thirdAssertion;
+    await sleep(0);
+    expect([...finishes.keys()]).toEqual([1, 2, 5, 4]);
+    for (const id of [2, 4, 5]) finishes.get(id)({ status: 'success', data: `image-${id}` });
+    await expect(Promise.all([second, fourth, preview])).resolves.toEqual([
+      'data:image/png;base64,image-2', 'data:image/png;base64,image-4', 'data:image/png;base64,image-5',
+    ]);
   });
 
   it('rejects full image requests that exceed the queue deadline', async () => {

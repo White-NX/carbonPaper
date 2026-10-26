@@ -146,3 +146,39 @@ tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
+
+# Optimize the concrete storage crypto entry point and its primitive callees.
+# Generic AES code instantiated in the desktop crate would still run at opt=0.
+# The desktop's application/session code keeps its ordinary debug profile.
+[profile.dev.package.carbonpaper-app-bound]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.ctr]
+opt-level = 3
+
+[profile.dev.package.ghash]
+opt-level = 3
+
+[profile.dev.package.polyval]
+opt-level = 3
+
+[profile.dev.package.cipher]
+opt-level = 3
+
+[profile.dev.package.aead]
+opt-level = 3
+
+[profile.dev.package.crypto-common]
+opt-level = 3
+
+[profile.dev.package.universal-hash]
+opt-level = 3
+
+[profile.dev.package.base64]
+opt-level = 3

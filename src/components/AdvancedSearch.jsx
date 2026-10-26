@@ -190,9 +190,9 @@ export function AdvancedSearch({
               key={`${item.id || item.image_path || index}-${index}`}
               item={item}
               sourceType="search"
+              imageKind="original"
               onSelect={(payload) => onSelectResult?.(payload)}
               onOpenFloatingPreview={openFloatingPreview}
-              preloadedSrc={thumbnailCache[item.screenshot_id ?? item.metadata?.screenshot_id] || null}
             />
           ))}
         </div>

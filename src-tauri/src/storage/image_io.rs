@@ -1,69 +1,206 @@
 //! Image reading with decryption support.
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_row_key_with_cng_silent, decrypt_with_master_key,
-    encrypt_with_master_key, CredentialError,
+    decrypt_row_key_with_cng, decrypt_row_key_with_cng_measured, decrypt_row_key_with_cng_silent,
+    decrypt_with_master_key, encrypt_with_master_key, CredentialError, RowKeyDecryptTimings,
 };
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::{BackgroundReadError, StorageState};
+
+const IMAGE_BY_ID_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
+    WHERE id = ?1 AND is_deleted = 0";
+const IMAGE_BY_PATH_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
+    WHERE image_path = ?1 AND is_deleted = 0";
+const IMAGE_BY_HASH_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
+    WHERE image_hash = ?1 AND is_deleted = 0";
+
+#[derive(Clone, Copy)]
+enum ImageLookup<'a> {
+    Id(i64),
+    Path(&'a str),
+    Hash(&'a str),
+}
+
+#[derive(Debug)]
+struct ImageLocation {
+    key_enc: Option<Vec<u8>>,
+    path: String,
+}
+
+impl ImageLookup<'_> {
+    fn from_path(path: &str) -> ImageLookup<'_> {
+        match path.strip_prefix("memory://") {
+            Some(hash) => ImageLookup::Hash(hash),
+            None => ImageLookup::Path(path),
+        }
+    }
+
+    fn sql(&self) -> &'static str {
+        match self {
+            Self::Id(_) => IMAGE_BY_ID_SQL,
+            Self::Path(_) => IMAGE_BY_PATH_SQL,
+            Self::Hash(_) => IMAGE_BY_HASH_SQL,
+        }
+    }
+
+    fn parameter(&self) -> &dyn ToSql {
+        match self {
+            Self::Id(id) => id,
+            Self::Path(path) | Self::Hash(path) => path,
+        }
+    }
+
+    /// Fetch only the file location and opaque wrapped key, without decrypting metadata.
+    fn query(&self, conn: &Connection) -> Result<ImageLocation, String> {
+        let mut statement = conn
+            .prepare_cached(self.sql())
+            .map_err(|error| format!("Failed to prepare image key query: {error}"))?;
+        statement
+            .query_row([self.parameter()], |row| {
+                Ok(ImageLocation {
+                    key_enc: row.get(0)?,
+                    path: row.get(1)?,
+                })
+            })
+            .optional()
+            .map_err(|error| format!("Failed to query image key: {error}"))?
+            .ok_or_else(|| match self {
+                Self::Id(_) => "Image not found".to_string(),
+                Self::Hash(hash) => format!("No screenshot found for hash: {hash}"),
+                Self::Path(_) => "Failed to unwrap image row key".to_string(),
+            })
+    }
+}
+
+#[derive(Default)]
+struct ImageFileReadTimings {
+    file_read: Duration,
+    decrypt: Duration,
+}
+
+fn image_locations_by_ids(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, ImageLocation>, String> {
+    let mut locations = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let ids = ids
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect::<Vec<_>>();
+    for chunk in ids.chunks(500) {
+        // NOT INDEXED still permits INTEGER PRIMARY KEY seeks. It keeps
+        // competing live-row indexes from turning an ID list into a scan.
+        let sql = format!(
+            "SELECT id, content_key_encrypted, image_path FROM screenshots NOT INDEXED
+             WHERE is_deleted = 0 AND id IN ({})",
+            vec!["?"; chunk.len()].join(",")
+        );
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ImageLocation {
+                        key_enc: row.get(1)?,
+                        path: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (id, location) = row.map_err(|error| error.to_string())?;
+            locations.insert(id, location);
+        }
+    }
+    Ok(locations)
+}
 
 impl StorageState {
     /// Read an encrypted image file and return Base64-encoded data.
     pub fn read_image(&self, path: &str) -> Result<(String, String), String> {
-        let diag_start = std::time::Instant::now();
+        self.read_image_with_lookup(ImageLookup::from_path(path))
+    }
 
-        // Phase 1: Hold mutex only for DB query to get the encrypted key
-        let (key_enc, abs_path) = {
-            let guard = self.get_connection_named("read_image")?;
-            let conn = guard.as_ref().unwrap();
+    /// Load a full screenshot by its primary key without hydrating its metadata.
+    pub fn read_image_by_id(&self, id: i64) -> Result<(String, String), String> {
+        self.read_image_with_lookup(ImageLookup::Id(id))
+    }
 
-            if let Some(hash) = path.strip_prefix("memory://") {
-                // 旧数据兼容：从 memory:// 中提取 hash 查找
-                let result: Option<(Option<Vec<u8>>, String)> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
-                        [hash],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok();
-                match result {
-                    Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
-                    None => return Err(format!("No screenshot found for hash: {}", hash)),
-                }
-            } else {
-                // 正常路径查找（原有逻辑）
-                let key: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
-                        [path],
-                        |row| row.get(0),
-                    )
-                    .ok();
-
-                let resolved = self.resolve_image_path(path);
-                (key, resolved)
-            }
-            // guard dropped here, mutex released
+    fn read_image_with_lookup(&self, lookup: ImageLookup<'_>) -> Result<(String, String), String> {
+        let started = Instant::now();
+        // Keep the database and directory stable while using the fetched file location.
+        // This shared maintenance permit does not serialize other image readers.
+        let _activity = self.foreground_db_read();
+        let maintenance_wait = started.elapsed();
+        let acquiring = Instant::now();
+        let primary = self.try_get_connection_named("read_image")?;
+        let db_wait = acquiring.elapsed();
+        let (location, read_open, db_query, db_connection) = if let Some(guard) = primary {
+            let querying = Instant::now();
+            let location = lookup.query(guard.as_ref().unwrap())?;
+            (location, Duration::ZERO, querying.elapsed(), "primary")
+        } else {
+            let opening = Instant::now();
+            let conn = self.open_read_connection_named("read_image")?;
+            let read_open = opening.elapsed();
+            let querying = Instant::now();
+            let location = lookup.query(&conn)?;
+            (location, read_open, querying.elapsed(), "independent")
         };
 
-        let query_elapsed = diag_start.elapsed();
-
-        // Phase 2: CNG decrypt + file read + AES decrypt + base64 — all outside mutex
-        let mut row_key = key_enc
+        // Path resolution, CNG, file I/O and decoding all run after releasing the DB mutex.
+        let resolve_started = Instant::now();
+        let abs_path = self.resolve_image_path(&location.path);
+        let path_resolve = resolve_started.elapsed();
+        let encrypted_key = location
+            .key_enc
             .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
+        let mut cng = RowKeyDecryptTimings::default();
+        let mut row_key = decrypt_row_key_with_cng_measured(
+            &self.credential_state,
+            encrypted_key,
+            &mut cng,
+            &|| false,
+        )
+        .ok()
+        .flatten()
+        .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
         let abs_path_str = abs_path.to_string_lossy().to_string();
-        let result = read_encrypted_image_as_base64(&abs_path_str, &row_key);
+        let mut file_timings = ImageFileReadTimings::default();
+        let mut base64_elapsed = Duration::ZERO;
+        let result = (|| -> Result<(String, String), String> {
+            let (data, mime_type) =
+                read_encrypted_image_bytes_measured(&abs_path_str, &row_key, &mut file_timings)?;
+            let base64_started = Instant::now();
+            let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+            base64_elapsed = base64_started.elapsed();
+            Ok((encoded, mime_type))
+        })();
         Self::zeroize_bytes(&mut row_key);
-        if diag_start.elapsed().as_secs() >= 5 {
+        let total = started.elapsed();
+        if total >= Duration::from_millis(250) {
             tracing::warn!(
-                "[DIAG:DB] read_image({}) query {:?}, total {:?}",
-                path,
-                query_elapsed,
-                diag_start.elapsed()
+                ?maintenance_wait,
+                ?db_wait,
+                db_connection,
+                ?read_open,
+                ?db_query,
+                ?path_resolve,
+                cng_calls = cng.calls,
+                cng_wait = ?cng.lock_wait,
+                cng_decrypt = ?cng.decrypt,
+                file_read = ?file_timings.file_read,
+                file_decrypt = ?file_timings.decrypt,
+                base64 = ?base64_elapsed,
+                ?total,
+                "[DIAG:IMAGE] read_image timing"
             );
         }
         result
@@ -82,45 +219,19 @@ impl StorageState {
         }
         let diag_start = std::time::Instant::now();
 
-        let (key_enc, abs_path) = {
+        let (location, abs_path) = {
             let guard = self
                 .get_connection_named("read_image_bytes_silent")
                 .map_err(BackgroundReadError::Other)?;
-            let conn = guard.as_ref().unwrap();
-
-            if let Some(hash) = path.strip_prefix("memory://") {
-                let result: Option<(Option<Vec<u8>>, String)> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
-                        [hash],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok();
-                match result {
-                    Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
-                    None => {
-                        return Err(BackgroundReadError::Other(format!(
-                            "No screenshot found for hash: {}",
-                            hash
-                        )))
-                    }
-                }
-            } else {
-                let key: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
-                        [path],
-                        |row| row.get(0),
-                    )
-                    .ok();
-
-                let resolved = self.resolve_image_path(path);
-                (key, resolved)
-            }
+            let location = ImageLookup::from_path(path)
+                .query(guard.as_ref().unwrap())
+                .map_err(BackgroundReadError::Other)?;
+            let abs_path = self.resolve_image_path(&location.path);
+            (location, abs_path)
         };
 
         let query_elapsed = diag_start.elapsed();
-        let encrypted_key = key_enc.as_ref().ok_or_else(|| {
+        let encrypted_key = location.key_enc.as_ref().ok_or_else(|| {
             BackgroundReadError::Other("Failed to unwrap image row key".to_string())
         })?;
         if !self.is_silent_read_authorized() {
@@ -170,39 +281,45 @@ impl StorageState {
     /// Read a thumbnail for an image, generating and caching it on first request.
     /// Returns base64-encoded JPEG data with MIME type.
     pub fn read_thumbnail(&self, path: &str) -> Result<(String, String), String> {
+        self.read_thumbnail_with_lookup(ImageLookup::from_path(path))
+    }
+
+    /// Load a thumbnail with a single primary-key query for its path and wrapped key.
+    pub fn read_thumbnail_by_id(&self, id: i64) -> Result<(String, String), String> {
+        self.read_thumbnail_with_lookup(ImageLookup::Id(id))
+    }
+
+    fn read_thumbnail_with_lookup(
+        &self,
+        lookup: ImageLookup<'_>,
+    ) -> Result<(String, String), String> {
+        let _activity = self.foreground_db_read();
         // Phase 1: DB query for the encrypted row key
-        let (key_enc, abs_path) = {
+        let (location, abs_path) = {
             let conn = self.open_read_connection_named("read_thumbnail")?;
-
-            if let Some(hash) = path.strip_prefix("memory://") {
-                let result: Option<(Option<Vec<u8>>, String)> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
-                        [hash],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok();
-                match result {
-                    Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
-                    None => return Err(format!("No screenshot found for hash: {}", hash)),
-                }
-            } else {
-                let key: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
-                        [path],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                let resolved = self.resolve_image_path(path);
-                (key, resolved)
-            }
+            let location = lookup.query(&conn)?;
+            let abs_path = self.resolve_image_path(&location.path);
+            (location, abs_path)
         };
+        self.read_thumbnail_at(
+            &abs_path,
+            location.key_enc.as_deref(),
+            &mut RowKeyDecryptTimings::default(),
+        )
+    }
 
-        // Phase 2: Decrypt row key
+    fn read_thumbnail_at(
+        &self,
+        abs_path: &Path,
+        key_enc: Option<&[u8]>,
+        cng: &mut RowKeyDecryptTimings,
+    ) -> Result<(String, String), String> {
         let mut row_key = key_enc
-            .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
+            .and_then(|enc| {
+                decrypt_row_key_with_cng_measured(&self.credential_state, enc, cng, &|| false)
+                    .ok()
+                    .flatten()
+            })
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
         let thumb_path = Self::thumbnail_path_for(&abs_path);
@@ -243,32 +360,11 @@ impl StorageState {
         }
 
         // Phase 2: DB query for the encrypted row key (only reached when thumbnail is missing)
-        let (key_enc, abs_path) = {
+        let (location, abs_path) = {
             let conn = self.open_read_connection_named("ensure_thumbnail_cached")?;
-
-            if let Some(hash) = path.strip_prefix("memory://") {
-                let result: Option<(Option<Vec<u8>>, String)> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
-                        [hash],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok();
-                match result {
-                    Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
-                    None => return Err(format!("No screenshot found for hash: {}", hash)),
-                }
-            } else {
-                let key: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
-                        [path],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                let resolved = self.resolve_image_path(path);
-                (key, resolved)
-            }
+            let location = ImageLookup::from_path(path).query(&conn)?;
+            let abs_path = self.resolve_image_path(&location.path);
+            (location, abs_path)
         };
 
         // Re-check for memory:// paths (resolved above)
@@ -278,7 +374,8 @@ impl StorageState {
         }
 
         // Phase 3: Decrypt row key and generate thumbnail
-        let mut row_key = key_enc
+        let mut row_key = location
+            .key_enc
             .as_ref()
             .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
@@ -290,7 +387,7 @@ impl StorageState {
     }
 
     /// Batch read thumbnails by screenshot IDs.
-    /// Does batch id→path lookup and then batch thumbnail reading, all within the storage module.
+    /// Fetches paths and opaque wrapped keys together, without hydrating metadata.
     /// Returns a map of id (as string) → Result with base64/mime or error.
     pub fn batch_read_thumbnails_by_ids(
         &self,
@@ -300,70 +397,61 @@ impl StorageState {
             return std::collections::HashMap::new();
         }
 
-        // Batch id → image_path lookup (single DB query)
-        let id_path_map: std::collections::HashMap<i64, String> = {
-            let guard = match self.get_connection_named("batch_thumbnails_by_ids") {
-                Ok(g) => g,
-                Err(e) => {
-                    return ids
-                        .iter()
-                        .map(|id| (id.to_string(), Err(format!("DB connection error: {}", e))))
-                        .collect();
-                }
-            };
-            let conn = guard.as_ref().unwrap();
-
-            let mut map = std::collections::HashMap::new();
-            for chunk in ids.chunks(500) {
-                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                let sql = format!(
-                    "SELECT id, image_path FROM screenshots WHERE is_deleted = 0 AND id IN ({})",
-                    placeholders.join(",")
-                );
-                let params: Vec<&dyn rusqlite::ToSql> =
-                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    }) {
-                        for row in rows.filter_map(|r| r.ok()) {
-                            map.insert(row.0, row.1);
-                        }
-                    }
-                }
+        let started = Instant::now();
+        // Keep maintenance from replacing files or row keys during the batch;
+        // this shared permit never holds the primary database mutex.
+        let _activity = self.foreground_db_read();
+        let lookup = (|| -> Result<_, String> {
+            let conn = self.open_read_connection_named("batch_thumbnails_by_ids")?;
+            let mut locations = image_locations_by_ids(&conn, ids)?;
+            // Resolve paths while the independent-read maintenance permit still
+            // pins this database and data directory, without the primary mutex.
+            for location in locations.values_mut() {
+                location.path = self
+                    .resolve_image_path(&location.path)
+                    .to_string_lossy()
+                    .into_owned();
             }
-            map
-            // guard dropped here
+            Ok(locations)
+        })();
+        let query = started.elapsed();
+        let locations = match lookup {
+            Ok(locations) => locations,
+            Err(error) => {
+                return ids
+                    .iter()
+                    .map(|id| {
+                        (
+                            id.to_string(),
+                            Err(format!("DB image lookup error: {error}")),
+                        )
+                    })
+                    .collect()
+            }
         };
-
-        // Collect paths and batch read thumbnails
-        let paths: Vec<String> = ids
-            .iter()
-            .filter_map(|id| id_path_map.get(id).cloned())
-            .collect();
-
-        let thumb_results = self.batch_read_thumbnails(&paths);
-
-        // Build path → result lookup
-        let path_result_map: std::collections::HashMap<&str, &Result<(String, String), String>> =
-            thumb_results.iter().map(|(p, r)| (p.as_str(), r)).collect();
-
-        // Build result keyed by id string
+        let mut cng = RowKeyDecryptTimings::default();
         let mut results = std::collections::HashMap::new();
         for id in ids {
-            let result = if let Some(path) = id_path_map.get(id) {
-                if let Some(r) = path_result_map.get(path.as_str()) {
-                    (*r).clone()
-                } else {
-                    Err("Thumbnail processing failed".to_string())
-                }
+            if results.contains_key(&id.to_string()) {
+                continue;
+            }
+            let result = if let Some(location) = locations.get(id) {
+                self.read_thumbnail_at(
+                    Path::new(&location.path),
+                    location.key_enc.as_deref(),
+                    &mut cng,
+                )
             } else {
                 Err("Screenshot not found".to_string())
             };
             results.insert(id.to_string(), result);
         }
-
+        let total = started.elapsed();
+        if total >= Duration::from_millis(250) {
+            tracing::warn!(requested = ids.len(), ?query, cng_calls = cng.calls,
+                cng_wait = ?cng.lock_wait, cng_decrypt = ?cng.decrypt, ?total,
+                "[DIAG:IMAGE] batch thumbnail timing");
+        }
         results
     }
 
@@ -633,6 +721,8 @@ pub fn read_image_as_base64(path: &str) -> Result<(String, String), String> {
 }
 
 /// Read an encrypted image file and return Base64-encoded data (with decryption).
+/// Standalone file adapter; foreground screenshot loads use the measured storage path.
+#[allow(dead_code)]
 pub fn read_encrypted_image_as_base64(
     path: &str,
     row_key: &[u8],
@@ -646,13 +736,24 @@ pub fn read_encrypted_image_as_base64(
 
 /// Read an encrypted image file and return raw image bytes (with decryption).
 pub fn read_encrypted_image_bytes(path: &str, row_key: &[u8]) -> Result<(Vec<u8>, String), String> {
+    read_encrypted_image_bytes_measured(path, row_key, &mut ImageFileReadTimings::default())
+}
+
+fn read_encrypted_image_bytes_measured(
+    path: &str,
+    row_key: &[u8],
+    timings: &mut ImageFileReadTimings,
+) -> Result<(Vec<u8>, String), String> {
     let path = Path::new(path);
 
-    if !path.exists() {
-        return Err(format!("Image file not found: {}", path.display()));
-    }
-
-    let data = std::fs::read(path).map_err(|e| format!("Failed to read image file: {}", e))?;
+    let read_started = Instant::now();
+    let data = if path.exists() {
+        std::fs::read(path).map_err(|e| format!("Failed to read image file: {}", e))
+    } else {
+        Err(format!("Image file not found: {}", path.display()))
+    };
+    timings.file_read = read_started.elapsed();
+    let data = data?;
     // Detect encrypted file: filename contains ".enc" (compatible with .enc.pending)
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let is_encrypted = fname.contains(".enc");
@@ -682,11 +783,17 @@ pub fn read_encrypted_image_bytes(path: &str, row_key: &[u8]) -> Result<(Vec<u8>
 
     let image_data = if is_encrypted {
         // Decrypt file contents
-        decrypt_with_master_key(row_key, &data)
-            .map_err(|e| format!("Failed to decrypt image: {}", e))?
+        let decrypt_started = Instant::now();
+        let decrypted = decrypt_with_master_key(row_key, &data)
+            .map_err(|e| format!("Failed to decrypt image: {}", e));
+        timings.decrypt = decrypt_started.elapsed();
+        decrypted?
     } else {
         data
     };
 
     Ok((image_data, mime_type.to_string()))
 }
+
+#[cfg(test)]
+mod tests;

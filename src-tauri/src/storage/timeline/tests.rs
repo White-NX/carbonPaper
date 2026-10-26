@@ -24,6 +24,224 @@ fn row(id: i64) -> RawTimelineRow {
     }
 }
 
+fn encrypted_history() -> (tempfile::TempDir, StorageState, Connection) {
+    let temp = tempfile::tempdir().unwrap();
+    let credential = Arc::new(CredentialManagerState::new(temp.path().into()));
+    let storage = StorageState::new(temp.path().into(), credential);
+    let conn = Connection::open_in_memory().unwrap();
+    storage.init_tables(&conn).unwrap();
+    for id in 1..=20 {
+        let encrypted = row(id);
+        conn.execute(
+            "INSERT INTO screenshots(id,image_path,image_hash,created_at,window_title,process_name,
+                window_title_enc,process_name_enc,metadata_enc,content_key_encrypted,category)
+             VALUES (?1, ?1 || '.enc', ?1, datetime(1767225600 + (?1 - 1) * 30, 'unixepoch'),
+                'legacy title', 'legacy process', ?2, ?3, ?4, ?5, 'work')",
+            params![
+                id,
+                encrypted.title_enc,
+                encrypted.process_enc,
+                encrypted.metadata_enc,
+                encrypted.key_enc
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE screenshots SET is_deleted = 1 WHERE id = 1", [])
+        .unwrap();
+    (temp, storage, conn)
+}
+
+#[test]
+fn headers_preserve_full_timeline_positions_without_loading_or_unwrapping_details() {
+    let (_temp, _storage, conn) = encrypted_history();
+    for limit in [3, 500] {
+        let full = read_rows(
+            &conn,
+            1767225600.0,
+            1767226200.0,
+            limit,
+            &|| Ok(()),
+            &mut Timings::default(),
+        )
+        .unwrap();
+        let headers = read_rows_with_details(
+            &conn,
+            1767225600.0,
+            1767226200.0,
+            limit,
+            false,
+            &|| Ok(()),
+            &mut Timings::default(),
+        )
+        .unwrap();
+        let positions = |rows: &[RawTimelineRow]| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.id,
+                        row.image_path.clone(),
+                        row.created_at.clone(),
+                        row.timestamp,
+                        row.category.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(positions(&headers), positions(&full));
+        assert!(headers.iter().all(|row| row.key_enc.is_none()
+            && row.title_enc.is_none()
+            && row.process_enc.is_none()
+            && row.metadata_enc.is_none()));
+        let mut unwraps = 0;
+        let records = hydrate(
+            headers,
+            &|| Ok(()),
+            &mut |_, _| {
+                unwraps += 1;
+                Ok(Some(Zeroizing::new(vec![7; 32])))
+            },
+            &mut Timings::default(),
+        )
+        .unwrap();
+        assert_eq!(unwraps, 0);
+        for record in records {
+            assert!(record.window_title.is_none() && record.process_name.is_none());
+            assert!(record.process_icon.is_none() && record.process_path.is_none());
+            assert!(!serde_json::to_value(record)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("content_key_encrypted"));
+        }
+    }
+    conn.execute_batch("DROP TABLE page_icons").unwrap();
+    assert_eq!(
+        read_rows_with_details(
+            &conn,
+            1767225600.0,
+            1767226200.0,
+            500,
+            false,
+            &|| Ok(()),
+            &mut Timings::default()
+        )
+        .unwrap()
+        .len(),
+        19
+    );
+}
+
+#[test]
+fn details_read_only_requested_live_ids_and_retain_decrypted_fields() {
+    let (_temp, _storage, conn) = encrypted_history();
+    let mut timings = Timings::default();
+    let rows = read_rows_by_ids(&conn, &[20, 2, 2, 1, 99, -1], &|| Ok(()), &mut timings).unwrap();
+    assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [2, 20]);
+    assert_eq!(
+        timings.count,
+        Duration::ZERO,
+        "ID reads need no range count"
+    );
+    let mut unwraps = 0;
+    let records = hydrate(
+        rows,
+        &|| Ok(()),
+        &mut |_, _| {
+            unwraps += 1;
+            Ok(Some(Zeroizing::new(vec![7; 32])))
+        },
+        &mut timings,
+    )
+    .unwrap();
+    assert_eq!(unwraps, 2);
+    assert!(records.iter().all(
+        |record| record.window_title.as_deref() == Some("encrypted title")
+            && record.process_name.as_deref() == Some("browser.exe")
+            && record.process_path.as_deref() == Some("browser.exe")
+    ));
+    assert!(read_rows_by_ids(&conn, &[], &|| Ok(()), &mut timings)
+        .unwrap()
+        .is_empty());
+    assert!(read_rows_by_ids(&conn, &vec![2; 501], &|| Ok(()), &mut timings).is_err());
+    assert_eq!(
+        read_rows_by_ids(&conn, &[2], &|| Err(CANCELLED.into()), &mut timings)
+            .err()
+            .unwrap(),
+        CANCELLED
+    );
+}
+
+#[test]
+fn headers_and_details_recheck_cancellation_revocation_and_the_admitted_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let credential = Arc::new(CredentialManagerState::new(temp.path().into()));
+    crate::credential_manager::save_public_key_to_file(&credential, b"timeline-header-test-key")
+        .unwrap();
+    let storage = StorageState::new(temp.path().into(), Arc::clone(&credential));
+    storage.initialize().unwrap();
+    storage
+        .get_connection_named("seed_timeline_header")
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .execute(
+            "INSERT INTO screenshots(id,image_path,image_hash,created_at,window_title)
+         VALUES (1, 'one.enc', 'one', '2026-01-01 00:00:00', 'legacy title')",
+            [],
+        )
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    assert_eq!(
+        storage
+            .get_timeline_headers(1767225600.0, 1767225660.0, 500, &stop)
+            .unwrap_err(),
+        "AUTH_REQUIRED"
+    );
+    assert_eq!(
+        storage.get_timeline_details(&[1], &stop).unwrap_err(),
+        "AUTH_REQUIRED"
+    );
+    credential.update_auth_time();
+    assert!(storage
+        .get_timeline_headers(1767225600.0, 1767225660.0, 500, &stop)
+        .unwrap()[0]
+        .window_title
+        .is_none());
+    assert_eq!(
+        storage.get_timeline_details(&[1], &stop).unwrap()[0]
+            .window_title
+            .as_deref(),
+        Some("legacy title")
+    );
+    let cancelled = storage.load_timeline_records(&stop, "test_cancel", |conn, check, timings| {
+        let rows = read_rows_by_ids(conn, &[1], check, timings)?;
+        stop.store(true, Ordering::Release);
+        Ok(rows)
+    });
+    assert_eq!(cancelled.unwrap_err(), CANCELLED);
+    assert_eq!(
+        storage.get_timeline_details(&[1], &stop).unwrap_err(),
+        CANCELLED
+    );
+    stop.store(false, Ordering::Release);
+    for unlock_again in [false, true] {
+        credential.update_auth_time();
+        let result = storage.load_timeline_records(&stop, "test_revoke", |conn, check, timings| {
+            let rows = read_rows_by_ids(conn, &[1], check, timings)?;
+            credential.invalidate_session();
+            if unlock_again {
+                credential.update_auth_time();
+            }
+            Ok(rows)
+        });
+        assert_eq!(result.unwrap_err(), "AUTH_REQUIRED");
+    }
+    assert!(storage
+        .try_database_maintenance("after_timeline_header")
+        .is_some());
+}
+
 #[test]
 fn repeated_icons_unwrap_once_and_return_only_timeline_fields() {
     let mut timings = Timings::default();

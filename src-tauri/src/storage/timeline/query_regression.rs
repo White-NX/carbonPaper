@@ -153,6 +153,137 @@ fn sampled_query_uses_primary_key_hydration_with_linear_work() {
 }
 
 #[test]
+fn short_header_ranges_do_not_scan_unrelated_history_on_fresh_or_analyzed_databases() {
+    let (_temp, _storage, conn) = fixture(20000);
+    for analyzed in [false, true] {
+        if analyzed {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        let mut timings = Timings::default();
+        let rows = read_rows_with_details(
+            &conn,
+            (1767225600_i64 + 19905 * 60) as f64,
+            (1767225600_i64 + 20000 * 60) as f64,
+            500,
+            false,
+            &|| Ok(()),
+            &mut timings,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 96);
+        assert_eq!(rows.first().unwrap().id, 19905);
+        assert_eq!(rows.last().unwrap().id, 20000);
+        assert!(
+            timings.sql_vm_steps < 10000,
+            "96 rows amid 20000 used {} steps",
+            timings.sql_vm_steps
+        );
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                timeline_rows_sql_with_details(None, false)
+            ))
+            .unwrap()
+            .query_map(
+                params!["2026-01-14 19:45:00", "2026-01-14 21:20:00", 500],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("; ");
+        assert!(plan.contains("idx_screenshots_deleted_created_at (is_deleted=? AND created_at>? AND created_at<?)"), "{plan}");
+        assert!(!plan.contains("idx_screenshots_live_image_path"), "{plan}");
+        assert!(
+            !plan.contains("page_icons"),
+            "headers do not join icon ciphertext: {plan}"
+        );
+    }
+}
+
+#[test]
+fn detail_id_batches_use_primary_key_seeks_before_and_after_analyze() {
+    let (_temp, _storage, conn) = fixture(20000);
+    conn.execute("UPDATE screenshots SET is_deleted = 1 WHERE id = 19999", [])
+        .unwrap();
+    for analyzed in [false, true] {
+        if analyzed {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        let mut timings = Timings::default();
+        let rows = read_rows_by_ids(
+            &conn,
+            &[1, 10000, 19999, 20000, 1, -1, 29999],
+            &|| Ok(()),
+            &mut timings,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [1, 10000, 20000]
+        );
+        assert!(
+            timings.sql_vm_steps < 500,
+            "an ID batch scanned history: {} steps",
+            timings.sql_vm_steps
+        );
+    }
+}
+
+#[test]
+#[ignore = "warm synthetic SQLCipher timeline benchmark; no CNG, image I/O or frontend"]
+fn compare_short_timeline_header_queries() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(CredentialManagerState::new(temp.path().into()));
+    let storage = StorageState::new(temp.path().into(), credentials);
+    let conn = Connection::open(temp.path().join("timeline-benchmark.db")).unwrap();
+    crate::storage::connection::configure_sqlcipher_connection(&conn, &[0x42; 32]).unwrap();
+    storage.init_tables(&conn).unwrap();
+    conn.execute(
+        "WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id < 20000)
+         INSERT INTO screenshots(id,image_path,image_hash,created_at,metadata_enc,content_key_encrypted)
+         SELECT id, 'image.enc', CAST(id AS TEXT), datetime(1767225600 + id * 60, 'unixepoch'), zeroblob(2048), zeroblob(256) FROM ids", []
+    ).unwrap();
+    conn.execute_batch("PRAGMA cache_size = -2048").unwrap();
+    let full = timeline_rows_sql(None);
+    let before = full.replace(" INDEXED BY idx_screenshots_deleted_created_at", "");
+    let headers = timeline_rows_sql_with_details(None, false);
+    eprintln!("synthetic=true warm_connection=true historical_rows=20000 returned_rows=96 cache_kib=2048 samples=9");
+    for (label, sql) in [
+        ("before_details", before),
+        ("indexed_details", full),
+        ("headers", headers),
+    ] {
+        let mut statement = conn.prepare(&sql).unwrap();
+        let mut elapsed = Duration::ZERO;
+        let mut steps = 0;
+        for sample in 0..11 {
+            statement.reset_status(StatementStatus::VmStep);
+            let started = Instant::now();
+            let rows = statement
+                .query_map(
+                    params!["2026-01-14 19:45:00", "2026-01-14 21:20:00", 500],
+                    RawTimelineRow::from_row,
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let query = started.elapsed();
+            assert_eq!(rows.len(), 96);
+            if sample >= 2 {
+                elapsed += query;
+                steps += statement.get_status(StatementStatus::VmStep);
+            }
+        }
+        eprintln!(
+            "{label}: mean_sql={:?} mean_vm_steps={}",
+            elapsed / 9,
+            steps / 9
+        );
+    }
+}
+
+#[test]
 fn cancellation_interrupts_sql_before_first_row_and_removes_handler() {
     let (_temp, _storage, conn) = fixture(4000);
     let cancelled = Arc::new(AtomicBool::new(false));

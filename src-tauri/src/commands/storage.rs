@@ -237,6 +237,7 @@ pub async fn storage_get_timeline(
     end_time: f64,
     max_records: Option<i64>,
     request_id: Option<String>,
+    include_details: Option<bool>,
 ) -> Result<Vec<storage::TimelineRecord>, String> {
     check_auth_required(&credential_state)?;
     let request_id = request_id.unwrap_or_else(|| format!("legacy-{}", rand::random::<u64>()));
@@ -259,10 +260,39 @@ pub async fn storage_get_timeline(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        state.get_timeline_records(start_ts, end_ts, max_records.unwrap_or(500), &cancelled)
+        if include_details.unwrap_or(true) {
+            state.get_timeline_records(start_ts, end_ts, max_records.unwrap_or(500), &cancelled)
+        } else {
+            state.get_timeline_headers(start_ts, end_ts, max_records.unwrap_or(500), &cancelled)
+        }
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+/// Loads authenticated timeline labels and icons only for the requested screenshot IDs.
+#[tauri::command]
+pub async fn storage_get_timeline_details(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    ids: Vec<i64>,
+    request_id: Option<String>,
+) -> Result<Vec<storage::TimelineRecord>, String> {
+    check_auth_required(&credential_state)?;
+    if ids.len() > 500 {
+        return Err("Too many timeline detail IDs".into());
+    }
+    let request_id = request_id.unwrap_or_else(|| format!("details-{}", rand::random::<u64>()));
+    if request_id.len() > 128 {
+        return Err("Invalid timeline request id".into());
+    }
+    let ticket = TIMELINE_REQUESTS.begin(window.label(), &request_id)?;
+    let cancelled = ticket.cancelled.clone();
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.get_timeline_details(&ids, &cancelled))
+        .await
+        .map_err(|error| format!("Task join error: {error:?}"))?
 }
 
 /// Stops a timeline read for the calling window. Authentication: required.
@@ -396,24 +426,16 @@ pub async fn storage_get_image(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        let image_path = if let Some(id) = id {
-            let record = state.screenshots().by_id(id)?;
-            record.map(|r| r.image_path)
-        } else {
-            path
+        let (data, mime_type) = match (id, path.as_deref()) {
+            (Some(id), _) => state.read_image_by_id(id)?,
+            (None, Some(path)) => state.read_image(path)?,
+            (None, None) => return Err("Image not found".to_string()),
         };
-
-        match image_path {
-            Some(path) => match state.read_image(&path) {
-                Ok((data, mime_type)) => Ok(serde_json::json!({
-                    "status": "success",
-                    "data": data,
-                    "mime_type": mime_type
-                })),
-                Err(e) => Err(e),
-            },
-            None => Err("Image not found".to_string()),
-        }
+        Ok(serde_json::json!({
+            "status": "success",
+            "data": data,
+            "mime_type": mime_type
+        }))
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?
@@ -434,24 +456,16 @@ pub async fn storage_get_thumbnail(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        let image_path = if let Some(id) = id {
-            let record = state.screenshots().by_id(id)?;
-            record.map(|r| r.image_path)
-        } else {
-            path
+        let (data, mime_type) = match (id, path.as_deref()) {
+            (Some(id), _) => state.read_thumbnail_by_id(id)?,
+            (None, Some(path)) => state.read_thumbnail(path)?,
+            (None, None) => return Err("Image not found".to_string()),
         };
-
-        match image_path {
-            Some(path) => match state.read_thumbnail(&path) {
-                Ok((data, mime_type)) => Ok(serde_json::json!({
-                    "status": "success",
-                    "data": data,
-                    "mime_type": mime_type
-                })),
-                Err(e) => Err(e),
-            },
-            None => Err("Image not found".to_string()),
-        }
+        Ok(serde_json::json!({
+            "status": "success",
+            "data": data,
+            "mime_type": mime_type
+        }))
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?

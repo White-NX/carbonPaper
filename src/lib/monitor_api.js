@@ -175,6 +175,8 @@ export class RequestQueue {
 
 // Global request queue for image fetching (limit concurrent requests)
 const imageQueue = new RequestQueue(3, 100);
+// Visible picture-search results share a small queue without occupying preview slots.
+const searchImageQueue = new RequestQueue(2, 100);
 // Dedicated queue for card thumbnails — separate from imageQueue to avoid starvation
 const thumbnailQueue = new RequestQueue(6, 100);
 // Timeline thumbnails should load in parallel to avoid long UI delays after pan/zoom
@@ -212,26 +214,18 @@ export const verifyUser = async () => {
  * 获取时间线数据 - 直接从 Rust 存储层获取
  * 需要认证才能访问
  */
-export const getTimeline = async (startTime, endTime, maxRecords = null, { signal } = {}) => {
+const invokeTimelineRead = async (command, params, signal) => {
     return withAuth(async () => {
         const aborted = () => new DOMException('Timeline request cancelled', 'AbortError');
         if (signal?.aborted) throw aborted();
         const requestId = crypto.randomUUID();
-        const params = {
-            startTime: startTime,
-            endTime: endTime,
-            requestId,
-        };
-        if (maxRecords !== null) {
-            params.maxRecords = maxRecords;
-        }
         const cancel = () => {
             void withAuth(() => invoke('storage_cancel_timeline', { requestId }))
                 .catch((error) => console.warn('[Timeline] Cancellation failed:', error));
         };
         signal?.addEventListener('abort', cancel, { once: true });
         try {
-            const records = await invoke('storage_get_timeline', params);
+            const records = await invoke(command, { ...params, requestId });
             if (signal?.aborted) throw aborted();
             return records || [];
         } catch (error) {
@@ -241,6 +235,17 @@ export const getTimeline = async (startTime, endTime, maxRecords = null, { signa
             signal?.removeEventListener('abort', cancel);
         }
     });
+};
+
+export const getTimeline = async (startTime, endTime, maxRecords = null, { signal, includeDetails } = {}) => {
+    const params = { startTime, endTime };
+    if (maxRecords !== null) params.maxRecords = maxRecords;
+    if (includeDetails !== undefined) params.includeDetails = includeDetails;
+    return invokeTimelineRead('storage_get_timeline', params, signal);
+};
+
+export const getTimelineDetails = async (ids, { signal } = {}) => {
+    return invokeTimelineRead('storage_get_timeline_details', { ids }, signal);
 };
 
 /**
@@ -276,6 +281,26 @@ export const fetchImage = async (id, path = null) => {
             return null;
         });
     }, { priority: 'high', key, deadlineMs: REQUEST_DEADLINES.imageMs });
+};
+
+/** Load an original for a visible search result; retain the slot until IPC settles. */
+export const fetchSearchImage = async (id, path = null, { signal } = {}) => {
+    const checkCancelled = () => {
+        if (signal?.aborted) throw new DOMException('Image request cancelled', 'AbortError');
+    };
+    checkCancelled();
+    return searchImageQueue.enqueue(async () => {
+        checkCancelled();
+        return withAuth(async () => {
+            checkCancelled();
+            const response = await invoke('storage_get_image', { id, path });
+            checkCancelled();
+            if (response?.status === 'success' && response.data) {
+                return `data:${response.mime_type || 'image/png'};base64,${response.data}`;
+            }
+            return null;
+        });
+    });
 };
 
 /**
@@ -329,9 +354,12 @@ export const fetchThumbnail = async (id, path = null) => {
  * @param {number[]} ids - 截图 ID 列表
  * @returns {Promise<Object>} { [id]: dataUrl }
  */
-export const fetchThumbnailBatch = async (ids) => {
+export const fetchThumbnailBatch = async (ids, { signal } = {}) => {
     return withAuth(async () => {
+        const aborted = () => new DOMException('Thumbnail request cancelled', 'AbortError');
+        if (signal?.aborted) throw aborted();
         const response = await invoke('storage_batch_get_thumbnails', { ids });
+        if (signal?.aborted) throw aborted();
         if (!response?.results) return {};
         const mapped = {};
         for (const [id, entry] of Object.entries(response.results)) {

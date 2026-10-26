@@ -39,11 +39,16 @@ function FrameStrip({
   }, [events, timeToX, width, overscanPx, highlightedEventId]);
 
   useEffect(() => {
-    const ids = visibleFrames
+    const ids = [...visibleFrames]
+      .sort((a, b) => {
+        const priority = ({ event, x }) => event.id === highlightedEventId ? -1
+          : (x >= 0 && x <= width ? 0 : 1);
+        return priority(a) - priority(b) || Math.abs(a.x - width / 2) - Math.abs(b.x - width / 2);
+      })
       .map(({ event }) => event.id)
       .filter((id) => typeof id === 'number' && id > 0);
     onVisibleFramesChange?.(ids);
-  }, [visibleFrames, onVisibleFramesChange]);
+  }, [visibleFrames, width, highlightedEventId, onVisibleFramesChange]);
 
   const top = Math.max(0, (height - THUMB_SIZE) / 2);
 

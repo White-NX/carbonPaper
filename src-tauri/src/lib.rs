@@ -1259,6 +1259,7 @@ pub fn run() {
             // 安全告警调试触发（设置 → 高级 → 调试）
             // 存储相关命令
             commands::storage::storage_get_timeline,
+            commands::storage::storage_get_timeline_details,
             commands::storage::storage_cancel_timeline,
             commands::storage::storage_get_timeline_density,
             commands::storage::storage_search,

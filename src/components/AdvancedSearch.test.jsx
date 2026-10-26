@@ -20,8 +20,8 @@ vi.mock('@tauri-apps/api/event', () => ({
 }));
 
 vi.mock('./ThumbnailCard', () => ({
-  ThumbnailCard: ({ item, onSelect }) => (
-    <button onClick={() => onSelect(item)}>{item.id || item.screenshot_id || 'thumb'}</button>
+  ThumbnailCard: ({ item, onSelect, imageKind = 'thumbnail' }) => (
+    <button data-image-kind={imageKind} onClick={() => onSelect(item)}>{item.id || item.screenshot_id || 'thumb'}</button>
   ),
   CategoryBadge: () => <span>badge</span>,
 }));
@@ -29,6 +29,7 @@ vi.mock('./ThumbnailCard', () => ({
 vi.mock('../lib/monitor_api', () => ({
   searchScreenshots: vi.fn(async () => []),
   fetchImage: vi.fn(async () => null),
+  fetchSearchImage: vi.fn(async () => null),
   fetchThumbnail: vi.fn(async () => null),
   fetchThumbnailBatch: vi.fn(async () => ({})),
   listProcesses: vi.fn(async () => [{ process_name: 'code.exe', count: 2 }]),
@@ -51,6 +52,7 @@ import {
   listProcesses,
   listRecentScreenshots,
   getCategoriesFromDb,
+  fetchThumbnailBatch,
 } from '../lib/monitor_api';
 
 const makeOcrResult = (id) => ({
@@ -292,7 +294,7 @@ describe('AdvancedSearch', () => {
     expect(screen.queryByRole('button', { name: /Recall the design decision/ })).not.toBeInTheDocument();
   });
 
-  it('fills the landing grid from recent captures, not from an empty search', async () => {
+  it.each(['ocr', 'nl'])('keeps the %s landing grid on recent-capture thumbnails', async (mode) => {
     // 空查询会落进搜索的 OCR 回退路径，那条路径数的是文本块而不是截图。
     listRecentScreenshots.mockResolvedValueOnce([
       { screenshot_id: 91, process_name: 'terminal.exe', created_at: 1_754_900_000 },
@@ -303,15 +305,15 @@ describe('AdvancedSearch', () => {
     render(
       <AdvancedSearch
         active
-        searchParams={{ query: '', mode: 'ocr' }}
+        searchParams={{ query: '', mode }}
         onSelectResult={vi.fn()}
       />
     );
 
     await waitFor(() => {
-      expect(listRecentScreenshots).toHaveBeenCalled();
+      expect(fetchThumbnailBatch).toHaveBeenCalledWith([91, 92, 93]);
     });
-    expect(searchScreenshots).not.toHaveBeenCalledWith('', 'ocr', expect.anything());
+    expect(searchScreenshots).not.toHaveBeenCalledWith('', mode, expect.anything());
   });
 
   it('runs OCR search with debounced query from searchParams', async () => {
@@ -382,6 +384,45 @@ describe('AdvancedSearch', () => {
 
     await waitFor(() => expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl')).toBeInTheDocument());
     expect(onSearchModeChange).not.toHaveBeenCalled();
+  });
+
+  it('uses original cards for picture results without prefetching thumbnail batches', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(22), similarity: 0.8 }]);
+    render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
+    expect(await screen.findByRole('button', { name: '22' })).toHaveAttribute('data-image-kind', 'original');
+    expect(fetchThumbnailBatch).not.toHaveBeenCalled();
+  });
+
+  it('clears picture cards when leaving the search page', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(23), similarity: 0.8 }]);
+    const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
+    const { rerender } = render(<AdvancedSearch active {...props} />);
+    await screen.findByRole('button', { name: '23' });
+    rerender(<AdvancedSearch active={false} {...props} />);
+    expect(screen.queryByRole('button', { name: '23' })).not.toBeInTheDocument();
+  });
+
+  it('clears picture cards immediately when their query is emptied', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(24), similarity: 0.8 }]);
+    render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
+    await screen.findByRole('button', { name: '24' });
+    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl'), { target: { value: '' } });
+    expect(screen.queryByRole('button', { name: '24' })).not.toBeInTheDocument();
+  });
+
+  it.each(['leave', 'clear'])('ignores late picture results after %s', async (action) => {
+    let finishSearch;
+    searchScreenshots.mockImplementationOnce(() => new Promise((resolve) => { finishSearch = resolve; }));
+    const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
+    const { rerender } = render(<AdvancedSearch active {...props} />);
+    await waitFor(() => expect(finishSearch).toEqual(expect.any(Function)));
+    if (action === 'leave') {
+      rerender(<AdvancedSearch active={false} {...props} />);
+    } else {
+      fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl'), { target: { value: '' } });
+    }
+    await act(async () => finishSearch([{ ...makeOcrResult(25), similarity: 0.8 }]));
+    expect(screen.queryByRole('button', { name: '25' })).not.toBeInTheDocument();
   });
 
   it('shows no-result state when query exists but no matches', async () => {

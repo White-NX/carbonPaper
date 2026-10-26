@@ -67,13 +67,52 @@ impl StorageState {
         limit: i64,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<Vec<TimelineRecord>, String> {
+        self.load_timeline_records(cancelled, "details", |conn, check, timings| {
+            read_rows(conn, start_ts, end_ts, limit, check, timings)
+        })
+    }
+
+    pub fn get_timeline_headers(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        limit: i64,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<TimelineRecord>, String> {
+        self.load_timeline_records(cancelled, "headers", |conn, check, timings| {
+            read_rows_with_details(conn, start_ts, end_ts, limit, false, check, timings)
+        })
+    }
+
+    pub fn get_timeline_details(
+        &self,
+        ids: &[i64],
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<TimelineRecord>, String> {
+        self.load_timeline_records(cancelled, "detail_ids", |conn, check, timings| {
+            read_rows_by_ids(conn, ids, check, timings)
+        })
+    }
+
+    fn load_timeline_records(
+        &self,
+        cancelled: &Arc<AtomicBool>,
+        purpose: &'static str,
+        read: impl FnOnce(
+            &Connection,
+            &dyn Fn() -> Result<(), String>,
+            &mut Timings,
+        ) -> Result<Vec<RawTimelineRow>, String>,
+    ) -> Result<Vec<TimelineRecord>, String> {
         let started = Instant::now();
         let mut timings = Timings::default();
+        let admitted_session = self.credential_state.session_marker();
         let check = || {
             if cancelled.load(Ordering::Acquire) {
                 Err(CANCELLED.to_owned())
             } else if !self.credential_state.is_session_valid()
                 || self.credential_state.silent_read_auth_required()
+                || self.credential_state.session_marker() != admitted_session
             {
                 Err("AUTH_REQUIRED".to_owned())
             } else {
@@ -93,8 +132,9 @@ impl StorageState {
                     stop.load(Ordering::Acquire)
                         || !credentials.is_session_valid()
                         || credentials.silent_read_auth_required()
+                        || credentials.session_marker() != admitted_session
                 })?;
-                let result = read_rows(&conn, start_ts, end_ts, limit, &check, &mut timings);
+                let result = read(&conn, &check, &mut timings);
                 // SQLite reports SQLITE_INTERRUPT; preserve the public cancel
                 // or auth error instead of exposing a generic database failure.
                 check()?;
@@ -115,6 +155,7 @@ impl StorageState {
                         &|| {
                             cancelled.load(Ordering::Acquire)
                                 || !self.credential_state.is_session_valid()
+                                || self.credential_state.session_marker() != admitted_session
                         },
                     ) {
                         Ok(key) => key.map(Zeroizing::new),
@@ -143,7 +184,7 @@ impl StorageState {
         };
         macro_rules! report {
             ($level:ident) => {
-                tracing::$level!(status, rows = timings.rows, processed = timings.processed,
+                tracing::$level!(status, purpose, rows = timings.rows, processed = timings.processed,
                     cng_calls = timings.cng.calls, icon_cache_hits = timings.icon_cache_hits,
                     read_open = ?timings.read_open, count = ?timings.count, sql = ?timings.sql,
                     sql_vm_steps = timings.sql_vm_steps,
@@ -182,13 +223,32 @@ impl Drop for SqlCancellation<'_> {
 }
 
 fn timeline_rows_sql(bucket: Option<i64>) -> String {
+    timeline_rows_sql_with_details(bucket, true)
+}
+
+fn timeline_projection(include_details: bool) -> &'static str {
+    if include_details {
+        "s.id, s.image_path, s.created_at,
+         CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
+         s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
+         s.content_key_encrypted, s.page_icon_id,
+         pi.icon_enc, pi.icon_key_encrypted, s.category"
+    } else {
+        // Do not fetch ciphertext or large metadata blobs just to draw frame positions.
+        "s.id, s.image_path, s.created_at,
+         CAST(strftime('%s', s.created_at) AS INTEGER), NULL, NULL, NULL,
+         NULL, NULL, NULL, NULL, NULL, NULL, NULL, s.category"
+    }
+}
+
+fn timeline_rows_sql_with_details(bucket: Option<i64>, include_details: bool) -> String {
     let selection = match bucket {
         Some(bucket) => format!(
-            "SELECT MIN(id) AS picked_id FROM screenshots
+            "SELECT MIN(id) AS picked_id FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
              WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
              GROUP BY CAST(strftime('%s', created_at) AS INTEGER) / {bucket}"
         ),
-        None => "SELECT id AS picked_id FROM screenshots
+        None => "SELECT id AS picked_id FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
                  WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
                  ORDER BY created_at ASC, id ASC LIMIT ?3"
             .into(),
@@ -196,15 +256,17 @@ fn timeline_rows_sql(bucket: Option<i64>) -> String {
     // Materialize the small ID set exactly once, then force it to drive primary
     // key hydration. Repeating the time predicate on s lets an unanalyzed DB
     // reverse the join and restart the GROUP BY coroutine for every screenshot.
+    let projection = timeline_projection(include_details);
+    let icon_join = if include_details {
+        "LEFT JOIN page_icons pi ON pi.id = s.page_icon_id"
+    } else {
+        ""
+    };
     format!(
         "WITH picks AS MATERIALIZED ({selection})
-        SELECT s.id, s.image_path, s.created_at,
-        CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
-        s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
-        s.content_key_encrypted, s.page_icon_id,
-        pi.icon_enc, pi.icon_key_encrypted, s.category
+         SELECT {projection}
         FROM picks CROSS JOIN screenshots s ON s.id = picks.picked_id
-        LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
+         {icon_join}
         ORDER BY s.created_at ASC, s.id ASC LIMIT ?3"
     )
 }
@@ -214,7 +276,19 @@ fn read_rows(
     start_ts: f64,
     end_ts: f64,
     limit: i64,
-    check: &impl Fn() -> Result<(), String>,
+    check: &dyn Fn() -> Result<(), String>,
+    timings: &mut Timings,
+) -> Result<Vec<RawTimelineRow>, String> {
+    read_rows_with_details(conn, start_ts, end_ts, limit, true, check, timings)
+}
+
+fn read_rows_with_details(
+    conn: &Connection,
+    start_ts: f64,
+    end_ts: f64,
+    limit: i64,
+    include_details: bool,
+    check: &dyn Fn() -> Result<(), String>,
     timings: &mut Timings,
 ) -> Result<Vec<RawTimelineRow>, String> {
     if !start_ts.is_finite() || !end_ts.is_finite() || start_ts > end_ts {
@@ -233,7 +307,7 @@ fn read_rows(
     // after limit + 1 rather than counting an entire year of history.
     let total: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM screenshots
+            "SELECT COUNT(*) FROM (SELECT 1 FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
          WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2 LIMIT ?3)",
             params![start, end, limit + 1],
             |row| row.get(0),
@@ -248,31 +322,17 @@ fn read_rows(
     } else {
         None
     };
-    let sql = timeline_rows_sql(bucket);
+    let sql = if include_details {
+        timeline_rows_sql(bucket)
+    } else {
+        timeline_rows_sql_with_details(bucket, false)
+    };
     let querying = Instant::now();
     let result = (|| {
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let result = (|| {
             let rows = stmt
-                .query_map(params![start, end, limit], |row| {
-                    Ok(RawTimelineRow {
-                        id: row.get(0)?,
-                        image_path: row.get(1)?,
-                        created_at: row.get(2)?,
-                        timestamp: row.get(3)?,
-                        window_title: row.get(4)?,
-                        process_name: row.get(5)?,
-                        metadata: row.get(6)?,
-                        title_enc: row.get(7)?,
-                        process_enc: row.get(8)?,
-                        metadata_enc: row.get(9)?,
-                        key_enc: row.get(10)?,
-                        icon_id: row.get(11)?,
-                        shared_icon_enc: row.get(12)?,
-                        shared_icon_key: row.get(13)?,
-                        category: row.get(14)?,
-                    })
-                })
+                .query_map(params![start, end, limit], RawTimelineRow::from_row)
                 .map_err(|e| e.to_string())?;
             let mut result = Vec::new();
             for row in rows {
@@ -285,6 +345,64 @@ fn read_rows(
         result
     })();
     timings.sql = querying.elapsed();
+    result
+}
+
+impl RawTimelineRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            image_path: row.get(1)?,
+            created_at: row.get(2)?,
+            timestamp: row.get(3)?,
+            window_title: row.get(4)?,
+            process_name: row.get(5)?,
+            metadata: row.get(6)?,
+            title_enc: row.get(7)?,
+            process_enc: row.get(8)?,
+            metadata_enc: row.get(9)?,
+            key_enc: row.get(10)?,
+            icon_id: row.get(11)?,
+            shared_icon_enc: row.get(12)?,
+            shared_icon_key: row.get(13)?,
+            category: row.get(14)?,
+        })
+    }
+}
+
+fn read_rows_by_ids(
+    conn: &Connection,
+    ids: &[i64],
+    check: &dyn Fn() -> Result<(), String>,
+    timings: &mut Timings,
+) -> Result<Vec<RawTimelineRow>, String> {
+    if ids.len() > 500 {
+        return Err("Too many timeline detail IDs".into());
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    check()?;
+    let started = Instant::now();
+    // Force rowid seeks for this bounded ID list, including before ANALYZE.
+    let sql = format!(
+        "SELECT {} FROM screenshots s NOT INDEXED
+         LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
+         WHERE s.is_deleted = 0 AND s.id IN ({}) ORDER BY s.created_at, s.id",
+        timeline_projection(true),
+        vec!["?"; ids.len()].join(",")
+    );
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let result = statement
+        .query_map(rusqlite::params_from_iter(ids), RawTimelineRow::from_row)
+        .map_err(|error| error.to_string())?
+        .map(|row| {
+            check()?;
+            row.map_err(|error| error.to_string())
+        })
+        .collect();
+    timings.sql = started.elapsed();
+    timings.sql_vm_steps = statement.get_status(rusqlite::StatementStatus::VmStep);
     result
 }
 
@@ -303,7 +421,7 @@ fn decrypt_string(
 
 fn hydrate(
     rows: Vec<RawTimelineRow>,
-    check: &impl Fn() -> Result<(), String>,
+    check: &dyn Fn() -> Result<(), String>,
     unwrap: &mut impl FnMut(
         &[u8],
         &mut RowKeyDecryptTimings,

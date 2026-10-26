@@ -5,6 +5,7 @@ import { fetchThumbnail } from '../lib/monitor_api';
 import { CATEGORY_COLORS } from '../lib/categories';
 import { cn } from '../lib/utils';
 import { usePreference } from '../lib/preference_store';
+import { OriginalSearchImage } from './search/OriginalSearchImage';
 
 export function CategoryBadge({ category }) {
   if (!category) return null;
@@ -29,12 +30,14 @@ export function ThumbnailCard({
   footerPersistent = false,
   selected = false,
   sourceType = 'preview',
+  imageKind = 'thumbnail',
 }) {
   const { t } = useTranslation();
   const [imageSrc, setImageSrc] = useState(preloadedSrc);
   const [loadingImage, setLoadingImage] = useState(!preloadedSrc);
 
   useEffect(() => {
+    if (imageKind === 'original') return undefined;
     if (preloadedSrc) {
       setImageSrc(preloadedSrc);
       setLoadingImage(false);
@@ -56,7 +59,7 @@ export function ThumbnailCard({
     };
     loadImage();
     return () => { active = false; };
-  }, [item, preloadedSrc]);
+  }, [item, preloadedSrc, imageKind]);
 
   const processName = item.process_name || item.metadata?.process_name;
   const similarity = item.similarity;
@@ -107,7 +110,9 @@ export function ThumbnailCard({
         className="block h-full w-full text-left focus-visible:outline-none"
         onClick={handleSelect}
       >
-        {imageSrc ? (
+        {imageKind === 'original' ? (
+          <OriginalSearchImage item={item} />
+        ) : imageSrc ? (
           <img src={imageSrc} alt="" className="h-full w-full object-cover" loading="lazy" />
         ) : loadingImage ? (
           <div className="flex h-full w-full items-center justify-center">
