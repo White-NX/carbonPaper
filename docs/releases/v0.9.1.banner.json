@@ -1,0 +1,18 @@
+{
+  "version": "0.9.1",
+  "codename": "Taeka",
+  "category": "General Update",
+  "headline": "Recap Search & Workspace Update",
+  "background": ".version-banner.local/bannerBackground.png",
+  "font": "Segoe UI",
+  "focus": {
+    "x": 0.5,
+    "y": 0.45
+  },
+  "colors": {
+    "category": "#24555B",
+    "version": "#96752D",
+    "headline": "#202725",
+    "rule": "#C4AE71"
+  }
+}
