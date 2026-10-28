@@ -1709,6 +1709,10 @@
     "jumpToNow": "跳转到现在",
     "fitSearchResults": "缩放到已加载的搜索结果",
     "label": "截图时间线",
+    "title": "时间线",
+    "searchResultsTrack": "搜索结果的时间分布",
+    "searchResultAt": "{{time}} 的搜索结果",
+    "searchResultsBetween": "{{from}} 至 {{to}}，{{count}} 条搜索结果",
     "collapse": "收起时间线",
     "expand": "展开时间线",
     "duration": {

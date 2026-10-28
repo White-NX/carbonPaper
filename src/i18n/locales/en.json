@@ -1709,6 +1709,10 @@
     "jumpToNow": "Jump to Now",
     "fitSearchResults": "Fit loaded search results",
     "label": "Screenshot timeline",
+    "title": "Timeline",
+    "searchResultsTrack": "Search result timeline",
+    "searchResultAt": "Search result at {{time}}",
+    "searchResultsBetween": "{{count}} search results from {{from}} to {{to}}",
     "collapse": "Collapse timeline",
     "expand": "Expand timeline",
     "duration": {

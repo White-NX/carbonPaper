@@ -266,6 +266,166 @@ body {
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
 
+/* Collapsed search timeline overview. */
+.tl-container {
+  container: timeline / inline-size;
+}
+
+.tl-compact-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 44px;
+  padding: 4px 12px;
+}
+
+.tl-compact-context {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.tl-compact-time {
+  color: var(--ide-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tl-compact-rail {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 36px;
+}
+
+.tl-compact-scrubber {
+  position: absolute;
+  inset: 0 0 auto;
+  width: 100%;
+  height: 24px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.tl-compact-scrubber::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 2px;
+  background: var(--ide-border);
+}
+
+.tl-compact-scrubber::-webkit-slider-thumb {
+  width: 8px;
+  height: 8px;
+  margin-top: -3px;
+  appearance: none;
+  border: 0;
+  border-radius: 50%;
+  background: var(--ide-accent);
+}
+
+.tl-compact-scrubber[data-in-range="false"]::-webkit-slider-thumb {
+  opacity: 0;
+}
+
+.tl-compact-markers {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 24px;
+  pointer-events: none;
+}
+
+.tl-compact-marker {
+  position: absolute;
+  top: 0;
+  height: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.tl-compact-marker:hover,
+.tl-compact-marker:focus-visible {
+  background: color-mix(in srgb, var(--ide-accent) 10%, transparent);
+}
+
+.tl-compact-marker-dot {
+  position: absolute;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tl-search);
+  transform: translate(-50%, -50%);
+}
+
+.tl-compact-marker[data-active="true"] .tl-compact-marker-dot {
+  width: 8px;
+  height: 8px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tl-search) 18%, transparent);
+}
+
+.tl-compact-marker[data-selected="true"] .tl-compact-marker-dot {
+  background: var(--ide-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ide-accent) 15%, transparent);
+}
+
+.tl-compact-range {
+  position: absolute;
+  inset: auto 0 0;
+  display: flex;
+  justify-content: space-between;
+  color: var(--ide-muted);
+  font-size: 11px;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.tl-compact-expand {
+  margin-left: auto;
+  min-height: 30px;
+}
+
+@container timeline (max-width: 560px) {
+  .tl-compact-bar {
+    flex-wrap: wrap;
+    gap: 2px 12px;
+    padding-block: 6px;
+  }
+
+  .tl-compact-rail {
+    order: 3;
+    flex-basis: 100%;
+    margin-inline: 12px;
+  }
+
+  .tl-compact-expand {
+    order: 2;
+  }
+}
+
+@media (pointer: coarse) {
+  .tl-compact-expand {
+    min-height: 44px;
+  }
+
+  .tl-compact-rail {
+    height: 56px;
+  }
+
+  .tl-compact-scrubber,
+  .tl-compact-markers,
+  .tl-compact-marker {
+    height: 44px;
+  }
+}
+
 /* Timeline session block inset shadow */
 .tl-session {
   box-shadow:

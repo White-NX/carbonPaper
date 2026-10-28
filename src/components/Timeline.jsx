@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronUp, Focus, Play } from 'lucide-react';
+import { ChevronUp, Focus, Play } from 'lucide-react';
 import { Button } from './ui/Button';
 import { getTimeline, getTimelineDetails, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
 import {
@@ -25,6 +25,7 @@ import OverviewBand from './timeline/OverviewBand';
 import SessionBand from './timeline/SessionBand';
 import DetailTrack from './timeline/DetailTrack';
 import SearchMarkerLayer from './timeline/SearchMarkerLayer';
+import CompactTimeline from './timeline/CompactTimeline';
 import { getSearchMarkerFitRange } from '../lib/timeline_search';
 import { createTimelineRequestQueue } from '../lib/timeline_requests';
 import { createTimelineBatchQueue } from '../lib/timeline_batch_queue';
@@ -37,12 +38,8 @@ const DAY = 86400000;
 const OVERVIEW_HEIGHT = 20;
 const SESSION_HEIGHT = 30;
 const DETAIL_HEIGHT = 58;
-const COMPACT_DETAIL_HEIGHT = 20;
 const AXIS_HEIGHT = 18;
-const COMPACT_AXIS_HEIGHT = 16;
-const COMPACT_CONTROLS_HEIGHT = 28;
 const TIMELINE_HEIGHT = OVERVIEW_HEIGHT + SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT;
-const COMPACT_TIMELINE_HEIGHT = COMPACT_DETAIL_HEIGHT + COMPACT_AXIS_HEIGHT + COMPACT_CONTROLS_HEIGHT;
 
 /** Tier threshold boundaries for detail track. */
 const FRAME_TIER_MAX_SPAN = 30 * MINUTE;
@@ -818,11 +815,11 @@ const Timeline = ({
   }, [active, width, jumpTimestamp, camera, flyTo, resetImagePipeline]);
 
   useEffect(() => {
-    camera.setLive(active && isFollowingNow);
-  }, [active, camera, isFollowingNow]);
+    camera.setLive(active && !compact && isFollowingNow);
+  }, [active, compact, camera, isFollowingNow]);
 
   useEffect(() => {
-    if (!active) return undefined;
+    if (!active || compact) return undefined;
     const handleKeyDown = (event) => {
       if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return;
       const target = event.target;
@@ -840,7 +837,7 @@ const Timeline = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [active, zoomToSpan, jumpToNow]);
+  }, [active, compact, zoomToSpan, jumpToNow]);
 
   // ── Pointer Interaction ─────────────────────────────────────
 
@@ -950,9 +947,31 @@ const Timeline = ({
     { key: 'week', span: 7 * DAY, label: t('timeline.week'), title: t('timeline.zoomWeek'), shortcut: '2' },
     { key: 'month', span: 30 * DAY, label: t('timeline.month'), title: t('timeline.zoomMonth'), shortcut: '3' },
   ];
-  const sessionHeight = compact ? 0 : SESSION_HEIGHT;
-  const detailHeight = compact ? COMPACT_DETAIL_HEIGHT : DETAIL_HEIGHT;
-  const axisHeight = compact ? COMPACT_AXIS_HEIGHT : AXIS_HEIGHT;
+
+  if (compact) {
+    return (
+      <div
+        ref={containerRef}
+        role="region"
+        aria-label={t('timeline.label')}
+        hidden={!active}
+        className={`tl-container relative w-full shrink-0 select-none border-b border-ide-border bg-ide-panel ${active ? '' : 'hidden'}`}
+        data-keep-selection="true"
+      >
+        <CompactTimeline
+          markers={searchState?.markers}
+          hoveredIds={searchState?.hoveredIds}
+          centerTime={centerTime}
+          onScrub={scrubTo}
+          onSelectMarker={(marker) => {
+            scrubTo(marker.time);
+            if (marker.result) onSelectSearchResult?.(marker.result);
+          }}
+          onExpand={onToggleCompact}
+        />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -961,10 +980,10 @@ const Timeline = ({
       aria-label={t('timeline.label')}
       hidden={!active}
       className={`relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border ${active ? '' : 'hidden'}`}
-      style={{ height: compact ? COMPACT_TIMELINE_HEIGHT : TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
+      style={{ height: TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
       data-keep-selection="true"
     >
-      {!compact && <OverviewBand
+      <OverviewBand
         width={width}
         height={OVERVIEW_HEIGHT}
         buckets={overviewBuckets}
@@ -978,11 +997,11 @@ const Timeline = ({
         onInteractingChange={setOverviewInteracting}
         searchMarkers={searchState?.markers || []}
         hoveredSearchMarkerIds={searchState?.hoveredIds || []}
-      />}
+      />
 
       <div
         className={`relative ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-        style={{ height: sessionHeight + detailHeight + axisHeight }}
+        style={{ height: SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={endDrag}
@@ -990,7 +1009,7 @@ const Timeline = ({
         onWheel={handleWheel}
         onClick={handleBackgroundClick}
       >
-        {!compact && <SessionBand
+        <SessionBand
           blocks={sessionBlocks}
           timeToX={timeToX}
           width={width}
@@ -1001,9 +1020,9 @@ const Timeline = ({
           activeId={activeSessionId}
           onSelect={handleSelectSession}
           onZoomTo={handleZoomToSession}
-        />}
+        />
 
-        {!compact && <DetailTrack
+        <DetailTrack
           tier={tier}
           events={events}
           buckets={densityBuckets}
@@ -1019,17 +1038,15 @@ const Timeline = ({
           onSelectEvent={handleSelectFrame}
           onSeek={seekTo}
           onVisibleFramesChange={handleVisibleFramesChange}
-        />}
+        />
 
-        {compact && <div style={{ height: detailHeight }} />}
-
-        <div className="pointer-events-none absolute inset-x-0" style={{ top: sessionHeight, height: detailHeight }}>
+        <div className="pointer-events-none absolute inset-x-0" style={{ top: SESSION_HEIGHT, height: DETAIL_HEIGHT }}>
           <SearchMarkerLayer
             markers={searchState?.markers || []}
             hoveredIds={searchState?.hoveredIds || []}
             timeToX={timeToX}
             width={width}
-            height={detailHeight}
+            height={DETAIL_HEIGHT}
             overscanPx={overscanPx}
             stageRef={markerStageRef}
             onSelectMarker={(marker) => {
@@ -1038,7 +1055,7 @@ const Timeline = ({
           />
         </div>
 
-        <div className="relative" style={{ height: axisHeight }}>
+        <div className="relative" style={{ height: AXIS_HEIGHT }}>
           <div ref={axisRef} className="absolute inset-0">
             {ticks.map((tick) => (
               <div
@@ -1062,20 +1079,20 @@ const Timeline = ({
         />
       </div>
 
-      <div className={`absolute right-2 z-40 flex items-center gap-1 ${compact ? 'bottom-0 h-7' : 'bottom-1.5'}`}>
+      <div className="absolute bottom-1.5 right-2 z-40 flex items-center gap-1">
         {onToggleCompact && (
           <Button
             variant="secondary"
             size="xs"
-            icon={compact ? ChevronDown : ChevronUp}
-            aria-expanded={!compact}
+            icon={ChevronUp}
+            aria-expanded
             data-tauri-drag-region="false"
             onClick={(event) => {
               event.stopPropagation();
               onToggleCompact();
             }}
           >
-            {compact ? t('timeline.expand') : t('timeline.collapse')}
+            {t('timeline.collapse')}
           </Button>
         )}
         {searchState?.markers?.length > 0 && (

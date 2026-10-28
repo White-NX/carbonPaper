@@ -266,11 +266,50 @@ it('keeps compact search markers selectable without reading screenshot history',
   const result = { screenshot_id: 42 };
   const onSelect = vi.fn();
   render(<Timeline compact searchState={{ fitKey: 'query', markers: [{ id: 'result', time: Date.now(), result }] }} onSelectSearchResult={onSelect} />);
-  expect(screen.getByRole('region', { name: 'timeline.label' })).toHaveStyle({ height: '64px' });
+  expect(screen.getByRole('slider', { name: 'timeline.searchResultsTrack' })).toBeInTheDocument();
+  expect(screen.queryByTestId('overview')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('events')).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'timeline.today' })).not.toBeInTheDocument();
   expect(getTimeline).not.toHaveBeenCalled();
   expect(getTimelineDensity).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole('button', { name: 'result' }));
+  fireEvent.click(screen.getByRole('button', { name: 'timeline.searchResultAt' }));
   expect(onSelect).toHaveBeenCalledWith(result);
+});
+
+it('keeps the compact overview and camera position across expansion without hidden shortcuts', () => {
+  const markerTime = Date.parse('2025-12-01T12:00:00Z');
+  const searchState = { fitKey: 'query', markers: [
+    { id: 'a', time: markerTime, result: { screenshot_id: 41 } },
+    { id: 'b', time: markerTime + 3600000, result: { screenshot_id: 42 } },
+  ] };
+  const view = render(<Timeline compact searchState={searchState} />);
+  const track = screen.getByRole('slider');
+  fireEvent.change(track, { target: { value: '250' } });
+  const selectedTime = track.getAttribute('aria-valuetext');
+  fireEvent.keyDown(window, { key: '1' });
+  expect(track).toHaveAttribute('aria-valuetext', selectedTime);
+
+  view.rerender(<Timeline searchState={searchState} />);
+  const overview = screen.getByTestId('overview');
+  const expandedCenter = (Number(overview.dataset.start) + Number(overview.dataset.end)) / 2;
+  const range = { from: markerTime - 3600000 * 0.12, to: markerTime + 3600000 * 1.12 };
+  expect(expandedCenter).toBe(range.from + (range.to - range.from) * 0.25);
+  const viewport = { ...overview.dataset };
+  view.rerender(<Timeline compact searchState={searchState} />);
+  expect(screen.getByRole('slider')).toHaveAttribute('aria-valuetext', selectedTime);
+  view.rerender(<Timeline searchState={searchState} />);
+  expect(screen.getByTestId('overview').dataset).toMatchObject(viewport);
+});
+
+it('shows an expand entry without a track or screenshot reads when compact search has no hits', () => {
+  const onToggleCompact = vi.fn();
+  render(<Timeline compact onToggleCompact={onToggleCompact} />);
+  expect(screen.queryByRole('slider')).not.toBeInTheDocument();
+  expect(screen.getByText('timeline.title')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'timeline.expand' }));
+  expect(onToggleCompact).toHaveBeenCalledOnce();
+  expect(getTimeline).not.toHaveBeenCalled();
+  expect(getTimelineDensity).not.toHaveBeenCalled();
 });
 
 it('exposes the interactive marker layer to keyboard and assistive-technology users', async () => {
@@ -305,5 +344,5 @@ it('preserves the home viewport and search collapse preference across page chang
   expect(home).toHaveStyle({ height: '126px' });
   view.rerender(<WorkspaceTimelines activeTab="advanced-search" searchState={searchState} />);
   expect(screen.getByRole('button', { name: 'timeline.expand' })).toHaveAttribute('aria-expanded', 'false');
-  expect(screen.getByRole('region', { name: 'timeline.label' })).toHaveStyle({ height: '64px' });
+  expect(within(screen.getByRole('region', { name: 'timeline.label' })).getByRole('slider')).toBeInTheDocument();
 });
