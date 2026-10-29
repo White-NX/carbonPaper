@@ -44,7 +44,7 @@ export function normalizeTimestampToMs(value) {
   return null;
 }
 
-export function useSelectedSnapshot() {
+export function useSelectedSnapshot({ enabled = true } = {}) {
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [selectedDetails, setSelectedDetails] = useState(null);
   const [selectedImageSrc, setSelectedImageSrc] = useState(null);
@@ -55,7 +55,7 @@ export function useSelectedSnapshot() {
   const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
 
   useEffect(() => {
-    if (!selectedEvent) {
+    if (!enabled || !selectedEvent) {
       setSelectedDetails(null);
       setSelectedImageSrc(null);
       setLastError(null);
@@ -122,10 +122,10 @@ export function useSelectedSnapshot() {
     return () => {
       cancelled = true;
     };
-  }, [selectedEvent]);
+  }, [enabled, selectedEvent]);
 
   useEffect(() => {
-    if (!selectedEvent) return undefined;
+    if (!enabled || !selectedEvent) return undefined;
     const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
     if (!targetId) return undefined;
     let disposed = false;
@@ -144,7 +144,7 @@ export function useSelectedSnapshot() {
       disposed = true;
       unlisten?.();
     };
-  }, [selectedEvent]);
+  }, [enabled, selectedEvent]);
 
   const ocrBoxes = useMemo(() => {
     return (selectedDetails?.ocr_results || []).map((item, index) => {

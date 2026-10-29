@@ -65,6 +65,7 @@ export default function SnapshotSourceAction({
   ocrResults,
   onOpenUrl,
   compact = false,
+  placement = 'top',
   className = '',
 }) {
   const { t } = useTranslation();
@@ -125,7 +126,7 @@ export default function SnapshotSourceAction({
     ? 'flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs text-ide-text transition-colors hover:bg-ide-hover disabled:cursor-wait disabled:opacity-60'
     : 'flex w-full items-center justify-center gap-2 rounded-md border border-ide-accent bg-ide-accent/10 px-3 py-2 text-xs font-medium text-ide-accent transition-colors hover:bg-ide-accent/20 disabled:cursor-wait disabled:opacity-60';
   const errorClassName = compact
-    ? 'absolute bottom-full left-1/2 z-50 mb-2 w-max max-w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 break-words rounded-md border border-red-500/40 bg-ide-panel px-3 py-2 text-xs text-red-400 shadow-xl'
+    ? `absolute ${placement === 'bottom' ? 'top-full mt-2' : 'bottom-full mb-2'} left-1/2 z-50 w-max max-w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 break-words rounded-md border border-ide-error/40 bg-ide-panel px-3 py-2 text-xs text-ide-error shadow-xl`
     : 'mt-1 break-words text-[11px] text-red-400';
 
   return (
@@ -164,7 +165,7 @@ export default function SnapshotSourceAction({
       {menuOpen && (
         <div
           role="menu"
-          className={`absolute bottom-full z-40 mb-2 min-w-64 max-w-[min(24rem,calc(100vw-2rem))] overflow-hidden rounded-lg border border-ide-border bg-ide-panel p-1 shadow-xl ${compact ? 'right-0' : 'left-0 right-0'}`}
+          className={`absolute ${placement === 'bottom' ? 'top-full mt-2' : 'bottom-full mb-2'} z-40 min-w-64 max-w-[min(24rem,calc(100vw-2rem))] overflow-hidden rounded-lg border border-ide-border bg-ide-panel p-1 shadow-xl ${compact ? 'right-0' : 'left-0 right-0'}`}
         >
           {sources.map((source) => (
             <button

@@ -1,11 +1,14 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { fetchSearchImage } from '../../lib/monitor_api';
 
-/** Load on first visibility and retain the original for this search result's lifetime. */
+export const SearchImageActivityContext = createContext(true);
+
+/** Load on first visibility; release the original when its workspace is hidden or locked. */
 export function OriginalSearchImage({ item, placeholder }) {
   const { t } = useTranslation();
+  const active = useContext(SearchImageActivityContext);
   const ref = useRef(null);
   const screenshotId = item?.screenshot_id ?? item?.metadata?.screenshot_id;
   const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
@@ -15,7 +18,8 @@ export function OriginalSearchImage({ item, placeholder }) {
   const current = image.key === key ? image : { src: null, loading: Boolean(id || path) };
 
   useEffect(() => {
-    setImage({ key, src: null, loading: Boolean(id || path) });
+    setImage({ key, src: null, loading: active && Boolean(id || path) });
+    if (!active) return undefined;
     if (!id && !path) return undefined;
 
     let disposed = false;
@@ -52,7 +56,7 @@ export function OriginalSearchImage({ item, placeholder }) {
       observer?.disconnect();
       controller?.abort();
     };
-  }, [id, path, key]);
+  }, [active, id, path, key]);
 
   return (
     <div ref={ref} className="h-full w-full">

@@ -10,6 +10,15 @@
 @tailwind components;
 @tailwind utilities;
 
+.workspace-focus:focus-visible { box-shadow: inset 0 0 0 2px var(--ide-accent); }
+.snapshot-viewer { container: snapshot-viewer / inline-size; }
+.snapshot-viewer-body { display: grid; grid-template-columns: minmax(0, 1fr); }
+.snapshot-viewer-body--details { grid-template-columns: minmax(0, 1fr) 300px; }
+@container snapshot-viewer (max-width: 760px) {
+  .snapshot-viewer-body--details { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(180px, 1fr) minmax(140px, 40%); }
+  .snapshot-viewer-info { border-left: 0; border-top: 1px solid var(--ide-border); }
+}
+
 .recap-surface { container: recap / inline-size; }
 .snapshot-recap-title { color: color-mix(in srgb, var(--ide-muted) 85%, var(--ide-text)); }
 .snapshot-recap-details { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 220ms cubic-bezier(.2, .7, .2, 1); }

@@ -356,6 +356,7 @@ export function AiSearchPanel({ controller: c, tabs, onSelectResult, header: Hea
     <form onSubmit={submit} className="flex w-full items-end gap-3 rounded-[25px] border border-ide-border bg-ide-panel p-1.5 pl-5 shadow-sm transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
       <textarea
         ref={inputRef}
+        data-workspace-search-input
         rows={1}
         aria-label={t(hasConversation ? 'aiSearch.followUp' : 'aiSearch.placeholder')}
         placeholder={t(hasConversation ? 'aiSearch.followUp' : 'aiSearch.placeholder')}

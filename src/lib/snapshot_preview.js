@@ -111,7 +111,7 @@ export function sanitizeSnapshotPreviewItem(item) {
 
 export function sanitizeSnapshotPreviewState(state = {}) {
   const tabs = Array.isArray(state.tabs)
-    ? state.tabs.map(sanitizeSnapshotPreviewItem).filter((tab) => getSnapshotPreviewKey(tab))
+    ? state.tabs.map(sanitizeSnapshotPreviewItem).filter((tab) => getSnapshotPreviewKey(tab)).slice(-SNAPSHOT_PREVIEW_TAB_LIMIT)
     : [];
   const activeKey = state.activeKey && tabs.some((tab) => getSnapshotPreviewKey(tab) === state.activeKey)
     ? state.activeKey

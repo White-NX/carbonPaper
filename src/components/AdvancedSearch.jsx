@@ -15,6 +15,8 @@ import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
 import { buildSearchTimelineMarkers, searchResultMarkerId } from '../lib/timeline_search';
 import { RecapSearchResultDetails, RecapSearchResultRow } from './search/RecapSearchResult';
 import { useRecapSourceAction } from './recap/RecapSources';
+import { useSnapshotOpenPreference } from '../hooks/useSnapshotOpenPreference';
+import { SearchImageActivityContext } from './search/OriginalSearchImage';
 
 export function AdvancedSearch({
   active,
@@ -26,8 +28,12 @@ export function AdvancedSearch({
   onTimelineSearchChange,
   onOpenRecapDay,
   isAuthenticated = true,
+  focusRequest = 0,
+  recordsRevision = 0,
 }) {
   const { t } = useTranslation();
+  const rootRef = React.useRef(null);
+  const standalonePreferred = useSnapshotOpenPreference('search');
   const {
     query,
     setQuery,
@@ -76,6 +82,8 @@ export function AdvancedSearch({
     useRecapSemantic,
   } = useAdvancedSearchController({
     active: active && isAuthenticated,
+    authenticated: isAuthenticated,
+    recordsRevision,
     searchParams,
     searchMode,
     onSearchModeChange,
@@ -83,7 +91,14 @@ export function AdvancedSearch({
   });
   const isMigrating = useHmacMigrationStatus();
   const [aiActive, setAiActive] = React.useState(false);
-  const ai = useAiSearch({ active: active && aiActive });
+  const ai = useAiSearch({ active: active && aiActive && isAuthenticated });
+  const focusedRequestRef = React.useRef(0);
+  React.useEffect(() => {
+    if (active && isAuthenticated && focusRequest > focusedRequestRef.current) {
+      const input = rootRef.current?.querySelector('[data-workspace-search-input]');
+      if (input) { input.focus({ preventScroll: true }); focusedRequestRef.current = focusRequest; }
+    }
+  }, [active, aiActive, focusRequest, isAuthenticated]);
   const handleTabChange = (next) => {
     setAiActive(next === 'ai');
     if (next !== 'ai') handleModeChange(next);
@@ -164,11 +179,10 @@ export function AdvancedSearch({
           onUseProcess={applyProcessFilter}
           latest={landingCaptures}
           thumbnailCache={thumbnailCache}
-          onSelectLatest={(item) => onSelectResult?.({
-            ...item,
-            id: item.screenshot_id || item.id,
-            path: item.image_path || item.metadata?.image_path || item.path,
-          })}
+          onSelectLatest={(item) => {
+            const payload = { ...item, id: item.screenshot_id || item.id, path: item.image_path || item.metadata?.image_path || item.path };
+            if (standalonePreferred && openFloatingPreview) openFloatingPreview(payload); else onSelectResult?.(payload);
+          }}
           eggMessage={rotatingMessage}
         />
       ) : (
@@ -225,14 +239,18 @@ export function AdvancedSearch({
 
   if (aiActive) {
     return (
-      <div className={pageClassName}>
+      <SearchImageActivityContext.Provider value={active && isAuthenticated}>
+      <div ref={rootRef} className={pageClassName}>
         <AiSearchPanel controller={ai} tabs={tabs} onSelectResult={onSelectResult} header={PageHeader} />
       </div>
+      </SearchImageActivityContext.Provider>
     );
   }
 
   return (
+    <SearchImageActivityContext.Provider value={active && isAuthenticated}>
     <div
+      ref={rootRef}
       className={pageClassName}
     >
       {isMigrating && (
@@ -299,6 +317,8 @@ export function AdvancedSearch({
       >
         <div className="flex h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
           <input
+            data-workspace-search-input
+            aria-label={t('workspace.searchField')}
             type="text"
             className="min-w-0 flex-1 bg-transparent text-sm text-ide-text outline-none placeholder:text-ide-muted"
             placeholder={mode === 'ocr'
@@ -364,5 +384,6 @@ export function AdvancedSearch({
       {currentRecap && active && isAuthenticated && <RecapSearchResultDetails item={currentRecap} action={recapAction} time={recapTime}
         onClose={() => setSelectedRecap(null)} onOpenDay={(date) => { setSelectedRecap(null); onOpenRecapDay?.(date); }} />}
     </div>
+    </SearchImageActivityContext.Provider>
   );
 }

@@ -1,19 +1,20 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Eye, Maximize2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { usePreference } from '../../lib/preference_store';
+import { useSnapshotOpenPreference } from '../../hooks/useSnapshotOpenPreference';
 import { fetchThumbnail } from '../../lib/monitor_api';
 import { sourceResult } from '../../lib/recap_api';
 
 export function useRecapSourceAction(onSelect, onFloating) {
   const { t } = useTranslation();
-  const behavior = usePreference('cardClickBehavior_recap', 'standalone');
-  const floating = behavior === 'standalone' && Boolean(onFloating);
+  const standalonePreferred = useSnapshotOpenPreference('recap');
+  const floating = standalonePreferred && Boolean(onFloating);
   return {
     floating,
     open: (source, alternate = false) => {
-      if ((alternate ? !floating : floating) && onFloating) onFloating(sourceResult(source), { sourceLabel: t('recap.title'), sourceType: 'recap' });
-      else onSelect?.(sourceResult(source));
+      const payload = { ...sourceResult(source), sourceLabel: t('recap.title'), sourceType: 'recap' };
+      if ((alternate ? !floating : floating) && onFloating) onFloating(payload, { sourceLabel: t('recap.title'), sourceType: 'recap' });
+      else onSelect?.(payload);
     },
   };
 }

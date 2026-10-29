@@ -347,8 +347,8 @@
       },
       "cardClickBehavior": {
         "label": "卡片点击默认行为",
-        "description": "配置在不同功能视图下点击快照卡片时的默认响应操作。",
-        "preview": "跳转到主预览页面",
+        "description": "选择点击截图后，在当前页面预览或打开独立窗口。",
+        "preview": "在当前页面预览",
         "standalone": "从独立窗口打开",
         "searchLabel": "高级搜索卡片",
         "clustersLabel": "智能聚类卡片"
@@ -1256,12 +1256,18 @@
     "settings": "设置",
     "hideToTray": "隐藏到托盘",
     "service": {
-      "running": "运行中",
+      "running": "正在记录",
       "paused": "已暂停",
       "starting": "启动中...",
       "offline": "离线",
       "powerSavingOffline": "因节电模式配置离线。"
-    }
+    },
+    "notifications": "通知",
+    "lightTheme": "切换到浅色主题",
+    "darkTheme": "切换到深色主题",
+    "minimize": "最小化窗口",
+    "maximize": "最大化窗口",
+    "restore": "还原窗口"
   },
   "previewAction": {
     "deleteNowTitle": "立即删除此记录",
@@ -1272,7 +1278,7 @@
     "more": "更多",
     "showOcr": "显示OCR内容",
     "openFloatingPreview": "在独立窗口中查看",
-    "openMainPreview": "在主窗口/预览中查看",
+    "openMainPreview": "在当前页面预览",
     "float": "独立预览"
   },
   "snapshotSource": {
@@ -1314,7 +1320,7 @@
     "closeTab": "关闭标签页",
     "minimize": "最小化",
     "openMain": "在主预览中打开",
-    "openStandalone": "弹出独立窗口",
+    "openStandalone": "独立窗口",
     "loadingImage": "正在加载……",
     "loadingDetails": "加载详情",
     "source": "来源",
@@ -1324,8 +1330,8 @@
     "category": "分类",
     "path": "路径",
     "links": "链接",
-    "ocrText": "OCR 文本",
-    "copyOcr": "复制 OCR 文本",
+    "ocrText": "识别文字",
+    "copyOcr": "复制文字",
     "copied": "已复制",
     "copy": "复制",
     "loadingOcr": "正在加载 OCR 文本",
@@ -1335,10 +1341,23 @@
     "collapseOcr": "收起 OCR 文本",
     "expandOcr": "展开 OCR 文本",
     "sources": {
-      "mainPreview": "主预览",
-      "advancedSearch": "高级搜索",
-      "smartClusters": "智能聚类"
-    }
+      "mainPreview": "记录",
+      "advancedSearch": "搜索",
+      "smartClusters": "主题"
+    },
+    "openSnapshot": "预览 {{title}}",
+    "openTimeline": "在时间线上查看",
+    "details": "详情",
+    "copyFailed": "无法复制文字，请重试。",
+    "imageUnavailable": "暂时无法显示这张截图",
+    "processingText": "正在识别这张截图中的文字",
+    "restoreWindows": "打开独立预览（{{count}} 张截图）",
+    "closeNamedTab": "关闭 {{title}}",
+    "confirmDeleteTitle": "删除截图？",
+    "confirmDelete": "这张截图及其识别文字将被删除。",
+    "confirmDeleteNearby": "这张截图附近 5 分钟内的记录及其识别文字将被删除。",
+    "deleting": "正在删除……",
+    "timestampUnavailable": "无法确定这张截图的时间"
   },
   "search": {
     "searchError": "搜索出错：{{message}}",
@@ -1428,7 +1447,12 @@
     "advancedSearch": "高级搜索",
     "smartCluster": "智能聚类",
     "expand": "展开侧栏",
-    "collapse": "收起侧栏"
+    "collapse": "收起侧栏",
+    "records": "记录",
+    "search": "搜索",
+    "recap": "回顾",
+    "topics": "主题",
+    "navigation": "主要功能"
   },
   "clusterCard": {
     "actionResume": "继续",
@@ -2044,5 +2068,10 @@
       "minutes": "耗时 {{count}} 分钟",
       "minutesSeconds": "耗时 {{minutes}} 分钟 {{seconds}} 秒"
     }
+  },
+  "workspace": {
+    "openSearch": "搜索记录与回顾",
+    "searchField": "搜索历史记录",
+    "backTo": "返回{{page}}"
   }
 }

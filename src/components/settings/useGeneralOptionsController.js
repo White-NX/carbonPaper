@@ -78,8 +78,8 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
     auto_lightweight_delay_minutes: 5,
   });
   const [cardClickBehaviorSearch, setCardClickBehaviorSearch] = useState(() => localStorage.getItem('cardClickBehavior_search') || 'preview');
-  const [cardClickBehaviorClusters, setCardClickBehaviorClusters] = useState(() => localStorage.getItem('cardClickBehavior_clusters') || 'standalone');
-  const [cardClickBehaviorRecap, setCardClickBehaviorRecap] = useState(() => localStorage.getItem('cardClickBehavior_recap') || 'standalone');
+  const [cardClickBehaviorClusters, setCardClickBehaviorClusters] = useState(() => localStorage.getItem('cardClickBehavior_clusters') || 'preview');
+  const [cardClickBehaviorRecap, setCardClickBehaviorRecap] = useState(() => localStorage.getItem('cardClickBehavior_recap') || 'preview');
 
   useEffect(() => {
     if (active) getLightweightConfig().then(setLightweightConfigState).catch((error) => setOptionError(t('settings.feedback.readFailed')));

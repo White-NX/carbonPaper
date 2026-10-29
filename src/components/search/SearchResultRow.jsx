@@ -5,7 +5,7 @@ import { fetchThumbnail } from '../../lib/monitor_api';
 import { CATEGORY_COLORS } from '../../lib/categories';
 import { buildSnippet } from '../../lib/search_snippet';
 import { captureDateOf } from '../../lib/search_grouping';
-import { usePreference } from '../../lib/preference_store';
+import { useSnapshotOpenPreference } from '../../hooks/useSnapshotOpenPreference';
 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -132,8 +132,8 @@ export function SearchResultRow({
     path: item.image_path || item.metadata?.image_path || item.path,
   });
 
-  const cardClickBehavior = usePreference('cardClickBehavior_search', 'preview');
-  const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
+  const standalonePreferred = useSnapshotOpenPreference('search');
+  const isStandaloneDefault = standalonePreferred && !!onOpenFloatingPreview;
 
   const handleSelect = (item) => {
     const payload = normalize(item);

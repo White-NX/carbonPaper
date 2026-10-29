@@ -1,79 +1,37 @@
 import React from 'react';
-import { Layout, Search as SearchIcon, Sparkles, CalendarDays, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
+import { History, Search, Sparkles, CalendarDays, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { Button } from './ui/Button';
+import { WORKSPACE_PAGES } from '../lib/workspace_navigation';
 
-const NAV_ITEMS = [
-  { id: 'preview', icon: Layout, i18nKey: 'activityBar.preview' },
-  { id: 'advanced-search', icon: SearchIcon, i18nKey: 'activityBar.advancedSearch' },
-  { id: 'recap', icon: CalendarDays, i18nKey: 'recap.title' },
-  { id: 'smart-cluster', icon: Sparkles, i18nKey: 'activityBar.smartCluster' },
-];
+const ICONS = { preview: History, 'advanced-search': Search, recap: CalendarDays, 'smart-cluster': Sparkles };
 
-export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggleExpand }) {
+export default function ActivityBar({ activeTab, setActiveTab, expanded = true, onToggleExpand }) {
   const { t } = useTranslation();
-
   return (
-    <aside
-      className={`hidden md:flex flex-col bg-ide-panel border-r border-ide-border h-full shrink-0 transition-all duration-200 select-none ${
-        expanded ? 'w-40' : 'w-12'
-      }`}
-    >
-      {/* Navigation icons */}
-      <nav className="flex-1 flex flex-col">
-        {NAV_ITEMS.map(({ id, icon: Icon, i18nKey }) => {
-          const isActive = activeTab === id;
-          const label = t(i18nKey);
+    <aside className={`workspace-navigation flex h-full w-14 shrink-0 flex-col border-r border-ide-border bg-ide-panel select-none ${expanded ? 'md:w-40' : ''}`}>
+      <nav aria-label={t('activityBar.navigation')} className="flex flex-1 flex-col gap-1 p-2">
+        {WORKSPACE_PAGES.map(({ id, labelKey }) => {
+          const Icon = ICONS[id];
+          const selected = activeTab === id;
+          const label = t(labelKey);
           return (
-            <button
-              key={id}
-              type="button"
-              data-tauri-drag-region="false"
-              aria-label={label}
-              aria-current={isActive ? 'page' : undefined}
-              onClick={() => setActiveTab(id)}
-              title={!expanded ? label : undefined}
-              className={`relative flex items-center gap-3 h-10 cursor-pointer transition-colors overflow-hidden ${
-                expanded ? 'px-3' : 'px-0 justify-center'
-              } ${
-                isActive
-                  ? 'text-ide-text bg-ide-active'
-                  : 'text-ide-muted hover:text-ide-text hover:bg-ide-hover'
-              }`}
-            >
-              {/* Active indicator bar */}
-              {isActive && (
-                <span className="absolute left-0 top-1 bottom-1 w-0.5 bg-ide-accent rounded-r" />
-              )}
-              <Icon className="w-[18px] h-[18px] shrink-0" />
-              {expanded && (
-                <span className="text-sm truncate whitespace-nowrap">{label}</span>
-              )}
-            </button>
+            <Button key={id} variant="ghost" icon={<Icon className="h-[18px] w-[18px] shrink-0" aria-hidden="true" />}
+              aria-label={label} aria-current={selected ? 'page' : undefined} title={label}
+              onClick={() => setActiveTab(id)} data-tauri-drag-region="false"
+              className={`workspace-focus h-10 w-full gap-3 px-0 ${expanded ? 'md:justify-start md:px-2.5' : ''} ${selected ? 'bg-ide-accent/10 text-ide-accent' : ''}`}>
+              {expanded && <span className="hidden truncate text-sm md:block">{label}</span>}
+            </Button>
           );
         })}
       </nav>
-
-      {/* Expand / Collapse toggle */}
-      <div className="border-t border-ide-border">
-        <button
-          type="button"
-          data-tauri-drag-region="false"
-          onClick={onToggleExpand}
-          title={expanded ? t('activityBar.collapse') : t('activityBar.expand')}
-          aria-label={expanded ? t('activityBar.collapse') : t('activityBar.expand')}
-          className={`flex items-center gap-3 h-10 w-full cursor-pointer text-ide-muted hover:text-ide-text hover:bg-ide-hover transition-colors ${
-            expanded ? 'px-3' : 'px-0 justify-center'
-          }`}
-        >
-          {expanded ? (
-            <>
-              <PanelLeftClose className="w-[18px] h-[18px] shrink-0" />
-              <span className="text-xs truncate whitespace-nowrap">{t('activityBar.collapse')}</span>
-            </>
-          ) : (
-            <PanelLeftOpen className="w-[18px] h-[18px] shrink-0" />
-          )}
-        </button>
+      <div className="border-t border-ide-border p-2">
+        <Button variant="ghost" icon={expanded ? PanelLeftClose : PanelLeftOpen} onClick={onToggleExpand}
+          aria-label={t(expanded ? 'activityBar.collapse' : 'activityBar.expand')}
+          title={t(expanded ? 'activityBar.collapse' : 'activityBar.expand')}
+          className={`workspace-focus h-9 w-full px-0 ${expanded ? 'md:justify-start md:px-2.5' : ''}`}>
+          {expanded && <span className="hidden md:block">{t('activityBar.collapse')}</span>}
+        </Button>
       </div>
     </aside>
   );

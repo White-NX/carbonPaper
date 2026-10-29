@@ -1,7 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RequestQueue } from './monitor_api';
+import { deleteRecordsByTimeRange } from './monitor_api';
+import { invoke } from '@tauri-apps/api/core';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+it('keeps an explicit epoch-zero screenshot as the deletion range anchor', async () => {
+  invoke.mockResolvedValue({});
+  await deleteRecordsByTimeRange(5, 0);
+  expect(invoke).toHaveBeenCalledWith('storage_delete_by_time_range', { startTime: -300000, endTime: 0 });
+});
 
 describe('RequestQueue', () => {
   afterEach(() => {

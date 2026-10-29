@@ -15,7 +15,7 @@ function getHostname(url) {
   }
 }
 
-export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange, active = true, isAuthenticated = false, onOpenRecap }) {
+export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange, active = true, isAuthenticated = false, onOpenRecap, docked = false }) {
   const { t } = useTranslation();
   const [scoredLinks, setScoredLinks] = useState([]);
   const [editingCategory, setEditingCategory] = useState(false);
@@ -93,13 +93,13 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
   // Reading an expanded recap or using the keyboard must not dismiss the card.
   useEffect(() => {
-    if (!active || !isVisible || isHoveringCard || hasCardFocus || isRecapExpanded || editingCategory) {
+    if (docked || !active || !isVisible || isHoveringCard || hasCardFocus || isRecapExpanded || editingCategory) {
       clearTimer();
     } else {
       startHideTimer();
     }
     return clearTimer;
-  }, [selectedId, active, isVisible, isHoveringCard, hasCardFocus, isRecapExpanded, editingCategory, clearTimer, startHideTimer]);
+  }, [docked, selectedId, active, isVisible, isHoveringCard, hasCardFocus, isRecapExpanded, editingCategory, clearTimer, startHideTimer]);
 
   const handleMouseEnterCard = () => setIsHoveringCard(true);
   const handleMouseLeaveCard = () => setIsHoveringCard(false);
@@ -128,7 +128,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
   // Dismiss on outside press without intercepting the underlying image drag.
   useEffect(() => {
-    if (!isVisible) return undefined;
+    if (docked || !isVisible) return undefined;
 
     const handleOutsidePointerDown = (event) => {
       const cardEl = cardRef.current;
@@ -144,14 +144,14 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
     return () => {
       document.removeEventListener('pointerdown', handleOutsidePointerDown, true);
     };
-  }, [isVisible, clearTimer]);
+  }, [docked, isVisible, clearTimer]);
 
   if (!selectedEvent) return null;
 
   return (
     <>
       {/* Collapsed indicator pill — hover to re-open */}
-      <button
+      {!docked && <button
         type="button"
         aria-label={t('sidebar.details.title')}
         aria-controls={cardId}
@@ -167,10 +167,10 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
       >
         <Info size={14} className="text-ide-accent shrink-0" />
         <span className="text-xs text-ide-muted whitespace-nowrap">{selectedDetails?.record?.process_name || selectedEvent.appName}</span>
-      </button>
+      </button>}
 
       {/* Invisible left-edge hover zone to re-trigger card */}
-      {!isVisible && (
+      {!docked && !isVisible && (
         <div
           className="absolute left-0 top-0 bottom-0 w-8 z-10"
           onMouseEnter={handleEdgeHover}
@@ -183,8 +183,8 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
         id={cardId}
         role="region"
         aria-label={t('sidebar.details.title')}
-        aria-hidden={!isVisible}
-        className={`absolute top-4 left-4 w-80 max-h-[calc(100%-2rem)] overflow-y-auto z-20 rounded-xl border border-ide-border bg-ide-panel shadow-lg transition-all duration-300 ${
+        aria-hidden={docked ? undefined : !isVisible}
+        className={docked ? 'w-full bg-ide-panel' : `absolute top-4 left-4 w-80 max-h-[calc(100%-2rem)] overflow-y-auto z-20 rounded-xl border border-ide-border bg-ide-panel shadow-lg transition-all duration-300 ${
           isVisible
             ? 'visible opacity-100 translate-x-0 pointer-events-auto'
             : 'invisible opacity-0 -translate-x-4 pointer-events-none'
@@ -282,8 +282,8 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
               <label className="text-xs font-medium text-ide-muted">{t('sidebar.links.title')}</label>
               <div className="mt-1 space-y-1">
                 {pageUrl && (
-                  <div
-                    className="hover:bg-ide-hover/60 cursor-pointer rounded p-2 text-xs flex items-start gap-2 group"
+                  <button type="button"
+                    className="workspace-focus w-full hover:bg-ide-hover/60 rounded p-2 text-left text-xs flex items-start gap-2 group"
                     onClick={() => handleOpenUrl(pageUrl)}
                     title={pageUrl}
                   >
@@ -293,12 +293,12 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
                       <div className="truncate opacity-60">{getHostname(pageUrl)}</div>
                     </div>
                     <ExternalLink size={12} className="shrink-0 mt-0.5 opacity-0 group-hover:opacity-60" />
-                  </div>
+                  </button>
                 )}
                 {scoredLinks.map((link, idx) => (
-                  <div
+                  <button type="button"
                     key={idx}
-                    className="hover:bg-ide-hover/60 cursor-pointer rounded p-2 text-xs flex items-start gap-2 group"
+                    className="workspace-focus w-full hover:bg-ide-hover/60 rounded p-2 text-left text-xs flex items-start gap-2 group"
                     onClick={() => handleOpenUrl(link.url)}
                     title={link.text}
                   >
@@ -307,7 +307,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
                       <div className="truncate">{link.text || link.url}</div>
                       <div className="truncate opacity-60">{getHostname(link.url)}</div>
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>

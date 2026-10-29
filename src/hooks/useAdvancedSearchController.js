@@ -34,6 +34,8 @@ function useDebouncedValue(value, delay = 300) {
 
 export function useAdvancedSearchController({
   active,
+  authenticated = true,
+  recordsRevision = 0,
   searchParams,
   searchMode,
   onSearchModeChange,
@@ -72,6 +74,7 @@ export function useAdvancedSearchController({
   const sentinelRef = useRef(null);
   const lastParamsRef = useRef({ query: '', mode: 'ocr' });
   const searchIdRef = useRef(0);
+  const completedRequestRef = useRef(null);
   /**
    * 筛选选项和最近截图都是「打开面板时看一眼」的数据，来回切换面板时不必反复
    * 重查。这里记下上一次取数用的令牌，只有用户显式刷新才会让它们重新取。
@@ -83,16 +86,29 @@ export function useAdvancedSearchController({
   const debouncedQuery = useDebouncedValue(query, 400);
   useEffect(() => {
     searchIdRef.current += 1;
+    completedRequestRef.current = null;
     setSemanticUpdating(false);
     setLoading(false);
     setLoadingMore(false);
     setResults([]);
     setHasMore(false);
     setTotals(null);
-  }, [query, active, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate]);
+  }, [query, authenticated, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate]);
+  useEffect(() => {
+    if (active) return;
+    // Leaving a workspace cancels pending work, while completed results and their scroll container stay mounted.
+    searchIdRef.current += 1;
+    setLoading(false); setLoadingMore(false); setSemanticUpdating(false);
+  }, [active]);
+  useEffect(() => {
+    if (authenticated) return;
+    completedRequestRef.current = null;
+    optionsTokenRef.current = null; landingTokenRef.current = null;
+    setThumbnailCache({}); setLandingCaptures([]); setProcessOptions([]); setCategoryOptions([]);
+  }, [authenticated]);
   useEffect(() => () => { searchIdRef.current += 1; }, []);
   /** 重取的判据：只有用户显式刷新时它才变化。 */
-  const reloadToken = searchParams?.refreshKey ?? 0;
+  const reloadToken = `${searchParams?.refreshKey ?? 0}:${recordsRevision}`;
   const rotatingMessages = useMemo(() => t('advancedSearch.rotating', { returnObjects: true }) || [], [t]);
   const [rotatingMessage, setRotatingMessage] = useState(() => {
     return rotatingMessages.length > 0 ? rotatingMessages[Math.floor(Math.random() * rotatingMessages.length)] : '';
@@ -201,10 +217,12 @@ export function useAdvancedSearchController({
     }
   };
 
-  const resetAndFetch = useCallback(async () => {
-    if (!active) return;
+  const resetAndFetch = useCallback(async (force = false) => {
+    if (!active || !authenticated) return;
     if (query.trim() !== debouncedQuery.trim()) return;
     const normalizedQuery = debouncedQuery.trim();
+    const requestKey = JSON.stringify([normalizedQuery, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, reloadToken]);
+    if (!force && completedRequestRef.current === requestKey) return;
     if (!normalizedQuery && !hasFilters && !(mode === 'ocr' && searchTarget === 'recaps')) {
       searchIdRef.current += 1;
       setResults([]);
@@ -250,7 +268,7 @@ export function useAdvancedSearchController({
         const keywords = await searchSnapshotsAndRecaps(normalizedQuery, options);
         if (searchIdRef.current !== currentSearchId) return;
         apply(keywords, false);
-        if (!normalizedQuery || !useRecapSemantic || keywords.semantic_status === 'disabled') return;
+        if (!normalizedQuery || !useRecapSemantic || keywords.semantic_status === 'disabled') { completedRequestRef.current = requestKey; return; }
         setSemanticUpdating(true);
         try {
           const combined = await searchSnapshotsAndRecaps(normalizedQuery, { ...options, includeSemantic: true });
@@ -260,7 +278,7 @@ export function useAdvancedSearchController({
             setSemanticStatus('unavailable');
           }
         } finally {
-          if (searchIdRef.current === currentSearchId) setSemanticUpdating(false);
+          if (searchIdRef.current === currentSearchId) { setSemanticUpdating(false); completedRequestRef.current = requestKey; }
         }
         return;
       }
@@ -280,6 +298,7 @@ export function useAdvancedSearchController({
 
       if (searchIdRef.current !== currentSearchId) return;
       setResults(fetched);
+      completedRequestRef.current = requestKey;
       setResultSetKey(currentSearchId);
       setHasMore(fetched.length === pageSize);
       setElapsedMs(performance.now() - startedAt);
@@ -302,7 +321,7 @@ export function useAdvancedSearchController({
         setLoading(false);
       }
     }
-  }, [active, query, debouncedQuery, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters]);
+  }, [active, authenticated, reloadToken, query, debouncedQuery, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters]);
 
   useEffect(() => {
     // Query/filter changes and explicit refresh share one trigger. A separate
@@ -336,6 +355,7 @@ export function useAdvancedSearchController({
 
   useEffect(() => {
     // Picture results load originals at the card; landing captures keep thumbnails.
+    if (!active || !authenticated) return undefined;
     if (mode === 'nl' && !isLanding) return undefined;
     const source = results.length > 0 ? results : landingCaptures;
     if (source.length === 0) return;
@@ -352,10 +372,10 @@ export function useAdvancedSearchController({
       }
     })();
     return () => { activeBatch = false; };
-  }, [results, landingCaptures, mode, isLanding]);
+  }, [active, authenticated, results, landingCaptures, mode, isLanding]);
 
   const loadMore = useCallback(async () => {
-    if (!hasMore || loadingMore || loading || semanticUpdating) return;
+    if (!active || !authenticated || !hasMore || loadingMore || loading || semanticUpdating) return;
     const currentSearchId = searchIdRef.current;
     setLoadingMore(true);
     setError(null);
@@ -426,7 +446,7 @@ export function useAdvancedSearchController({
         setLoadingMore(false);
       }
     }
-  }, [debouncedQuery, mode, searchTarget, hasFilters, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating]);
+  }, [active, authenticated, debouncedQuery, mode, searchTarget, hasFilters, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating]);
 
   useEffect(() => {
     if (!active) return;
@@ -452,7 +472,7 @@ export function useAdvancedSearchController({
 
   const handleSubmit = (event) => {
     event.preventDefault();
-    resetAndFetch();
+    resetAndFetch(true);
   };
 
   const clearFilters = () => {

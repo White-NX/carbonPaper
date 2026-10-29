@@ -90,7 +90,7 @@ function Landing({ enabled, hasClosedPeriod, loading, error, onConfigure, onGene
   </div>;
 }
 
-export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview, navigation }) {
+export default function RecapView({ active, isAuthenticated, onSelectScreenshot, onOpenSnapshotPreview, navigation, hasWorkspaceHeader = false }) {
   const { t, i18n } = useTranslation();
   const [date, setDate] = useState(localDate);
   const [task, setTask] = useState(null);
@@ -249,7 +249,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
       <div className="recap-header grid min-w-0 flex-1 items-start gap-x-5 gap-y-2">
         <div className="flex h-10 min-w-0 items-center">
           {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
-            : <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 shrink-0 text-ide-accent" /><span className="truncate">{t('recap.title')}</span></h1>}
+            : !hasWorkspaceHeader && <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 shrink-0 text-ide-accent" /><span className="truncate">{t('recap.title')}</span></h1>}
         </div>
         <div className="recap-header-actions flex min-h-10 items-center justify-end gap-1.5">
           {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}

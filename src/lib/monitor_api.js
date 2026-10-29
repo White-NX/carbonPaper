@@ -580,7 +580,7 @@ export const deleteScreenshot = async (screenshotId) => {
 export const deleteRecordsByTimeRange = async (minutes, centerTimestamp = null) => {
     return withAuth(async () => {
         try {
-            const now = centerTimestamp || Date.now();
+            const now = centerTimestamp ?? Date.now();
             let startTime, endTime;
             
             if (minutes === 'today') {

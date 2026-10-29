@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect width="1280" height="720" fill="#f4f6fa"/>
+  <rect width="1280" height="48" fill="#e4e9f1"/>
+  <circle cx="24" cy="24" r="6" fill="#a0aab8"/>
+  <rect x="62" y="13" width="940" height="24" rx="8" fill="#fff"/>
+  <text x="84" y="29" font-family="Segoe UI, sans-serif" font-size="12" fill="#64748b">localhost / design-notes</text>
+  <rect y="48" width="230" height="672" fill="#fff"/>
+  <text x="26" y="102" font-family="Segoe UI, sans-serif" font-size="19" font-weight="600" fill="#253149">Design notes</text>
+  <rect x="16" y="134" width="198" height="42" rx="8" fill="#e8f1ff"/>
+  <text x="32" y="161" font-family="Segoe UI, sans-serif" font-size="15" fill="#2563eb">Workspace navigation</text>
+  <text x="32" y="208" font-family="Segoe UI, sans-serif" font-size="15" fill="#64748b">Screenshot preview</text>
+  <text x="32" y="255" font-family="Segoe UI, sans-serif" font-size="15" fill="#64748b">Reading layouts</text>
+  <text x="290" y="127" font-family="Segoe UI, sans-serif" font-size="34" font-weight="600" fill="#253149">A familiar place for every screenshot</text>
+  <text x="290" y="176" font-family="Segoe UI, sans-serif" font-size="19" fill="#64748b">Find a moment. Open its source. Return to where you were.</text>
+  <rect x="288" y="223" width="896" height="195" rx="14" fill="#fff" stroke="#d9e0ea"/>
+  <text x="322" y="267" font-family="Segoe UI, sans-serif" font-size="20" font-weight="600" fill="#253149">One preview, three ways to find it</text>
+  <g font-family="Segoe UI, sans-serif" font-size="16" fill="#475569">
+    <text x="322" y="307">Search keeps the query and filters.</text>
+    <text x="322" y="341">Recap keeps the date and reading position.</text>
+    <text x="322" y="375">Topics keep the selected collection and citation.</text>
+  </g>
+  <rect x="288" y="448" width="426" height="190" rx="14" fill="#eaf2ff"/>
+  <rect x="740" y="448" width="444" height="190" rx="14" fill="#eef7f2"/>
+  <text x="320" y="492" font-family="Segoe UI, sans-serif" font-size="19" font-weight="600" fill="#253149">Stable controls</text>
+  <text x="320" y="533" font-family="Segoe UI, sans-serif" font-size="16" fill="#475569">Copy text · View source · Details</text>
+  <text x="774" y="492" font-family="Segoe UI, sans-serif" font-size="19" font-weight="600" fill="#253149">Explicit navigation</text>
+  <text x="774" y="533" font-family="Segoe UI, sans-serif" font-size="16" fill="#475569">View in timeline · Separate window</text>
+  <text x="290" y="687" font-family="Segoe UI, sans-serif" font-size="12" fill="#94a3b8">Synthetic review fixture · No personal screenshot data</text>
+</svg>

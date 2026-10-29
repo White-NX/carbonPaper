@@ -347,8 +347,8 @@
       },
       "cardClickBehavior": {
         "label": "Card Click Default Behavior",
-        "description": "Configure the default action when clicking on snapshot cards under different functional views.",
-        "preview": "Jump to main preview page",
+        "description": "Choose whether a screenshot opens in the current page or in a separate window.",
+        "preview": "Preview in the current page",
         "standalone": "Open in separate window",
         "searchLabel": "Advanced Search Cards",
         "clustersLabel": "Smart Clusters Cards"
@@ -1256,12 +1256,18 @@
     "settings": "Settings",
     "hideToTray": "Hide to tray",
     "service": {
-      "running": "Running",
+      "running": "Recording",
       "paused": "Paused",
       "starting": "Starting...",
       "offline": "Offline",
       "powerSavingOffline": "Offline due to power saving settings."
-    }
+    },
+    "notifications": "Notifications",
+    "lightTheme": "Switch to light theme",
+    "darkTheme": "Switch to dark theme",
+    "minimize": "Minimize window",
+    "maximize": "Maximize window",
+    "restore": "Restore window"
   },
   "previewAction": {
     "deleteNowTitle": "Delete this record immediately",
@@ -1272,7 +1278,7 @@
     "more": "More",
     "showOcr": "Show OCR content",
     "openFloatingPreview": "View in separate window",
-    "openMainPreview": "View in main window/preview",
+    "openMainPreview": "Preview in the current page",
     "float": "Separate Preview"
   },
   "snapshotSource": {
@@ -1314,7 +1320,7 @@
     "closeTab": "Close tab",
     "minimize": "Minimize",
     "openMain": "Open in main preview",
-    "openStandalone": "Pop out to separate window",
+    "openStandalone": "Separate window",
     "loadingImage": "Loading image...",
     "loadingDetails": "Loading details",
     "source": "Source",
@@ -1324,8 +1330,8 @@
     "category": "Category",
     "path": "Path",
     "links": "Links",
-    "ocrText": "OCR Text",
-    "copyOcr": "Copy OCR text",
+    "ocrText": "Recognized text",
+    "copyOcr": "Copy text",
     "copied": "Copied",
     "copy": "Copy",
     "loadingOcr": "Loading OCR text",
@@ -1335,10 +1341,23 @@
     "collapseOcr": "Collapse OCR text",
     "expandOcr": "Expand OCR text",
     "sources": {
-      "mainPreview": "Main Preview",
-      "advancedSearch": "Advanced Search",
-      "smartClusters": "Smart Clusters"
-    }
+      "mainPreview": "Records",
+      "advancedSearch": "Search",
+      "smartClusters": "Topics"
+    },
+    "openSnapshot": "Preview {{title}}",
+    "openTimeline": "View in timeline",
+    "details": "Details",
+    "copyFailed": "Could not copy the text. Please try again.",
+    "imageUnavailable": "This screenshot cannot be displayed right now",
+    "processingText": "Recognizing text in this screenshot",
+    "restoreWindows": "Open separate preview ({{count}} screenshots)",
+    "closeNamedTab": "Close {{title}}",
+    "confirmDeleteTitle": "Delete screenshot?",
+    "confirmDelete": "This screenshot and its recognized text will be deleted.",
+    "confirmDeleteNearby": "Records within 5 minutes of this screenshot and their recognized text will be deleted.",
+    "deleting": "Deleting…",
+    "timestampUnavailable": "The capture time is unavailable"
   },
   "search": {
     "searchError": "Search failed: {{message}}",
@@ -1428,7 +1447,12 @@
     "advancedSearch": "Advanced Search",
     "smartCluster": "Smart Clusters",
     "expand": "Expand Sidebar",
-    "collapse": "Collapse Sidebar"
+    "collapse": "Collapse Sidebar",
+    "records": "Records",
+    "search": "Search",
+    "recap": "Recap",
+    "topics": "Topics",
+    "navigation": "Main navigation"
   },
   "clusterCard": {
     "actionResume": "Resume",
@@ -2045,5 +2069,10 @@
       "minutes": "Took {{count}} min",
       "minutesSeconds": "Took {{minutes}} min {{seconds}} sec"
     }
+  },
+  "workspace": {
+    "openSearch": "Search records and recaps",
+    "searchField": "Search history",
+    "backTo": "Back to {{page}}"
   }
 }

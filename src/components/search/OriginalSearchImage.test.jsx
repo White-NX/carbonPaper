@@ -2,7 +2,7 @@ import React from 'react';
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { fetchSearchImage } from '../../lib/monitor_api';
-import { OriginalSearchImage } from './OriginalSearchImage';
+import { OriginalSearchImage, SearchImageActivityContext } from './OriginalSearchImage';
 
 vi.mock('../../lib/monitor_api', () => ({ fetchSearchImage: vi.fn() }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
@@ -94,6 +94,21 @@ it('supports path-only results and shows the existing placeholder after a read f
   expect(requests[0]).toMatchObject({ id: null, path: 'memory://legacy' });
   await act(async () => requests[0].reject(new Error('missing image')));
   expect(screen.getByText('unavailable')).toBeInTheDocument();
+});
+
+it('releases originals and cancels pending reads while the search workspace is hidden', async () => {
+  const View = ({ active }) => <SearchImageActivityContext.Provider value={active}><OriginalSearchImage item={{ screenshot_id: 18 }} /></SearchImageActivityContext.Provider>;
+  const { container, rerender } = render(<View active />);
+  intersect(true);
+  await act(async () => requests[0].resolve('large original'));
+  rerender(<View active={false} />);
+  expect(container.querySelector('img')).not.toBeInTheDocument();
+  rerender(<View active />);
+  intersect(true);
+  rerender(<View active={false} />);
+  expect(requests[1].signal.aborted).toBe(true);
+  await act(async () => requests[1].resolve('late hidden original'));
+  expect(container.querySelector('img')).not.toBeInTheDocument();
 });
 
 it('avoids invalid requests and still loads when IntersectionObserver is unavailable', async () => {

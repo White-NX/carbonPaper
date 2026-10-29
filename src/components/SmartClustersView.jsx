@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSnapshotOpenPreference } from '../hooks/useSnapshotOpenPreference';
 import { listen } from '@tauri-apps/api/event';
 import {
   Sparkles, Plus, Loader2, AlertCircle, X,
@@ -358,6 +359,7 @@ export default function SmartClustersView({
   active = true,
 }) {
   const { t } = useTranslation();
+  const standalonePreferred = useSnapshotOpenPreference('clusters');
   const [clusters, setClusters] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [assignments, setAssignments] = useState([]);
@@ -622,7 +624,7 @@ export default function SmartClustersView({
       sourceType: 'smart-cluster-summary',
     };
 
-    if (onOpenSnapshotPreview) {
+    if (standalonePreferred && onOpenSnapshotPreview) {
       onOpenSnapshotPreview(payload, {
         sourceLabel: t('smartClusters.aiSummary'),
         sourceDetail,
@@ -632,7 +634,7 @@ export default function SmartClustersView({
     }
 
     onSelectScreenshot?.(payload);
-  }, [onOpenSnapshotPreview, onSelectScreenshot, selected, t]);
+  }, [onOpenSnapshotPreview, onSelectScreenshot, selected, standalonePreferred, t]);
 
   const activeClusters = useMemo(() => clusters.filter((c) => c.enabled), [clusters]);
   const pausedClusters = useMemo(() => clusters.filter((c) => !c.enabled), [clusters]);
@@ -986,7 +988,7 @@ export default function SmartClustersView({
                       }}
                       preloadedSrc={thumbnailCache[s.screenshot_id] || null}
                       onSelect={(payload) => {
-                        onSelectScreenshot?.({ ...payload, assigned_at: s.assigned_at });
+                        onSelectScreenshot?.({ ...payload, assigned_at: s.assigned_at, sourceDetail: clusterName(selected), sourceType: 'smart-cluster' });
                       }}
                       onOpenFloatingPreview={onOpenSnapshotPreview
                         ? (payload) => {

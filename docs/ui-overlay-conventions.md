@@ -5,6 +5,11 @@ maintenance progress, onboarding, and native prompts in the main and settings
 windows. New surfaces use the existing primitives, layer tokens, and interaction
 policy. Existing surfaces follow these rules when they are changed.
 
+The v1.0 application frame and screenshot behavior follow
+[the workspace conventions](ui-workspace-conventions.md). See
+[the UI baseline](ui-v1-baseline.md) for repeatable synthetic review and
+[the roadmap](ui-v1-roadmap.md) for deferred page layouts and state work.
+
 On-demand dialogs opened from a button (including recap corrections and
 sources, the OCR repair card, and dialogs inside settings) use
 `components/Dialog.jsx`; short decisions use `ConfirmDialog`.

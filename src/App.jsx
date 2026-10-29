@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import WorkspaceTimelines from './components/WorkspaceTimelines';
@@ -10,6 +10,9 @@ import AppBoundUpgradePrompt from './components/AppBoundUpgradePrompt';
 import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
+import WorkspaceHeader from './components/WorkspaceHeader';
+import { setPreference, usePreference } from './lib/preference_store';
+import { useSnapshotPreviewWindow } from './hooks/useSnapshotPreviewWindow';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
 import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
@@ -58,9 +61,13 @@ function App() {
 
   const [showOcrModelRepair, setShowOcrModelRepair] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
-  const [sidebarExpanded, setSidebarExpanded] = useState(false);
+  const sidebarExpanded = usePreference('workspaceNavigationExpanded', 'true') === 'true';
   const [searchMode, setSearchMode] = useState('ocr');
-  const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [advancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [searchFocusRequest, setSearchFocusRequest] = useState(0);
+  const [returnTo, setReturnTo] = useState(null);
+  const returnFocusRef = useRef(null);
+  const [previewRequest, setPreviewRequest] = useState(null);
   const [timelineSearch, setTimelineSearch] = useState(null);
 
   const openOcrModelRepair = useCallback(() => {
@@ -171,7 +178,7 @@ function App() {
     ocrBoxes,
     clearSelection,
     bumpTimelineRefresh,
-  } = useSelectedSnapshot();
+  } = useSelectedSnapshot({ enabled: isAuthenticated });
   const { showSettings, openSettings } = useSettingsHost({
     onMonitorAction: handleSettingsMonitorAction,
     onRecordsChanged: bumpTimelineRefresh,
@@ -191,7 +198,7 @@ function App() {
   } = useUpdateManager();
 
   const handleCopyText = (text) => {
-    navigator.clipboard.writeText(text);
+    return navigator.clipboard.writeText(text);
   };
 
   const handleGlobalClick = useCallback((event) => {
@@ -204,23 +211,54 @@ function App() {
     }
   }, [highlightedEventId, setHighlightedEventId]);
 
-  const selectSearchResult = useCallback((res) => {
+  const navigate = useCallback((page, options = {}) => {
+    setReturnTo(null);
+    returnFocusRef.current = null;
+    setActiveTab(page);
+    if (page === 'advanced-search' && options.focusSearch !== false) setSearchFocusRequest((request) => request + 1);
+  }, []);
+
+  const returnToSource = useCallback(() => {
+    if (!returnTo) return;
+    const trigger = returnFocusRef.current;
+    navigate(returnTo, { focusSearch: false });
+    requestAnimationFrame(() => { if (trigger?.isConnected) trigger.focus({ preventScroll: true }); });
+  }, [navigate, returnTo]);
+
+  const selectSearchResult = useCallback((res, options = {}) => {
     const event = searchResultToSnapshotEvent(res);
-    if (event) {
-      setSelectedEvent(event);
-      setHighlightedEventId(event.id);
-      if (event.timestamp !== null) {
-        setTimelineJump({ time: event.timestamp, ts: Date.now() });
-      }
+    if (!event) return;
+    if (activeTab !== 'preview') {
+      setReturnTo(activeTab);
+      returnFocusRef.current = options.trigger || document.activeElement;
+    }
+    setSelectedEvent(event);
+    setHighlightedEventId(event.id);
+    if (event.timestamp !== null) {
+      setTimelineJump({ time: event.timestamp, ts: Date.now() });
     }
     setActiveTab('preview');
-  }, [setHighlightedEventId, setSelectedEvent, setTimelineJump]);
+  }, [activeTab, setHighlightedEventId, setSelectedEvent, setTimelineJump]);
 
-  const handleSearchSubmit = ({ query, mode }) => {
-    setActiveTab('advanced-search');
-    setSearchMode(mode);
-    setAdvancedSearchParams({ query, mode, refreshKey: Date.now() });
-  };
+  const openSearch = useCallback(() => {
+    if (!isAuthenticated || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
+    navigate('advanced-search');
+  }, [isAuthenticated, navigate, overlays.active]);
+
+  useEffect(() => {
+    const keydown = (event) => {
+      if (event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return;
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && isAuthenticated && overlays.active === null) {
+        event.preventDefault(); openSearch();
+      } else if (event.altKey && event.key === 'ArrowLeft' && activeTab === 'preview' && returnTo && isAuthenticated && overlays.active === null) {
+        event.preventDefault(); returnToSource();
+      }
+    };
+    window.addEventListener('keydown', keydown);
+    return () => window.removeEventListener('keydown', keydown);
+  }, [activeTab, isAuthenticated, openSearch, overlays.active, returnTo, returnToSource]);
+
+  const previewWindows = useSnapshotPreviewWindow({ isAuthenticated, onOpenTimeline: selectSearchResult });
 
   return (
     <OverlayCoordinatorProvider value={overlays.value}>
@@ -240,10 +278,9 @@ function App() {
         onMinimize={minimize}
         onToggleMaximize={toggleMaximize}
         onHideToTray={hideToTray}
-        onSearchSelect={selectSearchResult}
-        onSearchSubmit={handleSearchSubmit}
-        searchMode={searchMode}
-        onSearchModeChange={setSearchMode}
+        onOpenSearch={openSearch}
+        previewCount={previewWindows.tabs.length}
+        onRestorePreviews={previewWindows.restore}
         backendStatus={backendStatus}
         powerSavingSuppressed={monitorPowerSavingSuppressed}
         monitorPaused={monitorPaused}
@@ -310,18 +347,23 @@ function App() {
 
         <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings} />
 
-        <main className="flex-1 min-h-0 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
+        <main className="flex-1 min-h-0 flex flex-row overflow-hidden relative bg-ide-bg">
           <ActivityBar
             activeTab={activeTab}
-            setActiveTab={setActiveTab}
+            setActiveTab={navigate}
             expanded={sidebarExpanded}
-            onToggleExpand={() => setSidebarExpanded((prev) => !prev)}
+            onToggleExpand={() => setPreference('workspaceNavigationExpanded', !sidebarExpanded)}
           />
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            <WorkspaceHeader activeTab={activeTab} returnTo={returnTo} onReturn={returnToSource} />
             <WorkspaceTimelines
               activeTab={activeTab}
               onSelectEvent={(evt) => {
+                if (activeTab === 'advanced-search' && evt) {
+                  setPreviewRequest({ item: { ...evt, screenshot_id: evt.id, image_path: evt.imagePath, captured_at_ms: evt.timestamp }, token: Date.now() });
+                  return;
+                }
                 setSelectedEvent(evt);
                 setHighlightedEventId(evt?.id ?? null);
               }}
@@ -331,17 +373,22 @@ function App() {
               refreshKey={timelineRefreshKey}
               sqlPaused={!windowFocused}
               searchState={timelineSearch}
-              onSelectSearchResult={selectSearchResult}
+              onSelectSearchResult={(item) => setPreviewRequest({ item, token: Date.now() })}
             />
 
             <MainArea
               activeTab={activeTab}
-              setActiveTab={setActiveTab}
+              setActiveTab={navigate}
+              searchFocusRequest={searchFocusRequest}
+              recordsRevision={timelineRefreshKey}
+              previewRequest={previewRequest}
+              onOpenSnapshotPreview={previewWindows.open}
               selectedImageSrc={selectedImageSrc}
               isLoadingDetails={isLoadingDetails}
               selectedEvent={selectedEvent}
               selectedDetails={selectedDetails}
               lastError={lastError}
+              onRetrySnapshot={() => setSelectedEvent((event) => event ? { ...event } : null)}
               ocrBoxes={ocrBoxes}
               advancedSearchParams={advancedSearchParams}
               searchMode={searchMode}
@@ -357,18 +404,20 @@ function App() {
                   bumpTimelineRefresh();
                 } catch (e) {
                   console.error('Failed to delete record', e);
+                  throw e;
                 }
               }}
               onDeleteNearbyRecords={async (timestamp, minutes) => {
                 try {
-                  const ts = normalizeTimestampToMs(timestamp);
-                  if (ts) {
+                  const ts = Number.isFinite(timestamp) ? timestamp : normalizeTimestampToMs(timestamp);
+                  if (ts !== null) {
                     await deleteRecordsByTimeRange(minutes, ts);
-                  }
+                  } else throw new Error(t('snapshotPreview.timestampUnavailable'));
                   clearSelection();
                   bumpTimelineRefresh();
                 } catch (e) {
                   console.error('Failed to delete nearby records', e);
+                  throw e;
                 }
               }}
               onCopyText={handleCopyText}

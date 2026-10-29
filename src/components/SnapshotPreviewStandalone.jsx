@@ -3,6 +3,12 @@ import { emitTo, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Image as ImageIcon, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useAuthSession } from '../hooks/useAuthSession';
+import { initAuthListeners } from '../lib/auth_api';
+import { DialogVisibilityContext } from '../hooks/useDialogFocus';
+import { OverlayCoordinatorProvider, useOverlayCoordinator } from './overlay';
+import AuthMask from './AuthMask';
+import { Button } from './ui/Button';
 import SnapshotPreviewDock from './SnapshotPreviewDock';
 import {
   getSnapshotPreviewKey,
@@ -61,40 +67,40 @@ function StandaloneTitleBar({ title }) {
       <div className="min-w-0 flex-1 truncate text-sm font-medium text-ide-text" title={title}>
         {title}
       </div>
-      <button
-        type="button"
-        className="rounded p-1.5 text-ide-muted transition-colors hover:bg-red-500/15 hover:text-red-400"
+      <Button variant="ghost" icon={X}
+        className="workspace-focus h-7 w-7 px-0 hover:bg-ide-error hover:text-white"
         onMouseDown={(event) => event.stopPropagation()}
         onClick={closeWindow}
-        title={t('common.close')}
-      >
-        <X className="h-4 w-4" />
-      </button>
+        title={t('common.close')} aria-label={t('common.close')}
+      />
     </div>
   );
 }
 
 export default function SnapshotPreviewStandalone() {
   const { t } = useTranslation();
+  const overlays = useOverlayCoordinator();
+  const auth = useAuthSession();
+  useEffect(() => initAuthListeners(), []);
   const [tabs, setTabs] = useState(() => readPreviewState().tabs);
   const [activeKey, setActiveKey] = useState(() => readPreviewState().activeKey);
   const suppressNextEmitRef = useRef(false);
   const closeTimerRef = useRef(null);
 
   const activeTab = tabs.find((tab) => getSnapshotPreviewKey(tab) === activeKey) || tabs[0] || null;
-  const title = getSnapshotTitle(activeTab, t);
+  const title = auth.isAuthenticated ? getSnapshotTitle(activeTab, t) : t('snapshotPreview.windowTitle');
 
   const persistAndNotify = useCallback((nextTabs, nextActiveKey) => {
-    const state = {
+    const state = sanitizeSnapshotPreviewState({
       tabs: nextTabs,
       activeKey: nextActiveKey,
       updatedAt: Date.now(),
-    };
+    });
     try {
       localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify(sanitizeSnapshotPreviewState(state)));
       emitTo('main', 'snapshot-preview-state-changed', state).catch(() => {});
     } catch {
-      // best-effort POC sync
+      // Window synchronization is best effort; the saved descriptors remain available.
     }
   }, []);
 
@@ -112,14 +118,16 @@ export default function SnapshotPreviewStandalone() {
   }, [title]);
 
   useEffect(() => {
+    let live = true;
     let unlisten;
     listen('snapshot-preview-state', (event) => {
-      const payload = event.payload || {};
+      if (!live) return;
+      const payload = sanitizeSnapshotPreviewState(event.payload || {});
       suppressNextEmitRef.current = true;
       setTabs(Array.isArray(payload.tabs) ? payload.tabs : []);
       setActiveKey(payload.activeKey || null);
     }).then((fn) => {
-      unlisten = fn;
+      if (live) unlisten = fn; else fn();
     });
 
     const handleStorage = (event) => {
@@ -132,6 +140,7 @@ export default function SnapshotPreviewStandalone() {
     window.addEventListener('storage', handleStorage);
 
     return () => {
+      live = false;
       if (unlisten) unlisten();
       window.removeEventListener('storage', handleStorage);
     };
@@ -189,15 +198,18 @@ export default function SnapshotPreviewStandalone() {
 
   const openInMainPreview = useCallback((tab) => {
     const target = tab || activeTab;
-    if (!target) return;
+    if (!target || !auth.isAuthenticated) return;
     emitTo('main', 'snapshot-preview-open-main', target).catch(() => {});
-  }, [activeTab]);
+  }, [activeTab, auth.isAuthenticated]);
 
   return (
+    <OverlayCoordinatorProvider value={overlays.value}>
+    <DialogVisibilityContext.Provider value={auth.isAuthenticated}>
     <div className="h-screen w-screen overflow-hidden bg-transparent p-[3px] text-ide-text">
       <div className="flex h-full w-full flex-col overflow-hidden rounded-md border border-ide-border bg-ide-bg shadow-2xl">
         <StandaloneTitleBar title={title} />
-        <div className="min-h-0 flex-1">
+        <div className="relative min-h-0 flex-1">
+          <AuthMask isVisible={!auth.isAuthenticated} onAuthSuccess={auth.handleAuthSuccess} authError={auth.authError} setAuthError={auth.setAuthError} />
           {tabs.length > 0 && (
             <SnapshotPreviewDock
               tabs={tabs}
@@ -206,11 +218,13 @@ export default function SnapshotPreviewStandalone() {
               onCloseTab={closeTab}
               onClear={clearTabs}
               onOpenInMainPreview={openInMainPreview}
-              standalone
+              isAuthenticated={auth.isAuthenticated}
             />
           )}
         </div>
       </div>
     </div>
+    </DialogVisibilityContext.Provider>
+    </OverlayCoordinatorProvider>
   );
 }

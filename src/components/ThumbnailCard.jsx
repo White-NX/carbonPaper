@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { CATEGORY_COLORS } from '../lib/categories';
 import { cn } from '../lib/utils';
-import { usePreference } from '../lib/preference_store';
+import { useSnapshotOpenPreference } from '../hooks/useSnapshotOpenPreference';
 import { OriginalSearchImage } from './search/OriginalSearchImage';
 
 export function CategoryBadge({ category }) {
@@ -74,8 +74,8 @@ export function ThumbnailCard({
   };
 
   const clickScope = ['search', 'clusters'].includes(sourceType) ? sourceType : 'preview';
-  const cardClickBehavior = usePreference(`cardClickBehavior_${clickScope}`, clickScope === 'clusters' ? 'standalone' : 'preview');
-  const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
+  const standalonePreferred = useSnapshotOpenPreference(clickScope);
+  const isStandaloneDefault = standalonePreferred && !!onOpenFloatingPreview;
 
   const handleSelect = (event) => {
     event.stopPropagation();
@@ -108,6 +108,7 @@ export function ThumbnailCard({
       <button
         type="button"
         className="block h-full w-full text-left focus-visible:outline-none"
+        aria-label={t('snapshotPreview.openSnapshot', { title: item.window_title || item.metadata?.window_title || footerPrimary })}
         onClick={handleSelect}
       >
         {imageKind === 'original' ? (

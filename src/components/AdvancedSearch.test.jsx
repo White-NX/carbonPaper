@@ -78,6 +78,7 @@ describe('AdvancedSearch', () => {
   let observerCallback;
 
   beforeEach(() => {
+    localStorage.clear();
     observerCallback = null;
     searchSnapshotsAndRecaps.mockReset().mockResolvedValue(response([]));
     globalThis.IntersectionObserver = class {
@@ -393,13 +394,42 @@ describe('AdvancedSearch', () => {
     expect(fetchThumbnailBatch).not.toHaveBeenCalled();
   });
 
-  it('clears picture cards when leaving the search page', async () => {
+  it('retains completed picture cards and avoids a new query when returning to search', async () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(23), similarity: 0.8 }]);
     const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
     const { rerender } = render(<AdvancedSearch active {...props} />);
     await screen.findByRole('button', { name: '23' });
     rerender(<AdvancedSearch active={false} {...props} />);
+    expect(screen.getByRole('button', { name: '23' })).toBeInTheDocument();
+    rerender(<AdvancedSearch active {...props} />);
+    expect(screen.getByRole('button', { name: '23' })).toBeInTheDocument();
+    expect(searchScreenshots).toHaveBeenCalledOnce();
+    rerender(<AdvancedSearch active {...props} isAuthenticated={false} />);
     expect(screen.queryByRole('button', { name: '23' })).not.toBeInTheDocument();
+  });
+
+  it('refreshes retained results after records change without clearing the query', async () => {
+    searchSnapshotsAndRecaps.mockResolvedValue(response([makeOcrResult(26)]));
+    const props = { active: true, searchParams: { query: 'design', mode: 'ocr' } };
+    const { rerender } = render(<AdvancedSearch {...props} recordsRevision={0} />);
+    await screen.findByText('text-26');
+    expect(searchSnapshotsAndRecaps).toHaveBeenCalledOnce();
+    rerender(<AdvancedSearch {...props} active={false} recordsRevision={0} />);
+    searchSnapshotsAndRecaps.mockResolvedValue(response([]));
+    rerender(<AdvancedSearch {...props} active={false} recordsRevision={1} />);
+    rerender(<AdvancedSearch {...props} recordsRevision={1} />);
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('textbox', { name: 'workspace.searchField' })).toHaveValue('design');
+    expect(screen.queryByText('text-26')).not.toBeInTheDocument();
+  });
+
+  it('focuses the existing query from the title-bar request without clearing filters', async () => {
+    const props = { active: true, searchParams: { query: 'design', mode: 'ocr' } };
+    const { rerender } = render(<AdvancedSearch {...props} />);
+    await screen.findByRole('textbox', { name: 'workspace.searchField' });
+    rerender(<AdvancedSearch {...props} focusRequest={1} />);
+    expect(screen.getByRole('textbox', { name: 'workspace.searchField' })).toHaveFocus();
+    expect(screen.getByRole('textbox', { name: 'workspace.searchField' })).toHaveValue('design');
   });
 
   it('clears picture cards immediately when their query is emptied', async () => {

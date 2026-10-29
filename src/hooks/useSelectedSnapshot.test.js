@@ -89,3 +89,18 @@ it('still corrects the timeline position from the stored UTC capture time', asyn
   await act(async () => details[0].resolve({ record: { created_at: '2026-01-01T00:00:00Z' } }));
   expect(result.current.timelineJump.time).toBe(Date.parse('2026-01-01T00:00:00Z'));
 });
+
+it('drops loaded and in-flight data on lock and reloads the same selection after unlock', async () => {
+  const { result, rerender } = renderHook(({ enabled }) => useSelectedSnapshot({ enabled }), { initialProps: { enabled: true } });
+  act(() => result.current.setSelectedEvent({ id: 8 }));
+  await act(async () => images[0].resolve('sensitive image'));
+  rerender({ enabled: false });
+  expect(result.current.selectedImageSrc).toBeNull();
+  await act(async () => details[0].resolve({ record: { id: 8 } }));
+  expect(result.current.selectedDetails).toBeNull();
+  expect(result.current.selectedEvent.id).toBe(8);
+  rerender({ enabled: true });
+  expect(images).toHaveLength(2);
+  await act(async () => { images[1].resolve('reloaded'); details[1].resolve({ record: { id: 8 } }); });
+  expect(result.current.selectedImageSrc).toBe('reloaded');
+});
