@@ -5,10 +5,11 @@ Use these rules for the main window and screenshot previews alongside
 
 ## Application frame
 
-The title bar owns brand, search entry, recording status, settings, notifications,
-theme and native window controls. Search focuses the existing page input.
-Ctrl+K invokes the same action without clearing query or filters. Startup gates
-and modal dialogs retain keyboard ownership.
+The title bar owns brand, quick search, recording status, settings, notifications,
+theme and native window controls. Text and picture queries show inline results;
+Enter or the view-more action sends the query and mode to the full-search page.
+Ctrl+K focuses the title-bar input without leaving the current workspace or
+clearing its query. Startup gates and modal dialogs retain keyboard ownership.
 
 Navigation names user tasks: Records, Search, Recap and Topics. Page IDs remain
 `preview`, `advanced-search`, `recap` and `smart-cluster` for compatibility.
@@ -25,7 +26,8 @@ accessible label at narrow widths; use semantic `ide-*` tokens for states.
 
 | Operation | Destination |
 |---|---|
-| Click a search, recap or topic screenshot/citation | Contextual dialog in the same workspace |
+| Click a title-bar quick-search result | Records viewer and timeline |
+| Click a full-search, recap or topic screenshot/citation | Contextual dialog in the same workspace |
 | Click a records timeline thumbnail | Records viewer below the timeline |
 | “View in timeline” | Records with an explicit return action |
 | “Separate window” | Native window with the same viewer and bounded tabs |

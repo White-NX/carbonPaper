@@ -35,7 +35,7 @@ export function SearchModeTabs({ mode, onChange }) {
             disabled={disabled}
             title={hint}
             onClick={() => { if (!disabled) onChange(value); }}
-            className={`relative flex items-center gap-1.5 rounded-t-md px-3 pb-2.5 pt-1.5 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 disabled:cursor-not-allowed disabled:opacity-40 ${
+            className={`relative flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 disabled:cursor-not-allowed disabled:opacity-40 ${
               selected ? 'font-semibold text-ide-accent' : 'text-ide-muted hover:bg-ide-hover hover:text-ide-text'
             }`}
           >

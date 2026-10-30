@@ -63,7 +63,8 @@ function App() {
   const [activeTab, setActiveTab] = useState('preview');
   const sidebarExpanded = usePreference('workspaceNavigationExpanded', 'true') === 'true';
   const [searchMode, setSearchMode] = useState('ocr');
-  const [advancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const searchInputRef = useRef(null);
+  const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
   const [searchFocusRequest, setSearchFocusRequest] = useState(0);
   const [returnTo, setReturnTo] = useState(null);
   const returnFocusRef = useRef(null);
@@ -240,23 +241,30 @@ function App() {
     setActiveTab('preview');
   }, [activeTab, setHighlightedEventId, setSelectedEvent, setTimelineJump]);
 
-  const openSearch = useCallback(() => {
+  const handleSearchSubmit = useCallback(({ query, mode }) => {
     if (!isAuthenticated || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
     navigate('advanced-search');
+    setSearchMode(mode);
+    setAdvancedSearchParams((params) => ({ query, mode, refreshKey: params.refreshKey + 1 }));
   }, [isAuthenticated, navigate, overlays.active]);
+
+  const focusQuickSearch = useCallback(() => {
+    if (!isAuthenticated || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
+    searchInputRef.current?.focus();
+  }, [isAuthenticated, overlays.active]);
 
   useEffect(() => {
     const keydown = (event) => {
       if (event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && isAuthenticated && overlays.active === null) {
-        event.preventDefault(); openSearch();
+        event.preventDefault(); focusQuickSearch();
       } else if (event.altKey && event.key === 'ArrowLeft' && activeTab === 'preview' && returnTo && isAuthenticated && overlays.active === null) {
         event.preventDefault(); returnToSource();
       }
     };
     window.addEventListener('keydown', keydown);
     return () => window.removeEventListener('keydown', keydown);
-  }, [activeTab, isAuthenticated, openSearch, overlays.active, returnTo, returnToSource]);
+  }, [activeTab, focusQuickSearch, isAuthenticated, overlays.active, returnTo, returnToSource]);
 
   const previewWindows = useSnapshotPreviewWindow({ isAuthenticated, onOpenTimeline: selectSearchResult });
 
@@ -278,7 +286,11 @@ function App() {
         onMinimize={minimize}
         onToggleMaximize={toggleMaximize}
         onHideToTray={hideToTray}
-        onOpenSearch={openSearch}
+        searchInputRef={searchInputRef}
+        onSearchSelect={selectSearchResult}
+        onSearchSubmit={handleSearchSubmit}
+        searchMode={searchMode}
+        onSearchModeChange={setSearchMode}
         previewCount={previewWindows.tabs.length}
         onRestorePreviews={previewWindows.restore}
         backendStatus={backendStatus}
@@ -356,7 +368,7 @@ function App() {
           />
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-            <WorkspaceHeader activeTab={activeTab} returnTo={returnTo} onReturn={returnToSource} />
+            <WorkspaceHeader activeTab={activeTab} />
             <WorkspaceTimelines
               activeTab={activeTab}
               onSelectEvent={(evt) => {
@@ -378,6 +390,8 @@ function App() {
 
             <MainArea
               activeTab={activeTab}
+              returnTo={returnTo}
+              onReturn={returnToSource}
               setActiveTab={navigate}
               searchFocusRequest={searchFocusRequest}
               recordsRevision={timelineRefreshKey}

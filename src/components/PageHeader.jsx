@@ -2,16 +2,8 @@ import React from 'react';
 import { cn } from '../lib/utils';
 
 /**
- * 主区域各页面共用的顶栏骨架。
- *
- * 检索页、智能聚类页和创建流程原本各自写了一套顶栏，行高、内边距和分隔线
- * 都不一样，放在相邻标签页里切换时能明显看出断层。这里把三者的度量统一到
- * 一处：外层的留白、两行之间的间距、第二行的最小高度都由这个组件决定，
- * 页面只负责往两行里放东西。
- *
- * 第一行放当前页面的主要动作（检索页是搜索框，聚类页是「新建」按钮）；
- * 第二行放选项卡、筛选药丸或状态药丸。第二行留空时不会塌陷，因为切换页面
- * 时顶栏高度跳动比空一行更扎眼。
+ * 主区域各页面共用的紧凑工具区。
+ * 主要动作、选项卡和结果统计共用第一行；筛选或状态行只在有内容时占据高度。
  *
  * 需要提交行为的页面（比如检索页的搜索框）可以传 `as="form"`，其余属性会
  * 透传给最外层元素。
@@ -19,6 +11,7 @@ import { cn } from '../lib/utils';
  * @param {object} props
  * @param {'div' | 'form'} [props.as] 渲染成什么元素，默认 div
  * @param {React.ReactNode} props.children 第一行内容
+ * @param {string} [props.primaryRowClassName] 第一行的附加类名
  * @param {React.ReactNode} [props.secondaryRow] 第二行内容
  * @param {string} [props.secondaryRowClassName] 第二行的附加类名
  * @param {boolean} [props.bordered] 是否画出底部分隔线。下面紧跟着统计条时
@@ -30,6 +23,7 @@ import { cn } from '../lib/utils';
 export function PageHeader({
   as: Tag = 'div',
   children,
+  primaryRowClassName,
   secondaryRow,
   secondaryRowClassName,
   bordered = true,
@@ -39,14 +33,14 @@ export function PageHeader({
 }) {
   return (
     <Tag
-      className={`shrink-0 bg-ide-panel px-6 pt-4 ${flushBottom ? '' : 'pb-3.5'} ${
+      className={`shrink-0 bg-ide-panel px-4 pt-2 ${flushBottom ? '' : 'pb-2'} ${
         bordered ? 'border-b border-ide-border' : ''
       } ${className}`}
       {...rest}
     >
-      <div className="flex min-h-10 items-center gap-3">{children}</div>
+      <div className={cn('flex min-h-9 items-center gap-2', primaryRowClassName)}>{children}</div>
       {secondaryRow !== undefined && (
-        <div className={cn('mt-3.5 flex min-h-[34px] items-center gap-7', secondaryRowClassName)}>{secondaryRow}</div>
+        <div className={cn('mt-2 flex min-h-8 items-center gap-3 empty:hidden', secondaryRowClassName)}>{secondaryRow}</div>
       )}
     </Tag>
   );

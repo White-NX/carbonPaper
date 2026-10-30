@@ -181,9 +181,13 @@ describe('SmartClustersView manual drain', () => {
     const user = userEvent.setup();
     renderView();
 
+    await user.click(await screen.findByRole('button', { name: 'smartClusters.statusDetails' }));
     await user.click(await screen.findByRole('button', { name: 'smartClusters.processNow' }));
 
     expect(smartClusterDrainNow).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'smartClusters.stopDrain' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'smartClusters.statusDetails' }));
+    expect(screen.getByRole('button', { name: 'smartClusters.statusDetails' })).toHaveAttribute('aria-expanded', 'false');
     expect(screen.getByRole('button', { name: 'smartClusters.stopDrain' })).toBeInTheDocument();
   });
 
@@ -192,6 +196,7 @@ describe('SmartClustersView manual drain', () => {
     const user = userEvent.setup();
     renderView();
 
+    await user.click(await screen.findByRole('button', { name: 'smartClusters.statusDetails' }));
     await user.click(await screen.findByRole('button', { name: 'smartClusters.processNow' }));
 
     expect(await screen.findByText('Background scheduler is unavailable')).toBeInTheDocument();
@@ -214,7 +219,9 @@ describe('SmartClustersView manual drain', () => {
     const user = userEvent.setup();
     renderView();
 
-    expect(await screen.findByText('smartClusters.processingFailed')).toBeInTheDocument();
+    expect(await screen.findByText('smartClusters.processingFailedDetail')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'smartClusters.statusDetails' }));
+    expect(screen.getByText('smartClusters.processingFailed')).toBeInTheDocument();
     const retry = await screen.findByRole('button', { name: 'smartClusters.retryFailed' });
     expect(retry).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'smartClusters.stopDrain' })).not.toBeInTheDocument();

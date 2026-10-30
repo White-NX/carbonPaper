@@ -149,7 +149,7 @@ describe('daily recap page', () => {
     api.getRecapProgress.mockResolvedValue({ ...progress, version: 3, stage: 'ready', completed_batches: 4, finished_at_ms: Date.now() });
     await act(async () => { await notify(); });
     await waitFor(() => expect(api.getRecapDay).toHaveBeenCalledTimes(dayReads + 1));
-    expect(header.getByText('recap.updated')).toBeInTheDocument();
+    expect(header.getByTitle('recap.updated')).toHaveAttribute('type', 'date');
     expect(header.queryByRole('status')).not.toBeInTheDocument();
     expect(header.queryByRole('progressbar')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'recap.stop' })).not.toBeInTheDocument();

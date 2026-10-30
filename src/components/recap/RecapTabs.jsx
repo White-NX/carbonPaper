@@ -45,7 +45,7 @@ export function RecapTabs({ tab, onChange }) {
                 document.getElementById(`recap-tab-${next}`)?.focus();
               }
             }}
-            className={`relative flex items-center gap-1.5 rounded-t-md px-3 pb-2.5 pt-1.5 text-[13px] transition-colors ${focusStyle} ${
+            className={`relative flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[13px] transition-colors ${focusStyle} ${
               selected
                 ? 'font-semibold text-ide-accent'
                 : 'text-ide-muted hover:bg-ide-hover hover:text-ide-text'

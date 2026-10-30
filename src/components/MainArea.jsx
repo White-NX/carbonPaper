@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ArrowLeft } from 'lucide-react';
+import { Button } from './ui/Button';
 import { AdvancedSearch } from './AdvancedSearch';
 import SmartClustersView from './SmartClustersView';
 import RecapView from './recap/RecapView';
@@ -14,10 +16,11 @@ export default function MainArea({
   activeTab, setActiveTab, selectedImageSrc, isLoadingDetails, selectedEvent, selectedDetails, lastError,
   onAdvancedSelect, advancedSearchParams, searchMode, onSearchModeChange, onDeleteRecord, onDeleteNearbyRecords,
   onCopyText, isAuthenticated, onTimelineSearchChange, onOpenSnapshotPreview, searchFocusRequest, previewRequest,
-  onRetrySnapshot,
+  onRetrySnapshot, returnTo, onReturn,
   recordsRevision = 0,
 }) {
   const { t } = useTranslation();
+  const returnLabel = returnTo ? t('workspace.backTo', { page: t(workspaceLabelKey(returnTo)) }) : undefined;
   const [inlineItem, setInlineItem] = useState(null);
   const originRef = useRef(null);
   const lastPreviewRequest = useRef(null);
@@ -54,11 +57,16 @@ export default function MainArea({
 
   return (
     <section className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-ide-bg">
-      <div className={`${activeTab === 'preview' ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col overflow-hidden`}>
+      <div className={`${activeTab === 'preview' ? 'flex' : 'hidden'} relative min-h-0 min-w-0 flex-1 flex-col overflow-hidden`}>
         {currentItem && isAuthenticated ? <SnapshotViewer item={currentItem} imageSrc={selectedImageSrc} details={selectedDetails}
           loading={isLoadingDetails} error={lastError} onRetry={onRetrySnapshot} active={activeTab === 'preview'} isAuthenticated={isAuthenticated}
+          onClose={returnTo ? onReturn : undefined} closeLabel={returnLabel}
           onOpenStandalone={onOpenSnapshotPreview} onOpenRecap={handleOpenRecap} onCopyText={onCopyText}
-          onDeleteRecord={onDeleteRecord} onDeleteNearbyRecords={onDeleteNearbyRecords} /> : <EmptyPreview />}
+          onDeleteRecord={onDeleteRecord} onDeleteNearbyRecords={onDeleteNearbyRecords} /> : <>
+            {returnTo && <Button variant="secondary" size="xs" icon={ArrowLeft} onClick={onReturn}
+              className="workspace-focus absolute left-3 top-3 z-20 shadow-lg">{returnLabel}</Button>}
+            <EmptyPreview />
+          </>}
       </div>
       <div className={`${activeTab === 'advanced-search' ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col overflow-hidden`}>
         <AdvancedSearch active={activeTab === 'advanced-search'} searchParams={advancedSearchParams}

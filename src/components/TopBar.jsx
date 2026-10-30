@@ -1,6 +1,7 @@
 import React from 'react';
-import { Moon, Sun, Settings, Bell, Minus, Square, X, Copy, Loader2, Search, ExternalLink } from 'lucide-react';
+import { Moon, Sun, Settings, Bell, Minus, Square, X, Copy, Loader2, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { SearchBox } from './SearchBox';
 import { Button } from './ui/Button';
 import { APP_VERSION } from '../lib/version';
 import BrandMark from './BrandMark';
@@ -30,7 +31,8 @@ function ServiceStatusBadge({ backendStatus, powerSavingSuppressed, monitorPause
 
 export default function TopBar({
   darkMode, setDarkMode, setShowSettings, showNotifications, setShowNotifications,
-  isMaximized, onMinimize, onToggleMaximize, onHideToTray, onOpenSearch, previewCount = 0, onRestorePreviews,
+  isMaximized, onMinimize, onToggleMaximize, onHideToTray,
+  searchInputRef, onSearchSelect, onSearchSubmit, searchMode, onSearchModeChange, previewCount = 0, onRestorePreviews,
   backendStatus, powerSavingSuppressed = false, monitorPaused,
   handleStartBackend, handlePauseMonitor, handleResumeMonitor, isAuthenticated, interfaceLocked = false,
 }) {
@@ -45,12 +47,17 @@ export default function TopBar({
         </div>
         <span className="hidden text-xs text-ide-muted xl:block">{APP_VERSION}</span>
       </div>
-      <Button variant="secondary" icon={Search} onClick={onOpenSearch} disabled={settingsDisabled}
-        aria-label={t('workspace.openSearch')} aria-keyshortcuts="Control+K" data-tauri-drag-region="false"
-        className="workspace-focus h-8 min-w-0 flex-1 justify-start gap-2 px-3 text-ide-muted md:max-w-[480px]">
-        <span className="min-w-0 flex-1 truncate text-left">{t('workspace.openSearch')}</span>
-        <kbd className="hidden text-[10px] text-ide-muted sm:block">Ctrl K</kbd>
-      </Button>
+      <SearchBox
+        ref={searchInputRef}
+        onSelectResult={onSearchSelect}
+        onSubmit={onSearchSubmit}
+        mode={searchMode}
+        onModeChange={onSearchModeChange}
+        monitorPaused={monitorPaused}
+        handlePauseMonitor={handlePauseMonitor}
+        handleResumeMonitor={handleResumeMonitor}
+        disabled={settingsDisabled}
+      />
       <div className="flex shrink-0 items-center gap-0.5">
         {previewCount > 0 && <Button variant="ghost" icon={ExternalLink} disabled={settingsDisabled} onClick={onRestorePreviews}
           title={t('snapshotPreview.restoreWindows', { count: previewCount })} aria-label={t('snapshotPreview.restoreWindows', { count: previewCount })}

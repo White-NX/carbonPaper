@@ -11,7 +11,7 @@ remain outside Git; review fixtures use invented content.
 |---|---|---|---|
 | Windows Hello lock | One clear unlock action | Repeated encryption text and a busy blurred background | Keep the existing gate and coordinator. Visual simplification is phase 4 work. |
 | Records and timeline | Horizontal time navigation and a large original | Details cover the screenshot; actions are split between corners and a hover-only bottom bar | Shared viewer with a stable action row and collapsible information pane. |
-| Advanced search | Useful query, mode, filter and result hierarchy | Two query owners; a result click replaces the workspace | One title-bar entry focuses the page's field. Results open a contextual preview. |
+| Advanced search | Useful query, mode, filter and result hierarchy | Two query owners; a result click replaces the workspace | Keep title-bar quick search and submit its query/mode to full search. Page results open a contextual preview. |
 | Daily recap | Time periods and activities support recall | Long lines, repeated overview/detail text and a different source destination | Sources use the shared viewer. Reading layout remains phase 3 work. |
 | Smart clusters | Collection list, document and evidence | Technical status competes with the topic; cards and citations differ | Navigation calls this “Topics”; cards and citations share one default. Reading layout remains phase 3 work. |
 

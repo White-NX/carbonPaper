@@ -799,7 +799,7 @@ export default function SmartClustersView({
 
         {/* Detail pane */}
         {selected && (
-          <header className="flex min-h-14 shrink-0 items-center gap-3 border-b border-ide-border bg-ide-panel px-4 py-2">
+          <header className="flex min-h-10 shrink-0 items-center gap-2 border-b border-ide-border bg-ide-panel px-4 py-1.5">
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 text-sm font-medium text-ide-text">
                 <span
@@ -807,22 +807,14 @@ export default function SmartClustersView({
                   style={{ backgroundColor: selected.dominant_color || '#6b7280' }}
                   aria-hidden="true"
                 />
-                <span className="truncate" title={clusterName(selected)}>{clusterName(selected)}</span>
+                <span className="truncate" title={[
+                  clusterName(selected),
+                  `${t('smartClusters.archived')} ${selected.assignment_count ?? 0} ${t('smartClusters.snapshotsCount')}`,
+                  selected.display_name && selected.display_name !== selected.anchor_text ? t('smartClusters.collecting', { text: selected.anchor_text }) : null,
+                ].filter(Boolean).join(' · ')}>{clusterName(selected)}</span>
                 {!selected.enabled && (
                   <span className="rounded border border-ide-border bg-ide-bg px-1.5 py-0.5 text-[10px] text-ide-muted">
                     {t('smartClusters.paused')}
-                  </span>
-                )}
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ide-muted">
-                <span>
-                  {t('smartClusters.archived')}
-                  <span className="mx-1 font-mono text-ide-text">{selected.assignment_count ?? 0}</span>
-                  {t('smartClusters.snapshotsCount')}
-                </span>
-                {selected.display_name && selected.display_name !== selected.anchor_text && (
-                  <span className="truncate" title={selected.anchor_text}>
-                    {t('smartClusters.collecting', { text: selected.anchor_text })}
                   </span>
                 )}
               </div>

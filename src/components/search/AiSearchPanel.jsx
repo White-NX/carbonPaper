@@ -434,11 +434,12 @@ export function AiSearchPanel({ controller: c, tabs, onSelectResult, header: Hea
 
   return (
     <>
-      <Header bordered flushBottom secondaryRow={tabs}>
+      <Header bordered>
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <Bot className="h-4 w-4 shrink-0 text-ide-accent" />
           <h1 title={title} className="truncate text-sm font-medium text-ide-text">{title}</h1>
         </div>
+        {tabs}
         {hasConversation && <button type="button" disabled={running || c.status === 'consent'} onClick={() => { c.reset(); setInput(''); }}
           className="flex shrink-0 items-center gap-1.5 rounded-lg border border-ide-border px-3 py-2 text-xs text-ide-text transition-colors hover:bg-ide-hover disabled:opacity-40"><Plus className="h-3.5 w-3.5" />{t('aiSearch.newConversation')}</button>}
       </Header>

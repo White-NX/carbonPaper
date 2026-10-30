@@ -26,12 +26,16 @@ it('copies recognized text and navigates using the stored UTC capture time', asy
 
 it('uses keyboard tabs and remembers a manually hidden information panel', () => {
   const { rerender } = render(<SnapshotViewer item={item} details={details} />);
+  const toggle = screen.getByRole('button', { name: 'snapshotPreview.details' });
+  expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  fireEvent.click(toggle);
   const tabs = screen.getByRole('tablist');
   fireEvent.keyDown(tabs, { key: 'ArrowRight' });
   expect(screen.getByRole('tab', { name: 'snapshotPreview.ocrText' })).toHaveFocus();
   expect(screen.getByRole('textbox', { name: 'snapshotPreview.ocrText' })).toHaveValue('First line\nSecond line');
-  fireEvent.click(screen.getByRole('button', { name: 'snapshotPreview.details' }));
+  fireEvent.click(screen.getByRole('button', { name: 'snapshotPreview.hideDetails' }));
   expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+  expect(toggle).toHaveFocus();
   rerender(<SnapshotViewer item={{ ...item, screenshot_id: 43 }} details={details} />);
   expect(screen.getByRole('button', { name: 'snapshotPreview.details' })).toHaveAttribute('aria-expanded', 'false');
 });

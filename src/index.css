@@ -12,11 +12,25 @@
 
 .workspace-focus:focus-visible { box-shadow: inset 0 0 0 2px var(--ide-accent); }
 .snapshot-viewer { container: snapshot-viewer / inline-size; }
-.snapshot-viewer-body { display: grid; grid-template-columns: minmax(0, 1fr); }
-.snapshot-viewer-body--details { grid-template-columns: minmax(0, 1fr) 300px; }
-@container snapshot-viewer (max-width: 760px) {
-  .snapshot-viewer-body--details { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(180px, 1fr) minmax(140px, 40%); }
-  .snapshot-viewer-info { border-left: 0; border-top: 1px solid var(--ide-border); }
+.snapshot-viewer-context { max-width: min(48%, 26rem); }
+@container snapshot-viewer (max-width: 720px) {
+  .snapshot-viewer-action-label { display: none; }
+  .snapshot-viewer-actions button { gap: 0; }
+}
+@container snapshot-viewer (max-width: 400px) {
+  .snapshot-viewer-context { max-width: calc(100% - 160px); }
+  .snapshot-viewer-context:has(button) .snapshot-viewer-title { display: none; }
+}
+
+.search-surface { container: workspace-search / inline-size; }
+@container workspace-search (max-width: 680px) {
+  .search-toolbar { flex-wrap: wrap; }
+  .search-toolbar .search-input { flex-basis: 100%; }
+}
+
+.cluster-list-header { container: topic-list-header / inline-size; }
+@container topic-list-header (max-width: 320px) {
+  .cluster-status-label { display: none; }
 }
 
 .recap-surface { container: recap / inline-size; }
@@ -28,8 +42,6 @@
 @media (prefers-reduced-motion: reduce) {
   .snapshot-recap-details, .snapshot-recap-details-body { transition: none; }
 }
-/* Anchor day navigation to the right edge, independently of changing actions. */
-.recap-header { grid-template-columns: minmax(0, 1fr) auto auto; }
 .recap-focus:focus-visible, .recap-input:focus-visible {
   @apply outline-none brightness-90 dark:brightness-125;
 }
@@ -60,9 +72,6 @@
   .recap-period-status { max-width: 38%; }
 }
 @container recap (max-width: 720px) {
-  .recap-header { grid-template-columns: minmax(0, 1fr) auto; }
-  .recap-header-actions { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
-  .recap-date-navigation { grid-column: 2; grid-row: 1; }
   .recap-period { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .recap-time-dot { display: none; }
 }

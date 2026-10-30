@@ -232,26 +232,31 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   if (!active) return null;
   if (!isAuthenticated) return <div className="m-auto p-8 text-sm text-ide-muted">{t('recap.locked')}</div>;
   return <div className="recap-surface relative flex min-h-0 flex-1 flex-col bg-ide-bg text-ide-text">
+    {!hasWorkspaceHeader && <h1 className="sr-only">{t('recap.title')}</h1>}
     <PageHeader
       as="header"
       bordered
-      flushBottom={Boolean(!task && showTabs)}
-      secondaryRowClassName="min-w-0 gap-3 empty:hidden"
+      secondaryRowClassName="min-w-0"
       secondaryRow={(
         <>
-          {!task && showTabs && <RecapTabs tab={tab} onChange={setTab} />}
           <RecapRunStatus key={date} date={date} active={active} pending={operation === 'generate' || Boolean(day?.running)}
-            updated={!task && showTabs && latest > 0 ? t('recap.updated', { time: time(latest) }) : null}
             onRunning={setLiveRunning} onComplete={refresh} onDetails={() => setDiagnostics(true)} />
         </>
       )}
     >
-      <div className="recap-header grid min-w-0 flex-1 items-start gap-x-5 gap-y-2">
-        <div className="flex h-10 min-w-0 items-center">
-          {task ? <Button variant="ghost" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>
-            : !hasWorkspaceHeader && <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><CalendarDays className="h-4 w-4 shrink-0 text-ide-accent" /><span className="truncate">{t('recap.title')}</span></h1>}
+      <div className="recap-header flex min-w-0 flex-1 flex-wrap items-center gap-2">
+        {task && <Button variant="ghost" size="xs" icon={ArrowLeft} onClick={back}>{t('recap.back')}</Button>}
+        <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-9 shrink-0 items-center gap-1">
+          <Button variant="ghost" size="xs" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
+          <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates"
+            title={latest > 0 ? t('recap.updated', { time: time(latest) }) : undefined}
+            onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
+            className="recap-focus h-8 w-32 min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2 text-xs tabular-nums text-ide-text" />
+          <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
+          <Button variant="ghost" size="xs" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
         </div>
-        <div className="recap-header-actions flex min-h-10 items-center justify-end gap-1.5">
+        {!task && showTabs && <RecapTabs tab={tab} onChange={setTab} />}
+        <div className="recap-header-actions ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
           {date !== localDate() && <Button variant="ghost" onClick={() => setDate(localDate())}>{t('recap.today')}</Button>}
           {task ? <ActionMenu label={t('recap.editEvent')} icon={ChevronDown} text items={[
             { label: t('recap.correction.rename'), icon: Pencil, onClick: () => editTask('rename'), disabled: !selected },
@@ -266,13 +271,6 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
               { label: t('recap.delete'), icon: Trash2, danger: true, onClick: () => setConfirmDelete(true), disabled: running || Boolean(operation) || !day || !(hasContent || days.includes(date)) },
             ]} />
           </>}
-        </div>
-        <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-10 shrink-0 items-center gap-1.5">
-          <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
-          <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
-            className="recap-focus h-[30px] w-36 min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
-          <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
-          <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
         </div>
       </div>
     </PageHeader>

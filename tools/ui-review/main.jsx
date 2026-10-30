@@ -10,8 +10,10 @@ const params = new URLSearchParams(location.search);
 localStorage.setItem('language', params.get('lang') || 'zh-CN');
 localStorage.setItem('theme', params.get('theme') || 'dark');
 localStorage.setItem('autoStartMonitor', 'false');
-localStorage.setItem('snapshotPreviewDetailsVisible', 'true');
+localStorage.setItem('snapshotPreviewDetailsVisible', params.get('details') === 'true' ? 'true' : 'false');
 localStorage.setItem('workspaceNavigationExpanded', 'true');
+localStorage.setItem('recordsTimelineCollapsed', params.get('timeline') === 'compact' ? 'true' : 'false');
+localStorage.setItem('searchTimelineCollapsed', params.get('timeline') === 'compact' ? 'true' : 'false');
 // Freeze the clock of this isolated fixture so the timeline and recap date stay reproducible.
 const NativeDate = Date;
 const now = REVIEW_START + 25 * 60000;

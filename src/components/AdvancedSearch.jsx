@@ -1,5 +1,5 @@
 import React from 'react';
-import { Search, X, Loader2, RefreshCw } from 'lucide-react';
+import { Search, X, Loader2, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { ThumbnailCard } from './ThumbnailCard';
 import { SearchModeTabs } from './search/SearchModeTabs';
@@ -10,6 +10,7 @@ import { SearchLanding, SearchNoResults } from './search/SearchLanding';
 import { AiSearchPanel } from './search/AiSearchPanel';
 import { useAiSearch } from '../hooks/useAiSearch';
 import { PageHeader } from './PageHeader';
+import { Button } from './ui/Button';
 import { useAdvancedSearchController } from '../hooks/useAdvancedSearchController';
 import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
 import { buildSearchTimelineMarkers, searchResultMarkerId } from '../lib/timeline_search';
@@ -33,6 +34,8 @@ export function AdvancedSearch({
 }) {
   const { t } = useTranslation();
   const rootRef = React.useRef(null);
+  const filtersId = React.useId();
+  const [filtersOpen, setFiltersOpen] = React.useState(false);
   const standalonePreferred = useSnapshotOpenPreference('search');
   const {
     query,
@@ -116,6 +119,8 @@ export function AdvancedSearch({
 
   const hasResults = results.length > 0;
   const showStats = hasResults && !loading;
+  const filterCount = Number(Boolean(startDate || endDate)) + Number(selectedProcesses.length > 0)
+    + Number(mode === 'ocr' && searchTarget !== 'recaps' && selectedCategories.length > 0);
   const timelineMarkers = React.useMemo(
     () => (mode === 'ocr' && query.trim() ? buildSearchTimelineMarkers(results) : []),
     [mode, query, results],
@@ -235,7 +240,7 @@ export function AdvancedSearch({
     );
   };
 
-  const pageClassName = `flex min-h-0 w-full flex-1 flex-col ${active ? 'opacity-100' : 'pointer-events-none opacity-0'} transition-opacity duration-200`;
+  const pageClassName = `search-surface flex min-h-0 w-full flex-1 flex-col ${active ? 'opacity-100' : 'pointer-events-none opacity-0'} transition-opacity duration-200`;
 
   if (aiActive) {
     return (
@@ -272,17 +277,9 @@ export function AdvancedSearch({
       <PageHeader
         as="form"
         onSubmit={handleSubmit}
-        bordered={!showStats}
-        flushBottom
-        secondaryRow={(
-          <div className="flex w-full flex-wrap items-center gap-x-7 gap-y-2">
-            {tabs}
-
-            <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:flex-1">
-              {mode === 'ocr' && <>
-                <SearchTargetChip value={searchTarget} onChange={setSearchTarget} />
-                {searchTarget !== 'snapshots' && <RecapSemanticToggle checked={recapSemantic} onChange={setRecapSemantic} />}
-              </>}
+        primaryRowClassName="search-toolbar"
+        secondaryRow={filtersOpen ? (
+            <div id={filtersId} className="flex w-full flex-wrap items-center gap-2">
               <TimeRangeChip
                 preset={rangePreset}
                 startDate={startDate}
@@ -301,6 +298,7 @@ export function AdvancedSearch({
                   onChange={setSelectedCategories}
                 />
               )}
+              {mode === 'ocr' && searchTarget !== 'snapshots' && <RecapSemanticToggle checked={recapSemantic} onChange={setRecapSemantic} />}
               {hasFilters && (
                 <button
                   type="button"
@@ -311,11 +309,11 @@ export function AdvancedSearch({
                   {t('advancedSearch.filters.reset')}
                 </button>
               )}
+              {mode === 'nl' && !isLanding && <p className="w-full text-[11px] leading-relaxed text-ide-muted">{t('advancedSearch.nl_notice')}</p>}
             </div>
-          </div>
-        )}
+        ) : undefined}
       >
-        <div className="flex h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
+        <div className="search-input flex h-9 min-w-[160px] flex-1 items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3 pr-1 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
           <input
             data-workspace-search-input
             aria-label={t('workspace.searchField')}
@@ -346,21 +344,20 @@ export function AdvancedSearch({
             <Search className="h-4 w-4" />
           </button>
         </div>
+        {tabs}
+        {mode === 'ocr' && <SearchTargetChip value={searchTarget} onChange={setSearchTarget} />}
+        <Button variant={hasFilters ? 'secondary' : 'ghost'} size="xs" icon={SlidersHorizontal}
+          aria-label={t('advancedSearch.filters.label')} aria-controls={filtersId} aria-expanded={filtersOpen}
+          onClick={() => setFiltersOpen((open) => !open)} className={hasFilters ? 'text-ide-accent' : ''}>
+          {t('advancedSearch.filters.label')}
+          {filterCount > 0 && <span className="rounded bg-ide-accent/10 px-1 text-[10px] tabular-nums text-ide-accent">{filterCount}</span>}
+        </Button>
+        {showStats && <SearchStatsBar compact count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode}
+          snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
+          categoryScoped={mode === 'ocr' && searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />}
       </PageHeader>
-
-      {showStats && (
-      <SearchStatsBar count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode}
-        snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
-        categoryScoped={mode === 'ocr' && searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />
-      )}
       {unified && semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticUpdating')}</p>}
       {unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
-
-      {mode === 'nl' && !isLanding && (
-        <p className="shrink-0 border-b border-ide-border bg-ide-panel px-6 pb-2 text-[11px] leading-relaxed text-ide-muted">
-          {t('advancedSearch.nl_notice')}
-        </p>
-      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
         {error && (

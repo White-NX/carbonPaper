@@ -1348,6 +1348,7 @@
     "openSnapshot": "预览 {{title}}",
     "openTimeline": "在时间线上查看",
     "details": "详情",
+    "hideDetails": "收起详情",
     "copyFailed": "无法复制文字，请重试。",
     "imageUnavailable": "暂时无法显示这张截图",
     "processingText": "正在识别这张截图中的文字",
@@ -1475,6 +1476,7 @@
     "processingFailedDetail": "连续处理失败，自动重试已暂停。你可以重试此任务。",
     "refresh": "刷新",
     "chipRunning": "{{count}} 个运行中",
+    "statusDetails": "整理状态",
     "chipPaused": "{{count}} 个已暂停",
     "chipPending": "{{count}} 张待处理",
     "pausedGroup": "已暂停 {{count}} 个",
@@ -1562,6 +1564,7 @@
       "count": "{{count}} 个分类"
     },
     "filters": {
+      "label": "筛选",
       "reset": "重置"
     },
     "range": {
@@ -2068,6 +2071,14 @@
       "minutes": "耗时 {{count}} 分钟",
       "minutesSeconds": "耗时 {{minutes}} 分钟 {{seconds}} 秒"
     }
+  },
+  "imageViewer": {
+    "image": "图片",
+    "unavailable": "暂时无法显示图片",
+    "zoomOut": "缩小",
+    "resetZoom": "重置缩放",
+    "zoomIn": "放大",
+    "fitWindow": "适应窗口"
   },
   "workspace": {
     "openSearch": "搜索记录与回顾",

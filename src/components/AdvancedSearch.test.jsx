@@ -105,6 +105,7 @@ describe('AdvancedSearch', () => {
     searchSnapshotsAndRecaps.mockResolvedValue(mixedResponse('ready'));
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     await screen.findByText('text-1');
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.filters.label' }));
     expect(screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' })).toHaveAttribute('aria-checked', 'true');
     await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({ target: 'mixed', includeSemantic: true })));
   });
@@ -118,6 +119,7 @@ describe('AdvancedSearch', () => {
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.targets.mixed' }));
     fireEvent.click(screen.getByRole('radio', { name: 'advancedSearch.targets.snapshots' }));
     await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({ target: 'snapshots', includeSemantic: false })));
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.filters.label' }));
     expect(screen.queryByRole('switch', { name: 'advancedSearch.recapSemantic' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.targets.snapshots' }));
     fireEvent.click(screen.getByRole('radio', { name: 'advancedSearch.targets.recaps' }));
@@ -133,6 +135,7 @@ describe('AdvancedSearch', () => {
       ? new Promise((resolve) => { resolveSemantic = resolve; }) : Promise.resolve(mixedResponse('ready')));
     render(<AdvancedSearch active searchParams={{ query: 'design', mode: 'ocr' }} />);
     await screen.findByText('text-1');
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.filters.label' }));
     const toggle = screen.getByRole('switch', { name: 'advancedSearch.recapSemantic' });
     await screen.findByText('advancedSearch.semanticUpdating');
     const vectorResponse = { ...mixedResponse('ready'), items: [{ kind: 'recap', recap: { ...recapHit, semantic_score: 0.83 } }] };
@@ -353,6 +356,7 @@ describe('AdvancedSearch', () => {
     ));
     expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(2);
 
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.filters.label' }));
     fireEvent.click(screen.getByText('advancedSearch.processes.all'));
     const checkbox = within(screen.getByTestId('filter-panel'))
       .getByText('code.exe').closest('label').querySelector('input[type="checkbox"]');
@@ -486,7 +490,8 @@ describe('AdvancedSearch', () => {
       expect(listProcesses).toHaveBeenCalledTimes(1);
     });
 
-    // 筛选器收在药丸的下拉面板里，逐个展开操作，操作完点开外部把面板收起来。
+    // 展开筛选工具区，再逐个操作药丸中的下拉面板。
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.filters.label' }));
     fireEvent.click(screen.getByText('advancedSearch.processes.all'));
     const processCheckbox = within(screen.getByTestId('filter-panel'))
       .getByText('code.exe')
@@ -521,6 +526,14 @@ describe('AdvancedSearch', () => {
         endTime: Math.floor(new Date('2026-01-02T04:05').getTime() / 1000),
       }));
     });
+    const filters = screen.getByRole('button', { name: 'advancedSearch.filters.label' });
+    fireEvent.click(filters);
+    expect(filters).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('advancedSearch.range.custom_active')).not.toBeInTheDocument();
+    fireEvent.click(filters);
+    fireEvent.click(screen.getByText('advancedSearch.range.custom_active'));
+    expect(document.querySelectorAll('input[type="datetime-local"]')[0]).toHaveValue('2026-01-02T03:04');
+    expect(document.querySelectorAll('input[type="datetime-local"]')[1]).toHaveValue('2026-01-02T04:05');
   });
 
   it('loads more results when sentinel intersects', async () => {

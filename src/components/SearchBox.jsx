@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useImperativeHandle } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
@@ -6,7 +6,7 @@ import { useSearchBoxController } from '../hooks/useSearchBoxController';
 import { ProgressBar } from './overlay/ProgressBlock';
 import { OriginalSearchImage } from './search/OriginalSearchImage';
 
-export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
+export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }, ref) {
     const { t } = useTranslation();
     const {
         query,
@@ -58,6 +58,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         t,
     });
 
+    useImperativeHandle(ref, () => inputRef.current, [inputRef]);
+
     return (
         <div
             className={`relative w-[450px] z-50 ${disabled ? 'pointer-events-none opacity-60' : 'pointer-events-auto'}`}
@@ -65,6 +67,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             ref={wrapperRef}
             onClick={(e) => e.stopPropagation()}
             data-keep-selection="true"
+            data-tauri-drag-region="false"
         >
             <div className="relative flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm overflow-hidden">
                 {showProgressBar && (progressFillPercent !== null || progressActive) && (
@@ -75,6 +78,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <button
                     className="p-2 text-ide-muted hover:text-ide-text transition-colors"
                     onClick={toggleMode}
+                    disabled={disabled}
                     title={mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR')}
                 >
                     {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
@@ -86,6 +90,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         setShowModeMenu(!showModeMenu);
                     }}
                     title={t('search.selectMode')}
+                    disabled={disabled}
                 >
                     <ChevronDown size={14} />
                 </button>
@@ -94,6 +99,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             <input
                 ref={inputRef}
                 type="text"
+                disabled={disabled}
+                aria-label={mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl')}
+                aria-keyshortcuts="Control+K"
                 className="relative z-10 bg-transparent border-none outline-none text-ide-text text-sm w-full h-8 px-3 placeholder-ide-muted"
                 placeholder={showProgressBar ? taskSummaryPlaceholder : (mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl'))}
                 value={query}
@@ -104,6 +112,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             {canCancelClusterTask && (
                 <button
                     onClick={handleCancelCluster}
+                    disabled={disabled}
                     className="relative z-10 p-1 mr-2 text-rose-500 hover:text-rose-600 transition-colors shrink-0"
                     title={t('search.task.stopTooltip')}
                 >
@@ -114,14 +123,14 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <Loader2 size={16} className="relative z-10 animate-spin text-ide-muted mr-2" />
             ) : (
                 query && (
-                    <button onClick={() => setQuery('')} className="relative z-10 p-1 mr-2 text-ide-muted hover:text-ide-text">
+                    <button disabled={disabled} onClick={() => setQuery('')} className="relative z-10 p-1 mr-2 text-ide-muted hover:text-ide-text">
                         <X size={14} />
                     </button>
                 )
             )}
             </div>
 
-            {showModeMenu && (
+            {!disabled && showModeMenu && (
                 <div className="absolute top-full left-0 mt-2 w-72 bg-ide-panel border border-ide-border rounded-md shadow-xl z-[60] p-1 flex flex-col gap-1">
                     <button
                         className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'ocr' ? 'bg-ide-active border border-ide-border' : ''}`}
@@ -148,7 +157,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 </div>
             )}
 
-            {showResults && (
+            {!disabled && showResults && (
                 <div className="absolute top-full mt-2 w-[450px] bg-ide-panel border border-ide-border rounded-lg shadow-2xl overflow-hidden max-h-[600px] flex flex-col">
                     {hasDeleteTask && (
                         <div className="p-3 bg-sky-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
@@ -274,7 +283,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             )}
         </div>
     );
-}
+});
 
 function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
     const { t } = useTranslation();

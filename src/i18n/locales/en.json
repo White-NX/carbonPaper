@@ -1348,6 +1348,7 @@
     "openSnapshot": "Preview {{title}}",
     "openTimeline": "View in timeline",
     "details": "Details",
+    "hideDetails": "Hide details",
     "copyFailed": "Could not copy the text. Please try again.",
     "imageUnavailable": "This screenshot cannot be displayed right now",
     "processingText": "Recognizing text in this screenshot",
@@ -1475,6 +1476,7 @@
     "processingFailedDetail": "Processing failed repeatedly, so automatic retries are paused. You can retry this task.",
     "refresh": "Refresh",
     "chipRunning": "{{count}} running",
+    "statusDetails": "Organizing status",
     "chipPaused": "{{count}} paused",
     "chipPending": "{{count}} pending",
     "pausedGroup": "{{count}} paused",
@@ -1562,6 +1564,7 @@
       "count": "{{count}} Categories"
     },
     "filters": {
+      "label": "Filters",
       "reset": "Reset"
     },
     "range": {
@@ -2069,6 +2072,14 @@
       "minutes": "Took {{count}} min",
       "minutesSeconds": "Took {{minutes}} min {{seconds}} sec"
     }
+  },
+  "imageViewer": {
+    "image": "Image",
+    "unavailable": "Image unavailable",
+    "zoomOut": "Zoom out",
+    "resetZoom": "Reset zoom",
+    "zoomIn": "Zoom in",
+    "fitWindow": "Fit to window"
   },
   "workspace": {
     "openSearch": "Search records and recaps",

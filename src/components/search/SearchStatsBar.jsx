@@ -15,7 +15,7 @@ import { useTranslation } from 'react-i18next';
  * @param {boolean} props.hasMore 是否还有下一页
  * @param {'ocr'|'nl'} props.mode 当前检索模式，决定排序说明
  */
-export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, mode, snapshotCount, recapCount, categoryScoped = false, complete = true }) {
+export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, mode, snapshotCount, recapCount, categoryScoped = false, complete = true, compact = false }) {
   const { t } = useTranslation();
 
   const parts = [t(totalKnown ? 'advancedSearch.stats.total' : 'advancedSearch.stats.loaded', { count })];
@@ -32,13 +32,16 @@ export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, 
   }
 
   const SortIcon = mode === 'nl' || totalKnown ? Sparkles : Clock;
+  const sortLabel = totalKnown ? t('advancedSearch.stats.sort_relevance') : mode === 'nl' ? t('advancedSearch.stats.sort_similarity') : t('advancedSearch.stats.sort_time');
 
   return (
-    <div className="flex shrink-0 items-center justify-between gap-4 border-b border-ide-border bg-ide-panel px-6 py-2 text-[11px] text-ide-muted">
-      <span className="tabular-nums">{parts.join(' · ')}</span>
+    <div role="status" title={compact ? [...parts, sortLabel].join(' · ') : undefined}
+      className={compact ? 'ml-auto flex min-w-0 max-w-64 items-center gap-2 text-[11px] text-ide-muted'
+        : 'flex shrink-0 items-center justify-between gap-4 border-b border-ide-border bg-ide-panel px-6 py-2 text-[11px] text-ide-muted'}>
+      <span className="min-w-0 truncate tabular-nums">{parts.join(' · ')}</span>
       <span className="flex shrink-0 items-center gap-1.5">
         <SortIcon className="h-3 w-3" />
-        {totalKnown ? t('advancedSearch.stats.sort_relevance') : mode === 'nl' ? t('advancedSearch.stats.sort_similarity') : t('advancedSearch.stats.sort_time')}
+        <span className={compact ? 'sr-only' : undefined}>{sortLabel}</span>
       </span>
     </div>
   );

@@ -88,11 +88,17 @@ export async function invoke(command, args = {}) {
     case 'storage_list_processes': return ['Browser', 'Editor', 'Notes'].map((process_name) => ({ process_name, count: 8 }));
     case 'storage_get_categories_from_db': return ['阅读学习', '编程开发'];
     case 'storage_batch_get_categories': return {};
+    case 'storage_search': {
+      const query = (args.query || '').trim().toLowerCase();
+      const matches = snapshots.filter((snapshot) => `${snapshot.text} ${snapshot.window_title} ${snapshot.process_name}`.toLowerCase().includes(query));
+      const offset = args.offset || 0;
+      return matches.slice(offset, offset + (args.limit || 20));
+    }
     case 'storage_search_unified': return {
       items: snapshots.slice(0, 6).map((snapshot) => ({ kind: 'snapshot', snapshot })), total: 6, snapshot_count: 6,
       recap_count: 0, next_offset: null, semantic_status: 'disabled', complete: true,
     };
-    case 'monitor_search_nl': return snapshots.slice(0, 12).map((snapshot) => ({ ...snapshot, similarity: 0.85 }));
+    case 'monitor_search_nl': return { results: snapshots.slice(0, 12).map((snapshot) => ({ ...snapshot, metadata: snapshot, ocr_text: snapshot.text, similarity: 0.85 })) };
     case 'recap_get_settings': return { enabled: true };
     case 'recap_list_days': return [REVIEW_DATE];
     case 'recap_get_day': return {

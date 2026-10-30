@@ -72,7 +72,7 @@ export function useAdvancedSearchController({
   const unified = mode === 'ocr' && Boolean(query.trim() || searchTarget === 'recaps' || selectedProcesses.length || (searchTarget !== 'recaps' && selectedCategories.length) || startDate || endDate);
   const observerRef = useRef(null);
   const sentinelRef = useRef(null);
-  const lastParamsRef = useRef({ query: '', mode: 'ocr' });
+  const lastParamsRef = useRef({ query: '', mode: 'ocr', refreshKey: searchParams?.refreshKey });
   const searchIdRef = useRef(0);
   const completedRequestRef = useRef(null);
   /**
@@ -169,15 +169,16 @@ export function useAdvancedSearchController({
 
   useEffect(() => {
     if (!searchParams) return;
-    const { query: nextQuery = '', mode: nextMode = 'ocr' } = searchParams;
+    const { query: nextQuery = '', mode: nextMode = 'ocr', refreshKey } = searchParams;
     const prev = lastParamsRef.current;
-    if (prev.query !== nextQuery) {
+    const refreshed = prev.refreshKey !== refreshKey;
+    if (refreshed || prev.query !== nextQuery) {
       setQuery(nextQuery);
     }
-    if (prev.mode !== nextMode) {
+    if (refreshed || prev.mode !== nextMode) {
       handleModeChange(nextMode);
     }
-    lastParamsRef.current = { query: nextQuery, mode: nextMode };
+    lastParamsRef.current = { query: nextQuery, mode: nextMode, refreshKey };
   }, [searchParams, handleModeChange]);
 
   const queryTokens = useMemo(() => {

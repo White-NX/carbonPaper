@@ -45,6 +45,7 @@ describe('main preview recap navigation', () => {
         selectedEvent={{ id: 42, timestamp: start, appName: 'Editor', windowTitle: 'Capture settings' }} onAdvancedSelect={select} />;
     }
     render(<Preview />);
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotPreview.details' }));
     fireEvent.click(await screen.findByRole('button', { name: activity.task_title }));
     fireEvent.click(screen.getByRole('button', { name: 'sidebar.recap.openDetails' }));
     expect((await screen.findByText('recap.snapshotActivity')).closest('article')).toHaveAttribute('data-recap-activity', activity.id);

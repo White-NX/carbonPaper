@@ -17,7 +17,7 @@ References: [baseline](ui-v1-baseline.md),
 ## Phase 2 — Application frame and preview
 
 - [x] Expand labelled task navigation by default and persist collapse choice.
-- [x] Use one title-bar search entry and the existing page query input.
+- [x] Preserve title-bar quick search and submit its query/mode to the full-search page.
 - [x] Add a workspace header and explicit source return action.
 - [x] Share one viewer across records, source dialogs and native windows.
 - [x] Align card/citation defaults while honoring saved preferences.

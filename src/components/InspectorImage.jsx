@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
+import { useTranslation } from 'react-i18next';
 import { EyeOff, ZoomIn, ZoomOut, Maximize } from 'lucide-react';
 import { cn } from '../lib/utils';
 
@@ -134,7 +135,8 @@ InspectorOverlay.propTypes = {
   onBoxClick: PropTypes.func,
 };
 
-export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHeight, className }) => {
+export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHeight, className, controlsPosition = 'top-right' }) => {
+  const { t } = useTranslation();
   const containerRef = useRef(null);
   const imageRef = useRef(null);
   const [metrics, setMetrics] = useState(null);
@@ -271,7 +273,7 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
     return (
       <div className="flex aspect-square w-full items-center justify-center rounded border border-ide-border bg-ide-panel text-ide-muted">
         <EyeOff className="h-6 w-6" />
-        <span className="ml-2 text-sm">Image not available</span>
+        <span className="ml-2 text-sm">{t('imageViewer.unavailable')}</span>
       </div>
     );
   }
@@ -302,7 +304,7 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
         <img
           ref={imageRef}
           src={item.imageUrl}
-          alt={item.prompt || 'Generated result'}
+          alt={item.prompt || t('imageViewer.image')}
           className={cn('max-w-full max-h-full object-contain pointer-events-none transition', blurred && 'blur-xl')}
           style={maxHeight ? { maxHeight } : undefined}
           onLoad={updateMetrics}
@@ -318,27 +320,28 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
 
       {/* Zoom Controls */}
       <div
-        className="absolute top-4 right-4 flex items-center gap-1 px-2 py-1.5 preview-action-bar border border-ide-border rounded-full z-20"
+        className={cn('absolute right-3 flex items-center gap-1 px-2 py-1.5 preview-action-bar border border-ide-border rounded-full z-20',
+          controlsPosition === 'bottom-right' ? 'bottom-3' : 'top-4')}
         onPointerDown={(event) => event.stopPropagation()}
       >
         <button
           onClick={zoomOut}
           className="p-1.5 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors"
-          title="Zoom Out"
+          title={t('imageViewer.zoomOut')}
         >
           <ZoomOut size={16} />
         </button>
         <button
           onClick={resetZoom}
           className="px-2 py-1 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors font-mono text-[11px]"
-          title="Reset Zoom"
+          title={t('imageViewer.resetZoom')}
         >
           {Math.round(transform.scale * 100)}%
         </button>
         <button
           onClick={zoomIn}
           className="p-1.5 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors"
-          title="Zoom In"
+          title={t('imageViewer.zoomIn')}
         >
           <ZoomIn size={16} />
         </button>
@@ -346,7 +349,7 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
         <button
           onClick={resetZoom}
           className="p-1.5 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors"
-          title="Fit to Window"
+          title={t('imageViewer.fitWindow')}
         >
           <Maximize size={16} />
         </button>
@@ -365,6 +368,7 @@ InspectorImage.propTypes = {
   onBoxClick: PropTypes.func,
   maxHeight: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
   className: PropTypes.string,
+  controlsPosition: PropTypes.oneOf(['top-right', 'bottom-right']),
 };
 
 export default InspectorImage;
