@@ -317,6 +317,35 @@ pub async fn storage_get_timeline_nearest(
         .map_err(|error| format!("Task join error: {error:?}"))?
 }
 
+/// Returns unsampled IDs and explicit millisecond timestamps, including range
+/// neighbours, without decrypting screenshot details. Authentication: required.
+#[tauri::command]
+pub async fn storage_get_timeline_index(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    start_time_ms: f64,
+    end_time_ms: f64,
+    request_id: String,
+) -> Result<Vec<storage::TimelineIndexEntry>, String> {
+    check_auth_required(&credential_state)?;
+    if !start_time_ms.is_finite()
+        || !end_time_ms.is_finite()
+        || start_time_ms >= end_time_ms
+        || request_id.len() > 128
+    {
+        return Err("Invalid timeline index request".into());
+    }
+    let ticket = TIMELINE_REQUESTS.begin(window.label(), &request_id)?;
+    let cancelled = ticket.cancelled.clone();
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        state.get_timeline_index(start_time_ms, end_time_ms, &cancelled)
+    })
+    .await
+    .map_err(|error| format!("Task join error: {error:?}"))?
+}
+
 /// Stops a timeline read for the calling window. Authentication: required.
 #[tauri::command]
 pub fn storage_cancel_timeline(
@@ -496,18 +525,20 @@ pub async fn storage_get_thumbnail(
 /// Loads thumbnails for multiple screenshot `ids` in one IPC call.
 ///
 /// Authentication: required. Returns an object keyed by screenshot ID with per-item
-/// thumbnail results. Frontend: `lib/monitor_api.js`.
+/// thumbnail results. `cached_only` skips generation for speculative prefetches.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_batch_get_thumbnails(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     ids: Vec<i64>,
+    cached_only: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        let results_map = state.batch_read_thumbnails_by_ids(&ids);
+        let results_map = state.batch_read_thumbnails_by_ids(&ids, cached_only.unwrap_or(false));
 
         let mut results = serde_json::Map::new();
         for (id_str, result) in results_map {

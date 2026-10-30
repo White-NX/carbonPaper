@@ -248,6 +248,11 @@ export const getTimelineDetails = async (ids, { signal } = {}) => {
     return invokeTimelineRead('storage_get_timeline_details', { ids }, signal);
 };
 
+/** Unsampled [ID, Unix milliseconds] pairs, including the range neighbours. */
+export const getTimelineIndex = async (startTimeMs, endTimeMs, { signal } = {}) => {
+    return invokeTimelineRead('storage_get_timeline_index', { startTimeMs, endTimeMs }, signal);
+};
+
 /** Resolve against the full history, including screenshots omitted by sampling. */
 export const getTimelineNearest = async (timeMs, { signal } = {}) => {
     const records = await invokeTimelineRead('storage_get_timeline_nearest', { timeMs }, signal);
@@ -360,11 +365,13 @@ export const fetchThumbnail = async (id, path = null) => {
  * @param {number[]} ids - 截图 ID 列表
  * @returns {Promise<Object>} { [id]: dataUrl }
  */
-export const fetchThumbnailBatch = async (ids, { signal } = {}) => {
+export const fetchThumbnailBatch = async (ids, { signal, cachedOnly } = {}) => {
     return withAuth(async () => {
         const aborted = () => new DOMException('Thumbnail request cancelled', 'AbortError');
         if (signal?.aborted) throw aborted();
-        const response = await invoke('storage_batch_get_thumbnails', { ids });
+        const params = { ids };
+        if (cachedOnly !== undefined) params.cachedOnly = cachedOnly;
+        const response = await invoke('storage_batch_get_thumbnails', params);
         if (signal?.aborted) throw aborted();
         if (!response?.results) return {};
         const mapped = {};

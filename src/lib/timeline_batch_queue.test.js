@@ -136,4 +136,26 @@ describe('progressive timeline batches', () => {
     f.calls[1].resolve({ 3: 'image', 4: 'image' });
     await flush();
   });
+
+  it('reloads evicted accepted images without bypassing the cooldown for missing images', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.queue.setIds([1, 2], { paused: false });
+    f.calls[0].resolve({ 1: 'image' });
+    await flush();
+    f.cache.delete(1);
+    f.queue.invalidate(1);
+    f.queue.invalidate(2);
+    f.queue.setIds([1, 2]);
+    expect(f.calls[1].ids).toEqual([1]);
+    f.calls[1].resolve({ 1: 'reloaded image' });
+    await flush();
+    expect(f.cache.has(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000);
+    f.queue.setIds([1, 2]);
+    expect(f.calls[2].ids).toEqual([2]);
+    f.calls[2].resolve({ 2: 'image' });
+    await flush();
+    expect(f.queue.isBusy()).toBe(false);
+  });
 });

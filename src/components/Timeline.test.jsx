@@ -3,13 +3,14 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Timeline from './Timeline';
 import WorkspaceTimelines from './WorkspaceTimelines';
-import { fetchImage, fetchThumbnailBatch, getTimeline, getTimelineDetails, getTimelineDensity, getTimelineNearest } from '../lib/monitor_api';
+import { fetchImage, fetchThumbnailBatch, getTimeline, getTimelineDetails, getTimelineDensity, getTimelineIndex, getTimelineNearest } from '../lib/monitor_api';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n: { language: 'en' } }) }));
 vi.mock('../lib/monitor_api', () => ({
   getTimeline: vi.fn(), getTimelineDetails: vi.fn(async () => []),
   getTimelineDensity: vi.fn(async () => []), fetchThumbnailBatch: vi.fn(async () => ({})),
   getTimelineNearest: vi.fn(), fetchImage: vi.fn(async () => 'data:image/png;base64,original'),
+  getTimelineIndex: vi.fn(),
 }));
 vi.mock('../hooks/useTimelineCamera', async () => {
   const { useEffect, useMemo, useRef } = await import('react');
@@ -73,8 +74,9 @@ beforeEach(() => {
   });
   reads = [];
   getTimelineDetails.mockReset().mockResolvedValue([]);
+  getTimelineIndex.mockReset().mockResolvedValue([]);
   fetchThumbnailBatch.mockReset().mockResolvedValue({});
-  fetchImage.mockClear();
+  fetchImage.mockReset().mockResolvedValue('data:image/png;base64,original');
   getTimelineNearest.mockReset().mockResolvedValue({ id: 42, timestamp: 1767225660, process_name: 'app', window_title: 'actual nearest' });
   getTimeline.mockImplementation((_start, _end, _limit, { signal }) => new Promise((resolve) => {
     reads.push({ signal, resolve });
@@ -122,7 +124,7 @@ it('cancels during SQL pause and resumes without believing the cancelled range i
   await act(async () => { reads[1].resolve([]); });
 });
 
-it('loads session labels without eager image I/O and reuses them on periodic header refresh', async () => {
+it('loads labels and cached-only viewport thumbnails and reuses both on periodic header refresh', async () => {
   const details = [];
   getTimelineDetails.mockImplementation((ids, { signal }) => new Promise((resolve) => {
     details.push({ ids, signal, resolve });
@@ -130,13 +132,19 @@ it('loads session labels without eager image I/O and reuses them on periodic hea
   const headers = Array.from({ length: 13 }, (_, index) => ({
     id: 100 + index, timestamp: 1767225600 + index, window_title: null, process_name: null,
   }));
+  getTimelineIndex.mockResolvedValue(headers.map((record) => [record.id, record.timestamp * 1000]));
+  fetchThumbnailBatch.mockImplementation(async (ids) => Object.fromEntries(ids.map((id) => [id, `thumbnail-${id}`])));
   const view = render(<Timeline />);
   await advance();
   expect(getTimeline).toHaveBeenCalledWith(expect.any(Number), expect.any(Number), 500, {
     signal: expect.any(AbortSignal), includeDetails: false,
   });
   await act(async () => { reads[0].resolve(headers); });
-  expect(fetchThumbnailBatch).not.toHaveBeenCalled();
+  expect(fetchThumbnailBatch).toHaveBeenCalledTimes(4);
+  for (const [ids, options] of fetchThumbnailBatch.mock.calls) {
+    expect(ids.length).toBeLessThanOrEqual(4);
+    expect(options.cachedOnly).toBe(true);
+  }
   expect(fetchImage).not.toHaveBeenCalled();
   expect(details[0].ids).toHaveLength(12);
   for (let index = 0; index < 2; index += 1) {
@@ -151,7 +159,7 @@ it('loads session labels without eager image I/O and reuses them on periodic hea
   await act(async () => { reads[1].resolve(headers); });
   expect(screen.getByTestId('events')).toHaveTextContent('title-112');
   expect(details).toHaveLength(2);
-  expect(fetchThumbnailBatch).not.toHaveBeenCalled();
+  expect(fetchThumbnailBatch).toHaveBeenCalledTimes(4);
   view.unmount();
 });
 
@@ -419,4 +427,85 @@ it('does not let an obsolete click selection complete after the timeline becomes
   expect(signal.aborted).toBe(true);
   await act(async () => finish({ id: 42, timestamp: 1767225600 }));
   expect(onSelect).not.toHaveBeenCalled();
+});
+
+it('renders a viewport thumbnail before the exact original and reuses the image element when promoting it', async () => {
+  const thumbnail = 'data:image/jpeg;base64,thumbnail';
+  getTimelineIndex.mockResolvedValue([[1, 1767225600000], [42, 1767225602000]]);
+  getTimelineDetails.mockImplementation(async (ids) => ids.includes(42)
+    ? [{ id: 42, timestamp: 1767225602, process_name: 'app', window_title: 'actual nearest' }] : []);
+  fetchThumbnailBatch.mockResolvedValue({ 42: thumbnail });
+  let finishImage;
+  fetchImage.mockImplementationOnce(() => new Promise((resolve) => { finishImage = resolve; }));
+  render(<Timeline />);
+  await advance();
+  await act(async () => reads[0].resolve(record('sampled event')));
+  fireEvent.pointerMove(screen.getByTestId('timeline-track'), { clientX: 402, clientY: 20 });
+  const image = screen.getByRole('img', { name: 'timeline.snapshotPreview' });
+  expect(image).toHaveAttribute('src', thumbnail);
+  expect(image).toHaveAttribute('data-preview-source', 'thumbnail');
+  expect(fetchImage).not.toHaveBeenCalled();
+  await act(async () => vi.advanceTimersByTimeAsync(100));
+  expect(screen.getByRole('tooltip')).not.toHaveTextContent('sampled event');
+  expect(fetchImage).toHaveBeenCalledWith(42);
+  expect(getTimelineNearest).not.toHaveBeenCalled();
+  await act(async () => finishImage('data:image/png;base64,original'));
+  expect(screen.getByRole('img', { name: 'timeline.snapshotPreview' })).toBe(image);
+  expect(image).toHaveAttribute('data-preview-source', 'original');
+  expect(screen.getByRole('tooltip')).toHaveTextContent('actual nearest');
+});
+
+it('opens the exact cached hover snapshot on a quick click without another nearest lookup', async () => {
+  const onSelect = vi.fn();
+  getTimelineIndex.mockResolvedValue([[1, 1767225600000], [42, 1767225602000]]);
+  fetchThumbnailBatch.mockResolvedValue({ 42: 'data:image/jpeg;base64,thumbnail' });
+  render(<Timeline onSelectEvent={onSelect} />);
+  await advance();
+  await act(async () => reads[0].resolve(record('sampled event')));
+  const track = screen.getByTestId('timeline-track');
+  fireEvent.pointerMove(track, { clientX: 402, clientY: 20 });
+  expect(screen.getByRole('img', { name: 'timeline.snapshotPreview' })).toHaveAttribute('src', 'data:image/jpeg;base64,thumbnail');
+  fireEvent.pointerDown(track, { clientX: 402, clientY: 20, button: 0 });
+  fireEvent.pointerUp(track, { clientX: 402, clientY: 20, button: 0 });
+  fireEvent.click(track, { clientX: 402, clientY: 20, button: 0 });
+  expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: 42, timestamp: 1767225602000 }));
+  expect(getTimelineNearest).not.toHaveBeenCalled();
+  expect(fetchImage).not.toHaveBeenCalled();
+  expect(screen.getByTestId('timeline-playhead')).toHaveStyle({ left: '402px' });
+});
+
+it('replaces the previous image element immediately when a sweep chooses another snapshot ID', async () => {
+  getTimelineIndex.mockResolvedValue([[1, 1767225600000], [42, 1767225602000]]);
+  fetchThumbnailBatch.mockResolvedValue({ 1: 'data:image/jpeg;base64,first', 42: 'data:image/jpeg;base64,second' });
+  render(<Timeline />);
+  await advance();
+  await act(async () => reads[0].resolve(record('sampled event')));
+  const track = screen.getByTestId('timeline-track');
+  fireEvent.pointerMove(track, { clientX: 400, clientY: 20 });
+  const first = screen.getByRole('img', { name: 'timeline.snapshotPreview' });
+  expect(first).toHaveAttribute('data-preview-id', '1');
+  fireEvent.pointerMove(track, { clientX: 402, clientY: 20 });
+  const second = screen.getByRole('img', { name: 'timeline.snapshotPreview' });
+  expect(first).not.toBeInTheDocument();
+  expect(second).toHaveAttribute('data-preview-id', '42');
+  expect(second).toHaveAttribute('src', 'data:image/jpeg;base64,second');
+});
+
+it('keeps a long stationary preview as the click target after the index has refreshed', async () => {
+  const onSelect = vi.fn();
+  getTimelineIndex.mockResolvedValue([[1, 1767225600000]]);
+  fetchThumbnailBatch.mockResolvedValue({ 1: 'data:image/jpeg;base64,first', 42: 'data:image/jpeg;base64,second' });
+  render(<Timeline onSelectEvent={onSelect} />);
+  await advance();
+  await act(async () => reads[0].resolve(record('sampled event')));
+  const track = screen.getByTestId('timeline-track');
+  fireEvent.pointerMove(track, { clientX: 402, clientY: 20 });
+  getTimelineIndex.mockResolvedValue([[1, 1767225600000], [42, 1767225602000]]);
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(screen.getByRole('img', { name: 'timeline.snapshotPreview' })).toHaveAttribute('data-preview-id', '1');
+  fireEvent.pointerDown(track, { clientX: 402, clientY: 20, button: 0 });
+  fireEvent.pointerUp(track, { clientX: 402, clientY: 20, button: 0 });
+  fireEvent.click(track, { clientX: 402, clientY: 20, button: 0 });
+  expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: 1, timestamp: 1767225600000 }));
+  expect(getTimelineNearest).not.toHaveBeenCalled();
 });

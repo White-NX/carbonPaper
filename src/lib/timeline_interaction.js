@@ -1,3 +1,5 @@
+const HOVER_PREVIEW_RADIUS_PX = 16;
+
 /** Timeline positions and records use milliseconds; storage records use seconds. */
 export function timelineEventFromRecord(record) {
   if (!record) return null;
@@ -30,6 +32,13 @@ export function nearestTimelineEvent(events, time) {
   if (!before) return after;
   if (!after) return before;
   return time - before.timestamp <= after.timestamp - time ? before : after;
+}
+
+/** A fixed CSS-pixel radius keeps hover previews predictable at every zoom. */
+export function isTimelinePreviewNearby(time, event, zoom) {
+  return Number.isFinite(time) && Number.isFinite(event?.timestamp)
+    && Number.isFinite(zoom) && zoom > 0
+    && Math.abs(event.timestamp - time) * zoom <= HOVER_PREVIEW_RADIUS_PX;
 }
 
 /**

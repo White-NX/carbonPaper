@@ -1261,6 +1261,7 @@ pub fn run() {
             commands::storage::storage_get_timeline,
             commands::storage::storage_get_timeline_details,
             commands::storage::storage_get_timeline_nearest,
+            commands::storage::storage_get_timeline_index,
             commands::storage::storage_cancel_timeline,
             commands::storage::storage_get_timeline_density,
             commands::storage::storage_search,

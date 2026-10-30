@@ -6,9 +6,11 @@ import useTimelineHoverPreview from '../../hooks/useTimelineHoverPreview';
 import { timelinePreviewPosition } from '../../lib/timeline_interaction';
 import { getProcessColor } from '../../lib/timeline_palette';
 
-const TimelineHoverPreview = forwardRef(function TimelineHoverPreview({ enabled, revision, onBusyChange }, ref) {
+const TimelineHoverPreview = forwardRef(function TimelineHoverPreview({
+  enabled, revision, onBusyChange, events, viewStart, viewEnd, width, trackLeft, prefetchPaused,
+}, ref) {
   const { t, i18n } = useTranslation();
-  const preview = useTimelineHoverPreview({ enabled, revision, onBusyChange });
+  const preview = useTimelineHoverPreview({ enabled, revision, onBusyChange, events, viewStart, viewEnd, width, trackLeft, prefetchPaused });
   const cardRef = useRef(null);
   const positionRef = useRef(null);
   const position = () => {
@@ -37,7 +39,7 @@ const TimelineHoverPreview = forwardRef(function TimelineHoverPreview({ enabled,
       aria-label={t('timeline.snapshotPreview')}
     >
       <div className="tl-hover-preview-image">
-        {state.imageSrc ? <img key={state.event?.id} src={state.imageSrc} alt={t('timeline.snapshotPreview')} draggable={false} onError={() => preview.reportImageError(state.event?.id)} />
+        {state.imageSrc ? <img key={state.event.id} src={state.imageSrc} decoding="sync" data-preview-id={state.event.id} data-preview-source={state.source} alt={t('timeline.snapshotPreview')} draggable={false} onError={() => preview.reportImageError(state.event?.id, state.source)} />
           : <span className="flex h-full items-center justify-center text-ide-muted">
             {state.error ? <ImageOff size={28} /> : <Loader2 size={24} className="animate-spin" />}
           </span>}

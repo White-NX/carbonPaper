@@ -134,7 +134,7 @@ fn full_images_and_batch_locations_do_not_wait_for_the_primary_mutex() {
             // No row key: reach the unwrap boundary without opening a native
             // CNG key. This still exercises real independent SQLCipher reads.
             let image = reader_storage.read_image_by_id(1);
-            let batch = reader_storage.batch_read_thumbnails_by_ids(&[1, 1, 99]);
+            let batch = reader_storage.batch_read_thumbnails_by_ids(&[1, 1, 99], false);
             finished_tx.send((image, batch)).unwrap();
         });
         let finished = finished_rx.recv_timeout(Duration::from_secs(5));
@@ -191,6 +191,86 @@ fn lookup_reports_missing_rows_and_database_errors_and_keeps_auth_required() {
     let error = ImageLookup::Id(1).query(conn).unwrap_err();
     assert!(error.contains("image key"), "{error}");
     assert!(error.contains("no such table"), "{error}");
+}
+
+#[test]
+fn cached_only_thumbnail_misses_skip_cng_and_original_generation() {
+    let (directory, storage, _conn) = fixture();
+    let original = directory.path().join("one.png.enc");
+    std::fs::write(&original, b"an original that must not be decoded").unwrap();
+    let thumb_path = StorageState::thumbnail_path_for(&original);
+    let mut timings = RowKeyDecryptTimings::default();
+    assert_eq!(
+        storage
+            .read_thumbnail_at(&original, None, &mut timings, true)
+            .unwrap_err(),
+        "Thumbnail not cached"
+    );
+    assert_eq!(timings.calls, 0);
+    assert!(!thumb_path.exists());
+    assert_eq!(
+        std::fs::read(&original).unwrap(),
+        b"an original that must not be decoded"
+    );
+    // Ordinary reads still reach the key boundary and retain lazy generation.
+    assert_eq!(
+        storage
+            .read_thumbnail_at(&original, None, &mut timings, false)
+            .unwrap_err(),
+        "Failed to unwrap image row key"
+    );
+    std::fs::create_dir_all(thumb_path.parent().unwrap()).unwrap();
+    std::fs::write(&thumb_path, b"encrypted thumbnail").unwrap();
+    // Even a disk hit must unwrap the screenshot key before reading its contents.
+    assert_eq!(
+        storage
+            .read_thumbnail_at(&original, None, &mut timings, true)
+            .unwrap_err(),
+        "Failed to unwrap image row key"
+    );
+    assert_eq!(std::fs::read(&thumb_path).unwrap(), b"encrypted thumbnail");
+}
+
+#[test]
+fn cached_only_thumbnail_reads_preserve_encryption_and_skip_missing_or_corrupt_cache_repair() {
+    let (directory, storage, _conn) = fixture();
+    let original = directory.path().join("one.png");
+    image::RgbImage::new(16, 9).save(&original).unwrap();
+    let thumb_path = StorageState::thumbnail_path_for(&original);
+    let key = [7; 32];
+    assert_eq!(
+        storage
+            .read_thumbnail_with_key(&original, &thumb_path, &key, true)
+            .unwrap_err(),
+        "Thumbnail not cached"
+    );
+    assert!(!thumb_path.exists());
+    std::fs::create_dir_all(thumb_path.parent().unwrap()).unwrap();
+    let encrypted = encrypt_with_master_key(&key, b"cached JPEG payload").unwrap();
+    std::fs::write(&thumb_path, &encrypted).unwrap();
+    let (encoded, mime) = storage
+        .read_thumbnail_with_key(&original, &thumb_path, &key, true)
+        .unwrap();
+    assert_eq!(mime, "image/jpeg");
+    assert_eq!(
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap(),
+        b"cached JPEG payload"
+    );
+    std::fs::write(&thumb_path, b"corrupt cached ciphertext").unwrap();
+    assert!(storage
+        .read_thumbnail_with_key(&original, &thumb_path, &key, true)
+        .is_err());
+    assert_eq!(
+        std::fs::read(&thumb_path).unwrap(),
+        b"corrupt cached ciphertext"
+    );
+    // Ordinary card reads continue to repair the cache and generate JPEGs lazily.
+    let (encoded, _) = storage
+        .read_thumbnail_with_key(&original, &thumb_path, &key, false)
+        .unwrap();
+    let jpeg = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap();
+    assert!(image::load_from_memory(&jpeg).is_ok());
+    assert!(storage.try_read_cached_thumbnail(&thumb_path, &key).is_ok());
 }
 
 #[test]

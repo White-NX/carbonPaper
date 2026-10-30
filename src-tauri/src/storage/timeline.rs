@@ -28,6 +28,11 @@ pub struct TimelineRecord {
     pub category: Option<String>,
 }
 
+/// Compact [screenshot ID, Unix milliseconds] pairs, ordered by time and ID.
+/// Unlike display records this index is unsampled and contains no ciphertext.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TimelineIndexEntry(pub i64, pub i64);
+
 struct RawTimelineRow {
     id: i64,
     image_path: String,
@@ -102,6 +107,61 @@ impl StorageState {
         self.load_timeline_records(cancelled, "nearest", |conn, check, timings| {
             read_nearest_rows(conn, time_ms, check, timings)
         })
+    }
+
+    pub fn get_timeline_index(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<TimelineIndexEntry>, String> {
+        self.load_timeline_index(cancelled, |conn, check| {
+            read_index_rows(conn, start_ms, end_ms, check)
+        })
+    }
+
+    fn load_timeline_index(
+        &self,
+        cancelled: &Arc<AtomicBool>,
+        read: impl FnOnce(
+            &Connection,
+            &dyn Fn() -> Result<(), String>,
+        ) -> Result<Vec<TimelineIndexEntry>, String>,
+    ) -> Result<Vec<TimelineIndexEntry>, String> {
+        let admitted_session = self.credential_state.session_marker();
+        let check = || {
+            if cancelled.load(Ordering::Acquire) {
+                Err(CANCELLED.to_owned())
+            } else if !self.credential_state.is_session_valid()
+                || self.credential_state.silent_read_auth_required()
+                || self.credential_state.session_marker() != admitted_session
+            {
+                Err("AUTH_REQUIRED".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let conn = self.open_read_connection_named("get_timeline_index")?;
+        check()?;
+        let stop = Arc::clone(cancelled);
+        let credentials = Arc::clone(&self.credential_state);
+        let _cancellation = SqlCancellation::install(&conn, move || {
+            stop.load(Ordering::Acquire)
+                || !credentials.is_session_valid()
+                || credentials.silent_read_auth_required()
+                || credentials.session_marker() != admitted_session
+        })?;
+        // All three index seeks must observe the same database snapshot.
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let result = read(&transaction, &check);
+        check()?;
+        let rows = result?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        check()?;
+        Ok(rows)
     }
 
     fn load_timeline_records(
@@ -426,6 +486,68 @@ const NEAREST_AFTER_SQL: &str = "SELECT id, CAST(strftime('%s', created_at) AS I
     FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
     WHERE is_deleted = 0 AND created_at > ?1
     ORDER BY created_at ASC, id ASC LIMIT 1";
+
+const INDEX_RANGE_SQL: &str = "SELECT id, CAST(strftime('%s', created_at) AS INTEGER) * 1000
+    FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
+    WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
+    ORDER BY created_at ASC, id ASC";
+
+fn read_index_rows(
+    conn: &Connection,
+    start_ms: f64,
+    end_ms: f64,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<TimelineIndexEntry>, String> {
+    if !start_ms.is_finite() || !end_ms.is_finite() || start_ms >= end_ms {
+        return Err("Invalid timeline index range".into());
+    }
+    let format = |time: f64| {
+        DateTime::<Utc>::from_timestamp_millis(time.floor() as i64)
+            .map(|date| date.format("%Y-%m-%d %H:%M:%S").to_string())
+            .ok_or_else(|| "Invalid timeline timestamp".to_owned())
+    };
+    let start = format(start_ms)?;
+    let end = format(end_ms)?;
+    let mut result = Vec::new();
+    // Include the immediate outside neighbours so empty spans and viewport
+    // edges resolve against the complete history, just like nearest selection.
+    let before_sql = NEAREST_BEFORE_SQL.replace("created_at <= ?1", "created_at < ?1");
+    let neighbour = |sql: &str, pivot: &str| {
+        check()?;
+        conn.query_row(sql, [pivot], |row| {
+            Ok(TimelineIndexEntry(
+                row.get(0)?,
+                row.get::<_, i64>(1)? * 1000,
+            ))
+        })
+        .optional()
+        .map_err(|error| error.to_string())
+    };
+    if let Some(entry) = neighbour(&before_sql, &start)? {
+        result.push(entry);
+    }
+    let after = neighbour(NEAREST_AFTER_SQL, &end)?;
+    check()?;
+    let mut statement = conn
+        .prepare(INDEX_RANGE_SQL)
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![start, end], |row| {
+            Ok(TimelineIndexEntry(row.get(0)?, row.get(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    // Keep the left bracket first and the right bracket last, without sorting
+    // or reading screenshot payloads for a potentially large visible range.
+    for row in rows {
+        check()?;
+        result.push(row.map_err(|error| error.to_string())?);
+    }
+    if let Some(entry) = after {
+        result.push(entry);
+    }
+    check()?;
+    Ok(result)
+}
 
 fn read_nearest_rows(
     conn: &Connection,

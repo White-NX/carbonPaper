@@ -65,6 +65,11 @@ export function createTimelineBatchQueue(load, {
     isBusy(nextIds = ids) {
       return active !== null || wanted(nextIds).length > 0;
     },
+    invalidate(id) {
+      // A bounded image cache can evict an accepted result. Allow reloading it
+      // without discarding the cooldown for genuinely missing/corrupt images.
+      completed.delete(id);
+    },
     reset() {
       generation += 1;
       ids = [];

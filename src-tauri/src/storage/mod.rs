@@ -53,7 +53,7 @@ pub(crate) use policy::disk_totals_for_path;
 pub(crate) use screenshot_reader::ScreenshotReader;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
-pub use timeline::TimelineRecord;
+pub use timeline::{TimelineIndexEntry, TimelineRecord};
 pub use types::*;
 
 use crate::credential_manager::{

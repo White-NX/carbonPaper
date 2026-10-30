@@ -202,7 +202,19 @@ fn headers_and_details_recheck_cancellation_revocation_and_the_admitted_session(
         storage.get_timeline_details(&[1], &stop).unwrap_err(),
         "AUTH_REQUIRED"
     );
+    assert_eq!(
+        storage
+            .get_timeline_index(1767225600000.0, 1767225660000.0, &stop)
+            .unwrap_err(),
+        "AUTH_REQUIRED"
+    );
     credential.update_auth_time();
+    assert_eq!(
+        storage
+            .get_timeline_index(1767225600000.0, 1767225660000.0, &stop)
+            .unwrap(),
+        [TimelineIndexEntry(1, 1767225600000)]
+    );
     assert!(storage
         .get_timeline_headers(1767225600.0, 1767225660.0, 500, &stop)
         .unwrap()[0]
@@ -224,11 +236,27 @@ fn headers_and_details_recheck_cancellation_revocation_and_the_admitted_session(
         storage.get_timeline_details(&[1], &stop).unwrap_err(),
         CANCELLED
     );
+    assert_eq!(
+        storage
+            .get_timeline_index(1767225600000.0, 1767225660000.0, &stop)
+            .unwrap_err(),
+        CANCELLED
+    );
     stop.store(false, Ordering::Release);
     for unlock_again in [false, true] {
         credential.update_auth_time();
         let result = storage.load_timeline_records(&stop, "test_revoke", |conn, check, timings| {
             let rows = read_rows_by_ids(conn, &[1], check, timings)?;
+            credential.invalidate_session();
+            if unlock_again {
+                credential.update_auth_time();
+            }
+            Ok(rows)
+        });
+        assert_eq!(result.unwrap_err(), "AUTH_REQUIRED");
+        credential.update_auth_time();
+        let result = storage.load_timeline_index(&stop, |conn, check| {
+            let rows = read_index_rows(conn, 1767225600000.0, 1767225660000.0, check)?;
             credential.invalidate_session();
             if unlock_again {
                 credential.update_auth_time();
@@ -394,4 +422,92 @@ fn sampling_preserves_buckets_order_limits_and_soft_deletion_without_link_sets()
     assert_eq!(read(0, &mut timings).len(), 1);
     assert_eq!(read(-1, &mut timings).len(), 1);
     assert!(read_rows(&conn, f64::NAN, 0.0, 500, &|| Ok(()), &mut timings).is_err());
+}
+
+#[test]
+fn index_reads_are_unsampled_covering_and_independent_of_encrypted_payloads() {
+    let (_temp, _storage, conn) = encrypted_history();
+    conn.execute_batch(
+        "WITH RECURSIVE ids(id) AS (SELECT 100 UNION ALL SELECT id + 1 FROM ids WHERE id < 1099)
+        INSERT INTO screenshots(id,image_path,image_hash,created_at)
+        SELECT id, 'encrypted.enc', id, datetime(1767225600 + id, 'unixepoch') FROM ids;
+        DROP TABLE page_icons;",
+    )
+    .unwrap();
+    let rows = read_index_rows(&conn, 1767225600000.0, 1767226800000.0, &|| Ok(())).unwrap();
+    assert_eq!(rows.len(), 1019);
+    assert!(rows
+        .windows(2)
+        .all(|pair| (pair[0].1, pair[0].0) < (pair[1].1, pair[1].0)));
+    assert!(rows.iter().all(|entry| entry.0 != 1));
+    assert_eq!(
+        serde_json::to_value(&rows[0]).unwrap(),
+        serde_json::json!([2, 1767225630000_i64])
+    );
+    let plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {INDEX_RANGE_SQL}"))
+        .unwrap()
+        .query_map(
+            params!["2026-01-01 00:00:00", "2026-01-01 00:20:00"],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("COVERING INDEX idx_screenshots_deleted_created_at")),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn index_includes_exact_outside_neighbours_and_duplicate_timestamp_order() {
+    let (_temp, _storage, conn) = encrypted_history();
+    conn.execute_batch(
+        "INSERT INTO screenshots(id,image_path,image_hash,created_at) VALUES
+        (21, 'a.enc', 'a', '2026-01-01 00:01:30'),
+        (22, 'b.enc', 'b', '2026-01-01 00:02:30');",
+    )
+    .unwrap();
+    let base = 1767225600000.0;
+    let rows = read_index_rows(&conn, base + 95000.25, base + 125000.75, &|| Ok(())).unwrap();
+    assert_eq!(
+        rows,
+        [
+            TimelineIndexEntry(21, 1767225690000),
+            TimelineIndexEntry(5, 1767225720000),
+            TimelineIndexEntry(6, 1767225750000)
+        ]
+    );
+    let rows = read_index_rows(&conn, base + 90000.0, base + 150000.0, &|| Ok(())).unwrap();
+    assert_eq!(
+        rows.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+        [3, 4, 21, 5, 6, 22, 7]
+    );
+    let gap = read_index_rows(&conn, base + 85000.0, base + 86000.0, &|| Ok(())).unwrap();
+    assert_eq!(gap.iter().map(|entry| entry.0).collect::<Vec<_>>(), [3, 4]);
+    for (offset, expected) in [
+        (90000.0, 21),
+        (105000.0, 21),
+        (105000.1, 5),
+        (135000.1, 6),
+        (150000.0, 22),
+    ] {
+        let nearest =
+            read_nearest_rows(&conn, base + offset, &|| Ok(()), &mut Timings::default()).unwrap();
+        assert_eq!(nearest[0].id, expected);
+    }
+    assert_eq!(
+        read_index_rows(&conn, base, base + 1000.0, &|| Err(CANCELLED.into())).unwrap_err(),
+        CANCELLED
+    );
+    for (start, end) in [
+        (f64::NAN, base),
+        (base, f64::INFINITY),
+        (base, base),
+        (base + 1.0, base),
+    ] {
+        assert!(read_index_rows(&conn, start, end, &|| Ok(())).is_err());
+    }
 }

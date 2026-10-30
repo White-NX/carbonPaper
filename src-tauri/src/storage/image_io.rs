@@ -305,6 +305,7 @@ impl StorageState {
             &abs_path,
             location.key_enc.as_deref(),
             &mut RowKeyDecryptTimings::default(),
+            false,
         )
     }
 
@@ -313,7 +314,13 @@ impl StorageState {
         abs_path: &Path,
         key_enc: Option<&[u8]>,
         cng: &mut RowKeyDecryptTimings,
+        cached_only: bool,
     ) -> Result<(String, String), String> {
+        let thumb_path = Self::thumbnail_path_for(abs_path);
+        // Speculative reads must not open CNG or decode the original on a miss.
+        if cached_only && !thumb_path.exists() {
+            return Err("Thumbnail not cached".into());
+        }
         let mut row_key = key_enc
             .and_then(|enc| {
                 decrypt_row_key_with_cng_measured(&self.credential_state, enc, cng, &|| false)
@@ -322,27 +329,40 @@ impl StorageState {
             })
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
-        let thumb_path = Self::thumbnail_path_for(&abs_path);
+        let result = self.read_thumbnail_with_key(abs_path, &thumb_path, &row_key, cached_only);
+        Self::zeroize_bytes(&mut row_key);
+        result
+    }
 
+    fn read_thumbnail_with_key(
+        &self,
+        abs_path: &Path,
+        thumb_path: &Path,
+        row_key: &[u8],
+        cached_only: bool,
+    ) -> Result<(String, String), String> {
         // Phase 3: Try reading cached thumbnail
         if thumb_path.exists() {
-            match self.try_read_cached_thumbnail(&thumb_path, &row_key) {
-                Ok(result) => {
-                    Self::zeroize_bytes(&mut row_key);
-                    return Ok(result);
-                }
-                Err(_) => {
+            match self.try_read_cached_thumbnail(thumb_path, row_key) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    if cached_only {
+                        return Err(error);
+                    }
                     // Corrupt cache — delete and regenerate
-                    let _ = std::fs::remove_file(&thumb_path);
+                    let _ = std::fs::remove_file(thumb_path);
                 }
             }
         }
 
+        // The file may have disappeared while CNG was unwrapping its key.
+        if cached_only {
+            return Err("Thumbnail not cached".into());
+        }
+
         // Phase 4: Generate thumbnail from full image
         let abs_path_str = abs_path.to_string_lossy().to_string();
-        let result = self.generate_and_cache_thumbnail(&abs_path_str, &thumb_path, &row_key);
-        Self::zeroize_bytes(&mut row_key);
-        result
+        self.generate_and_cache_thumbnail(&abs_path_str, thumb_path, row_key)
     }
 
     /// Generate and cache a thumbnail if not already cached.
@@ -392,6 +412,7 @@ impl StorageState {
     pub fn batch_read_thumbnails_by_ids(
         &self,
         ids: &[i64],
+        cached_only: bool,
     ) -> std::collections::HashMap<String, Result<(String, String), String>> {
         if ids.is_empty() {
             return std::collections::HashMap::new();
@@ -440,6 +461,7 @@ impl StorageState {
                     Path::new(&location.path),
                     location.key_enc.as_deref(),
                     &mut cng,
+                    cached_only,
                 )
             } else {
                 Err("Screenshot not found".to_string())

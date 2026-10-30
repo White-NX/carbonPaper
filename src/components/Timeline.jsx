@@ -770,7 +770,7 @@ const Timeline = ({
       hoverCursorRef.current.style.opacity = '1';
     }
     hoverPreviewRef.current?.show({
-      time, event: nearestTimelineEvent(eventsRef.current, time),
+      time, zoom: camera.read().zoom, event: nearestTimelineEvent(eventsRef.current, time),
       clientX: event.clientX, clientY: event.clientY, trackTop: rect.top, trackBottom: rect.bottom,
     });
   }, [camera, pointerTime, hideHoverPreview, sqlPaused, suspendSearchFit]);
@@ -1055,7 +1055,10 @@ const Timeline = ({
           </div>
         </div>
       </div>
-      <TimelineHoverPreview ref={hoverPreviewRef} enabled={!sqlPaused} revision={refreshKey} onBusyChange={handlePreviewBusyChange} />
+      <TimelineHoverPreview ref={hoverPreviewRef} enabled={!sqlPaused} revision={refreshKey}
+        events={events} viewStart={viewStart} viewEnd={viewEnd} width={width}
+        trackLeft={containerRef.current?.getBoundingClientRect().left || 0}
+        prefetchPaused={rangePending || isDragging || camera.isFlying()} onBusyChange={handlePreviewBusyChange} />
     </div>
   );
 };

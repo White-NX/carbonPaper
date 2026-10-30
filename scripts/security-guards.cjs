@@ -61,6 +61,7 @@ const COMMAND_TIERS = {
   'commands::storage::storage_get_timeline': 'session_required',
   'commands::storage::storage_get_timeline_details': 'session_required',
   'commands::storage::storage_get_timeline_nearest': 'session_required',
+  'commands::storage::storage_get_timeline_index': 'session_required',
   'commands::storage::storage_cancel_timeline': 'session_required',
   'commands::storage::storage_list_recent_screenshots': 'session_required',
   'commands::storage::storage_get_timeline_density': 'session_required',

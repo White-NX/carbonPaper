@@ -23,6 +23,7 @@ import {
   updateMonitorFilters,
   getTimeline,
   getTimelineDetails,
+  getTimelineIndex,
   getTimelineNearest,
   fetchThumbnailBatch,
 } from './monitor_api';
@@ -109,6 +110,28 @@ describe('monitor_api command wrappers', () => {
     expectWithAuth(2);
   });
 
+  it('requests an authenticated unsampled index in milliseconds and waits for cancellation acknowledgement', async () => {
+    let finish;
+    invoke.mockImplementation((command) => command === 'storage_get_timeline_index'
+      ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
+    const controller = new AbortController();
+    const request = getTimelineIndex(1767225600123, 1767225660456, { signal: controller.signal });
+    const params = invoke.mock.calls[0][1];
+    expect(params).toEqual({ startTimeMs: 1767225600123, endTimeMs: 1767225660456, requestId: expect.any(String) });
+    expectWithAuth(1);
+    const settled = vi.fn();
+    const handled = request.catch(settled);
+    controller.abort();
+    expect(invoke).toHaveBeenCalledWith('storage_cancel_timeline', { requestId: params.requestId });
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    finish([[42, 1767225600000]]);
+    await handled;
+    expect(settled.mock.calls[0][0].name).toBe('AbortError');
+    await expect(getTimelineIndex(1, 2, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(invoke.mock.calls.filter(([command]) => command === 'storage_get_timeline_index')).toHaveLength(1);
+  });
+
   it('cancels deferred timeline details and discards results after backend acknowledgement', async () => {
     let finish;
     invoke.mockImplementation((command) => command === 'storage_get_timeline_details'
@@ -158,6 +181,15 @@ describe('monitor_api command wrappers', () => {
       1: 'data:image/jpeg;base64,first', 3: 'data:image/png;base64,third',
     });
     expectWithAuth(1);
+  });
+
+  it('opts into cached-only thumbnail prefetch without changing ordinary thumbnail generation', async () => {
+    invoke.mockResolvedValue({ results: {} });
+    await fetchThumbnailBatch([1, 2]);
+    expect(invoke).toHaveBeenLastCalledWith('storage_batch_get_thumbnails', { ids: [1, 2] });
+    await fetchThumbnailBatch([1, 2], { cachedOnly: true });
+    expect(invoke).toHaveBeenLastCalledWith('storage_batch_get_thumbnails', { ids: [1, 2], cachedOnly: true });
+    expectWithAuth(2);
   });
 
   it('calls Rust visual search with the stable command payload', async () => {

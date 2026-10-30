@@ -35,6 +35,41 @@ it no longer repeats the grouping for each matching screenshot. Each response
 is capped at 500 records. Timestamp fields retain Unix seconds and RFC 3339 UTC
 semantics.
 
+## Exact hover identity
+
+`storage_get_timeline_index` reads every live screenshot ID and timestamp in the
+requested range from the existing covering time index, plus its immediate outside
+neighbours. The response consists of `[id, timestamp_ms]` pairs with explicit Unix
+milliseconds, sorted by timestamp and ID. It has no 500-record sampling cap and
+does not load screenshot payloads or unwrap CNG row keys. All three seeks share
+one read transaction and retain the timeline authentication, admitted-session and
+SQL cancellation checks.
+
+The frontend retains one index with a quarter-screen margin on each side in a
+compact array using 16 bytes per screenshot. Binary search resolves the pointer's
+exact ID before showing any image. Equal distances prefer the earlier timestamp;
+duplicate timestamps follow storage's last-ID-before / first-ID-after rule.
+Prefetch targets the exact IDs at screen/device-pixel positions, including both
+sides of floating-point midpoint boundaries. The compressed thumbnail cache is
+capped at 2,048 entries and 32 MiB; foreground originals retain the existing
+six-entry / 16 MiB cap. A missing exact thumbnail shows a loading state and receives
+queue priority. Evicted thumbnails can reload without bypassing missing-image
+retry backoff.
+
+The hover card appears only within 16 CSS pixels of the exact screenshot time,
+using the live camera zoom to convert the millisecond gap into screen distance.
+An unresolved target or a wider gap stays hidden and does not load an original
+or uncached labels. Index refreshes can reveal a new nearby capture while the
+pointer remains in a previously empty gap.
+
+Originals and uncached labels wait for the existing 100 ms hover delay and load by
+the selected ID. Index refreshes run every five seconds, but cannot replace a
+stationary hover's chosen ID. Pointer-down hides the card while preserving that
+identity for click selection. A new pointer target or explicit records revision
+can select a new ID. Thumbnail arrivals and original decoding only fill or upgrade
+the chosen image; another screenshot is never used as its placeholder. Lock,
+inactive timelines, revision changes and unmount clear the index and image caches.
+
 Within one response, repeated references to a page icon reuse its decrypted text.
 A metadata process icon takes precedence and avoids decrypting the page icon.
 This cache ends with the request, rechecks authorization before use, and contains

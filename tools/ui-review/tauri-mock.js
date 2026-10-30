@@ -6,6 +6,7 @@ let paused = false;
 let nextId = 0;
 const listeners = new Map();
 let imagePromise;
+let thumbnailPromise;
 const imageResponse = async () => {
   imagePromise ||= fetch('/tools/ui-review/fixtures/screenshot.svg').then((response) => response.text())
     .then((svg) => ({
@@ -13,6 +14,20 @@ const imageResponse = async () => {
       data: btoa(String.fromCharCode(...new TextEncoder().encode(svg))),
     }));
   return imagePromise;
+};
+const thumbnailResponse = async () => {
+  thumbnailPromise ||= imageResponse().then(async (response) => {
+    const image = new Image();
+    image.src = `data:${response.mime_type};base64,${response.data}`;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    const ratio = 192 / Math.max(image.naturalWidth, image.naturalHeight);
+    canvas.width = Math.round(image.naturalWidth * ratio);
+    canvas.height = Math.round(image.naturalHeight * ratio);
+    canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+    return { status: 'success', mime_type: 'image/jpeg', data: canvas.toDataURL('image/jpeg', 0.8).split(',')[1] };
+  });
+  return thumbnailPromise;
 };
 
 export async function listen(event, handler) {
@@ -73,18 +88,33 @@ export async function invoke(command, args = {}) {
     case 'storage_get_thumbnail_warmup_status': case 'storage_warmup_thumbnails': return noWork;
     case 'storage_get_timeline': {
       const toMilliseconds = (value) => value > 10_000_000_000 ? value : value * 1000;
-      return snapshots.filter((item) => item.captured_at_ms >= toMilliseconds(args.startTime)
+      const records = snapshots.filter((item) => item.captured_at_ms >= toMilliseconds(args.startTime)
         && item.captured_at_ms <= toMilliseconds(args.endTime));
+      const sampleStep = Math.max(1, Number(params.get('timelineSampleStep')) || 1);
+      return records.filter((_item, index) => index % sampleStep === 0).slice(0, args.maxRecords || 500);
     }
     case 'storage_get_timeline_details': return snapshots.filter((item) => args.ids.includes(item.id));
+    case 'storage_get_timeline_index': {
+      const ordered = [...snapshots].sort((a, b) => a.captured_at_ms - b.captured_at_ms || a.id - b.id);
+      const before = ordered.filter((item) => item.captured_at_ms < args.startTimeMs).at(-1);
+      const after = ordered.find((item) => item.captured_at_ms > args.endTimeMs);
+      return [before, ...ordered.filter((item) => item.captured_at_ms >= args.startTimeMs
+        && item.captured_at_ms <= args.endTimeMs), after].filter(Boolean)
+        .map((item) => [item.id, item.captured_at_ms]);
+    }
     case 'storage_get_timeline_nearest': {
       const nearest = snapshots.reduce((best, item) => !best
         || Math.abs(item.captured_at_ms - args.timeMs) < Math.abs(best.captured_at_ms - args.timeMs) ? item : best, null);
       return nearest ? [nearest] : [];
     }
     case 'storage_get_timeline_density': return Array.from({ length: 16 }, (_, index) => ({ timestamp: REVIEW_START / 1000 + index * 300, count: index % 5 + 2 }));
-    case 'storage_get_image': case 'storage_get_thumbnail': return imageResponse();
-    case 'storage_batch_get_thumbnails': return { results: Object.fromEntries(await Promise.all(args.ids.map(async (id) => [id, await imageResponse()]))) };
+    case 'storage_get_image': {
+      const delay = Number(params.get('imageDelayMs')) || 0;
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      return imageResponse();
+    }
+    case 'storage_get_thumbnail': return thumbnailResponse();
+    case 'storage_batch_get_thumbnails': return { results: Object.fromEntries(await Promise.all(args.ids.map(async (id) => [id, await thumbnailResponse()]))) };
     case 'storage_get_screenshot_details': return {
       record: { ...snapshots[(args.id || 1) - 1], status: 'ready', visible_links: [] },
       ocr_results: [
