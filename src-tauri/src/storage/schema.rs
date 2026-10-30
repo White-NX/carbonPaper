@@ -1449,17 +1449,10 @@ impl StorageState {
         // `anchor_text` — the same string those clusters were already showing.
         Self::add_column_if_missing(conn, "smart_clusters", "display_name", "TEXT")?;
 
-        // Staging table for bitmap index migration (same structure as blind_bitmap_index)
-        Self::create_table_if_missing(
-            conn,
-            "blind_bitmap_index_staging",
-            r#"
-            CREATE TABLE IF NOT EXISTS blind_bitmap_index_staging (
-                token_hash TEXT PRIMARY KEY,
-                postings_blob BLOB NOT NULL
-            )
-            "#,
-        )?;
+        // The pre-v0.6.4 bitmap rebuild used a staging table. HMAC v2 and
+        // lazy indexing write the live index directly and never consume it.
+        conn.execute("DROP TABLE IF EXISTS blind_bitmap_index_staging", [])
+            .map_err(|e| format!("Failed to drop retired bitmap staging table: {e}"))?;
 
         Self::create_table_if_missing(
             conn,
@@ -1768,6 +1761,94 @@ mod tests {
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential);
         (temp, storage)
+    }
+
+    #[test]
+    fn retiring_bitmap_staging_preserves_archive_data_and_hmac_progress() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        assert!(!StorageState::table_exists(&conn, "blind_bitmap_index_staging").unwrap());
+        conn.execute_batch(
+            "CREATE TABLE blind_bitmap_index_staging (token_hash TEXT PRIMARY KEY, postings_blob BLOB NOT NULL);
+             INSERT INTO blind_bitmap_index_staging VALUES ('old-staging-token',X'00');
+             INSERT INTO screenshots(id,image_path,image_hash,process_name,process_name_enc,content_key_encrypted)
+                VALUES (7,'saved.enc','saved-image','editor.exe',X'03',X'04');
+             INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted) VALUES
+                (11,7,'saved-hmac',X'01',X'02'), (12,7,'',X'05',X'06');
+             DELETE FROM app_metadata WHERE key='hmac_v2_migration_done';
+             INSERT INTO app_metadata(key,value) VALUES ('hmac_v2_migration_cursor','11');",
+        )
+        .unwrap();
+        let posting = roaring::RoaringBitmap::from_iter([11]);
+        let mut bytes = Vec::new();
+        posting.serialize_into(&mut bytes).unwrap();
+        conn.execute(
+            "INSERT INTO blind_bitmap_inline(token_hash,postings_blob) VALUES ('current-token',?1)",
+            [bytes],
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            storage.init_tables(&conn).unwrap();
+            assert!(!StorageState::table_exists(&conn, "blind_bitmap_index_staging").unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT process_name,process_name_enc,content_key_encrypted FROM screenshots WHERE id=7",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
+                )
+                .unwrap(),
+                ("editor.exe".into(), vec![3], vec![4])
+            );
+            let ocr = conn
+                .prepare(
+                    "SELECT text_hash,text_enc,text_key_encrypted FROM ocr_results ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                ocr,
+                vec![
+                    ("saved-hmac".into(), vec![1], vec![2]),
+                    ("".into(), vec![5], vec![6])
+                ]
+            );
+            assert_eq!(
+                super::super::blind_index::BlindIndex::open(&conn)
+                    .unwrap()
+                    .read("current-token", false)
+                    .unwrap()
+                    .unwrap()
+                    .bitmap,
+                posting
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT value FROM app_metadata WHERE key='hmac_v2_migration_cursor'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "11"
+            );
+            assert!(!conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key='hmac_v2_migration_done')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
     }
 
     #[test]

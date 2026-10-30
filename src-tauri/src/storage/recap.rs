@@ -211,26 +211,14 @@ impl StorageState {
         let conn = &*tx;
         let calendar = ensure_day_calendar(conn, day, start, end)?;
         let (start, end) = (calendar.start_ms, calendar.end_ms);
-        let previous: Option<String> = conn
-            .query_row(
-                "SELECT privacy_hash FROM recap_days WHERE day=?",
-                [day],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let adopt_legacy = match previous.as_deref() {
-            Some(hash) if hash != privacy.as_str() => privacy.matches_legacy(hash)?,
-            _ => false,
-        };
         let covered = calendar
             .closed_periods(chrono::Utc::now().timestamp_millis())
             .last()
             .map(|(_, b)| *b)
             .unwrap_or(start);
         conn.execute("INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms) VALUES (?1,?2,?3,?4,?5)
-            ON CONFLICT(day) DO UPDATE SET revision=revision+CASE WHEN ?6 AND privacy_hash=?7 THEN 0 ELSE 1 END,privacy_hash=excluded.privacy_hash
-            WHERE privacy_hash<>excluded.privacy_hash", params![day,start,end,privacy.as_str(),covered,adopt_legacy,previous]).map_err(|e| e.to_string())?;
+            ON CONFLICT(day) DO UPDATE SET revision=revision+1,privacy_hash=excluded.privacy_hash
+            WHERE privacy_hash<>excluded.privacy_hash", params![day,start,end,privacy.as_str(),covered]).map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE recap_days SET covered_until_ms=max(covered_until_ms,?) WHERE day=?",
             params![covered, day],
@@ -1482,64 +1470,6 @@ mod tests {
         assert_eq!(ids.last(), Some(&601));
         assert!(!ids.contains(&500));
     }
-    #[test]
-    fn legacy_privacy_upgrade_preserves_current_payloads_without_reviving_stale_ones() {
-        let (_temp, s) = storage();
-        let config = SensitiveFilterConfig {
-            version: 2,
-            ..SensitiveFilterConfig::default()
-        };
-        let legacy = crate::ai::recap::digest(&serde_json::to_string(&config).unwrap());
-        let saved = serde_json::to_value(config).unwrap();
-        let reloaded = PrivacyFingerprint::new(serde_json::from_value(saved).unwrap()).unwrap();
-        let (start, end) = crate::ai::recap::day_bounds("2026-01-01").unwrap();
-        {
-            let guard = s.db.lock().unwrap();
-            let conn = guard.as_ref().unwrap();
-            for (day, revision) in [("2026-01-01", 5), ("2026-01-02", 6)] {
-                let (start, end) = crate::ai::recap::day_bounds(day).unwrap();
-                conn.execute(
-                    "INSERT INTO recap_days VALUES (?1,?2,?3,?4,?5,?3)",
-                    params![day, start, end, revision, legacy],
-                )
-                .unwrap();
-                for kind in ["batch", "summary", "index"] {
-                    conn.execute(
-                        "INSERT INTO recap_payloads VALUES (?1,?2,?2,5,x'00',x'00')",
-                        params![kind, day],
-                    )
-                    .unwrap();
-                }
-            }
-        }
-        for (day, revision, visible) in [("2026-01-01", 5, 3), ("2026-01-02", 6, 0)] {
-            let (start, end) = crate::ai::recap::day_bounds(day).unwrap();
-            assert_eq!(
-                s.recap_day_revision(day, start, end, &reloaded).unwrap().0,
-                revision
-            );
-            let guard = s.db.lock().unwrap();
-            let conn = guard.as_ref().unwrap();
-            let stored: String = conn
-                .query_row(
-                    "SELECT privacy_hash FROM recap_days WHERE day=?",
-                    [day],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(stored, reloaded.as_str());
-            let count: i64 = conn.query_row("SELECT count(*) FROM recap_payloads p JOIN recap_days d ON p.day=d.day AND p.revision=d.revision WHERE d.day=?",
-                [day], |r| r.get(0)).unwrap();
-            assert_eq!(count, visible);
-        }
-        assert_eq!(
-            s.recap_day_revision("2026-01-01", start, end, &privacy(false))
-                .unwrap()
-                .0,
-            6
-        );
-    }
-
     #[test]
     fn old_database_generation_cannot_spend_or_settle_against_a_replacement() {
         let (_temp, s) = storage();
