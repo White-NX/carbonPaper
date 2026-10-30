@@ -107,7 +107,7 @@ pub async fn credential_verify_user(
                 {
                     scheduler.wake();
                 }
-                storage.try_bitmap_index_migration();
+                storage.start_lazy_indexer();
                 let recap_app = app.clone();
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     crate::ai::recap::protected::sync_after_unlock(&recap_app)

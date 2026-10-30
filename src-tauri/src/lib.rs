@@ -1052,11 +1052,6 @@ pub fn run() {
                             ),
                         }
 
-                        let storage_clone = storage.inner().clone();
-                        std::thread::spawn(move || {
-                            StorageState::backfill_plaintext_process_names(storage_clone);
-                        });
-
                         // Repair the text-search postings before any other
                         // sentinel-gated migration is allowed to take maintenance.
                         blind_index_repair::spawn_blind_index_auto_repair(
