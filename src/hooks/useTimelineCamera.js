@@ -306,18 +306,30 @@ export default function useTimelineCamera({
    * Zoom about a point on screen, so whatever the cursor is over stays there for
    * the whole movement rather than only at its two ends.
    */
-  const zoomAt = useCallback((cursorX, factor) => {
+  const zoomAt = useCallback((cursorX, factor, { immediate = false } = {}) => {
     const cam = camRef.current;
     const trackWidth = widthRef.current;
     if (!trackWidth) return;
 
     cam.live = false;
-    if (cam.mode !== 'glide') abandonMotion(cam);
+    if (immediate || cam.mode !== 'glide') abandonMotion(cam);
 
     cam.anchorX = cursorX;
     cam.anchorTime = cam.center + (cursorX - trackWidth / 2) / cam.zoom;
     cam.targetZoom = clampTarget(cam.targetZoom * factor);
     cam.targetCenter = cam.anchorTime - (cursorX - trackWidth / 2) / cam.targetZoom;
+
+    // Precision pinch deltas already describe continuous physical motion.
+    // Applying another glide would lag behind the fingers and compound deltas.
+    if (immediate) {
+      cam.zoom = cam.targetZoom;
+      cam.center = cam.targetCenter;
+      cam.mode = 'idle';
+      commitIfDrifted(DRIFT_LIMITS.gesture);
+      applyTransform();
+      scheduleSettle();
+      return;
+    }
 
     if (reducedMotionRef.current) {
       cam.mode = 'idle';
@@ -330,7 +342,7 @@ export default function useTimelineCamera({
 
     cam.mode = 'glide';
     ensureLoop();
-  }, [applyTransform, clampTarget, commit, ensureLoop]);
+  }, [applyTransform, clampTarget, commit, commitIfDrifted, ensureLoop, scheduleSettle]);
 
   /** Travel to a distant viewport along a path that keeps the content legible. */
   const flyTo = useCallback((nextCenter, nextZoom, options = {}) => {

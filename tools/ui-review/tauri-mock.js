@@ -8,7 +8,10 @@ const listeners = new Map();
 let imagePromise;
 const imageResponse = async () => {
   imagePromise ||= fetch('/tools/ui-review/fixtures/screenshot.svg').then((response) => response.text())
-    .then((svg) => ({ status: 'success', mime_type: 'image/svg+xml', data: btoa(svg) }));
+    .then((svg) => ({
+      status: 'success', mime_type: 'image/svg+xml',
+      data: btoa(String.fromCharCode(...new TextEncoder().encode(svg))),
+    }));
   return imagePromise;
 };
 
@@ -45,11 +48,14 @@ export class WebviewWindow {
 
 const noWork = { running: false, in_progress: false, needs_vacuum: false, phase: 'idle', manualActive: false };
 export async function invoke(command, args = {}) {
+  const counts = globalThis.__uiReviewCommandCounts ||= {};
+  counts[command] = (counts[command] || 0) + 1;
   switch (command) {
     case 'credential_check_session': return authenticated;
     case 'credential_get_session_timeout': return 900;
     case 'credential_initialize': return true;
     case 'credential_verify_user': authenticated = true; await emit('auth-session-changed', true); return true;
+    case 'credential_lock_session': authenticated = false; await emit('auth-session-changed', false); return null;
     case 'get_monitor_autostart': return false;
     case 'get_monitor_status': return JSON.stringify({ paused, stopped: false, running: true, power_saving_active: false });
     case 'pause_monitor': paused = true; return null;
@@ -71,6 +77,11 @@ export async function invoke(command, args = {}) {
         && item.captured_at_ms <= toMilliseconds(args.endTime));
     }
     case 'storage_get_timeline_details': return snapshots.filter((item) => args.ids.includes(item.id));
+    case 'storage_get_timeline_nearest': {
+      const nearest = snapshots.reduce((best, item) => !best
+        || Math.abs(item.captured_at_ms - args.timeMs) < Math.abs(best.captured_at_ms - args.timeMs) ? item : best, null);
+      return nearest ? [nearest] : [];
+    }
     case 'storage_get_timeline_density': return Array.from({ length: 16 }, (_, index) => ({ timestamp: REVIEW_START / 1000 + index * 300, count: index % 5 + 2 }));
     case 'storage_get_image': case 'storage_get_thumbnail': return imageResponse();
     case 'storage_batch_get_thumbnails': return { results: Object.fromEntries(await Promise.all(args.ids.map(async (id) => [id, await imageResponse()]))) };
@@ -123,3 +134,6 @@ export async function invoke(command, args = {}) {
     default: return null;
   }
 }
+
+// Keep review controls on the same module instance as the connected event listeners.
+globalThis.__uiReviewInvoke = invoke;

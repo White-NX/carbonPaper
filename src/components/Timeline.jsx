@@ -2,9 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next';
 import { ChevronUp, Focus, Play } from 'lucide-react';
 import { Button } from './ui/Button';
-import { getTimeline, getTimelineDetails, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
+import { getTimeline, getTimelineDetails, getTimelineDensity, getTimelineNearest } from '../lib/monitor_api';
 import {
-  aggregateAppDistribution,
   buildSessions,
   collapseSessions,
   estimateSampleInterval,
@@ -20,29 +19,26 @@ import {
 } from '../lib/timeline_viewport';
 import { RENDER_OVERSCAN_RATIO } from '../lib/timeline_camera';
 import useTimelineCamera from '../hooks/useTimelineCamera';
-import { accentWithAlpha } from '../lib/timeline_palette';
-import OverviewBand from './timeline/OverviewBand';
 import SessionBand from './timeline/SessionBand';
-import DetailTrack from './timeline/DetailTrack';
+import DensityBackdrop from './timeline/DensityBackdrop';
+import TimelineHoverPreview from './timeline/TimelineHoverPreview';
 import SearchMarkerLayer from './timeline/SearchMarkerLayer';
 import CompactTimeline from './timeline/CompactTimeline';
 import { getSearchMarkerFitRange } from '../lib/timeline_search';
 import { createTimelineRequestQueue } from '../lib/timeline_requests';
 import { createTimelineBatchQueue } from '../lib/timeline_batch_queue';
+import { nearestTimelineEvent, timelineEventFromRecord, timelineWheelAction } from '../lib/timeline_interaction';
 
 const MINUTE = 60000;
 const HOUR = 3600000;
 const DAY = 86400000;
 
 /** Track heights. */
-const OVERVIEW_HEIGHT = 20;
-const SESSION_HEIGHT = 30;
-const DETAIL_HEIGHT = 58;
-const AXIS_HEIGHT = 18;
-const TIMELINE_HEIGHT = OVERVIEW_HEIGHT + SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT;
+const SESSION_HEIGHT = 44;
+const AXIS_HEIGHT = 28;
+const TIMELINE_HEIGHT = SESSION_HEIGHT + AXIS_HEIGHT;
 
-/** Tier threshold boundaries for detail track. */
-const FRAME_TIER_MAX_SPAN = 30 * MINUTE;
+/** Use day-sized density buckets when viewing more than eight hours. */
 const SESSION_TIER_MAX_SPAN = 8 * HOUR;
 
 /** Minimum pixel width target before collapsing session blocks. */
@@ -60,31 +56,20 @@ const TIMELINE_SAMPLE_LIMIT = 500;
 /** How much wider than the viewport each kind of fetch reaches. */
 const EVENT_PREFETCH_FACTOR = 2.5;
 const DENSITY_PREFETCH_FACTOR = 2.5;
-const OVERVIEW_PREFETCH_FACTOR = 2;
 
 /** Refetch once the viewport comes this close to the edge of loaded data. */
 const REFETCH_MARGIN_RATIO = 0.35;
-const OVERVIEW_REFETCH_MARGIN_RATIO = 0.1;
 
 /** Shortest gap between two fetches of the same kind while the user is dragging. */
 const EVENT_FETCH_INTERVAL_MS = 300;
 const DENSITY_FETCH_INTERVAL_MS = 350;
-const OVERVIEW_FETCH_INTERVAL_MS = 500;
 
-/** Density bars aimed for across one screen width, and across the overview band. */
+/** Density buckets aimed for across one screen width. */
 const DENSITY_BUCKETS_PER_SCREEN = 120;
-const OVERVIEW_BUCKET_COUNT = 160;
 
 /** How often loaded data is read again so newly captured screenshots appear. */
 const FOLLOW_REFRESH_MS = 1000;
 const IDLE_REFRESH_MS = 5000;
-
-/** Overview band span configuration factor. */
-const OVERVIEW_SPAN_FACTOR = 10;
-const OVERVIEW_MIN_SPAN = 2 * HOUR;
-const OVERVIEW_MAX_SPAN = 90 * DAY;
-/** Recenter threshold ratio for overview band. */
-const OVERVIEW_RECENTER_RATIO = 0.3;
 
 /** Drag slop threshold in pixels. */
 const DRAG_SLOP_PX = 4;
@@ -93,24 +78,9 @@ const DRAG_SLOP_PX = 4;
 const MIN_ZOOM = 100 / (365 * DAY);
 const MAX_ZOOM = 20 / 1000;
 
-/** Multiplier applied to the zoom by one wheel notch. */
-const WHEEL_ZOOM_STEP = 1.2;
-
 /** Local timezone offset relative to UTC in milliseconds. */
 function localBucketOffsetMs() {
   return -new Date().getTimezoneOffset() * MINUTE;
-}
-
-const TIMELINE_IMAGE_CACHE_LIMIT = 800;
-const timelineImageCache = new Map();
-
-function setTimelineImageCache(key, dataUrl) {
-  if (key === null || key === undefined || !dataUrl) return;
-  if (!timelineImageCache.has(key) && timelineImageCache.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
-    const oldestKey = timelineImageCache.keys().next().value;
-    timelineImageCache.delete(oldestKey);
-  }
-  timelineImageCache.set(key, dataUrl);
 }
 
 function getTickStep(zoom) {
@@ -142,7 +112,6 @@ function formatTick(date, stepMs) {
 
 const Timeline = ({
   onSelectEvent,
-  onClearHighlight,
   jumpTimestamp,
   highlightedEventId,
   refreshKey,
@@ -155,6 +124,12 @@ const Timeline = ({
 }) => {
   const { t } = useTranslation();
   const containerRef = useRef(null);
+  const trackRef = useRef(null);
+  const hoverPreviewRef = useRef(null);
+  const hoverCursorRef = useRef(null);
+  const playheadRef = useRef(null);
+  const playheadAxisRef = useRef(null);
+  const selectionTimeRef = useRef(null);
   // Compact search draws the already-loaded result markers without reading screenshot history.
   const sqlPaused = windowSqlPaused || !active || compact;
 
@@ -162,23 +137,22 @@ const Timeline = ({
   const [events, setEvents] = useState([]);
   const [rangePending, setRangePending] = useState(false);
   const [densityBuckets, setDensityBuckets] = useState([]);
-  const [overviewBuckets, setOverviewBuckets] = useState([]);
-  const [imageEpoch, setImageEpoch] = useState(0);
+  const [selectedSnapshot, setSelectedSnapshot] = useState(null);
+  const [selectionError, setSelectionError] = useState(false);
 
   const [centerTime, setCenterTime] = useState(Date.now());
   const [zoom, setZoom] = useState(0.001);
   const [isFollowingNow, setIsFollowingNow] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const [overviewAnchor, setOverviewAnchor] = useState(() => Date.now());
-  const [overviewInteracting, setOverviewInteracting] = useState(false);
-
-  const lastMouseXRef = useRef(0);
-  const isDraggingRef = useRef(false);
+  const gestureRef = useRef(null);
   const dragMovedRef = useRef(0);
   const densityEpochRef = useRef(0);
-  const overviewEpochRef = useRef(0);
-  const wheelIdleTimerRef = useRef(null);
-  const pendingImageIdsRef = useRef([]);
+  const lastWheelRef = useRef(null);
+  const previewBusyRef = useRef(false);
+  const selectionPausedRef = useRef(sqlPaused);
+  const selectCallbackRef = useRef(onSelectEvent);
+  selectionPausedRef.current = sqlPaused;
+  selectCallbackRef.current = onSelectEvent;
   const searchFitKeyRef = useRef(null);
   const searchFitSuspendedRef = useRef(false);
   const jumpTokenRef = useRef(null);
@@ -186,7 +160,6 @@ const Timeline = ({
   /** Ranges already asked for, so a pan only refetches near their edges. */
   const requestedEventsRef = useRef(null);
   const requestedDensityRef = useRef(null);
-  const requestedOverviewRef = useRef(null);
   /** Sampling width behind the events currently held, used to decide merge or replace. */
   const loadedSampleMsRef = useRef(null);
   /**
@@ -197,7 +170,6 @@ const Timeline = ({
    * which is why the periodic refresh never fired during a drag.
    */
   const liveViewRef = useRef({ center: 0, span: 0 });
-  const overviewViewRef = useRef({ anchor: 0, span: 0 });
   const zoomLevelRef = useRef(null);
   const syncLoadersRef = useRef(null);
   const detailsCacheRef = useRef(new Map());
@@ -205,15 +177,14 @@ const Timeline = ({
   eventsRef.current = events;
   const pipelinePausedRef = useRef(true);
   pipelinePausedRef.current = Boolean(sqlPaused) || rangePending;
-  const frameTierRef = useRef(false);
 
   /** Elements the camera moves, and the axis it repositions label by label. */
   const sessionStageRef = useRef(null);
-  const detailStageRef = useRef(null);
+  const densityStageRef = useRef(null);
   const markerStageRef = useRef(null);
   const axisRef = useRef(null);
   const stages = useMemo(
-    () => [sessionStageRef, detailStageRef, markerStageRef],
+    () => [sessionStageRef, densityStageRef, markerStageRef],
     [],
   );
 
@@ -222,30 +193,12 @@ const Timeline = ({
   const viewEnd = centerTime + visibleSpan / 2;
   const overscanPx = width * RENDER_OVERSCAN_RATIO;
 
-  const tier = visibleSpan <= FRAME_TIER_MAX_SPAN
-    ? 'frame'
-    : visibleSpan <= SESSION_TIER_MAX_SPAN
-      ? 'session'
-      : 'day';
-  frameTierRef.current = tier === 'frame';
-
-  const imageQueue = useMemo(() => createTimelineBatchQueue(fetchThumbnailBatch, {
-    batchSize: 6,
-    isLoaded: (id) => timelineImageCache.has(id),
-    onResult: (batch, ids) => {
-      const added = [];
-      for (const id of ids) {
-        if (batch?.[id]) {
-          setTimelineImageCache(id, batch[id]);
-          added.push(id);
-        }
-      }
-      if (added.length) setImageEpoch((prev) => prev + 1);
-      return added;
-    },
-    onError: (error) => console.error('[Timeline] Batch thumbnail load error:', error),
-    onSettled: () => syncLoadersRef.current?.(),
-  }), []);
+  const selectedEvent = searchState && selectedSnapshot ? selectedSnapshot : highlightedEventId != null
+    ? events.find((event) => event.id === highlightedEventId)
+      || (selectedSnapshot?.id === highlightedEventId ? selectedSnapshot : null)
+    : highlightedEventId === undefined ? selectedSnapshot : null;
+  const selectedTime = selectedEvent?.timestamp ?? (highlightedEventId != null ? jumpTimestamp?.time : null) ?? null;
+  selectionTimeRef.current = selectedTime;
 
   const detailsQueue = useMemo(() => createTimelineBatchQueue(getTimelineDetails, {
     batchSize: 12,
@@ -273,40 +226,28 @@ const Timeline = ({
   }), []);
 
   const syncLoaders = useCallback(() => {
-    const paused = pipelinePausedRef.current;
+    const paused = pipelinePausedRef.current || previewBusyRef.current;
     const currentIds = eventsRef.current.map((event) => event.id);
-    const current = new Set(currentIds);
-    const visible = frameTierRef.current
-      ? pendingImageIdsRef.current.filter((id) => current.has(id)) : [];
-    // Let visible images finish before labels compete for the same CNG handle.
-    detailsQueue.setIds([...visible, ...currentIds], { paused: paused || imageQueue.isBusy(visible) });
-    imageQueue.setIds(visible, { paused });
-  }, [imageQueue, detailsQueue]);
+    detailsQueue.setIds(currentIds, { paused });
+  }, [detailsQueue]);
+
+  const handlePreviewBusyChange = useCallback((busy) => {
+    if (previewBusyRef.current === busy) return;
+    previewBusyRef.current = busy;
+    syncLoadersRef.current?.();
+  }, []);
 
   useEffect(() => {
     syncLoadersRef.current = syncLoaders;
     syncLoaders();
     return () => {
       syncLoadersRef.current = null;
-      imageQueue.setPaused(true);
       detailsQueue.setPaused(true);
-      imageQueue.reset();
       detailsQueue.reset();
     };
-  }, [syncLoaders, imageQueue, detailsQueue]);
+  }, [syncLoaders, detailsQueue]);
 
-  useEffect(() => { syncLoaders(); }, [events, sqlPaused, rangePending, tier, syncLoaders]);
-
-  // Snapped so the band, and the fetch behind it, hold still inside a zoom level
-  const overviewSpan = Math.max(
-    snapSpanUpMs(visibleSpan),
-    Math.min(
-      OVERVIEW_MAX_SPAN,
-      snapSpanUpMs(Math.max(OVERVIEW_MIN_SPAN, visibleSpan * OVERVIEW_SPAN_FACTOR)),
-    ),
-  );
-  const overviewStart = overviewAnchor - overviewSpan / 2;
-  const overviewEnd = overviewAnchor + overviewSpan / 2;
+  useEffect(() => { syncLoaders(); }, [events, sqlPaused, rangePending, syncLoaders]);
 
   const timeToX = useCallback(
     (time) => width / 2 + (time - centerTime) * zoom,
@@ -326,7 +267,7 @@ const Timeline = ({
     });
     observer.observe(containerRef.current);
     return () => observer.disconnect();
-  }, [active]);
+  }, [active, compact]);
 
   // ── Camera ─────────────────────────────────────────────────
 
@@ -352,6 +293,16 @@ const Timeline = ({
   const handleCameraFrame = useCallback((frame) => {
     liveViewRef.current = { center: frame.center, span: frame.span };
 
+    const trackWidth = containerRef.current?.clientWidth || 0;
+    const frameZoom = frame.zoom ?? trackWidth / frame.span;
+    const selectedX = selectionTimeRef.current == null ? trackWidth / 2
+      : trackWidth / 2 + (selectionTimeRef.current - frame.center) * frameZoom;
+    for (const marker of [playheadRef.current, playheadAxisRef.current]) {
+      if (!marker) continue;
+      marker.style.left = `${selectedX}px`;
+      marker.style.visibility = selectedX < 0 || selectedX > trackWidth ? 'hidden' : '';
+    }
+
     const node = axisRef.current;
     if (!node) return;
 
@@ -375,24 +326,18 @@ const Timeline = ({
   });
 
   useEffect(() => {
-    if (active) return;
+    if (active && !compact && !sqlPaused) return;
     const view = camera.read();
     camera.jumpTo(view.center, view.zoom);
-    isDraggingRef.current = false;
+    const pointerId = gestureRef.current?.id;
+    try {
+      if (pointerId != null && trackRef.current?.hasPointerCapture(pointerId)) trackRef.current.releasePointerCapture(pointerId);
+    } catch { /* The browser may already have cancelled capture. */ }
+    gestureRef.current = null;
+    lastWheelRef.current = null;
+    if (hoverCursorRef.current) hoverCursorRef.current.style.opacity = '0';
     setIsDragging(false);
-    setOverviewInteracting(false);
-    if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
-  }, [active, camera]);
-
-  // Recenter the overview band once the viewport has drifted too far across it.
-  // Suspended mid-flight, where the centre is passing through values nobody is
-  // meant to read.
-  useEffect(() => {
-    if (overviewInteracting || camera.isFlying()) return;
-    if (Math.abs(centerTime - overviewAnchor) > overviewSpan * OVERVIEW_RECENTER_RATIO) {
-      setOverviewAnchor(centerTime);
-    }
-  }, [centerTime, overviewAnchor, overviewSpan, overviewInteracting, camera]);
+  }, [active, compact, sqlPaused, camera]);
 
   // ── Data Fetching ──────────────────────────────────────────
 
@@ -403,21 +348,7 @@ const Timeline = ({
     }, onResult: (records, { start, end, sampleMs }) => {
       const mapped = (records || [])
         .filter((record) => record.timestamp != null)
-        .map((record) => {
-          return {
-            id: record.id,
-            timestamp: record.timestamp
-              ? record.timestamp * 1000
-              : (record.created_at ? new Date(record.created_at).getTime() : 0),
-            imagePath: record.image_path,
-            appName: record.process_name,
-            windowTitle: record.window_title,
-            processIcon: record.process_icon || null,
-            processPath: record.process_path || null,
-            category: record.category || null,
-            ...detailsCacheRef.current.get(record.id),
-          };
-        })
+        .map((record) => ({ ...timelineEventFromRecord(record), ...detailsCacheRef.current.get(record.id) }))
         .filter((event) => !Number.isNaN(event.timestamp));
 
       // Two fetches taken at different sampling widths describe the same hours at
@@ -467,23 +398,6 @@ const Timeline = ({
     }
   }, []);
 
-  const fetchOverviewRange = useCallback(async (start, end, bucketMs) => {
-    const epoch = ++overviewEpochRef.current;
-
-    try {
-      const buckets = await getTimelineDensity(start, end, bucketMs, localBucketOffsetMs());
-      if (overviewEpochRef.current !== epoch) return;
-      setOverviewBuckets((buckets || []).map((bucket) => ({
-        timestamp: bucket.timestamp * 1000,
-        count: bucket.count,
-        bucketMs,
-      })));
-    } catch (error) {
-      console.error('[Timeline] Overview fetch error:', error);
-      if (overviewEpochRef.current === epoch) requestedOverviewRef.current = null;
-    }
-  }, []);
-
   const requestEvents = useMemo(
     () => createThrottle(fetchEventsRange, EVENT_FETCH_INTERVAL_MS),
     [fetchEventsRange],
@@ -491,10 +405,6 @@ const Timeline = ({
   const requestDensity = useMemo(
     () => createThrottle(fetchDensityRange, DENSITY_FETCH_INTERVAL_MS),
     [fetchDensityRange],
-  );
-  const requestOverview = useMemo(
-    () => createThrottle(fetchOverviewRange, OVERVIEW_FETCH_INTERVAL_MS),
-    [fetchOverviewRange],
   );
 
   /**
@@ -553,32 +463,6 @@ const Timeline = ({
     requestDensity(start, end, bucketMs);
   }, [requestDensity]);
 
-  const ensureOverview = useCallback((anchor, span, force = false) => {
-    if (!span) return;
-
-    const requestSpan = span * OVERVIEW_PREFETCH_FACTOR;
-    const bucketMs = snapSpanUpMs(span / OVERVIEW_BUCKET_COUNT);
-    const requested = requestedOverviewRef.current;
-
-    const covered = requested?.bucketMs === bucketMs
-      && isRangeCovered(
-        requested,
-        anchor - span / 2,
-        anchor + span / 2,
-        span * OVERVIEW_REFETCH_MARGIN_RATIO,
-      );
-    if (covered && !force) return;
-
-    const start = anchor - requestSpan / 2;
-    const end = anchor + requestSpan / 2;
-    requestedOverviewRef.current = { start, end, bucketMs };
-    requestOverview(start, end, bucketMs);
-  }, [requestOverview]);
-
-  useEffect(() => {
-    overviewViewRef.current = { anchor: overviewAnchor, span: overviewSpan };
-  }, [overviewAnchor, overviewSpan]);
-
   // A flight asks for its destination once when it sets off, so nothing is
   // requested for the viewports it passes over on the way. Each of those is on
   // screen for a couple of frames and would never arrive in time to be seen.
@@ -589,23 +473,15 @@ const Timeline = ({
   }, [centerTime, visibleSpan, width, sqlPaused, camera, ensureEvents, ensureDensity]);
 
   useEffect(() => {
-    if (sqlPaused || !width || camera.isFlying()) return;
-    ensureOverview(overviewAnchor, overviewSpan);
-  }, [overviewAnchor, overviewSpan, width, sqlPaused, camera, ensureOverview]);
-
-  useEffect(() => {
     if (refreshKey === undefined || !width) return;
     setEvents([]);
     detailsCacheRef.current.clear();
-    imageQueue.reset();
     detailsQueue.reset();
     requestedEventsRef.current = null;
     requestedDensityRef.current = null;
-    requestedOverviewRef.current = null;
     loadedSampleMsRef.current = null;
     requestEvents.cancel();
     eventRequests.cancel();
-    setImageEpoch((prev) => prev + 1);
     if (sqlPaused) return;
     ensureEvents(centerTime, visibleSpan, true);
     ensureDensity(centerTime, visibleSpan, true);
@@ -623,14 +499,12 @@ const Timeline = ({
     const period = isFollowingNow ? FOLLOW_REFRESH_MS : IDLE_REFRESH_MS;
     const interval = setInterval(() => {
       const view = liveViewRef.current;
-      const overview = overviewViewRef.current;
       ensureEvents(view.center, view.span, true, true);
       ensureDensity(view.center, view.span, true);
-      ensureOverview(overview.anchor, overview.span, true);
     }, period);
 
     return () => clearInterval(interval);
-  }, [sqlPaused, width, isFollowingNow, ensureEvents, ensureDensity, ensureOverview]);
+  }, [sqlPaused, width, isFollowingNow, ensureEvents, ensureDensity]);
 
   useEffect(() => () => {
     requestEvents.cancel();
@@ -638,8 +512,7 @@ const Timeline = ({
     // Effect replay must request this range again after cancelling its read.
     requestedEventsRef.current = null;
     requestDensity.cancel();
-    requestOverview.cancel();
-  }, [requestEvents, requestDensity, requestOverview, eventRequests]);
+  }, [requestEvents, requestDensity, eventRequests]);
 
   useEffect(() => {
     if (sqlPaused) {
@@ -649,18 +522,8 @@ const Timeline = ({
       requestDensity.cancel();
       requestedDensityRef.current = null;
       densityEpochRef.current += 1;
-      requestOverview.cancel();
-      requestedOverviewRef.current = null;
-      overviewEpochRef.current += 1;
     }
-  }, [sqlPaused, requestEvents, requestDensity, requestOverview, eventRequests]);
-
-  // ── Thumbnail Loading ──────────────────────────────────────
-
-  const handleVisibleFramesChange = useCallback((ids) => {
-    pendingImageIdsRef.current = ids;
-    syncLoadersRef.current?.();
-  }, []);
+  }, [sqlPaused, requestEvents, requestDensity, eventRequests]);
 
   // ── Derived Data ───────────────────────────────────────────
 
@@ -689,26 +552,21 @@ const Timeline = ({
     () => collapseSessions(activities, { minBlockMs: fold.minBlockMs }),
     [activities, fold.minBlockMs],
   );
-  const distribution = useMemo(
-    () => (tier === 'day' ? aggregateAppDistribution(events, densityBuckets, 4) : []),
-    [tier, events, densityBuckets],
-  );
 
   /** Find session block matching the highlighted screenshot event. */
   const activeSessionId = useMemo(() => {
-    if (highlightedEventId === null || highlightedEventId === undefined) return null;
-    const event = events.find((item) => item.id === highlightedEventId);
-    if (!event) return null;
+    if (selectedTime == null) return null;
     const block = sessionBlocks.find(
-      (item) => event.timestamp >= item.start && event.timestamp < item.end,
+      (item) => selectedTime >= item.start && selectedTime < item.end,
     );
     return block ? block.id : null;
-  }, [events, sessionBlocks, highlightedEventId]);
+  }, [selectedTime, sessionBlocks]);
 
   // ── Navigation ───────────────────────────────────────────────
 
-  const resetImagePipeline = useCallback(() => {
-    setImageEpoch((prev) => prev + 1);
+  const hideHoverPreview = useCallback(() => {
+    hoverPreviewRef.current?.hide();
+    if (hoverCursorRef.current) hoverCursorRef.current.style.opacity = '0';
   }, []);
 
   const suspendSearchFit = useCallback(() => {
@@ -720,7 +578,7 @@ const Timeline = ({
    * still on its way.
    *
    * Every deliberate move goes through here: the quick zoom buttons, the search
-   * fit, a double click on a session, a click in the overview band. Continuous
+   * fit and a double click on a session. Continuous
    * input does not, because a path only makes sense between two places the user
    * has actually chosen.
    */
@@ -735,14 +593,8 @@ const Timeline = ({
     }
   }, [camera, ensureDensity, ensureEvents, sqlPaused, width]);
 
-  const seekTo = useCallback((time) => {
-    suspendSearchFit();
-    setIsFollowingNow(false);
-    flyTo(time, camera.read().zoom);
-  }, [camera, flyTo, suspendSearchFit]);
-
   /**
-   * Continuous drag of the overview viewport.
+   * Continuous drag of the compact search viewport.
    *
    * Unlike the main track this one redraws on every move rather than riding the
    * transform, because the rectangle the user has hold of is drawn from the
@@ -760,16 +612,16 @@ const Timeline = ({
     suspendSearchFit();
     setIsFollowingNow(false);
     flyTo((from + to) / 2, width / (to - from));
-    resetImagePipeline();
-  }, [width, flyTo, resetImagePipeline, suspendSearchFit]);
+    hideHoverPreview();
+  }, [width, flyTo, hideHoverPreview, suspendSearchFit]);
 
   const fitSearchMarkers = useCallback(() => {
     const range = getSearchMarkerFitRange(searchState?.markers);
     if (!range || !width) return;
     setIsFollowingNow(false);
     flyTo((range.from + range.to) / 2, width / (range.to - range.from));
-    resetImagePipeline();
-  }, [searchState?.markers, width, flyTo, resetImagePipeline]);
+    hideHoverPreview();
+  }, [searchState?.markers, width, flyTo, hideHoverPreview]);
 
   useEffect(() => {
     if (!active || !width || containerRef.current?.clientWidth !== width) return;
@@ -792,8 +644,8 @@ const Timeline = ({
     suspendSearchFit();
     setIsFollowingNow(false);
     flyTo(Date.now(), width / spanMs);
-    resetImagePipeline();
-  }, [width, flyTo, resetImagePipeline, suspendSearchFit]);
+    hideHoverPreview();
+  }, [width, flyTo, hideHoverPreview, suspendSearchFit]);
 
   const jumpToNow = useCallback(() => {
     suspendSearchFit();
@@ -801,8 +653,8 @@ const Timeline = ({
     // Following starts once the camera has landed, so the flight itself is not
     // fighting a centre that keeps moving forward underneath it.
     flyTo(Date.now(), MAX_ZOOM, { onDone: () => setIsFollowingNow(true) });
-    resetImagePipeline();
-  }, [flyTo, resetImagePipeline, suspendSearchFit]);
+    hideHoverPreview();
+  }, [flyTo, hideHoverPreview, suspendSearchFit]);
 
   // Guarded by the token rather than by the dependency list, because `flyTo`
   // changes identity whenever the track is resized and must not replay a jump.
@@ -811,15 +663,15 @@ const Timeline = ({
     jumpTokenRef.current = jumpTimestamp;
     setIsFollowingNow(false);
     flyTo(jumpTimestamp.time, Math.max(camera.read().zoom, 0.005));
-    resetImagePipeline();
-  }, [active, width, jumpTimestamp, camera, flyTo, resetImagePipeline]);
+    hideHoverPreview();
+  }, [active, width, jumpTimestamp, camera, flyTo, hideHoverPreview]);
 
   useEffect(() => {
-    camera.setLive(active && !compact && isFollowingNow);
-  }, [active, compact, camera, isFollowingNow]);
+    camera.setLive(active && !compact && !sqlPaused && isFollowingNow);
+  }, [active, compact, sqlPaused, camera, isFollowingNow]);
 
   useEffect(() => {
-    if (!active || compact) return undefined;
+    if (!active || compact || sqlPaused) return undefined;
     const handleKeyDown = (event) => {
       if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return;
       const target = event.target;
@@ -837,83 +689,161 @@ const Timeline = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [active, compact, zoomToSpan, jumpToNow]);
+  }, [active, compact, sqlPaused, zoomToSpan, jumpToNow]);
 
   // ── Pointer Interaction ─────────────────────────────────────
 
-  const handleMouseDown = useCallback((event) => {
-    suspendSearchFit();
-    setIsFollowingNow(false);
-    setIsDragging(true);
-    isDraggingRef.current = true;
-    dragMovedRef.current = 0;
-    lastMouseXRef.current = event.clientX;
-  }, [suspendSearchFit]);
-
-  const handleMouseMove = useCallback((event) => {
-    if (!isDraggingRef.current) return;
-    const deltaX = event.clientX - lastMouseXRef.current;
-    lastMouseXRef.current = event.clientX;
-    dragMovedRef.current += Math.abs(deltaX);
-    // Straight to the camera, with no smoothing: content that trails the cursor
-    // during a drag reads as lag rather than as polish.
-    camera.panBy(deltaX);
-  }, [camera]);
-
-  const endDrag = useCallback(() => {
-    if (!isDraggingRef.current) return;
-    setIsDragging(false);
-    isDraggingRef.current = false;
-    setImageEpoch((prev) => prev + 1);
+  const selectSnapshot = useCallback((event) => {
+    if (!event || selectionPausedRef.current) return;
+    setSelectedSnapshot(event);
+    setSelectionError(false);
+    selectCallbackRef.current?.(event);
   }, []);
+
+  const selectionRequests = useMemo(() => createTimelineRequestQueue(
+    ({ start }, signal) => getTimelineNearest(start, { signal }),
+    {
+      onResult: (record) => selectSnapshot(timelineEventFromRecord(record)),
+      onError: () => { if (!selectionPausedRef.current) setSelectionError(true); },
+    },
+  ), [selectSnapshot]);
+
+  useEffect(() => {
+    if (sqlPaused) selectionRequests.cancel();
+    return () => selectionRequests.cancel();
+  }, [sqlPaused, selectionRequests]);
+
+  useEffect(() => {
+    selectionRequests.cancel();
+    setSelectedSnapshot(null);
+    setSelectionError(false);
+  }, [refreshKey, selectionRequests]);
+
+  const pointerTime = useCallback((clientX) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || !width) return null;
+    const view = camera.read();
+    return view.center + (Math.max(0, Math.min(width, clientX - rect.left)) - width / 2) / view.zoom;
+  }, [camera, width]);
+
+  const handlePointerDown = useCallback((event) => {
+    if (event.button !== 0 || sqlPaused
+      || event.target?.closest?.('[data-timeline-tool]')) return;
+    selectionRequests.cancel();
+    dragMovedRef.current = 0;
+    gestureRef.current = { id: event.pointerId, startX: event.clientX, startY: event.clientY, lastX: event.clientX, moved: false };
+    // Preserve a marker's ordinary click target; capture it once it becomes a drag.
+    if (!event.target?.closest?.('[data-timeline-item="search-marker"]')) {
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* No capture in detached test surfaces. */ }
+    }
+    hideHoverPreview();
+  }, [sqlPaused, selectionRequests, hideHoverPreview]);
+
+  const handlePointerMove = useCallback((event) => {
+    const gesture = gestureRef.current;
+    if (gesture) {
+      if (gesture.id !== event.pointerId) return;
+      dragMovedRef.current = Math.max(dragMovedRef.current,
+        Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY));
+      if (!gesture.moved && dragMovedRef.current <= DRAG_SLOP_PX) return;
+      if (!gesture.moved) {
+        gesture.moved = true;
+        try { trackRef.current?.setPointerCapture(event.pointerId); } catch { /* Detached test surface. */ }
+        suspendSearchFit();
+        setIsFollowingNow(false);
+        setIsDragging(true);
+      }
+      camera.panBy(event.clientX - gesture.lastX);
+      gesture.lastX = event.clientX;
+      return;
+    }
+    if (sqlPaused || event.pointerType === 'touch'
+      || event.target?.closest?.('[data-timeline-tool]')) {
+      hideHoverPreview();
+      return;
+    }
+    const rect = containerRef.current?.getBoundingClientRect();
+    const time = pointerTime(event.clientX);
+    if (!rect || time == null) return;
+    if (hoverCursorRef.current) {
+      hoverCursorRef.current.style.left = `${event.clientX - rect.left}px`;
+      hoverCursorRef.current.style.opacity = '1';
+    }
+    hoverPreviewRef.current?.show({
+      time, event: nearestTimelineEvent(eventsRef.current, time),
+      clientX: event.clientX, clientY: event.clientY, trackTop: rect.top, trackBottom: rect.bottom,
+    });
+  }, [camera, pointerTime, hideHoverPreview, sqlPaused, suspendSearchFit]);
+
+  const endDrag = useCallback((event) => {
+    if (event && gestureRef.current?.id !== event.pointerId) return;
+    gestureRef.current = null;
+    setIsDragging(false);
+    try {
+      if (event?.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch { /* Capture may already have been released by the browser. */ }
+  }, []);
+
+  useEffect(() => {
+    const blur = () => { dragMovedRef.current = Infinity; endDrag(); hideHoverPreview(); };
+    window.addEventListener('blur', blur);
+    return () => window.removeEventListener('blur', blur);
+  }, [endDrag, hideHoverPreview]);
 
   const handleWheel = useCallback((event) => {
-    try { event.preventDefault(); } catch { /* passive listener */ }
-    setIsFollowingNow(false);
+    const now = performance.now();
+    const action = timelineWheelAction(event, width, lastWheelRef.current, now);
+    if (!action) return;
+    // Native non-passive listener also suppresses Chromium's Ctrl+wheel page zoom.
+    event.preventDefault();
+    lastWheelRef.current = { kind: action.kind, at: now };
     suspendSearchFit();
-
-    if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
-    wheelIdleTimerRef.current = setTimeout(() => setImageEpoch((prev) => prev + 1), 160);
-
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-
-    camera.zoomAt(
-      event.clientX - rect.left,
-      event.deltaY < 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP,
-    );
-  }, [camera, suspendSearchFit]);
-
-  const handleBackgroundClick = useCallback((event) => {
-    if (dragMovedRef.current > DRAG_SLOP_PX) return;
-    // Ignore background click if clicking an interactive item
-    if (event.target?.closest?.('[data-timeline-item]')) return;
     setIsFollowingNow(false);
-    onClearHighlight?.();
-  }, [onClearHighlight]);
+    hideHoverPreview();
+    selectionRequests.cancel();
+    if (action.kind === 'pan') camera.panBy(action.deltaX);
+    else {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) camera.zoomAt(Math.max(0, Math.min(width, event.clientX - rect.left)), action.factor, { immediate: action.immediate });
+    }
+  }, [camera, width, suspendSearchFit, hideHoverPreview, selectionRequests]);
 
-  /** Filter out clicks caused by drag mouseup. */
-  const guardedSelect = useCallback((handler) => (payload) => {
-    if (dragMovedRef.current > DRAG_SLOP_PX) return;
-    handler(payload);
-  }, []);
+  useEffect(() => {
+    const track = trackRef.current;
+    if (!active || compact || !track) return undefined;
+    track.addEventListener('wheel', handleWheel, { passive: false });
+    return () => track.removeEventListener('wheel', handleWheel);
+  }, [active, compact, handleWheel]);
 
-  const handleSelectSession = useMemo(
-    () => guardedSelect((session) => {
-      if (session.firstEvent) onSelectEvent?.(session.firstEvent);
-    }),
-    [guardedSelect, onSelectEvent],
-  );
+  const handleTimelineClick = useCallback((event) => {
+    if (sqlPaused || event.button !== 0 || event.detail > 1 || dragMovedRef.current > DRAG_SLOP_PX
+      || event.target?.closest?.('[data-timeline-tool], [data-timeline-item="search-marker"]')) return;
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || event.clientX < rect.left || event.clientX > rect.right
+      || event.clientY < rect.top || event.clientY > rect.bottom) return;
+    const time = pointerTime(event.clientX);
+    if (time == null) return;
+    suspendSearchFit();
+    setIsFollowingNow(false);
+    setSelectionError(false);
+    const resolved = hoverPreviewRef.current?.read(time);
+    if (resolved) selectSnapshot(resolved);
+    else selectionRequests.request({ start: time, end: time });
+    hideHoverPreview();
+  }, [pointerTime, hideHoverPreview, selectSnapshot, selectionRequests, sqlPaused, suspendSearchFit]);
 
   const handleZoomToSession = useCallback((session) => {
+    if (dragMovedRef.current > DRAG_SLOP_PX) return;
     const padding = Math.max(MINUTE, (session.end - session.start) * 0.15);
     seekRange(session.start - padding, session.end + padding);
   }, [seekRange]);
 
-  const handleSelectFrame = useMemo(
-    () => guardedSelect((event) => onSelectEvent?.(event)),
-    [guardedSelect, onSelectEvent],
-  );
+  const handleDoubleClick = useCallback((event) => {
+    if (event.target?.closest?.('[data-timeline-tool], [data-timeline-item="search-marker"]')) return;
+    const time = pointerTime(event.clientX);
+    const session = sessionBlocks.find((block) => time >= block.start && time < block.end);
+    if (session) handleZoomToSession(session);
+  }, [handleZoomToSession, pointerTime, sessionBlocks]);
 
   // ── Axis Ticks ──────────────────────────────────────────────
 
@@ -979,167 +909,153 @@ const Timeline = ({
       role="region"
       aria-label={t('timeline.label')}
       hidden={!active}
-      className={`relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border ${active ? '' : 'hidden'}`}
+      className={`tl-container relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border ${active ? '' : 'hidden'}`}
       style={{ height: TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
       data-keep-selection="true"
     >
-      <OverviewBand
-        width={width}
-        height={OVERVIEW_HEIGHT}
-        buckets={overviewBuckets}
-        rangeStart={overviewStart}
-        rangeEnd={overviewEnd}
-        viewStart={viewStart}
-        viewEnd={viewEnd}
-        onScrub={scrubTo}
-        onSeek={seekTo}
-        onSeekRange={seekRange}
-        onInteractingChange={setOverviewInteracting}
-        searchMarkers={searchState?.markers || []}
-        hoveredSearchMarkerIds={searchState?.hoveredIds || []}
-      />
-
       <div
+        ref={trackRef}
+        data-testid="timeline-track"
         className={`relative ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-        style={{ height: SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT }}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={endDrag}
-        onMouseLeave={endDrag}
-        onWheel={handleWheel}
-        onClick={handleBackgroundClick}
+        style={{ height: TIMELINE_HEIGHT, touchAction: 'none' }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={(event) => { dragMovedRef.current = Infinity; endDrag(event); hideHoverPreview(); }}
+        onLostPointerCapture={endDrag}
+        onPointerLeave={hideHoverPreview}
+        onClick={handleTimelineClick}
+        onDoubleClick={handleDoubleClick}
       >
-        <SessionBand
-          blocks={sessionBlocks}
-          timeToX={timeToX}
-          width={width}
-          height={SESSION_HEIGHT}
-          overscanPx={overscanPx}
-          foldLevel={fold.level}
-          stageRef={sessionStageRef}
-          activeId={activeSessionId}
-          onSelect={handleSelectSession}
-          onZoomTo={handleZoomToSession}
-        />
-
-        <DetailTrack
-          tier={tier}
-          events={events}
-          buckets={densityBuckets}
-          distribution={distribution}
-          timeToX={timeToX}
-          width={width}
-          height={DETAIL_HEIGHT}
-          overscanPx={overscanPx}
-          stageRef={detailStageRef}
-          highlightedEventId={highlightedEventId}
-          imageCache={timelineImageCache}
-          imageEpoch={imageEpoch}
-          onSelectEvent={handleSelectFrame}
-          onSeek={seekTo}
-          onVisibleFramesChange={handleVisibleFramesChange}
-        />
-
-        <div className="pointer-events-none absolute inset-x-0" style={{ top: SESSION_HEIGHT, height: DETAIL_HEIGHT }}>
+        <div className="relative overflow-hidden" style={{ height: SESSION_HEIGHT }}>
+          <DensityBackdrop buckets={densityBuckets} timeToX={timeToX} width={width}
+            height={SESSION_HEIGHT} overscanPx={overscanPx} stageRef={densityStageRef} />
+          <SessionBand
+            blocks={sessionBlocks}
+            timeToX={timeToX}
+            width={width}
+            height={SESSION_HEIGHT}
+            overscanPx={overscanPx}
+            foldLevel={fold.level}
+            stageRef={sessionStageRef}
+            activeId={activeSessionId}
+            embedded
+            showTooltips={false}
+            onZoomTo={handleZoomToSession}
+          />
           <SearchMarkerLayer
             markers={searchState?.markers || []}
             hoveredIds={searchState?.hoveredIds || []}
             timeToX={timeToX}
             width={width}
-            height={DETAIL_HEIGHT}
+            height={SESSION_HEIGHT}
             overscanPx={overscanPx}
             stageRef={markerStageRef}
             onSelectMarker={(marker) => {
-              if (marker?.result) onSelectSearchResult?.(marker.result);
+              if (!marker?.result) return;
+              setSelectedSnapshot({ id: marker.result.screenshot_id, timestamp: marker.time });
+              onSelectSearchResult?.(marker.result);
             }}
           />
+          <div ref={playheadRef} data-testid="timeline-playhead" className="tl-playhead" style={{ left: timeToX(selectedTime ?? centerTime) }}>
+            <span className="tl-playhead-head" />
+          </div>
+          <div ref={hoverCursorRef} className="tl-hover-cursor" />
+          {selectionError && <span role="alert" className="pointer-events-none absolute right-2 top-2 z-40 rounded border border-ide-border bg-ide-panel px-2 py-1 text-xs text-ide-muted">{t('timeline.selectionUnavailable')}</span>}
         </div>
 
-        <div className="relative" style={{ height: AXIS_HEIGHT }}>
-          <div ref={axisRef} className="absolute inset-0">
-            {ticks.map((tick) => (
-              <div
-                key={tick.time}
-                data-x={tick.x}
-                className="pointer-events-none absolute top-0 flex -translate-x-1/2 flex-col items-center"
-                style={{ left: tick.x }}
+        <div className="flex items-stretch border-t border-ide-border" style={{ height: AXIS_HEIGHT }}>
+          <div className="relative min-w-0 flex-1 overflow-hidden" data-testid="timeline-axis">
+            <div ref={axisRef} className="absolute inset-y-0 left-0" style={{ width }}>
+              {ticks.map((tick) => (
+                <div
+                  key={tick.time}
+                  data-x={tick.x}
+                  className="pointer-events-none absolute top-0 flex -translate-x-1/2 flex-col items-center"
+                  style={{ left: tick.x }}
+                >
+                  <span className="h-1 w-px bg-ide-border" />
+                  <span className="mt-1 whitespace-nowrap font-mono text-[10px] leading-none text-ide-muted">
+                    {tick.label}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div ref={playheadAxisRef} className="tl-axis-playhead" style={{ left: timeToX(selectedTime ?? centerTime) }}>
+              <time className="tl-playhead-time">{new Date(selectedTime ?? centerTime).toLocaleTimeString(undefined, { hour12: false })}</time>
+            </div>
+          </div>
+          <div className="tl-toolbar" data-timeline-tool>
+            {onToggleCompact && (
+              <Button
+                variant="secondary"
+                size="xs"
+                icon={ChevronUp}
+                className="h-[22px] rounded py-0 text-[11px]"
+                aria-expanded
+                aria-label={t('timeline.collapse')}
+                data-tauri-drag-region="false"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleCompact();
+                }}
               >
-                <span className="h-1 w-px bg-ide-border" />
-                <span className="mt-0.5 whitespace-nowrap font-mono text-[10px] leading-none text-ide-muted">
-                  {tick.label}
-                </span>
-              </div>
+                <span className="tl-collapse-label">{t('timeline.collapse')}</span>
+              </Button>
+            )}
+            {searchState?.markers?.length > 0 && (
+              <Button
+                variant="ghost"
+                size="xs"
+                className="h-[22px] rounded p-1 text-ide-warning"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  searchFitSuspendedRef.current = false;
+                  fitSearchMarkers();
+                }}
+                title={t('timeline.fitSearchResults')}
+                aria-label={t('timeline.fitSearchResults')}
+              >
+                <Focus size={14} />
+              </Button>
+            )}
+            {quickZooms.map((item) => (
+              <Button
+                key={item.key}
+                variant="ghost"
+                size="xs"
+                className="h-[22px] rounded px-2 py-0 text-[11px] text-ide-text"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  zoomToSpan(item.span);
+                }}
+                title={`${item.title} (${item.shortcut})`}
+              >
+                {item.label}
+              </Button>
             ))}
+            <Button
+              variant="ghost"
+              size="xs"
+              aria-label={t('timeline.jumpToNow')}
+              aria-pressed={isFollowingNow}
+              className={`h-[22px] rounded p-1 ${
+                isFollowingNow
+                  ? 'border-ide-accent bg-ide-accent text-white'
+                  : 'border-ide-border bg-ide-panel text-ide-text hover:bg-ide-active'
+              }`}
+              onClick={(event) => {
+                event.stopPropagation();
+                jumpToNow();
+              }}
+              title={`${t('timeline.jumpToNow')} (0)`}
+            >
+              <Play size={14} fill={isFollowingNow ? 'currentColor' : 'none'} className={isFollowingNow ? '' : 'ml-0.5'} />
+            </Button>
           </div>
         </div>
-
-        <div
-          className="pointer-events-none absolute inset-y-0 left-1/2 z-30 w-px"
-          style={{ backgroundColor: accentWithAlpha(0.75) }}
-        />
       </div>
-
-      <div className="absolute bottom-1.5 right-2 z-40 flex items-center gap-1">
-        {onToggleCompact && (
-          <Button
-            variant="secondary"
-            size="xs"
-            icon={ChevronUp}
-            aria-expanded
-            data-tauri-drag-region="false"
-            onClick={(event) => {
-              event.stopPropagation();
-              onToggleCompact();
-            }}
-          >
-            {t('timeline.collapse')}
-          </Button>
-        )}
-        {searchState?.markers?.length > 0 && (
-          <button
-            type="button"
-            className="rounded border border-ide-border bg-ide-panel p-1 text-ide-warning shadow-sm transition-colors hover:bg-ide-active"
-            onClick={(event) => {
-              event.stopPropagation();
-              searchFitSuspendedRef.current = false;
-              fitSearchMarkers();
-            }}
-            title={t('timeline.fitSearchResults')}
-            aria-label={t('timeline.fitSearchResults')}
-          >
-            <Focus size={14} />
-          </button>
-        )}
-        {quickZooms.map((item) => (
-          <button
-            key={item.key}
-            type="button"
-            className="rounded border border-ide-border bg-ide-panel px-2 py-0.5 text-[11px] text-ide-text shadow-sm transition-colors hover:bg-ide-active"
-            onClick={(event) => {
-              event.stopPropagation();
-              zoomToSpan(item.span);
-            }}
-            title={`${item.title} (${item.shortcut})`}
-          >
-            {item.label}
-          </button>
-        ))}
-        <button
-          type="button"
-          className={`rounded-full border p-1 shadow transition-colors ${
-            isFollowingNow
-              ? 'border-ide-accent bg-ide-accent text-white'
-              : 'border-ide-border bg-ide-panel text-ide-text hover:bg-ide-active'
-          }`}
-          onClick={(event) => {
-            event.stopPropagation();
-            jumpToNow();
-          }}
-          title={`${t('timeline.jumpToNow')} (0)`}
-        >
-          <Play size={14} fill={isFollowingNow ? 'currentColor' : 'none'} className={isFollowingNow ? '' : 'ml-0.5'} />
-        </button>
-      </div>
+      <TimelineHoverPreview ref={hoverPreviewRef} enabled={!sqlPaused} revision={refreshKey} onBusyChange={handlePreviewBusyChange} />
     </div>
   );
 };

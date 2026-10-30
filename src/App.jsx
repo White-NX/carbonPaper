@@ -383,7 +383,7 @@ function App() {
               jumpTimestamp={timelineJump}
               highlightedEventId={highlightedEventId}
               refreshKey={timelineRefreshKey}
-              sqlPaused={!windowFocused}
+              sqlPaused={!windowFocused || !isAuthenticated}
               searchState={timelineSearch}
               onSelectSearchResult={(item) => setPreviewRequest({ item, token: Date.now() })}
             />

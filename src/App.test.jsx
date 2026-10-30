@@ -5,9 +5,9 @@ import { invoke } from '@tauri-apps/api/core';
 import App from './App';
 import zh from './i18n/locales/zh-CN.json';
 import { searchSnapshotsAndRecaps } from './lib/search_api';
-import { getScreenshotDetails, searchScreenshots } from './lib/monitor_api';
+import { fetchImage, getScreenshotDetails, searchScreenshots } from './lib/monitor_api';
 
-const mocks = vi.hoisted(() => ({ authenticated: true, copy: vi.fn(async () => {}), window: vi.fn() }));
+const mocks = vi.hoisted(() => ({ authenticated: true, copy: vi.fn(async () => {}), window: vi.fn(), timelines: vi.fn() }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({
   t: (key, options = {}) => {
     const value = key.split('.').reduce((object, part) => object?.[part], zh);
@@ -43,7 +43,7 @@ vi.mock('./components/UpdateModal', () => ({ UpdateModal: () => null }));
 vi.mock('./components/AppBoundUpgradePrompt', () => ({ default: () => null }));
 vi.mock('./components/Notifications', () => ({ NotificationToast: () => null, NotificationPanel: () => null }));
 vi.mock('./components/OcrModelRepairCard', () => ({ default: () => null }));
-vi.mock('./components/WorkspaceTimelines', () => ({ default: () => null }));
+vi.mock('./components/WorkspaceTimelines', () => ({ default: (props) => { mocks.timelines(props); return null; } }));
 vi.mock('./components/SmartClustersView', () => ({ default: () => null }));
 vi.mock('./components/recap/RecapView', () => ({ default: () => null }));
 vi.mock('./components/InspectorImage', () => ({ InspectorImage: ({ item }) => <img src={item.imageUrl} alt="Screenshot" /> }));
@@ -96,6 +96,31 @@ it('returns from timeline navigation to the same search result with source focus
   await waitFor(() => expect(source).toHaveFocus());
   expect(field).toHaveValue('design');
   expect(searchSnapshotsAndRecaps).toHaveBeenCalledOnce();
+});
+
+it.each([42, undefined])('opens a visual search result in the timeline with an integer id when its metadata screenshot id is %s', async (screenshotId) => {
+  const path = 'memory://visual';
+  const captureTime = Date.parse('2026-10-28T02:00:00Z');
+  searchScreenshots.mockResolvedValueOnce([{
+    id: 'd766e83ee7354fb0d83f3dbf6d68c504', similarity: 0.8, distance: 0.2,
+    metadata: { screenshot_id: screenshotId, image_path: path, process_name: 'Editor', window_title: 'Visual design', created_at: '2026-10-28T02:00:00Z' },
+  }]);
+  render(<App />);
+  fireEvent.click(screen.getByRole('button', { name: '切换到画面搜索' }));
+  const input = screen.getByRole('textbox', { name: '描述你想找的画面' });
+  fireEvent.change(input, { target: { value: 'moon' } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  fireEvent.click(await screen.findByRole('button', { name: '预览 Visual design' }));
+  const dialog = await screen.findByRole('dialog', { name: '快照预览' });
+  await within(dialog).findByRole('img', { name: 'Screenshot' });
+  fireEvent.click(within(dialog).getByRole('button', { name: '在时间线上查看' }));
+  await screen.findByRole('img', { name: 'Screenshot' });
+  expect(screen.getByRole('heading', { name: '记录' })).toBeInTheDocument();
+  expect(getScreenshotDetails.mock.calls).toEqual([[screenshotId ?? null, path], [42, path]]);
+  expect(fetchImage.mock.calls).toEqual([[screenshotId ?? null, path], [42, path]]);
+  expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({
+    highlightedEventId: 42, jumpTimestamp: { time: captureTime, ts: expect.any(Number) },
+  }));
 });
 
 it('opens a title-bar quick-search result in the records viewer', async () => {
@@ -158,4 +183,15 @@ it('keeps the global search shortcut disabled while locked', () => {
   const input = screen.getByRole('textbox', { name: '搜索截图里出现过的文字' });
   expect(input).toBeDisabled();
   expect(input).not.toHaveFocus();
+});
+
+it('pauses timeline data and preview caches when the screenshot session is locked', () => {
+  const view = render(<App />);
+  expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({ sqlPaused: false }));
+  mocks.authenticated = false;
+  view.rerender(<App />);
+  expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({ sqlPaused: true }));
+  mocks.authenticated = true;
+  view.rerender(<App />);
+  expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({ sqlPaused: false }));
 });

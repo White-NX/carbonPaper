@@ -248,6 +248,12 @@ export const getTimelineDetails = async (ids, { signal } = {}) => {
     return invokeTimelineRead('storage_get_timeline_details', { ids }, signal);
 };
 
+/** Resolve against the full history, including screenshots omitted by sampling. */
+export const getTimelineNearest = async (timeMs, { signal } = {}) => {
+    const records = await invokeTimelineRead('storage_get_timeline_nearest', { timeMs }, signal);
+    return records?.[0] || null;
+};
+
 /**
  * Get timeline snapshot density bucket counts.
  * @param {number} bucketOffsetMs Offset in ms to align bucket boundaries with local timezone.

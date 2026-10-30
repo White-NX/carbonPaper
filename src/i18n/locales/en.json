@@ -1727,6 +1727,9 @@
     "repair": "Repair model now"
   },
   "timeline": {
+    "snapshotPreview": "Snapshot preview",
+    "previewUnavailable": "This preview could not be loaded",
+    "selectionUnavailable": "Could not open this snapshot. Try again.",
     "month": "1M",
     "week": "1W",
     "today": "Today",

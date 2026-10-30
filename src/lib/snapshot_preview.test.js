@@ -1,9 +1,36 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeSnapshotPreviewItem, sanitizeSnapshotPreviewState, searchResultToSnapshotEvent } from './snapshot_preview';
+import { getSnapshotPreviewKey, normalizeSnapshotPreviewItem, sanitizeSnapshotPreviewState, searchResultToSnapshotEvent } from './snapshot_preview';
 import { captureDateOf } from './search_grouping';
 import fixture from '../tests/fixtures/screenshot_contract_v3.json';
 
 describe('snapshot preview persistence', () => {
+  it.each([undefined, 'd766e83ee7354fb0d83f3dbf6d68c504'])('preserves the nested screenshot id through visual preview and persistence when the top-level screenshot id is %s', (screenshotId) => {
+    const source = {
+      id: 'd766e83ee7354fb0d83f3dbf6d68c504', screenshot_id: screenshotId, similarity: 0.8,
+      metadata: { screenshot_id: 42, image_path: 'memory://visual', created_at: fixture.captured_at_utc },
+    };
+    const preview = normalizeSnapshotPreviewItem(source);
+    expect(preview.screenshot_id).toBe(42);
+    expect(preview.id).toBe(42);
+    expect(getSnapshotPreviewKey(source)).toBe('id:42');
+    const persisted = sanitizeSnapshotPreviewState({ tabs: [source], activeKey: 'id:42' });
+    expect(persisted.activeKey).toBe('id:42');
+    expect(persisted.tabs[0].metadata.screenshot_id).toBe(42);
+    expect(searchResultToSnapshotEvent(persisted.tabs[0])).toMatchObject({ id: 42, path: 'memory://visual' });
+  });
+
+  it('uses the image path when a visual hit has only an index document id', () => {
+    const source = { id: 'd766e83ee7354fb0d83f3dbf6d68c504', metadata: { image_path: 'memory://visual' } };
+    const preview = normalizeSnapshotPreviewItem(source);
+    expect(preview.screenshot_id).toBeNull();
+    expect(getSnapshotPreviewKey(preview)).toBe('path:memory://visual');
+    const persisted = sanitizeSnapshotPreviewState({ tabs: [preview] }).tabs[0];
+    expect(persisted.screenshot_id).toBeNull();
+    expect(persisted.metadata).not.toHaveProperty('screenshot_id');
+    expect(searchResultToSnapshotEvent(persisted)).toMatchObject({ id: -1, path: 'memory://visual' });
+    expect(searchResultToSnapshotEvent({ screenshot_id: source.id })).toBeNull();
+  });
+
   it('keeps the tool capture instant through main preview, dock and standalone persistence', () => {
     const source = { screenshot_id: fixture.screenshot_id, captured_at_ms: fixture.captured_at_ms, created_at: fixture.ocr_processed_at_utc };
     const event = searchResultToSnapshotEvent(source);

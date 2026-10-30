@@ -5,7 +5,7 @@ use crate::credential_manager::{
     RowKeyDecryptTimings,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,6 +91,16 @@ impl StorageState {
     ) -> Result<Vec<TimelineRecord>, String> {
         self.load_timeline_records(cancelled, "detail_ids", |conn, check, timings| {
             read_rows_by_ids(conn, ids, check, timings)
+        })
+    }
+
+    pub fn get_timeline_nearest(
+        &self,
+        time_ms: f64,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<Vec<TimelineRecord>, String> {
+        self.load_timeline_records(cancelled, "nearest", |conn, check, timings| {
+            read_nearest_rows(conn, time_ms, check, timings)
         })
     }
 
@@ -404,6 +414,61 @@ fn read_rows_by_ids(
     timings.sql = started.elapsed();
     timings.sql_vm_steps = statement.get_status(rusqlite::StatementStatus::VmStep);
     result
+}
+
+// Two covering-index seeks keep hover/click selection independent of the
+// sampled display data and of the number of screenshots in the database.
+const NEAREST_BEFORE_SQL: &str = "SELECT id, CAST(strftime('%s', created_at) AS INTEGER)
+    FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
+    WHERE is_deleted = 0 AND created_at <= ?1
+    ORDER BY created_at DESC, id DESC LIMIT 1";
+const NEAREST_AFTER_SQL: &str = "SELECT id, CAST(strftime('%s', created_at) AS INTEGER)
+    FROM screenshots INDEXED BY idx_screenshots_deleted_created_at
+    WHERE is_deleted = 0 AND created_at > ?1
+    ORDER BY created_at ASC, id ASC LIMIT 1";
+
+fn read_nearest_rows(
+    conn: &Connection,
+    time_ms: f64,
+    check: &dyn Fn() -> Result<(), String>,
+    timings: &mut Timings,
+) -> Result<Vec<RawTimelineRow>, String> {
+    if !time_ms.is_finite() {
+        return Err("Invalid timeline timestamp".into());
+    }
+    let target = DateTime::<Utc>::from_timestamp_millis(time_ms.floor() as i64)
+        .ok_or_else(|| "Invalid timeline timestamp".to_owned())?;
+    let pivot = target.format("%Y-%m-%d %H:%M:%S").to_string();
+    let started = Instant::now();
+    let mut steps = 0;
+    let mut nearest: Option<(i64, f64)> = None;
+    for sql in [NEAREST_BEFORE_SQL, NEAREST_AFTER_SQL] {
+        check()?;
+        let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
+        let candidate = statement
+            .query_row([&pivot], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        steps += statement.get_status(rusqlite::StatementStatus::VmStep);
+        if let Some((id, seconds)) = candidate {
+            let distance = (seconds as f64 * 1000.0 - time_ms).abs();
+            // Equal distances prefer the earlier snapshot.
+            if nearest.is_none_or(|(_, current)| distance < current) {
+                nearest = Some((id, distance));
+            }
+        }
+    }
+    check()?;
+    let seek_time = started.elapsed();
+    let rows = match nearest {
+        Some((id, _)) => read_rows_by_ids(conn, &[id], check, timings)?,
+        None => Vec::new(),
+    };
+    timings.sql += seek_time;
+    timings.sql_vm_steps += steps;
+    Ok(rows)
 }
 
 fn decrypt_string(

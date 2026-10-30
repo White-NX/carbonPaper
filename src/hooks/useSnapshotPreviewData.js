@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
-import { getSnapshotPreviewKey } from '../lib/snapshot_preview';
+import { getSnapshotPreviewKey, getSnapshotScreenshotId } from '../lib/snapshot_preview';
 
 const empty = { key: null, imageSrc: null, details: null, loading: false, error: null };
 
 /** Independent image/detail completion, with no retained image data after lock or close. */
 export function useSnapshotPreviewData(item, enabled = true) {
   const key = getSnapshotPreviewKey(item);
-  const id = item?.screenshot_id ?? item?.id ?? item?.metadata?.screenshot_id;
-  const targetId = typeof id === 'number' && id > 0 ? id : null;
+  const targetId = getSnapshotScreenshotId(item);
   const targetPath = item?.image_path || item?.path || item?.metadata?.image_path || null;
   const [state, setState] = useState(empty);
   const [revision, setRevision] = useState(0);

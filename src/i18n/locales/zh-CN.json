@@ -1727,6 +1727,9 @@
     "repair": "立即修复模型"
   },
   "timeline": {
+    "snapshotPreview": "快照预览",
+    "previewUnavailable": "暂时无法加载预览",
+    "selectionUnavailable": "暂时无法打开快照，请重试。",
     "month": "1月",
     "week": "1周",
     "today": "当日",

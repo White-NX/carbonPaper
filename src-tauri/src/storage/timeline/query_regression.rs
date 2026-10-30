@@ -231,6 +231,141 @@ fn detail_id_batches_use_primary_key_seeks_before_and_after_analyze() {
 }
 
 #[test]
+fn nearest_snapshot_seeks_stay_bounded_and_skip_deleted_rows() {
+    let (_temp, _storage, conn) = fixture(20000);
+    conn.execute("UPDATE screenshots SET is_deleted = 1 WHERE id = 19999", [])
+        .unwrap();
+    for analyzed in [false, true] {
+        if analyzed {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        for (seconds, expected) in [
+            (1767225600.0, 1),
+            (1767225600.0 + 120.0, 2),
+            (1767225600.0 + 150.0, 2),
+            (1767225600.0 + 150.001, 3),
+            (1767225600.0 + 19999.0 * 60.0, 19998),
+            (1767225600.0 + 19999.0 * 60.0 + 0.001, 20000),
+            (1767225600.0 + 30000.0 * 60.0, 20000),
+        ] {
+            let mut timings = Timings::default();
+            let rows =
+                read_nearest_rows(&conn, seconds * 1000.0, &|| Ok(()), &mut timings).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, expected);
+            assert!(
+                timings.sql_vm_steps < 250,
+                "nearest selection scanned history: {} steps",
+                timings.sql_vm_steps
+            );
+        }
+        for sql in [NEAREST_BEFORE_SQL, NEAREST_AFTER_SQL] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(["2026-01-14 21:19:00"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                plan.contains("COVERING INDEX idx_screenshots_deleted_created_at"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
+}
+
+#[test]
+fn nearest_snapshot_handles_empty_history_invalid_times_and_cancellation() {
+    let (_temp, _storage, conn) = fixture(1);
+    conn.execute("DELETE FROM screenshots", []).unwrap();
+    assert!(
+        read_nearest_rows(&conn, 1767225600000.0, &|| Ok(()), &mut Timings::default())
+            .unwrap()
+            .is_empty()
+    );
+    for time in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+        assert!(read_nearest_rows(&conn, time, &|| Ok(()), &mut Timings::default()).is_err());
+    }
+    let mut timings = Timings::default();
+    let result = read_nearest_rows(
+        &conn,
+        1767225600000.0,
+        &|| Err(CANCELLED.into()),
+        &mut timings,
+    );
+    assert_eq!(result.err().as_deref(), Some(CANCELLED));
+    assert_eq!(timings.sql_vm_steps, 0);
+}
+
+#[test]
+#[ignore = "synthetic encrypted preview file benchmark; excludes CNG, DB, IPC and browser decode"]
+fn compare_timeline_hover_preview_images() {
+    let (temp, storage, _conn) = fixture(1);
+    let pixels = image::RgbImage::from_fn(1920, 1080, |x, y| {
+        let grain = (x.wrapping_mul(73856093) ^ y.wrapping_mul(19349663)) as u8;
+        if x < 480 && y > 80 {
+            image::Rgb([grain, grain.wrapping_add(31), grain.wrapping_add(73)])
+        } else if y % 30 < 2 && x > 540 {
+            image::Rgb([180, 180, 190])
+        } else {
+            let shade = 24 + ((x / 120 + y / 120) % 5) as u8;
+            image::Rgb([shade, shade, shade + 3])
+        }
+    });
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    let png = encoded.into_inner();
+    let key = [0x42; 32];
+    let original = temp.path().join("preview.png.enc");
+    std::fs::write(
+        &original,
+        crate::credential_manager::encrypt_with_master_key(&key, &png).unwrap(),
+    )
+    .unwrap();
+    let thumbnail = StorageState::thumbnail_path_for(&original);
+    let cold_started = Instant::now();
+    let (decoded, _) =
+        crate::storage::image_io::read_encrypted_image_bytes(original.to_str().unwrap(), &key)
+            .unwrap();
+    storage
+        .generate_thumbnail_from_data(&decoded, &original, &key)
+        .unwrap();
+    let cold_thumbnail = cold_started.elapsed();
+    let measure = |path: &std::path::Path| {
+        let mut elapsed = Vec::new();
+        for _ in 0..40 {
+            let started = Instant::now();
+            let (data, _) = crate::storage::image_io::read_encrypted_image_as_base64(
+                path.to_str().unwrap(),
+                &key,
+            )
+            .unwrap();
+            std::hint::black_box(data);
+            elapsed.push(started.elapsed());
+        }
+        elapsed.sort();
+        elapsed[elapsed.len() / 2]
+    };
+    let original_median = measure(&original);
+    let thumbnail_median = measure(&thumbnail);
+    let (jpeg, _) =
+        crate::storage::image_io::read_encrypted_image_bytes(thumbnail.to_str().unwrap(), &key)
+            .unwrap();
+    if let Ok(directory) = std::env::var("CARBONPAPER_HOVER_BENCH_OUTPUT") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("benchmark-original.png"), &png).unwrap();
+        std::fs::write(directory.join("benchmark-thumbnail.jpg"), &jpeg).unwrap();
+    }
+    eprintln!("synthetic_preview: pixels=1920x1080 original_bytes={} thumbnail_bytes={} warm_original_median={original_median:?} warm_thumbnail_median={thumbnail_median:?} cold_thumbnail_generation={cold_thumbnail:?} samples=40 excludes=CNG,DB,IPC,browser", png.len(), jpeg.len());
+}
+
+#[test]
 #[ignore = "warm synthetic SQLCipher timeline benchmark; no CNG, image I/O or frontend"]
 fn compare_short_timeline_header_queries() {
     let temp = tempfile::tempdir().unwrap();

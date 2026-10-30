@@ -70,7 +70,7 @@ export function useSelectedSnapshot({ enabled = true } = {}) {
 
     let cancelled = false;
 
-    const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
+    const targetId = Number.isSafeInteger(selectedEvent.id) && selectedEvent.id > 0 ? selectedEvent.id : null;
     const targetPath = selectedEvent.path || selectedEvent.image_path;
     const reportError = (err) => {
       if (cancelled) return;
@@ -126,7 +126,7 @@ export function useSelectedSnapshot({ enabled = true } = {}) {
 
   useEffect(() => {
     if (!enabled || !selectedEvent) return undefined;
-    const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
+    const targetId = Number.isSafeInteger(selectedEvent.id) && selectedEvent.id > 0 ? selectedEvent.id : null;
     if (!targetId) return undefined;
     let disposed = false;
     let unlisten;

@@ -5,12 +5,18 @@ export const SNAPSHOT_PREVIEW_WINDOW_LABEL = 'snapshot-preview';
 export const SNAPSHOT_PREVIEW_WINDOW_STATE_KEY = 'carbonpaper:snapshot-preview-window-state';
 
 const pickFirst = (...values) => values.find((value) => value !== undefined && value !== null) ?? null;
+const pickScreenshotId = (...values) => values.find((value) => Number.isSafeInteger(value) && value > 0) ?? null;
+
+/** CLIP's top-level id identifies an index document; storage uses integer screenshot ids. */
+export function getSnapshotScreenshotId(item) {
+  return pickScreenshotId(item?.screenshot_id, item?.metadata?.screenshot_id, item?.id);
+}
 
 /** The main preview and timeline consume milliseconds, including epoch zero. */
 export function searchResultToSnapshotEvent(item) {
-  const screenshotId = item?.screenshot_id ?? item?.metadata?.screenshot_id;
-  const path = item?.image_path || item?.metadata?.image_path;
-  if (screenshotId === undefined && !path) return null;
+  const screenshotId = pickScreenshotId(item?.screenshot_id, item?.metadata?.screenshot_id);
+  const path = item?.image_path || item?.metadata?.image_path || item?.path;
+  if (screenshotId === null && !path) return null;
   return {
     id: screenshotId ?? -1,
     path,
@@ -32,8 +38,8 @@ function explicitCaptureTime(item) {
 }
 
 export function getSnapshotPreviewKey(item) {
-  const id = item?.screenshot_id ?? item?.id ?? item?.metadata?.screenshot_id;
-  if (typeof id === 'number' && id > 0) return `id:${id}`;
+  const id = getSnapshotScreenshotId(item);
+  if (id !== null) return `id:${id}`;
   const path = item?.image_path || item?.path || item?.metadata?.image_path;
   return path ? `path:${path}` : null;
 }
@@ -46,7 +52,7 @@ export function normalizeSnapshotPreviewItem(item, options = {}) {
     sourceType = null,
   } = options;
 
-  const screenshotId = item?.screenshot_id ?? item?.id ?? item?.metadata?.screenshot_id;
+  const screenshotId = getSnapshotScreenshotId(item);
   const imagePath = item?.image_path || item?.path || item?.metadata?.image_path;
   // screenshot_created_at 排在前面：搜索结果的 created_at 是 OCR 行的写入时间，
   // 晚于截图本身，拿它当截图时刻会偏。其他来源没有这个字段，自然落到 created_at。
@@ -56,7 +62,7 @@ export function normalizeSnapshotPreviewItem(item, options = {}) {
     ...item,
     ...explicitCaptureTime(item),
     screenshot_id: screenshotId,
-    id: screenshotId || item?.id,
+    id: screenshotId,
     image_path: imagePath,
     path: imagePath,
     created_at: createdAt,
@@ -72,7 +78,7 @@ export function normalizeSnapshotPreviewItem(item, options = {}) {
 
 export function sanitizeSnapshotPreviewItem(item) {
   if (!item) return null;
-  const screenshotId = pickFirst(item.screenshot_id, item.id, item.metadata?.screenshot_id);
+  const screenshotId = getSnapshotScreenshotId(item);
   const imagePath = pickFirst(item.image_path, item.path, item.metadata?.image_path);
   const createdAt = previewCreatedAt(item);
 
@@ -92,7 +98,7 @@ export function sanitizeSnapshotPreviewItem(item) {
   return {
     ...explicitCaptureTime(item),
     screenshot_id: screenshotId,
-    id: screenshotId || item.id || null,
+    id: screenshotId,
     image_path: imagePath,
     path: imagePath,
     created_at: createdAt,

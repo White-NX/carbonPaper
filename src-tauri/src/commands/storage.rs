@@ -295,6 +295,28 @@ pub async fn storage_get_timeline_details(
         .map_err(|error| format!("Task join error: {error:?}"))?
 }
 
+/// Finds the actual closest live screenshot to an explicit millisecond time.
+/// Authentication and cancellation follow the other timeline reads.
+#[tauri::command]
+pub async fn storage_get_timeline_nearest(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    time_ms: f64,
+    request_id: String,
+) -> Result<Vec<storage::TimelineRecord>, String> {
+    check_auth_required(&credential_state)?;
+    if !time_ms.is_finite() || request_id.len() > 128 {
+        return Err("Invalid timeline request".into());
+    }
+    let ticket = TIMELINE_REQUESTS.begin(window.label(), &request_id)?;
+    let cancelled = ticket.cancelled.clone();
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.get_timeline_nearest(time_ms, &cancelled))
+        .await
+        .map_err(|error| format!("Task join error: {error:?}"))?
+}
+
 /// Stops a timeline read for the calling window. Authentication: required.
 #[tauri::command]
 pub fn storage_cancel_timeline(

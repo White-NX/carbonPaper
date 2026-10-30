@@ -7,6 +7,7 @@ const mock = path.join(root, 'tools/ui-review/tauri-mock.js');
 const port = Number(process.env.UI_REVIEW_PORT || 1426);
 const server = await createServer({
   root,
+  cacheDir: path.join(root, 'node_modules/.vite/ui-review'),
   resolve: { alias: [
     ...['core', 'event', 'window', 'webviewWindow'].map((name) => ({ find: `@tauri-apps/api/${name}`, replacement: mock })),
     ...['opener', 'dialog'].map((name) => ({ find: `@tauri-apps/plugin-${name}`, replacement: mock })),

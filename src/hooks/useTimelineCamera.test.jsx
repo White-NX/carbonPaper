@@ -67,6 +67,17 @@ afterEach(() => {
 });
 
 describe('useTimelineCamera', () => {
+  it('follows precision pinch input immediately and preserves the cursor anchor', () => {
+    const { camera } = mountCamera();
+    const x = 200;
+    const anchor = CENTER + (x - WIDTH / 2) / ZOOM;
+    act(() => camera().zoomAt(x, 1.04, { immediate: true }));
+    const view = camera().read();
+    expect(view.zoom).toBeCloseTo(ZOOM * 1.04);
+    expect(WIDTH / 2 + (anchor - view.center) * view.zoom).toBeCloseTo(x, 4);
+    act(() => advance(400));
+    expect(camera().read().zoom).toBeCloseTo(view.zoom);
+  });
   it('starts with the content exactly where it was drawn', () => {
     const { stage } = mountCamera();
     expect(stage.current.style.transform).toBe('translate3d(0px, 0, 0) scaleX(1)');

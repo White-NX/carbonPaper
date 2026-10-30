@@ -23,6 +23,7 @@ import {
   updateMonitorFilters,
   getTimeline,
   getTimelineDetails,
+  getTimelineNearest,
   fetchThumbnailBatch,
 } from './monitor_api';
 
@@ -76,6 +77,24 @@ describe('monitor_api command wrappers', () => {
     controller.abort();
     await expect(getTimeline(100, 200, 500, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('requests an authenticated nearest snapshot with explicit milliseconds and discards cancelled results', async () => {
+    let finish;
+    invoke.mockImplementation((command) => command === 'storage_get_timeline_nearest'
+      ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve());
+    const controller = new AbortController();
+    const request = getTimelineNearest(1767225600123, { signal: controller.signal });
+    const assertion = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    const params = invoke.mock.calls[0][1];
+    expect(params).toEqual({ timeMs: 1767225600123, requestId: expect.any(String) });
+    expectWithAuth(1);
+    controller.abort();
+    expect(invoke).toHaveBeenCalledWith('storage_cancel_timeline', { requestId: params.requestId });
+    finish([{ id: 1 }]);
+    await assertion;
+    invoke.mockResolvedValue([]);
+    await expect(getTimelineNearest(1767225600123)).resolves.toBeNull();
   });
 
   it('requests lightweight timeline headers only when the caller opts in', async () => {

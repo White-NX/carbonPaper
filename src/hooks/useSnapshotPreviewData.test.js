@@ -12,6 +12,15 @@ beforeEach(() => {
   getScreenshotDetails.mockReset().mockImplementation((id, path) => new Promise((resolve, reject) => details.push({ id, path, resolve, reject })));
 });
 
+it('loads a visual result using its nested screenshot id instead of the index document id', async () => {
+  const item = { id: 'd766e83ee7354fb0d83f3dbf6d68c504', metadata: { screenshot_id: 42, image_path: 'memory://visual' } };
+  const { result } = renderHook(() => useSnapshotPreviewData(item));
+  expect(images[0]).toMatchObject({ id: 42, path: 'memory://visual' });
+  expect(details[0]).toMatchObject({ id: 42, path: 'memory://visual' });
+  await act(async () => { images[0].resolve('original'); details[0].resolve({ record: { id: 42 } }); });
+  expect(result.current).toMatchObject({ key: 'id:42', imageSrc: 'original', error: null, loading: false });
+});
+
 it('paints the image before slow details and retains it after a detail failure', async () => {
   const { result } = renderHook(() => useSnapshotPreviewData({ screenshot_id: 42 }));
   await act(async () => images[0].resolve('original'));

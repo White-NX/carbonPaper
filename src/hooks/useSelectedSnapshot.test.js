@@ -21,6 +21,16 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+it('uses the path for a selected visual hit whose id is an index document string', async () => {
+  const { result } = renderHook(() => useSelectedSnapshot());
+  act(() => result.current.setSelectedEvent({ id: 'd766e83ee7354fb0d83f3dbf6d68c504', path: 'memory://visual' }));
+  expect(fetchImage).toHaveBeenCalledWith(null, 'memory://visual');
+  expect(getScreenshotDetails).toHaveBeenCalledWith(null, 'memory://visual');
+  await act(async () => { images[0].resolve('original'); details[0].resolve({ record: { id: 42 } }); });
+  expect(result.current.selectedImageSrc).toBe('original');
+  expect(result.current.lastError).toBeNull();
+});
+
 it('shows the original image while OCR and metadata are still pending', async () => {
   const { result } = renderHook(() => useSelectedSnapshot());
   act(() => result.current.setSelectedEvent({ id: 1 }));

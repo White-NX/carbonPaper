@@ -24,6 +24,16 @@ it('copies recognized text and navigates using the stored UTC capture time', asy
   expect(standalone).toHaveBeenCalledWith(expect.objectContaining({ captured_at_ms: Date.parse(details.record.created_at) }));
 });
 
+it('navigates a path-only visual preview using the screenshot id resolved from storage', () => {
+  const timeline = vi.fn(), standalone = vi.fn();
+  render(<SnapshotViewer item={{ id: 'd766e83ee7354fb0d83f3dbf6d68c504', image_path: 'memory://visual' }}
+    details={{ ...details, record: { ...details.record, id: 42 } }} onOpenTimeline={timeline} onOpenStandalone={standalone} />);
+  fireEvent.click(screen.getByRole('button', { name: 'snapshotPreview.openTimeline' }));
+  expect(timeline).toHaveBeenCalledWith(expect.objectContaining({ screenshot_id: 42, id: 42, captured_at_ms: Date.parse(details.record.created_at) }));
+  fireEvent.click(screen.getByRole('button', { name: 'snapshotPreview.openStandalone' }));
+  expect(standalone).toHaveBeenCalledWith(expect.objectContaining({ screenshot_id: 42, id: 42 }));
+});
+
 it('uses keyboard tabs and remembers a manually hidden information panel', () => {
   const { rerender } = render(<SnapshotViewer item={item} details={details} />);
   const toggle = screen.getByRole('button', { name: 'snapshotPreview.details' });

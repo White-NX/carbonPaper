@@ -123,6 +123,8 @@ export default function SessionBand({
   foldLevel = null,
   stageRef,
   activeId,
+  embedded = false,
+  showTooltips = true,
   onSelect,
   onZoomTo,
 }) {
@@ -199,7 +201,7 @@ export default function SessionBand({
 
   return (
     <div
-      className="relative shrink-0 overflow-hidden border-b border-ide-border bg-ide-panel"
+      className={`relative shrink-0 overflow-hidden ${embedded ? '' : 'border-b border-ide-border bg-ide-panel'}`}
       style={{ height }}
       data-keep-selection="true"
     >
@@ -233,9 +235,9 @@ export default function SessionBand({
               (block.apps || [])
                 .slice(0, MIXED_STRIPE_COLORS)
                 .map((app) => getProcessColor(app.appName)),
-              isActive ? 0.42 : 0.3,
+              isActive ? 0.56 : 0.4,
             )
-            : withAlpha(color, isActive ? 0.28 : 0.16);
+            : withAlpha(color, isActive ? 0.5 : 0.32);
 
           const showIcon = renderWidth >= SHOW_ICON_PX;
           const showName = renderWidth >= SHOW_NAME_PX;
@@ -267,7 +269,7 @@ export default function SessionBand({
             <div
               key={block.id}
               data-timeline-item="session"
-              className={`tl-session absolute top-0.5 bottom-0.5 flex items-center gap-1.5 overflow-hidden pl-1.5 cursor-pointer transition-colors ${
+              className={`tl-session absolute top-1 bottom-1 flex items-center gap-1.5 overflow-hidden pl-1.5 transition-colors ${
                 showFoldHint ? 'pr-2.5' : 'pr-1'
               } ${isActive ? 'ring-1 ring-ide-accent' : ''} ${
                 freshIds?.has(block.id) ? 'tl-fold-in' : ''
@@ -281,11 +283,11 @@ export default function SessionBand({
                 borderTopRightRadius: joinRight ? 0 : 2,
                 borderBottomRightRadius: joinRight ? 0 : 2,
               }}
-              title={buildTooltip(block, describeSegments)}
-              onClick={(event) => {
+              title={showTooltips ? buildTooltip(block, describeSegments) : undefined}
+              onClick={onSelect ? (event) => {
                 event.stopPropagation();
                 onSelect?.(block);
-              }}
+              } : undefined}
               onDoubleClick={(event) => {
                 event.stopPropagation();
                 onZoomTo?.(block);

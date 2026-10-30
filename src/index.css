@@ -444,6 +444,127 @@ body {
   }
 }
 
+/* Expanded timeline keeps the axis and its tools in separate flow boxes. */
+.tl-toolbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  padding: 0 6px;
+  border-left: 1px solid var(--ide-border);
+  background: var(--ide-panel);
+  cursor: default;
+}
+
+.tl-playhead,
+.tl-axis-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--ide-accent);
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 30;
+}
+
+.tl-playhead {
+  box-shadow: 0 0 6px color-mix(in srgb, var(--ide-accent) 35%, transparent);
+}
+
+.tl-playhead-head {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--ide-accent);
+}
+
+.tl-playhead-time {
+  position: absolute;
+  top: 7px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--ide-accent);
+  color: white;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.tl-hover-cursor {
+  position: absolute;
+  inset-block: 0;
+  width: 1px;
+  opacity: 0;
+  border-left: 1px dashed var(--ide-text);
+  pointer-events: none;
+  z-index: 31;
+}
+
+.tl-hover-preview {
+  position: fixed;
+  z-index: 45;
+  padding: 6px;
+  border: 1px solid var(--ide-border);
+  border-radius: 9px;
+  background: var(--ide-panel);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-5px) scale(0.98);
+  transform-origin: top center;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.tl-hover-preview[data-visible="true"] {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  animation: tl-preview-in 160ms ease-out;
+}
+
+.tl-hover-preview-image {
+  height: var(--tl-preview-image-height, 248px);
+  overflow: hidden;
+  border-radius: 5px;
+  background: var(--ide-timeline-bg);
+}
+
+.tl-hover-preview-image > img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  animation: tl-preview-image-in 120ms ease-out;
+}
+
+@keyframes tl-preview-in {
+  from { opacity: 0; transform: translateY(-5px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes tl-preview-image-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@container timeline (max-width: 560px) {
+  .tl-collapse-label { display: none; }
+  .tl-toolbar { padding-inline: 3px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-hover-preview,
+  .tl-hover-preview-image > img {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
 /* Timeline session block inset shadow */
 .tl-session {
   box-shadow:

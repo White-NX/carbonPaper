@@ -43,7 +43,7 @@ export default function SnapshotViewer({
   const copyTimer = useRef(null);
   const menuRef = useRef(null);
   const record = details?.record || {};
-  const normalized = normalizeSnapshotPreviewItem(item);
+  const normalized = normalizeSnapshotPreviewItem({ ...item, screenshot_id: record.id ?? item?.screenshot_id });
   const event = searchResultToSnapshotEvent(normalized);
   const timestamp = captureDateOf(record)?.getTime() ?? event?.timestamp ?? null;
   const navigationItem = { ...normalized, captured_at_ms: timestamp };
