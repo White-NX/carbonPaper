@@ -52,6 +52,26 @@ describe('monitor_api command wrappers', () => {
     }
   };
 
+  it('passes shared category filters to visual search', async () => {
+    invoke.mockResolvedValueOnce({ results: [] });
+    await searchScreenshots('charts', 'nl', { categories: ['development'], includeOcr: false });
+    expect(invoke).toHaveBeenCalledWith('monitor_search_nl', expect.objectContaining({ categories: ['development'], includeOcr: false }));
+  });
+
+  it('keeps an aborted search pending until its invoke finishes and discards the result', async () => {
+    let finish;
+    invoke.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const settled = vi.fn();
+    const request = searchScreenshots('charts', 'nl', { signal: controller.signal }).catch(settled);
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    finish({ results: [{ id: 1 }] });
+    await request;
+    expect(settled.mock.calls[0][0].name).toBe('AbortError');
+  });
+
   it('cancels the exact timeline request and waits for backend acknowledgement', async () => {
     let finish;
     invoke.mockImplementation((command) => command === 'storage_get_timeline'

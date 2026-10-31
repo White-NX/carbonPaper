@@ -231,6 +231,7 @@ pub struct ClipQueryRequest<'a> {
     limit: u32,
     offset: u32,
     process_names: &'a [String],
+    categories: &'a [String],
     /// Unix seconds, inclusive.
     start_time: Option<f64>,
     end_time: Option<f64>,
@@ -251,6 +252,7 @@ impl<'a> ClipQueryRequest<'a> {
             limit: limit.unwrap_or(20).clamp(1, u64::from(MAX_CLIP_RESULTS)) as u32,
             offset: offset.unwrap_or(0).min(u64::from(MAX_CLIP_OFFSET)) as u32,
             process_names,
+            categories: &[],
             start_time,
             end_time,
             include_ocr: true,
@@ -261,6 +263,11 @@ impl<'a> ClipQueryRequest<'a> {
     /// default OCR prefix and can use the same ranking and pagination path.
     pub(crate) fn with_ocr(mut self, include_ocr: bool) -> Self {
         self.include_ocr = include_ocr;
+        self
+    }
+
+    pub(crate) fn with_categories(mut self, categories: &'a [String]) -> Self {
+        self.categories = categories;
         self
     }
 }
@@ -403,6 +410,12 @@ async fn run_rust_clip_query(
         .cloned()
         .collect();
     let start_time = request.start_time;
+    let categories: Vec<String> = request
+        .categories
+        .iter()
+        .filter(|category| !category.trim().is_empty())
+        .cloned()
+        .collect();
     let end_time = request.end_time;
     let include_ocr = request.include_ocr;
 
@@ -429,7 +442,8 @@ async fn run_rust_clip_query(
             }
         };
         let mut candidate_filter =
-            ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline);
+            ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline)
+                .with_categories(&categories);
         let filtered = search_candidates(
             fetch,
             target,
@@ -449,7 +463,7 @@ async fn run_rust_clip_query(
             |scored| {
                 candidate_filter.filter(scored, |hashes| {
                     query_stage(&scan_stage, "candidate_metadata", || {
-                        if process_names.is_empty() {
+                        if process_names.is_empty() && categories.is_empty() {
                             scan_storage.clip_candidate_metadata(hashes, deadline)
                         } else {
                             load_candidate_summaries(&scan_storage, hashes, deadline)
@@ -667,6 +681,7 @@ struct ClipHit {
 struct ClipCandidateFilter<'a> {
     target: usize,
     process_names: &'a [String],
+    categories: &'a [String],
     start_time: Option<f64>,
     end_time: Option<f64>,
     deadline: Instant,
@@ -684,11 +699,17 @@ impl<'a> ClipCandidateFilter<'a> {
         Self {
             target,
             process_names,
+            categories: &[],
             start_time,
             end_time,
             deadline,
             summaries: HashMap::new(),
         }
+    }
+
+    fn with_categories(mut self, categories: &'a [String]) -> Self {
+        self.categories = categories;
+        self
     }
 
     fn filter(
@@ -736,7 +757,14 @@ impl<'a> ClipCandidateFilter<'a> {
                         .map(|summary| ClipHit {
                             subject: subject.clone(),
                             summary: summary.clone(),
-                            summary_complete: !self.process_names.is_empty(),
+                            summary_complete: !self.process_names.is_empty()
+                                || !self.categories.is_empty(),
+                        })
+                })
+                .filter(|hit| {
+                    self.categories.is_empty()
+                        || self.categories.iter().any(|category| {
+                            Some(category.as_str()) == hit.summary.category.as_deref()
                         })
                 })
                 .collect();
@@ -1178,6 +1206,38 @@ mod tests {
         assert_eq!(
             hits.into_iter().map(|hit| hit.subject).collect::<Vec<_>>(),
             revised
+        );
+    }
+
+    #[test]
+    fn category_filters_fill_the_page_before_pagination() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let categories = vec!["programming".to_string()];
+        let mut filter =
+            ClipCandidateFilter::new(3, &[], None, None, deadline).with_categories(&categories);
+        let hits = filter
+            .filter(scored(10), |keys| {
+                Ok(keys
+                    .iter()
+                    .map(|key| {
+                        let mut summary = summary_for_key(key);
+                        summary.category = (summary.id % 2 == 0).then(|| "programming".to_string());
+                        (key.clone(), summary)
+                    })
+                    .collect())
+            })
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.summary.id).collect::<Vec<_>>(),
+            vec![2, 4, 6]
+        );
+        assert!(hits.iter().all(|hit| hit.summary_complete));
+        assert_eq!(
+            paginate(hits, 1, 2)
+                .iter()
+                .map(|hit| hit.summary.id)
+                .collect::<Vec<_>>(),
+            vec![4, 6]
         );
     }
 

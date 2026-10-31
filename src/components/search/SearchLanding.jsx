@@ -75,9 +75,7 @@ export function SearchLanding({
           <div className="flex flex-wrap gap-2">
             {recentQueries.map((entry) => (
               <LandingPill key={`${entry.mode}-${entry.query}`} onClick={() => onUseQuery(entry)}>
-                {entry.mode === 'nl'
-                  ? <ImageIcon className="h-3 w-3 text-ide-muted" />
-                  : <Clock className="h-3 w-3 text-ide-muted" />}
+                <Clock className="h-3 w-3 text-ide-muted" />
                 {entry.query}
               </LandingPill>
             ))}
@@ -145,15 +143,15 @@ export function SearchLanding({
  * 不用居中的大图标，因为这时候用户需要的是下一步该做什么，
  * 所以左对齐给出原因和两个可以直接点的出口。
  */
-export function SearchNoResults({ query, mode, hasFilters, onClearFilters, onSwitchToVisual }) {
+export function SearchNoResults({ query, hasFilters, onClearFilters, compact = false }) {
   const { t } = useTranslation();
 
   return (
-    <div className="flex max-w-xl flex-col gap-2 px-6 py-14">
+    <div className={`flex max-w-xl flex-col gap-2 px-6 ${compact ? 'py-8' : 'py-14'}`}>
       <h3 className="flex items-center gap-2 text-sm font-semibold text-ide-text">
         <SlidersHorizontal className="h-4 w-4 text-ide-muted" />
         {query
-          ? t('advancedSearch.search.no_results_for', { query })
+          ? t('advancedSearch.search.no_text_results_for', { query })
           : t('advancedSearch.search.no_results_filtered')}
       </h3>
       <p className="text-xs leading-relaxed text-ide-muted">{t('advancedSearch.search.no_results_hint')}</p>
@@ -166,16 +164,6 @@ export function SearchNoResults({ query, mode, hasFilters, onClearFilters, onSwi
           >
             <RefreshCw className="h-3.5 w-3.5" />
             {t('advancedSearch.search.clear_filters')}
-          </button>
-        )}
-        {mode === 'ocr' && onSwitchToVisual && (
-          <button
-            type="button"
-            onClick={onSwitchToVisual}
-            className="flex h-8 items-center gap-1.5 rounded-md border border-ide-border bg-ide-panel px-3.5 text-xs text-ide-text transition-colors hover:border-ide-accent hover:bg-ide-hover"
-          >
-            <ImageIcon className="h-3.5 w-3.5" />
-            {t('advancedSearch.search.try_visual')}
           </button>
         )}
       </div>

@@ -28,6 +28,8 @@ export function ThumbnailCard({
   preloadedSrc = null,
   footerText = null,
   footerPersistent = false,
+  showFooter = true,
+  ariaLabel,
   selected = false,
   sourceType = 'preview',
   imageKind = 'thumbnail',
@@ -107,6 +109,7 @@ export function ThumbnailCard({
     >
       <button
         type="button"
+        aria-label={ariaLabel}
         className="block h-full w-full text-left focus-visible:outline-none"
         onClick={handleSelect}
       >
@@ -128,14 +131,14 @@ export function ThumbnailCard({
             <CategoryBadge category={categoryValue} />
           </div>
         )}
-        <div className={`pointer-events-none absolute inset-0 flex flex-col justify-end bg-gradient-to-t from-black/60 to-transparent transition p-2 ${overlayVisibilityClass}`}>
+        {showFooter && <div className={`pointer-events-none absolute inset-0 flex flex-col justify-end bg-gradient-to-t from-black/60 to-transparent transition p-2 ${overlayVisibilityClass}`}>
           <span className="text-xs text-white font-semibold truncate">{footerPrimary}</span>
           {similarity !== undefined && !footerPersistent && (
               <span className="text-[10px] text-white/80">
               {t('advancedSearch.similarity', { score: similarity.toFixed(2) })}
             </span>
           )}
-        </div>
+        </div>}
       </button>
       {onOpenFloatingPreview && (
         <button

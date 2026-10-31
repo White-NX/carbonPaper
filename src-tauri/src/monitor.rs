@@ -255,6 +255,7 @@ pub async fn monitor_search_nl(
     limit: Option<u32>,
     offset: Option<u32>,
     process_names: Option<Vec<String>>,
+    categories: Option<Vec<String>>,
     start_time: Option<f64>,
     end_time: Option<f64>,
     _fuzzy: Option<bool>,
@@ -262,6 +263,7 @@ pub async fn monitor_search_nl(
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let process_names = process_names.unwrap_or_default();
+    let categories = categories.unwrap_or_default();
 
     // `fuzzy` is retained in the command contract but does not apply to
     // text-to-image similarity.
@@ -275,7 +277,8 @@ pub async fn monitor_search_nl(
             start_time,
             end_time,
         )
-        .with_ocr(include_ocr.unwrap_or(true)),
+        .with_ocr(include_ocr.unwrap_or(true))
+        .with_categories(&categories),
     )
     .await?;
     Ok(serde_json::json!({ "status": "success", "results": results, "backend": "rust" }))

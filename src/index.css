@@ -58,6 +58,15 @@
   .recap-time-dot { display: none; }
 }
 
+.visual-search-card { container: visual-search / inline-size; }
+.visual-search-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 160px), 1fr)); }
+@container visual-search (max-width: 620px) {
+  .visual-search-previews { display: none; }
+}
+@container visual-search (max-width: 380px) {
+  .visual-search-disclosure { display: none; }
+}
+
 .ai-search-surface { container: ai-search / size; }
 .ai-search-conversation { max-width: 48rem; }
 .ai-search-turn { display: grid; gap: 1.5rem; }

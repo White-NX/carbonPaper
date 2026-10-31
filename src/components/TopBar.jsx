@@ -62,8 +62,6 @@ export default function TopBar({
   onHideToTray,
   onSearchSelect,
   onSearchSubmit,
-  searchMode,
-  onSearchModeChange,
   backendStatus,
   powerSavingSuppressed = false,
   monitorPaused,
@@ -92,12 +90,10 @@ export default function TopBar({
       <SearchBox
         onSelectResult={onSearchSelect}
         onSubmit={onSearchSubmit}
-        mode={searchMode}
-        onModeChange={onSearchModeChange}
         monitorPaused={monitorPaused}
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
-        disabled={interfaceLocked}
+        disabled={settingsDisabled}
       />
 
       <div className="flex items-center gap-1">

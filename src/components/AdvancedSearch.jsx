@@ -1,7 +1,6 @@
 import React from 'react';
 import { Search, X, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { ThumbnailCard } from './ThumbnailCard';
 import { SearchModeTabs } from './search/SearchModeTabs';
 import { TimeRangeChip, ProcessChip, CategoryChip, SearchTargetChip, RecapSemanticToggle } from './search/SearchFilters';
 import { SearchStatsBar } from './search/SearchStatsBar';
@@ -15,23 +14,27 @@ import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
 import { buildSearchTimelineMarkers, searchResultMarkerId } from '../lib/timeline_search';
 import { RecapSearchResultDetails, RecapSearchResultRow } from './search/RecapSearchResult';
 import { useRecapSourceAction } from './recap/RecapSources';
+import { VisualSearchCard } from './search/VisualSearchCard';
+import { useVisualSearchController } from '../hooks/useVisualSearchController';
 
 export function AdvancedSearch({
   active,
   searchParams,
   onSelectResult,
   onOpenSnapshotPreview,
-  searchMode,
-  onSearchModeChange,
   onTimelineSearchChange,
   onOpenRecapDay,
   isAuthenticated = true,
 }) {
   const { t } = useTranslation();
+  const [aiActive, setAiActive] = React.useState(false);
+  React.useEffect(() => {
+    setAiActive(false);
+  }, [searchParams?.query, searchParams?.refreshKey]);
   const {
     query,
     setQuery,
-    mode,
+    debouncedQuery,
     results,
     groupedResults,
     thumbnailCache,
@@ -56,11 +59,11 @@ export function AdvancedSearch({
     applyRecentQuery,
     applyProcessFilter,
     clearRecentQueries,
+    rememberVisualQuery,
     landingCaptures,
     sentinelRef,
     queryTokens,
     rotatingMessage,
-    handleModeChange,
     handleSubmit,
     clearFilters,
     searchSourceDetail,
@@ -74,21 +77,31 @@ export function AdvancedSearch({
     recapSemantic,
     setRecapSemantic,
     useRecapSemantic,
+    visualStartTime,
+    visualEndTime,
+    refreshKey,
   } = useAdvancedSearchController({
-    active: active && isAuthenticated,
+    active: active && isAuthenticated && !aiActive,
     searchParams,
-    searchMode,
-    onSearchModeChange,
     t,
   });
   const isMigrating = useHmacMigrationStatus();
-  const [aiActive, setAiActive] = React.useState(false);
-  const ai = useAiSearch({ active: active && aiActive });
+  const ai = useAiSearch({ active: active && isAuthenticated && aiActive });
+  const showVisual = Boolean(query.trim()) && searchTarget !== 'recaps' && !isMigrating;
+  const visual = useVisualSearchController({
+    active: active && isAuthenticated && !aiActive && showVisual,
+    query, debouncedQuery, processNames: selectedProcesses, categories: selectedCategories,
+    startTime: visualStartTime, endTime: visualEndTime, refreshKey,
+    sharedThumbnails: thumbnailCache,
+  });
+  const hasVisualResults = visual.results.length > 0;
+  React.useEffect(() => {
+    if (visual.phase === 'ready' && hasVisualResults) rememberVisualQuery(debouncedQuery.trim());
+  }, [visual.phase, visual.key, hasVisualResults, debouncedQuery, rememberVisualQuery]);
   const handleTabChange = (next) => {
     setAiActive(next === 'ai');
-    if (next !== 'ai') handleModeChange(next);
   };
-  const tabs = <SearchModeTabs mode={aiActive ? 'ai' : mode} onChange={handleTabChange} />;
+  const tabs = <SearchModeTabs mode={aiActive ? 'ai' : 'unified'} onChange={handleTabChange} />;
   const [hoveredMarkerIds, setHoveredMarkerIds] = React.useState([]);
   const [selectedRecap, setSelectedRecap] = React.useState(null);
   const currentRecap = selectedRecap && results.find((item) => item.kind === 'recap'
@@ -102,17 +115,17 @@ export function AdvancedSearch({
   const hasResults = results.length > 0;
   const showStats = hasResults && !loading;
   const timelineMarkers = React.useMemo(
-    () => (mode === 'ocr' && query.trim() ? buildSearchTimelineMarkers(results) : []),
-    [mode, query, results],
+    () => (query.trim() ? buildSearchTimelineMarkers(results) : []),
+    [query, results],
   );
 
   React.useEffect(() => {
     setHoveredMarkerIds([]);
-  }, [resultSetKey, mode]);
+  }, [resultSetKey]);
 
   React.useEffect(() => {
     const shouldShow = active
-      && mode === 'ocr'
+      && isAuthenticated && !aiActive
       && Boolean(query.trim())
       && !loading
       && !error
@@ -123,7 +136,7 @@ export function AdvancedSearch({
       hoveredIds: hoveredMarkerIds,
       fitKey: `ocr:${resultSetKey}`,
     } : null);
-  }, [active, aiActive, mode, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
+  }, [active, isAuthenticated, aiActive, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
 
   React.useEffect(() => () => onTimelineSearchChange?.(null), [onTimelineSearchChange]);
 
@@ -143,6 +156,16 @@ export function AdvancedSearch({
       });
     }
     : undefined;
+
+  const openVisualPreview = onOpenSnapshotPreview ? (payload) => {
+    const id = payload.screenshot_id ?? payload.metadata?.screenshot_id;
+    onOpenSnapshotPreview(payload, {
+      thumbnailSrc: visual.thumbnails[id] || null,
+      sourceLabel: t('advancedSearch.title'),
+      sourceDetail: `${t('advancedSearch.visual.title')} · ${query.trim()}`,
+      sourceType: 'advanced-search',
+    });
+  } : undefined;
 
   const renderBody = () => {
     if (loading) {
@@ -174,28 +197,10 @@ export function AdvancedSearch({
       ) : (
         <SearchNoResults
           query={query.trim()}
-          mode={mode}
           hasFilters={hasFilters}
           onClearFilters={clearFilters}
-          onSwitchToVisual={() => handleModeChange('nl')}
+          compact={showVisual}
         />
-      );
-    }
-
-    if (mode === 'nl') {
-      return (
-        <div className="grid grid-cols-2 gap-3 p-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-          {results.map((item, index) => (
-            <ThumbnailCard
-              key={`${item.id || item.image_path || index}-${index}`}
-              item={item}
-              sourceType="search"
-              imageKind="original"
-              onSelect={(payload) => onSelectResult?.(payload)}
-              onOpenFloatingPreview={openFloatingPreview}
-            />
-          ))}
-        </div>
       );
     }
 
@@ -209,7 +214,7 @@ export function AdvancedSearch({
           <SearchResultRow
             key={`${group.primary.id || group.primary.image_path || index}-${index}`}
             group={group}
-            mode={mode}
+            mode="ocr"
             queryTokens={queryTokens}
             thumbnailCache={thumbnailCache}
             onSelect={(payload) => onSelectResult?.(payload)}
@@ -254,17 +259,17 @@ export function AdvancedSearch({
       <PageHeader
         as="form"
         onSubmit={handleSubmit}
-        bordered={!showStats}
+        bordered
         flushBottom
         secondaryRow={(
           <div className="flex w-full flex-wrap items-center gap-x-7 gap-y-2">
             {tabs}
 
             <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:flex-1">
-              {mode === 'ocr' && <>
+              <>
                 <SearchTargetChip value={searchTarget} onChange={setSearchTarget} />
                 {searchTarget !== 'snapshots' && <RecapSemanticToggle checked={recapSemantic} onChange={setRecapSemantic} />}
-              </>}
+              </>
               <TimeRangeChip
                 preset={rangePreset}
                 startDate={startDate}
@@ -276,7 +281,7 @@ export function AdvancedSearch({
                 selected={selectedProcesses}
                 onChange={setSelectedProcesses}
               />
-              {mode === 'ocr' && searchTarget !== 'recaps' && (
+              {searchTarget !== 'recaps' && (
                 <CategoryChip
                   categories={categoryOptions}
                   selected={selectedCategories}
@@ -301,9 +306,7 @@ export function AdvancedSearch({
           <input
             type="text"
             className="min-w-0 flex-1 bg-transparent text-sm text-ide-text outline-none placeholder:text-ide-muted"
-            placeholder={mode === 'ocr'
-              ? t(searchTarget === 'mixed' ? 'advancedSearch.search.placeholder_ocr' : `advancedSearch.search.placeholder_${searchTarget}`)
-              : t('advancedSearch.search.placeholder_nl')}
+            placeholder={t(searchTarget === 'mixed' ? 'advancedSearch.search.placeholder_unified' : `advancedSearch.search.placeholder_${searchTarget}`)}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -328,21 +331,16 @@ export function AdvancedSearch({
         </div>
       </PageHeader>
 
-      {showStats && (
-      <SearchStatsBar count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode}
-        snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
-        categoryScoped={mode === 'ocr' && searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />
-      )}
-      {unified && semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticUpdating')}</p>}
-      {unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
-
-      {mode === 'nl' && !isLanding && (
-        <p className="shrink-0 border-b border-ide-border bg-ide-panel px-6 pb-2 text-[11px] leading-relaxed text-ide-muted">
-          {t('advancedSearch.nl_notice')}
-        </p>
-      )}
-
       <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
+        {showVisual && <VisualSearchCard controller={visual}
+          onSelectResult={(payload) => onSelectResult?.(payload)} onOpenFloatingPreview={openVisualPreview} />}
+        {showStats && (
+          <SearchStatsBar count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode="ocr"
+            snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
+            categoryScoped={searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />
+        )}
+        {unified && semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticUpdating')}</p>}
+        {unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
         {error && (
           <div className="mx-4 mt-3 shrink-0 break-words rounded border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-400">
             {t('advancedSearch.search.error', { message: error })}

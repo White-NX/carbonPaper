@@ -22,4 +22,18 @@ describe('unified search options', () => {
       process_names: ['code.exe'], categories: [], start_time: 100, end_time: 200,
     } });
   });
+
+  it('does not invoke a search cancelled before authentication finishes', async () => {
+    let afterAuthentication;
+    withAuth.mockImplementationOnce((action) => new Promise((resolve, reject) => {
+      afterAuthentication = () => Promise.resolve().then(action).then(resolve, reject);
+    }));
+    const controller = new AbortController();
+    const callsBefore = invoke.mock.calls.length;
+    const request = searchSnapshotsAndRecaps('private query', { signal: controller.signal });
+    controller.abort();
+    afterAuthentication();
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    expect(invoke.mock.calls).toHaveLength(callsBefore);
+  });
 });

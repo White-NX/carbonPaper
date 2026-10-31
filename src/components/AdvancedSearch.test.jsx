@@ -242,7 +242,7 @@ describe('AdvancedSearch', () => {
     render(<AdvancedSearch active searchParams={{ query: 'old', mode: 'ocr' }} />);
     await screen.findByText('text-1');
     await screen.findByText('advancedSearch.semanticUpdating');
-    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_ocr'), { target: { value: 'new' } });
+    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified'), { target: { value: 'new' } });
     await act(async () => resolveSemantic(mixedResponse('ready')));
     expect(screen.queryByRole('button', { name: /Recall the design decision/ })).not.toBeInTheDocument();
     await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('new', expect.anything()));
@@ -369,34 +369,68 @@ describe('AdvancedSearch', () => {
     );
   });
 
-  it('keeps visual mode available when the monitor is offline', async () => {
-    const onSearchModeChange = vi.fn();
+  it('opens unified search when the top bar resubmits a query from the AI tab', async () => {
+    const props = { active: true, searchParams: { query: 'moon', refreshKey: 1 } };
+    const { rerender } = render(<AdvancedSearch {...props} />);
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('tab', { name: 'advancedSearch.modes.ai' }));
+    expect(screen.getByRole('tab', { name: 'advancedSearch.modes.ai' })).toHaveAttribute('aria-selected', 'true');
+    searchSnapshotsAndRecaps.mockClear();
+    searchScreenshots.mockClear();
 
+    rerender(<AdvancedSearch {...props} searchParams={{ query: 'moon', refreshKey: 2 }} />);
+    expect(screen.getByRole('tab', { name: 'advancedSearch.modes.unified' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified')).toHaveValue('moon');
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(1));
+    expect(searchScreenshots).toHaveBeenCalledTimes(1);
+  });
+
+  it('restores a repeated top-bar query after editing the advanced search input', async () => {
+    const props = { active: true, searchParams: { query: 'invoice', refreshKey: 1 } };
+    const { rerender } = render(<AdvancedSearch {...props} />);
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified'), { target: { value: 'moon' } });
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('moon', expect.anything()));
+    searchSnapshotsAndRecaps.mockClear();
+    searchScreenshots.mockClear();
+
+    rerender(<AdvancedSearch {...props} searchParams={{ query: 'invoice', refreshKey: 2 }} />);
+    expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified')).toHaveValue('invoice');
+    await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('invoice', expect.anything()));
+    expect(searchSnapshotsAndRecaps).toHaveBeenCalledTimes(1);
+    expect(searchScreenshots).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens legacy visual queries in unified search without a mode switch', async () => {
     render(
       <AdvancedSearch
         active
         searchParams={{ query: 'q', mode: 'nl' }}
-        searchMode="nl"
-        onSearchModeChange={onSearchModeChange}
         onSelectResult={vi.fn()}
       />
     );
 
-    await waitFor(() => expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl')).toBeInTheDocument());
-    expect(onSearchModeChange).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified')).toBeInTheDocument());
+    expect(screen.getByRole('tab', { name: 'advancedSearch.modes.unified' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('tab', { name: 'advancedSearch.modes.nl' })).not.toBeInTheDocument();
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalledWith('q', 'nl', expect.anything()));
   });
 
-  it('uses original cards for picture results without prefetching thumbnail batches', async () => {
+  it('prefetches a compact visual preview and renders originals only after expansion', async () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(22), similarity: 0.8 }]);
     render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
+    await waitFor(() => expect(fetchThumbnailBatch).toHaveBeenCalledWith([22], { signal: expect.any(AbortSignal) }));
+    expect(screen.queryByRole('button', { name: '22' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
     expect(await screen.findByRole('button', { name: '22' })).toHaveAttribute('data-image-kind', 'original');
-    expect(fetchThumbnailBatch).not.toHaveBeenCalled();
   });
 
   it('clears picture cards when leaving the search page', async () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(23), similarity: 0.8 }]);
     const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
     const { rerender } = render(<AdvancedSearch active {...props} />);
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
     await screen.findByRole('button', { name: '23' });
     rerender(<AdvancedSearch active={false} {...props} />);
     expect(screen.queryByRole('button', { name: '23' })).not.toBeInTheDocument();
@@ -405,8 +439,10 @@ describe('AdvancedSearch', () => {
   it('clears picture cards immediately when their query is emptied', async () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(24), similarity: 0.8 }]);
     render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
     await screen.findByRole('button', { name: '24' });
-    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl'), { target: { value: '' } });
+    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified'), { target: { value: '' } });
     expect(screen.queryByRole('button', { name: '24' })).not.toBeInTheDocument();
   });
 
@@ -419,7 +455,7 @@ describe('AdvancedSearch', () => {
     if (action === 'leave') {
       rerender(<AdvancedSearch active={false} {...props} />);
     } else {
-      fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl'), { target: { value: '' } });
+      fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified'), { target: { value: '' } });
     }
     await act(async () => finishSearch([{ ...makeOcrResult(25), similarity: 0.8 }]));
     expect(screen.queryByRole('button', { name: '25' })).not.toBeInTheDocument();
@@ -437,7 +473,7 @@ describe('AdvancedSearch', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText('advancedSearch.search.no_results_for')).toBeInTheDocument();
+      expect(screen.getByText('advancedSearch.search.no_text_results_for')).toBeInTheDocument();
     });
   });
 
@@ -596,7 +632,7 @@ describe('AdvancedSearch', () => {
     });
   });
 
-  it('does not publish markers for visual search', async () => {
+  it('keeps visual card results out of the text result timeline', async () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(21), similarity: 0.8 }]);
     const onTimelineSearchChange = vi.fn();
 
@@ -604,7 +640,6 @@ describe('AdvancedSearch', () => {
       <AdvancedSearch
         active
         searchParams={{ query: 'page', mode: 'nl' }}
-        searchMode="nl"
         onSelectResult={vi.fn()}
         onTimelineSearchChange={onTimelineSearchChange}
       />
@@ -612,6 +647,32 @@ describe('AdvancedSearch', () => {
 
     await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
     await waitFor(() => expect(onTimelineSearchChange).toHaveBeenLastCalledWith(null));
+  });
+
+  it('returns text results before visual retrieval completes and keeps their states independent', async () => {
+    let finishVisual;
+    searchScreenshots.mockImplementationOnce(() => new Promise((resolve) => { finishVisual = resolve; }));
+    searchSnapshotsAndRecaps.mockResolvedValue(response([makeOcrResult(1)]));
+    render(<AdvancedSearch active searchParams={{ query: 'moon' }} onSelectResult={vi.fn()} />);
+    await screen.findByText('text-1');
+    expect(screen.getByText('advancedSearch.visual.loading')).toBeInTheDocument();
+    await act(async () => finishVisual([{ ...makeOcrResult(26), similarity: 0.8 }]));
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
+    expect(await screen.findByRole('button', { name: '26' })).toHaveAttribute('data-image-kind', 'original');
+    expect(screen.getByText('text-1')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
+    expect(screen.queryByRole('button', { name: '26' })).not.toBeInTheDocument();
+    expect(screen.getByText('text-1')).toBeInTheDocument();
+  });
+
+  it('remembers queries that match only visual results', async () => {
+    searchSnapshotsAndRecaps.mockResolvedValue(response([]));
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(27), similarity: 0.8 }]);
+    render(<AdvancedSearch active searchParams={{ query: 'visual-only' }} />);
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('carbonpaper.recentSearches')))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ query: 'visual-only' })])));
+    fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified'), { target: { value: '' } });
+    expect(await screen.findByRole('button', { name: 'visual-only' })).toBeInTheDocument();
   });
 
   it('displays search error banner when search fails', async () => {
