@@ -25,6 +25,7 @@ mod clip_contract;
 mod clip_index;
 mod clip_preprocess;
 mod clip_query;
+mod clip_text_model;
 pub mod commands;
 mod credential_manager;
 pub mod error;
