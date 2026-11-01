@@ -1,45 +1,33 @@
 import React from 'react';
-import { Clock, Sparkles } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 /**
  * 结果统计行。
  *
- * 搜索走的是盲位图索引，最终匹配需要解密验证，而且分页时按 `offset + limit`
- * 提前截断以免解密整个候选集，所以拿不到精确总数。这里只报已经加载到的
- * 条数和真实耗时，还有更多时明说，不去猜一个总量。
+ * 后端提供完整统计时显示总数；检索不完整或总数未知时显示已加载的条数。
+ * 检索状态保留给辅助技术和悬停提示，正文只显示结果数和以秒计的真实耗时。
  *
  * @param {object} props
- * @param {number} props.count 当前已加载的结果条数
+ * @param {number} props.count 已知总数或当前已加载的结果条数
+ * @param {boolean} props.totalKnown 是否已知完整结果总数
  * @param {number | null} props.elapsedMs 本次检索耗时（毫秒）
- * @param {boolean} props.hasMore 是否还有下一页
- * @param {'ocr'|'nl'} props.mode 当前检索模式，决定排序说明
+ * @param {boolean} props.updating 是否还在补充相关回顾
+ * @param {string | null} props.statusMessage 供辅助技术和悬停查看的检索状态
  */
-export function SearchStatsBar({ count, totalKnown = false, elapsedMs, hasMore, mode, snapshotCount, recapCount, categoryScoped = false, complete = true }) {
+export function SearchStatsBar({ count, totalKnown = false, elapsedMs, updating = false, statusMessage }) {
   const { t } = useTranslation();
-
-  const parts = [t(totalKnown ? 'advancedSearch.stats.total' : 'advancedSearch.stats.loaded', { count })];
-  if (mode === 'ocr' && (recapCount > 0 || snapshotCount > 0)) {
-    parts.push(t('advancedSearch.stats.resultTypes', { snapshots: snapshotCount, recaps: recapCount }));
-  }
-  if (categoryScoped) parts.push(t('advancedSearch.stats.categoryScope'));
-  if (complete === false) parts.push(t('advancedSearch.stats.partial'));
-  if (typeof elapsedMs === 'number') {
-    parts.push(t('advancedSearch.stats.elapsed', { ms: Math.max(1, Math.round(elapsedMs)) }));
-  }
-  if (hasMore) {
-    parts.push(t('advancedSearch.stats.has_more'));
-  }
-
-  const SortIcon = mode === 'nl' || totalKnown ? Sparkles : Clock;
+  const results = t(totalKnown ? 'advancedSearch.stats.total' : 'advancedSearch.stats.loaded', { count });
+  const label = Number.isFinite(elapsedMs)
+    ? t('advancedSearch.stats.summary', { results, seconds: (Math.max(0, elapsedMs) / 1000).toFixed(2) })
+    : results;
 
   return (
-    <div className="flex shrink-0 items-center justify-between gap-4 border-b border-ide-border bg-ide-panel px-6 py-2 text-[11px] text-ide-muted">
-      <span className="tabular-nums">{parts.join(' · ')}</span>
-      <span className="flex shrink-0 items-center gap-1.5">
-        <SortIcon className="h-3 w-3" />
-        {totalKnown ? t('advancedSearch.stats.sort_relevance') : mode === 'nl' ? t('advancedSearch.stats.sort_similarity') : t('advancedSearch.stats.sort_time')}
-      </span>
+    <div className="search-stats flex shrink-0 items-center gap-2 px-6 pb-1 pt-3 text-[11px] text-ide-muted"
+      role="status" title={statusMessage || undefined}>
+      <span className="tabular-nums">{label}</span>
+      {updating && <Loader2 className="h-3 w-3 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+      {statusMessage && <span className="sr-only">{statusMessage}</span>}
     </div>
   );
 }

@@ -1564,7 +1564,8 @@
       "sort_time": "按时间倒序",
       "sort_similarity": "按相似度",
       "sort_relevance": "按相关程度",
-      "total": "{{count}} 条结果",
+      "total": "共 {{count}} 个结果",
+      "summary": "{{results}}，用时 {{seconds}} 秒",
       "resultTypes": "快照 {{snapshots}} · 回顾 {{recaps}}",
       "categoryScope": "分类仅筛选快照",
       "partial": "已显示部分匹配，缩小范围可找到更准确的结果"
@@ -1614,6 +1615,8 @@
     "viewSource": "查看来源快照",
     "visual": {
       "title": "画面搜索",
+      "open": "查看全部画面",
+      "back": "返回综合搜索",
       "hint": "按画面内容查找相关快照",
       "loading": "正在查找相关画面…",
       "unavailable": "暂时无法查找画面",
@@ -1627,12 +1630,14 @@
       "count_more": "{{count}}+ 张",
       "count_more_one": "{{count}}+ 张",
       "count_more_other": "{{count}}+ 张",
-      "more": "加载更多",
+      "more": "再显示 {{count}} 张",
       "retry": "重试",
       "retry_hint": "暂时无法查找画面，请稍后重试。",
       "empty_hint": "试试更具体的画面描述，或调整筛选条件。",
       "page_error": "暂时无法加载更多画面。",
-      "order": "优先展示更相关的画面"
+      "order": "优先展示更相关的画面",
+      "relevance": "相关度 {{score}}",
+      "relevanceHint": "数值越高，画面内容与你的描述越接近。"
     }
   },
   "mask": {

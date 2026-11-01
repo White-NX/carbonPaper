@@ -1,16 +1,23 @@
-import React, { useId, useMemo } from 'react';
-import { ChevronDown, ChevronUp, Image as ImageIcon, Loader2, RefreshCw } from 'lucide-react';
+import React, { useEffect, useId, useMemo, useRef } from 'react';
+import { ArrowLeft, ChevronDown, ChevronRight, Image as ImageIcon, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { VISUAL_SEARCH_PAGE_SIZE, VISUAL_SEARCH_SUMMARY_SIZE } from '../../hooks/useVisualSearchController';
 import { ThumbnailCard } from '../ThumbnailCard';
-import { Button } from '../ui/Button';
+import { Button, focusStyle } from '../ui/Button';
 
-/** A compact visual preview opens into the existing screenshot gallery. */
-export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPreview }) {
+/** Inline visual results lead into a gallery under the same search. */
+export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPreview,
+  onOpenGallery, onBack, fullPage = false, scrollRef }) {
   const { t, i18n } = useTranslation();
   const regionId = useId();
-  const { phase, results, thumbnails, expanded, setExpanded, hasMore, loadingMore, pageError, retry, loadMore } = controller;
+  const sentinelRef = useRef(null);
+  const { phase, results, summaryResults, hasMore, summaryHasMore,
+    loadingMore, pageError, summaryPageError, retry, loadGalleryPage, galleryReady, showMore } = controller;
   const waiting = phase === 'loading' || phase === 'idle';
-  const failed = phase === 'error';
+  const visibleResults = fullPage ? results : summaryResults;
+  const canShowMore = fullPage ? hasMore : summaryHasMore;
+  const pagingError = fullPage ? pageError : summaryPageError;
+  const pageSize = fullPage ? VISUAL_SEARCH_PAGE_SIZE : VISUAL_SEARCH_SUMMARY_SIZE;
   const dateFormatter = useMemo(() => new Intl.DateTimeFormat(i18n?.language, {
     month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
   }), [i18n?.language]);
@@ -27,94 +34,94 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
         : date.toLocaleString(i18n?.language, { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
     return { short, full: date.toLocaleString(i18n?.language), iso: date.toISOString() };
   };
-  const hint = waiting ? t('advancedSearch.visual.loading') : failed ? t('advancedSearch.visual.unavailable')
-    : results.length ? t('advancedSearch.visual.hint') : t('advancedSearch.visual.empty');
+
+  useEffect(() => {
+    if (fullPage && phase === 'ready' && !galleryReady && !loadingMore && !pageError) void loadGalleryPage();
+  }, [fullPage, phase, galleryReady, loadingMore, pageError, loadGalleryPage]);
+
+  useEffect(() => {
+    if (!fullPage || phase !== 'ready' || !galleryReady || !hasMore || loadingMore || pageError
+      || typeof IntersectionObserver === 'undefined') return undefined;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void loadGalleryPage();
+    }, { root: scrollRef?.current || null, rootMargin: '200px' });
+    observer.observe(sentinelRef.current);
+    return () => observer.disconnect();
+  }, [fullPage, phase, galleryReady, hasMore, loadingMore, pageError, loadGalleryPage, scrollRef]);
 
   return (
-    <section className="visual-search-card mx-6 mb-4 mt-4 overflow-hidden rounded-xl border border-ide-border bg-ide-panel">
-      <button type="button" aria-label={t('advancedSearch.visual.title')} aria-expanded={expanded} aria-controls={regionId}
-        onClick={() => setExpanded(!expanded)}
-        className="group flex w-full items-center gap-3 px-4 py-3.5 text-left transition-colors hover:bg-ide-hover focus-visible:outline-none focus-visible:brightness-90 dark:focus-visible:brightness-125">
-        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-ide-accent/15 bg-ide-accent/10 text-ide-accent" aria-hidden="true">
-          <ImageIcon className="h-[18px] w-[18px]" />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span className="text-[13px] font-semibold text-ide-text">{t('advancedSearch.visual.title')}</span>
-            {phase === 'ready' && results.length > 0 && (
-              <span className="rounded-full border border-ide-border bg-ide-bg px-2 py-0.5 text-[10px] font-medium tabular-nums text-ide-muted">
-                {t(hasMore ? 'advancedSearch.visual.count_more' : 'advancedSearch.visual.count', { count: results.length })}
-              </span>
-            )}
-          </span>
-          <span className="mt-1 flex items-center gap-1.5 text-[11px] leading-relaxed text-ide-muted" aria-live="polite">
-            {waiting && <Loader2 className="h-3 w-3 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
-            <span className="truncate">{hint}</span>
-          </span>
-        </span>
-        {!expanded && (waiting || results.length > 0) && (
-          <span className="visual-search-previews flex shrink-0 gap-1.5" aria-hidden="true">
-            {waiting ? [0, 1, 2].map((index) => (
-              <span key={index} className="h-11 w-[68px] animate-pulse rounded-md border border-ide-border bg-ide-bg motion-reduce:animate-none" />
-            )) : results.slice(0, 3).map((item) => (
-              <span key={item.screenshot_id} className="h-11 w-[68px] overflow-hidden rounded-md border border-ide-border bg-ide-bg">
-                {thumbnails[item.screenshot_id]
-                  ? <img src={thumbnails[item.screenshot_id]} alt="" className="h-full w-full object-cover" loading="lazy" />
-                  : <span className="grid h-full w-full place-items-center text-ide-muted"><ImageIcon className="h-3.5 w-3.5 opacity-50" /></span>}
-              </span>
-            ))}
-          </span>
+    <section className={`visual-search-section mx-6 mt-4 ${fullPage ? 'mb-6' : 'mb-4'}`}>
+      {fullPage && <Button size="xs" variant="ghost" icon={ArrowLeft} onClick={onBack} className="visual-search-back mb-3 -ml-2">
+        {t('advancedSearch.visual.back')}
+      </Button>}
+      <h2 className="mb-3 flex items-center gap-2 text-[13px] font-medium text-ide-text">
+        {fullPage ? <><ImageIcon className="h-4 w-4 text-ide-accent" aria-hidden="true" />{t('advancedSearch.visual.title')}</> : (
+          <button type="button" onClick={onOpenGallery} aria-label={t('advancedSearch.visual.open')}
+            className={`visual-search-open group inline-flex items-center gap-2 rounded py-1 text-ide-text transition-colors hover:text-ide-accent ${focusStyle}`}>
+            <ImageIcon className="h-4 w-4 text-ide-accent" aria-hidden="true" />
+            <span>{t('advancedSearch.visual.title')}</span>
+            <ChevronRight className="h-3.5 w-3.5 text-ide-muted transition-colors group-hover:text-ide-accent" aria-hidden="true" />
+          </button>
         )}
-        <span className="visual-search-disclosure ml-1 shrink-0 text-[11px] text-ide-muted transition-colors group-hover:text-ide-text">
-          {t(expanded ? 'advancedSearch.visual.collapse' : 'advancedSearch.visual.expand')}
-        </span>
-        <ChevronDown className={`h-4 w-4 shrink-0 text-ide-muted transition-transform motion-reduce:transition-none ${expanded ? 'rotate-180' : ''}`} aria-hidden="true" />
-      </button>
+      </h2>
 
-      <div id={regionId} role="region" aria-label={t('advancedSearch.visual.results')} hidden={!expanded}
-        className="border-t border-ide-border px-4 pb-3 pt-4">
-        {expanded && <>
-          {waiting ? (
-            <div className="visual-search-grid grid gap-3" aria-hidden="true">
-              {[0, 1, 2, 3, 4, 5].map((index) => <div key={index} className="aspect-video animate-pulse rounded border border-ide-border bg-ide-bg motion-reduce:animate-none" />)}
-            </div>
-          ) : failed ? (
-            <div className="flex flex-wrap items-center justify-between gap-3 py-2">
-              <p role="status" className="text-xs leading-relaxed text-ide-muted">{t('advancedSearch.visual.retry_hint')}</p>
-              <Button size="xs" icon={RefreshCw} onClick={retry}>{t('advancedSearch.visual.retry')}</Button>
-            </div>
-          ) : results.length === 0 ? (
-            <p className="py-3 text-xs leading-relaxed text-ide-muted">{t('advancedSearch.visual.empty_hint')}</p>
-          ) : (
-            <>
-              <div className="visual-search-grid grid gap-3">
-                {results.map((item) => {
-                  const time = resultTime(item);
-                  const name = item.process_name || t('advancedSearch.unknown');
-                  return <div key={item.screenshot_id} className="min-w-0">
-                    <ThumbnailCard item={item} sourceType="search" imageKind="original" showFooter={false}
-                      ariaLabel={[item.window_title || name, time?.full].filter(Boolean).join(' · ')}
-                      onSelect={onSelectResult} onOpenFloatingPreview={onOpenFloatingPreview} />
-                    <div className="flex items-baseline justify-between gap-2 px-0.5 pt-1.5">
-                      <span className="min-w-0 truncate text-[11px] font-medium text-ide-text" title={name}>{name}</span>
-                      {time && <time dateTime={time.iso} title={time.full} className="shrink-0 text-[10px] tabular-nums text-ide-muted">{time.short}</time>}
-                    </div>
-                  </div>;
-                })}
-              </div>
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-ide-border pt-3">
-                <span className="text-[11px] leading-relaxed text-ide-muted" role={pageError ? 'status' : undefined}>
-                  {t(pageError ? 'advancedSearch.visual.page_error' : 'advancedSearch.visual.order')}
-                </span>
-                <div className="ml-auto flex items-center gap-2">
-                  {hasMore && <Button size="xs" loading={loadingMore} icon={pageError ? RefreshCw : undefined}
-                    onClick={pageError ? retry : loadMore}>{t(pageError ? 'advancedSearch.visual.retry' : 'advancedSearch.visual.more')}</Button>}
-                  <Button size="xs" variant="ghost" icon={ChevronUp} onClick={() => setExpanded(false)}>{t('advancedSearch.visual.collapse')}</Button>
+      <div id={regionId} role="region" aria-label={t('advancedSearch.visual.results')}>
+        {waiting ? <>
+          <p role="status" className="mb-3 flex items-center gap-1.5 text-xs text-ide-muted">
+            <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+            {t('advancedSearch.visual.loading')}
+          </p>
+          <div className={`visual-search-grid ${fullPage ? 'visual-search-gallery-grid' : 'visual-search-summary-grid'} grid gap-3`} aria-hidden="true">
+            {Array.from({ length: pageSize }, (_, index) => <div key={index}
+              className="aspect-video animate-pulse rounded border border-ide-border bg-ide-panel motion-reduce:animate-none" />)}
+          </div>
+        </> : phase === 'error' ? (
+          <div className="flex flex-wrap items-center gap-3 py-2">
+            <p role="status" className="text-xs leading-relaxed text-ide-muted">{t('advancedSearch.visual.retry_hint')}</p>
+            <Button size="xs" icon={RefreshCw} onClick={retry}>{t('advancedSearch.visual.retry')}</Button>
+          </div>
+        ) : visibleResults.length === 0 ? (
+          <p className="py-2 text-xs leading-relaxed text-ide-muted">{t('advancedSearch.visual.empty_hint')}</p>
+        ) : (
+          <div className={`visual-search-grid ${fullPage ? 'visual-search-gallery-grid' : 'visual-search-summary-grid'} grid gap-x-3 gap-y-4`}>
+            {visibleResults.map((item) => {
+              const time = resultTime(item);
+              const name = item.process_name || t('advancedSearch.unknown');
+              const title = item.window_title || name;
+              const relevance = Number.isFinite(item.similarity)
+                ? t('advancedSearch.visual.relevance', { score: item.similarity.toFixed(2) }) : null;
+              return <div key={item.screenshot_id} className="min-w-0">
+                <ThumbnailCard item={item} sourceType="search" imageKind="original" showFooter={false}
+                  ariaLabel={[title, time?.full, relevance].filter(Boolean).join(' · ')}
+                  onSelect={onSelectResult} onOpenFloatingPreview={onOpenFloatingPreview} />
+                <div className="mt-1.5 flex items-baseline gap-2 text-xs">
+                  <p className="min-w-0 flex-1 truncate text-ide-text" title={title}>{title}</p>
+                  {relevance && <span className="shrink-0 text-[11px] tabular-nums text-ide-accent" title={t('advancedSearch.visual.relevanceHint')}>
+                    {relevance}
+                  </span>}
                 </div>
-              </div>
-            </>
-          )}
-        </>}
+                <div className="flex items-baseline justify-between gap-2 pt-1 text-[11px] text-ide-muted">
+                  <span className="min-w-0 truncate" title={name}>{name}</span>
+                  {time && <time dateTime={time.iso} title={time.full} className="shrink-0 tabular-nums">{time.short}</time>}
+                </div>
+              </div>;
+            })}
+          </div>
+        )}
+
+        {pagingError && <p role="status" className="mt-3 text-xs text-ide-muted">{t('advancedSearch.visual.page_error')}</p>}
+        {phase === 'ready' && canShowMore && (
+          <div className="mt-4 flex items-center gap-3">
+            <span className="min-w-0 flex-1 border-t border-ide-border" aria-hidden="true" />
+            <Button size="xs" loading={loadingMore} icon={pagingError ? RefreshCw : ChevronDown}
+              onClick={fullPage ? loadGalleryPage : showMore} className="rounded-full px-4 py-1.5"
+              aria-controls={regionId}>
+              {t(pagingError ? 'advancedSearch.visual.retry' : 'advancedSearch.visual.more', { count: pageSize })}
+            </Button>
+            <span className="min-w-0 flex-1 border-t border-ide-border" aria-hidden="true" />
+          </div>
+        )}
+        {fullPage && <div ref={sentinelRef} className="h-1" aria-hidden="true" />}
       </div>
     </section>
   );

@@ -58,13 +58,21 @@
   .recap-time-dot { display: none; }
 }
 
-.visual-search-card { container: visual-search / inline-size; }
-.visual-search-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 160px), 1fr)); }
-@container visual-search (max-width: 620px) {
-  .visual-search-previews { display: none; }
+.visual-search-section { container: visual-search / inline-size; }
+.visual-search-summary-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.visual-search-gallery-grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr)); }
+.visual-search-grid img { object-fit: contain; }
+@container visual-search (max-width: 900px) {
+  .visual-search-summary-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
-@container visual-search (max-width: 380px) {
-  .visual-search-disclosure { display: none; }
+@container visual-search (max-width: 680px) {
+  .visual-search-summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container visual-search (max-width: 480px) {
+  .visual-search-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container visual-search (max-width: 280px) {
+  .visual-search-summary-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 .ai-search-surface { container: ai-search / size; }

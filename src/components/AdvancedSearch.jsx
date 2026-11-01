@@ -87,18 +87,49 @@ export function AdvancedSearch({
   });
   const isMigrating = useHmacMigrationStatus();
   const ai = useAiSearch({ active: active && isAuthenticated && aiActive });
-  const showVisual = Boolean(query.trim()) && searchTarget !== 'recaps' && !isMigrating;
+  const showVisual = isAuthenticated && Boolean(query.trim()) && searchTarget !== 'recaps' && !isMigrating;
   const visual = useVisualSearchController({
     active: active && isAuthenticated && !aiActive && showVisual,
     query, debouncedQuery, processNames: selectedProcesses, categories: selectedCategories,
     startTime: visualStartTime, endTime: visualEndTime, refreshKey,
     sharedThumbnails: thumbnailCache,
   });
+  const [gallerySearchKey, setGallerySearchKey] = React.useState(null);
+  const visualGallery = showVisual && gallerySearchKey === visual.searchKey;
+  const scrollRef = React.useRef(null);
+  const scrollPositions = React.useRef({ key: null, summary: 0, gallery: 0, wasGallery: false });
+  React.useEffect(() => {
+    setGallerySearchKey(null);
+  }, [active, isAuthenticated, showVisual, visual.searchKey]);
+  React.useLayoutEffect(() => {
+    const previous = scrollPositions.current;
+    if (previous.key !== visual.searchKey) {
+      scrollPositions.current = { key: visual.searchKey, summary: 0, gallery: 0, wasGallery: false };
+    }
+    const scroll = scrollRef.current;
+    if (scroll) {
+      scroll.scrollTop = scrollPositions.current[visualGallery ? 'gallery' : 'summary'];
+      if (visualGallery) scroll.querySelector('.visual-search-back')?.focus({ preventScroll: true });
+      else if (previous.wasGallery && previous.key === visual.searchKey) {
+        scroll.querySelector('.visual-search-open')?.focus({ preventScroll: true });
+      }
+    }
+    scrollPositions.current.wasGallery = visualGallery;
+  }, [visualGallery, visual.searchKey]);
+  const openVisualGallery = () => {
+    scrollPositions.current.summary = scrollRef.current?.scrollTop || 0;
+    setGallerySearchKey(visual.searchKey);
+  };
+  const closeVisualGallery = () => {
+    scrollPositions.current.gallery = scrollRef.current?.scrollTop || 0;
+    setGallerySearchKey(null);
+  };
   const hasVisualResults = visual.results.length > 0;
   React.useEffect(() => {
     if (visual.phase === 'ready' && hasVisualResults) rememberVisualQuery(debouncedQuery.trim());
   }, [visual.phase, visual.key, hasVisualResults, debouncedQuery, rememberVisualQuery]);
   const handleTabChange = (next) => {
+    setGallerySearchKey(null);
     setAiActive(next === 'ai');
   };
   const tabs = <SearchModeTabs mode={aiActive ? 'ai' : 'unified'} onChange={handleTabChange} />;
@@ -114,6 +145,9 @@ export function AdvancedSearch({
 
   const hasResults = results.length > 0;
   const showStats = hasResults && !loading;
+  const summaryStatus = unified && semanticUpdating ? t('advancedSearch.semanticUpdating')
+    : unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus)
+      ? t('advancedSearch.semanticFallback') : undefined;
   const timelineMarkers = React.useMemo(
     () => (query.trim() ? buildSearchTimelineMarkers(results) : []),
     [query, results],
@@ -125,7 +159,7 @@ export function AdvancedSearch({
 
   React.useEffect(() => {
     const shouldShow = active
-      && isAuthenticated && !aiActive
+      && isAuthenticated && !aiActive && !visualGallery
       && Boolean(query.trim())
       && !loading
       && !error
@@ -136,7 +170,7 @@ export function AdvancedSearch({
       hoveredIds: hoveredMarkerIds,
       fitKey: `ocr:${resultSetKey}`,
     } : null);
-  }, [active, isAuthenticated, aiActive, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
+  }, [active, isAuthenticated, aiActive, visualGallery, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
 
   React.useEffect(() => () => onTimelineSearchChange?.(null), [onTimelineSearchChange]);
 
@@ -331,33 +365,38 @@ export function AdvancedSearch({
         </div>
       </PageHeader>
 
-      <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
-        {showVisual && <VisualSearchCard controller={visual}
-          onSelectResult={(payload) => onSelectResult?.(payload)} onOpenFloatingPreview={openVisualPreview} />}
-        {showStats && (
-          <SearchStatsBar count={totals?.total ?? results.length} totalKnown={Boolean(totals)} elapsedMs={elapsedMs} hasMore={hasMore} mode="ocr"
-            snapshotCount={totals?.snapshots ?? results.filter((item) => item.kind !== 'recap').length} recapCount={totals?.recaps ?? results.filter((item) => item.kind === 'recap').length}
-            categoryScoped={searchTarget === 'mixed' && selectedCategories.length > 0} complete={totals?.complete} />
-        )}
-        {unified && semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticUpdating')}</p>}
-        {unified && useRecapSemantic && ['disabled', 'not_prepared', 'partial', 'unavailable'].includes(semanticStatus) && !semanticUpdating && <p role="status" className="shrink-0 border-b border-ide-border bg-ide-panel px-6 py-1.5 text-[11px] text-ide-muted">{t('advancedSearch.semanticFallback')}</p>}
-        {error && (
-          <div className="mx-4 mt-3 shrink-0 break-words rounded border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-400">
-            {t('advancedSearch.search.error', { message: error })}
-          </div>
-        )}
-
-        {renderBody()}
-
-        <div ref={sentinelRef} className="flex items-center justify-center py-4 text-xs text-ide-muted">
-          {loadingMore && (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              {t('advancedSearch.loading_more')}
-            </>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
+        <div className="search-overview" hidden={visualGallery}>
+          {showStats && (
+            <SearchStatsBar count={totals?.complete === false ? results.length : totals?.total ?? results.length}
+              totalKnown={Boolean(totals) && totals.complete !== false} elapsedMs={elapsedMs}
+              updating={unified && semanticUpdating} statusMessage={summaryStatus} />
           )}
-          {!loadingMore && !hasMore && hasResults && <span>{t('advancedSearch.no_more')}</span>}
+          {!showStats && summaryStatus && <p role="status" className="sr-only">{summaryStatus}</p>}
+          {showVisual && <VisualSearchCard controller={visual}
+            onOpenGallery={openVisualGallery}
+            onSelectResult={(payload) => onSelectResult?.(payload)} onOpenFloatingPreview={openVisualPreview} />}
+          {error && (
+            <div className="mx-4 mt-3 shrink-0 break-words rounded border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-400">
+              {t('advancedSearch.search.error', { message: error })}
+            </div>
+          )}
+
+          {renderBody()}
+
+          <div ref={sentinelRef} className="flex items-center justify-center py-4 text-xs text-ide-muted">
+            {loadingMore && (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                {t('advancedSearch.loading_more')}
+              </>
+            )}
+            {!loadingMore && !hasMore && hasResults && <span>{t('advancedSearch.no_more')}</span>}
+          </div>
         </div>
+        {visualGallery && <VisualSearchCard controller={visual} fullPage scrollRef={scrollRef}
+          onBack={closeVisualGallery} onSelectResult={(payload) => onSelectResult?.(payload)}
+          onOpenFloatingPreview={openVisualPreview} />}
       </div>
       {currentRecap && active && isAuthenticated && <RecapSearchResultDetails item={currentRecap} action={recapAction} time={recapTime}
         onClose={() => setSelectedRecap(null)} onOpenDay={(date) => { setSelectedRecap(null); onOpenRecapDay?.(date); }} />}

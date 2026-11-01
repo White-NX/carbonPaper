@@ -10,6 +10,8 @@ vi.mock('react-i18next', () => ({
         return ['hint-a', 'hint-b'];
       }
       if (key === 'advancedSearch.recapRelevance') return key + ':' + options.score;
+      if (key === 'advancedSearch.stats.total') return `共 ${options.count} 个结果`;
+      if (key === 'advancedSearch.stats.summary') return `${options.results}，用时 ${options.seconds} 秒`;
       return key;
     },
   }),
@@ -316,6 +318,54 @@ describe('AdvancedSearch', () => {
     expect(searchScreenshots).not.toHaveBeenCalledWith('', mode, expect.anything());
   });
 
+
+
+  it('pages fifty gallery pictures and returns to the ten-picture summary with its scroll position', async () => {
+    const pictures = Array.from({ length: 120 }, (_, index) => makeOcrResult(101 + index));
+    searchScreenshots.mockImplementation(async (_query, _mode, options) => pictures.slice(options.offset, options.offset + options.limit));
+    searchSnapshotsAndRecaps.mockResolvedValue(response([makeOcrResult(1)]));
+    const onTimelineSearchChange = vi.fn();
+    render(<AdvancedSearch active searchParams={{ query: 'moon' }} onTimelineSearchChange={onTimelineSearchChange} />);
+    await screen.findByRole('button', { name: '101' });
+    expect(within(screen.getByRole('region', { name: 'advancedSearch.visual.results' })).getAllByRole('button')).toHaveLength(11);
+    const scroll = document.querySelector('.search-overview').parentElement;
+    scroll.scrollTop = 127;
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.open' }));
+    expect(scroll.scrollTop).toBe(0);
+    expect(screen.getByText('text-1')).not.toBeVisible();
+    expect(onTimelineSearchChange).toHaveBeenLastCalledWith(null);
+    await screen.findByRole('button', { name: '150' });
+    expect(within(screen.getByRole('region', { name: 'advancedSearch.visual.results' })).getAllByRole('button')).toHaveLength(51);
+    await act(async () => { observerCallback?.([{ isIntersecting: true }]); });
+    await screen.findByRole('button', { name: '200' });
+    scroll.scrollTop = 400;
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.back' }));
+    expect(scroll.scrollTop).toBe(127);
+    expect(screen.getByText('text-1')).toBeVisible();
+    const region = screen.getByRole('region', { name: 'advancedSearch.visual.results' });
+    expect(within(region).getAllByRole('button')).toHaveLength(11);
+    expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified')).toHaveValue('moon');
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.more' }));
+    expect(within(region).getAllByRole('button')).toHaveLength(21);
+    expect(searchScreenshots).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.more' }));
+    await screen.findByRole('button', { name: '130' });
+    expect(within(region).getAllByRole('button')).toHaveLength(31);
+    expect(searchScreenshots).toHaveBeenCalledTimes(3);
+    expect(searchScreenshots.mock.calls.map(([, , options]) => [options.offset, options.limit])).toEqual([[0, 10], [0, 50], [50, 50]]);
+  });
+
+  it('places the compact result summary before visual results', async () => {
+    searchSnapshotsAndRecaps.mockResolvedValue(response([makeOcrResult(1), makeOcrResult(2), makeOcrResult(3)]));
+    searchScreenshots.mockResolvedValue([{ ...makeOcrResult(101), similarity: 0.8 }]);
+    const { container } = render(<AdvancedSearch active searchParams={{ query: 'moon' }} />);
+    await screen.findByText('text-1');
+    const summary = container.querySelector('.search-overview').firstElementChild;
+    expect(summary).toHaveTextContent(/共 3 个结果，用时 \d+\.\d{2} 秒/);
+    expect(summary).toHaveClass('search-stats');
+    expect(summary.nextElementSibling).toHaveClass('visual-search-section');
+  });
+
   it('runs OCR search with debounced query from searchParams', async () => {
     searchSnapshotsAndRecaps.mockResolvedValueOnce(response([{ screenshot_id: 1, text: 'hello world' }]));
 
@@ -416,12 +466,11 @@ describe('AdvancedSearch', () => {
     await waitFor(() => expect(searchScreenshots).toHaveBeenCalledWith('q', 'nl', expect.anything()));
   });
 
-  it('prefetches a compact visual preview and renders originals only after expansion', async () => {
+  it('shows inline visual results and preloads preview thumbnails', async () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(22), similarity: 0.8 }]);
     render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
     await waitFor(() => expect(fetchThumbnailBatch).toHaveBeenCalledWith([22], { signal: expect.any(AbortSignal) }));
-    expect(screen.queryByRole('button', { name: '22' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
+    expect(screen.getByRole('button', { name: '22' })).toHaveAttribute('data-image-kind', 'original');
     expect(await screen.findByRole('button', { name: '22' })).toHaveAttribute('data-image-kind', 'original');
   });
 
@@ -430,7 +479,7 @@ describe('AdvancedSearch', () => {
     const props = { searchParams: { query: 'moon', mode: 'nl' }, onSelectResult: vi.fn() };
     const { rerender } = render(<AdvancedSearch active {...props} />);
     await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.open' }));
     await screen.findByRole('button', { name: '23' });
     rerender(<AdvancedSearch active={false} {...props} />);
     expect(screen.queryByRole('button', { name: '23' })).not.toBeInTheDocument();
@@ -440,7 +489,7 @@ describe('AdvancedSearch', () => {
     searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(24), similarity: 0.8 }]);
     render(<AdvancedSearch active searchParams={{ query: 'moon', mode: 'nl' }} onSelectResult={vi.fn()} />);
     await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
-    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.open' }));
     await screen.findByRole('button', { name: '24' });
     fireEvent.change(screen.getByPlaceholderText('advancedSearch.search.placeholder_unified'), { target: { value: '' } });
     expect(screen.queryByRole('button', { name: '24' })).not.toBeInTheDocument();
@@ -657,12 +706,13 @@ describe('AdvancedSearch', () => {
     await screen.findByText('text-1');
     expect(screen.getByText('advancedSearch.visual.loading')).toBeInTheDocument();
     await act(async () => finishVisual([{ ...makeOcrResult(26), similarity: 0.8 }]));
-    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
     expect(await screen.findByRole('button', { name: '26' })).toHaveAttribute('data-image-kind', 'original');
-    expect(screen.getByText('text-1')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.title' }));
-    expect(screen.queryByRole('button', { name: '26' })).not.toBeInTheDocument();
-    expect(screen.getByText('text-1')).toBeInTheDocument();
+    expect(screen.getByText('text-1')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.open' }));
+    expect(screen.getByText('text-1')).not.toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.back' }));
+    expect(screen.getByRole('button', { name: '26' })).toBeVisible();
+    expect(screen.getByText('text-1')).toBeVisible();
   });
 
   it('remembers queries that match only visual results', async () => {

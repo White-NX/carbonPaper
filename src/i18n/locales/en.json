@@ -1565,6 +1565,7 @@
       "sort_similarity": "By similarity",
       "sort_relevance": "By relevance",
       "total": "{{count}} results",
+      "summary": "{{results}}, took {{seconds}} seconds",
       "resultTypes": "{{snapshots}} snapshots · {{recaps}} recaps",
       "categoryScope": "Categories filter snapshots",
       "partial": "Showing some matches. Narrow the search for more precise results."
@@ -1614,6 +1615,8 @@
     "viewSource": "Open source snapshot",
     "visual": {
       "title": "Visual search",
+      "open": "View all visual results",
+      "back": "Back to unified search",
       "hint": "Find screenshots by their visual content",
       "loading": "Finding related screenshots…",
       "unavailable": "Visual search is unavailable",
@@ -1627,12 +1630,14 @@
       "count_more": "{{count}}+ images",
       "count_more_one": "{{count}}+ images",
       "count_more_other": "{{count}}+ images",
-      "more": "Load more",
+      "more": "Show {{count}} more",
       "retry": "Retry",
       "retry_hint": "Unable to search visual content right now. Please try again.",
       "empty_hint": "Try a more specific scene description or adjust your filters.",
       "page_error": "Unable to load more screenshots right now.",
-      "order": "More relevant images appear first"
+      "order": "More relevant images appear first",
+      "relevance": "Relevance {{score}}",
+      "relevanceHint": "Higher values indicate a closer visual match to your description."
     }
   },
   "mask": {
