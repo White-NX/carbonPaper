@@ -128,8 +128,6 @@ export default function MainArea({
   onAdvancedSelect,
   advancedSearchParams,
   onInspectorBoxClick,
-  searchMode,
-  onSearchModeChange,
   onDeleteRecord,
   onDeleteNearbyRecords,
   onCopyText,
@@ -397,8 +395,6 @@ export default function MainArea({
             searchParams={advancedSearchParams}
             onSelectResult={onAdvancedSelect}
             onOpenSnapshotPreview={openSnapshotPreview}
-            searchMode={searchMode}
-            onSearchModeChange={onSearchModeChange}
             onTimelineSearchChange={onTimelineSearchChange}
             isAuthenticated={isAuthenticated}
             onOpenRecapDay={(date) => {

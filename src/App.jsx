@@ -59,8 +59,7 @@ function App() {
   const [showOcrModelRepair, setShowOcrModelRepair] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
-  const [searchMode, setSearchMode] = useState('ocr');
-  const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', refreshKey: Date.now() });
   const [timelineSearch, setTimelineSearch] = useState(null);
 
   const openOcrModelRepair = useCallback(() => {
@@ -216,10 +215,9 @@ function App() {
     setActiveTab('preview');
   }, [setHighlightedEventId, setSelectedEvent, setTimelineJump]);
 
-  const handleSearchSubmit = ({ query, mode }) => {
+  const handleSearchSubmit = ({ query }) => {
     setActiveTab('advanced-search');
-    setSearchMode(mode);
-    setAdvancedSearchParams({ query, mode, refreshKey: Date.now() });
+    setAdvancedSearchParams({ query, refreshKey: Date.now() });
   };
 
   return (
@@ -242,8 +240,6 @@ function App() {
         onHideToTray={hideToTray}
         onSearchSelect={selectSearchResult}
         onSearchSubmit={handleSearchSubmit}
-        searchMode={searchMode}
-        onSearchModeChange={setSearchMode}
         backendStatus={backendStatus}
         powerSavingSuppressed={monitorPowerSavingSuppressed}
         monitorPaused={monitorPaused}
@@ -344,8 +340,6 @@ function App() {
               lastError={lastError}
               ocrBoxes={ocrBoxes}
               advancedSearchParams={advancedSearchParams}
-              searchMode={searchMode}
-              onSearchModeChange={setSearchMode}
               isAuthenticated={isAuthenticated}
               onTimelineSearchChange={setTimelineSearch}
               onAdvancedSelect={selectSearchResult}

@@ -172,6 +172,7 @@ fn response_ids_cover_all_response_variants_and_handshakes() {
             },
         },
         MlResponse::EmbeddingComplete {
+            resident_sessions: vec![],
             request_id: 7,
             model: MlSemanticModel::MinilmL12,
             dimensions: 0,
@@ -186,6 +187,7 @@ fn response_ids_cover_all_response_variants_and_handshakes() {
             },
         },
         MlResponse::TokenizationComplete {
+            resident_sessions: vec![],
             request_id: 7,
             model: MlSemanticModel::MinilmL12,
             batch: 0,
@@ -195,6 +197,7 @@ fn response_ids_cover_all_response_variants_and_handshakes() {
             token_type_ids: vec![],
         },
         MlResponse::RerankComplete {
+            resident_sessions: vec![],
             request_id: 7,
             model: MlSemanticModel::BgeRerankerV2M3,
             scores: vec![],
@@ -208,6 +211,7 @@ fn response_ids_cover_all_response_variants_and_handshakes() {
             },
         },
         MlResponse::SemanticStatus {
+            resident_sessions: vec![],
             request_id: 7,
             provider: MlProvider::Cpu,
             loaded_model: None,
@@ -217,6 +221,7 @@ fn response_ids_cover_all_response_variants_and_handshakes() {
         },
         MlResponse::Unloaded { request_id: 7 },
         MlResponse::Error {
+            resident_sessions: vec![],
             request_id: 7,
             kind: "inference".into(),
             message: "failed".into(),
@@ -422,6 +427,7 @@ fn success_requires_matching_response_variant_and_model() {
     };
 
     let matching = MlResponse::EmbeddingComplete {
+        resident_sessions: vec![],
         request_id: 9,
         model: MlSemanticModel::BgeSmallZh,
         dimensions: 2,
@@ -431,6 +437,7 @@ fn success_requires_matching_response_variant_and_model() {
     assert!(response_matches_request(expected, 9, model, &matching));
 
     let wrong_model = MlResponse::EmbeddingComplete {
+        resident_sessions: vec![],
         request_id: 9,
         model: MlSemanticModel::MinilmL12,
         dimensions: 2,
@@ -543,6 +550,67 @@ fn cold_start_allowance_keeps_the_original_clock_and_warm_deadline() {
     assert!(RequestWatch::new(ordinary.deadline(started, false))
         .check(&runtime)
         .is_err());
+}
+
+#[test]
+fn clip_text_and_image_requests_use_distinct_residency_keys() {
+    let text = MlRequest::EmbedText {
+        request_id: 1,
+        timeout_ms: 1000,
+        model: MlSemanticModel::ChineseClip,
+        texts: vec!["a screenshot".into()],
+    };
+    let image = MlRequest::EmbedImage {
+        request_id: 2,
+        timeout_ms: 1000,
+        model: MlSemanticModel::ChineseClip,
+        images: vec![],
+        body_len: 0,
+    };
+    assert_eq!(
+        request_session(&text),
+        Some(MlSemanticSession::ChineseClipText)
+    );
+    assert_eq!(
+        request_session(&image),
+        Some(MlSemanticSession::ChineseClipImage)
+    );
+    let resident = [
+        MlSemanticSession::ChineseClipText,
+        MlSemanticSession::MinilmL12,
+    ];
+    assert!(resident.contains(&request_session(&text).unwrap()));
+    assert!(!resident.contains(&request_session(&image).unwrap()));
+}
+
+#[test]
+fn residency_responses_replace_evicted_sessions_and_accept_older_workers() {
+    let legacy: MlResponse = serde_json::from_value(serde_json::json!({
+        "status": "embedding_complete", "request_id": 1, "model": "chinese_clip",
+        "dimensions": 512, "vectors": [],
+        "timings": { "model_load_ms": 0, "preprocess_ms": 0, "inference_ms": 0,
+            "request_total_ms": 0, "cpu_ms": 0, "model_load_cpu_ms": 0 }
+    }))
+    .unwrap();
+    assert_eq!(
+        response_residency(&legacy, Some(MlSemanticSession::ChineseClipText)),
+        Some(vec![MlSemanticSession::ChineseClipText])
+    );
+
+    let response = MlResponse::Error {
+        request_id: 2,
+        kind: "model_missing".into(),
+        message: "load failed".into(),
+        resident_sessions: vec![MlSemanticSession::MinilmL12],
+    };
+    assert_eq!(
+        response_residency(&response, Some(MlSemanticSession::ChineseClipText)),
+        Some(vec![MlSemanticSession::MinilmL12])
+    );
+    assert_eq!(
+        response_residency(&MlResponse::Unloaded { request_id: 3 }, None),
+        Some(vec![])
+    );
 }
 
 #[tokio::test]

@@ -1,11 +1,12 @@
 //! Batch-capable ONNX semantic inference used only by the isolated ML worker.
 
 use crate::ml_protocol::{MlError, MlErrorKind};
-use crate::ml_protocol::{MlImageInput, MlProvider, MlSemanticModel};
+use crate::ml_protocol::{MlImageInput, MlProvider, MlSemanticModel, MlSemanticSession};
 use crate::semantic_cancellation::RequestControl;
 use crate::semantic_models::{
     resolve_semantic_model, ResolvedSemanticModel, SemanticPooling, SUPPORTED_SEMANTIC_MODELS,
 };
+use crate::semantic_session_cache::SessionCache;
 use image::RgbImage;
 use ort::{
     ep,
@@ -44,7 +45,7 @@ pub struct SemanticEngine {
     dml_device_id: i32,
     models_root: PathBuf,
     onnx_models_root: PathBuf,
-    loaded: Option<LoadedModel>,
+    sessions: SessionCache<LoadedModel>,
     request_control: Option<Arc<RequestControl>>,
 }
 
@@ -92,7 +93,7 @@ impl SemanticEngine {
             dml_device_id,
             models_root,
             onnx_models_root,
-            loaded: None,
+            sessions: SessionCache::default(),
             request_control: None,
         }
     }
@@ -110,11 +111,15 @@ impl SemanticEngine {
     }
 
     pub fn loaded_model(&self) -> Option<&ResolvedSemanticModel> {
-        self.loaded.as_ref().map(|loaded| &loaded.resolved)
+        self.sessions.active().map(|loaded| &loaded.resolved)
+    }
+
+    pub fn resident_sessions(&self) -> Vec<MlSemanticSession> {
+        self.sessions.resident_sessions()
     }
 
     pub fn unload(&mut self) {
-        self.loaded = None;
+        self.sessions.clear();
     }
 
     pub fn begin_request(&mut self, control: Arc<RequestControl>) {
@@ -149,8 +154,12 @@ impl SemanticEngine {
             ));
         }
         let options = self.run_options()?;
-        let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
-        let loaded = self.loaded.as_mut().expect("semantic model is loaded");
+        let (model_load_ms, model_load_cpu_ms) =
+            self.ensure_loaded(MlSemanticSession::for_text(model))?;
+        let loaded = self
+            .sessions
+            .active_mut()
+            .expect("semantic model is loaded");
 
         let preprocess_started = Instant::now();
         let tokens = tokenize_texts(&mut loaded.tokenizer, loaded.resolved.descriptor, texts)?;
@@ -187,8 +196,12 @@ impl SemanticEngine {
             ));
         }
         let options = self.run_options()?;
-        let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
-        let loaded = self.loaded.as_mut().expect("semantic model is loaded");
+        let (model_load_ms, model_load_cpu_ms) =
+            self.ensure_loaded(MlSemanticSession::ChineseClipImage)?;
+        let loaded = self
+            .sessions
+            .active_mut()
+            .expect("semantic model is loaded");
         let preprocessor = loaded.clip_preprocessor.clone().ok_or_else(|| {
             MlError::new(
                 MlErrorKind::ModelMismatch,
@@ -227,8 +240,12 @@ impl SemanticEngine {
             ));
         }
         let options = self.run_options()?;
-        let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
-        let loaded = self.loaded.as_mut().expect("semantic model is loaded");
+        let (model_load_ms, model_load_cpu_ms) =
+            self.ensure_loaded(MlSemanticSession::BgeRerankerV2M3)?;
+        let loaded = self
+            .sessions
+            .active_mut()
+            .expect("semantic model is loaded");
 
         let preprocess_started = Instant::now();
         let tokens = tokenize_pairs(
@@ -259,8 +276,11 @@ impl SemanticEngine {
         texts: &[String],
         text_pairs: Option<&[String]>,
     ) -> Result<SemanticTokenization, MlError> {
-        self.ensure_loaded(model)?;
-        let loaded = self.loaded.as_mut().expect("semantic model is loaded");
+        self.ensure_loaded(MlSemanticSession::for_text(model))?;
+        let loaded = self
+            .sessions
+            .active_mut()
+            .expect("semantic model is loaded");
         let tokens = match text_pairs {
             Some(pairs) => tokenize_pair_lists(
                 &mut loaded.tokenizer,
@@ -279,8 +299,9 @@ impl SemanticEngine {
         })
     }
 
-    fn ensure_loaded(&mut self, model: MlSemanticModel) -> Result<(f64, f64), MlError> {
+    fn ensure_loaded(&mut self, kind: MlSemanticSession) -> Result<(f64, f64), MlError> {
         self.check_request()?;
+        let model = kind.model();
         if !provider_supports_model(self.provider, model) {
             return Err(MlError::new(
                 MlErrorKind::ProviderUnavailable,
@@ -290,35 +311,42 @@ impl SemanticEngine {
                 ),
             ));
         }
-        if self
-            .loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded.resolved.descriptor.model == model)
-        {
+        if self.sessions.prepare(
+            kind,
+            Instant::now(),
+            crate::semantic_metrics::memory_pressure(),
+        ) {
             return Ok((0.0, 0.0));
         }
-
-        self.loaded = None;
         let started = Instant::now();
         let cpu_started = crate::semantic_metrics::cpu_ms();
-        let resolved = resolve_semantic_model(model, &self.models_root, &self.onnx_models_root)?;
+        let mut resolved =
+            resolve_semantic_model(model, &self.models_root, &self.onnx_models_root)?;
         self.check_request()?;
+        if kind == MlSemanticSession::ChineseClipText {
+            resolved.model_path = crate::clip_text_model::prepare(&resolved)?;
+            self.check_request()?;
+        }
         let tokenizer = load_tokenizer(&resolved)?;
         self.check_request()?;
-        let clip_preprocessor = resolved
-            .preprocessor_path
-            .as_deref()
+        let clip_preprocessor = (kind == MlSemanticSession::ChineseClipImage)
+            .then_some(resolved.preprocessor_path.as_deref())
+            .flatten()
             .map(load_clip_preprocessor)
             .transpose()?;
         let session = load_session(&resolved, self.provider, self.dml_device_id)?;
         self.check_request()?;
-        validate_session_layout(&session, &resolved)?;
-        self.loaded = Some(LoadedModel {
-            resolved,
-            tokenizer,
-            session,
-            clip_preprocessor,
-        });
+        validate_session_layout(&session, &resolved, kind)?;
+        self.sessions.insert(
+            kind,
+            LoadedModel {
+                resolved,
+                tokenizer,
+                session,
+                clip_preprocessor,
+            },
+            Instant::now(),
+        );
         Ok((
             elapsed_ms(started),
             crate::semantic_metrics::cpu_ms() - cpu_started,
@@ -664,15 +692,19 @@ fn load_session(
 fn validate_session_layout(
     session: &Session,
     resolved: &ResolvedSemanticModel,
+    kind: MlSemanticSession,
 ) -> Result<(), MlError> {
     let mut actual_inputs = session
         .inputs()
         .iter()
         .map(|outlet| outlet.name().to_string())
         .collect::<Vec<_>>();
-    let mut expected_inputs = resolved
-        .descriptor
-        .input_names
+    let input_names: &[&str] = if kind == MlSemanticSession::ChineseClipText {
+        &["input_ids", "attention_mask"]
+    } else {
+        resolved.descriptor.input_names
+    };
+    let mut expected_inputs = input_names
         .iter()
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
@@ -693,7 +725,12 @@ fn validate_session_layout(
         .iter()
         .map(|outlet| outlet.name().to_string())
         .collect::<Vec<_>>();
-    for expected in resolved.descriptor.output_names {
+    let output_names: &[&str] = if kind == MlSemanticSession::ChineseClipText {
+        &["text_embeds"]
+    } else {
+        resolved.descriptor.output_names
+    };
+    for expected in output_names {
         if !actual_outputs.iter().any(|actual| actual == expected) {
             return Err(MlError::new(
                 MlErrorKind::ModelMismatch,
@@ -811,12 +848,6 @@ fn run_clip_text(
     tokens: &TokenizedBatch,
     options: &RunOptions,
 ) -> Result<Vec<Vec<f32>>, MlError> {
-    let preprocessor = loaded.clip_preprocessor.as_ref().ok_or_else(|| {
-        MlError::new(
-            MlErrorKind::ModelMismatch,
-            "CLIP preprocessor is unavailable",
-        )
-    })?;
     let input_ids = Tensor::from_array(([tokens.batch, tokens.sequence], tokens.input_ids.clone()))
         .map_err(|error| {
             MlError::new(
@@ -834,28 +865,12 @@ fn run_clip_text(
             format!("failed to build CLIP attention_mask: {error}"),
         )
     })?;
-    let pixels = Tensor::from_array((
-        [
-            tokens.batch,
-            3,
-            preprocessor.height as usize,
-            preprocessor.width as usize,
-        ],
-        vec![0f32; tokens.batch * 3 * preprocessor.height as usize * preprocessor.width as usize],
-    ))
-    .map_err(|error| {
-        MlError::new(
-            MlErrorKind::Inference,
-            format!("failed to build CLIP placeholder pixels: {error}"),
-        )
-    })?;
     let outputs = loaded
         .session
         .run_with_options(
             ort::inputs![
                 "attention_mask" => attention_mask,
                 "input_ids" => input_ids,
-                "pixel_values" => pixels,
             ],
             options,
         )

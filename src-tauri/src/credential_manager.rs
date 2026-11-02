@@ -9,6 +9,9 @@
 //! `NCRYPT_UI_POLICY` to high protection, exports only the public blob for writes, and
 //! keeps decrypted master-key material in the bounded authenticated session cache.
 
+use crate::credential_contract::{
+    CNG_KEY_NAME, CNG_PROVIDER_NAME, MASTER_KEY_FILE_MAGIC, PUBLIC_KEY_FILE_NAME,
+};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -50,13 +53,8 @@ pub enum CredentialError {
 /// Default authenticated-session timeout in seconds.
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 15 * 60; // 15 分钟
 const BACKGROUND_PROCESSING_ENABLED_KEY: &str = "background_processing_enabled";
-pub(crate) const MASTER_KEY_FILE_NAME: &str = "credential_master_key.bin";
+pub(crate) use crate::credential_contract::MASTER_KEY_FILE_NAME;
 const MASTER_KEY_LEN: usize = 32;
-const MASTER_KEY_FILE_MAGIC: &[u8; 5] = b"CPMK3"; // 版本升级
-                                                  // Development and installed builds deliberately reuse the user's persisted key.
-const CNG_KEY_NAME: &str = "CarbonPaperMasterKeyV3";
-// The Software KSP supports RSA encryption and protected UI policy.
-const CNG_PROVIDER_NAME: &str = "Microsoft Software Key Storage Provider";
 
 /// Keep the exact private-key handle used for verification. Opening another
 /// handle is not a proof that it can decrypt silently, even in the same process.
@@ -646,10 +644,7 @@ pub fn derive_hmac_key_from_master(master_key: &[u8]) -> Vec<u8> {
 
 /// Derives the intentionally weak bootstrap database key from public material.
 pub fn derive_db_key_from_public_key(public_key: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(public_key);
-    hasher.update(b"CarbonPaper-Weak-DB-Key-v1");
-    hasher.finalize().to_vec()
+    crate::credential_contract::weak_database_key(public_key).to_vec()
 }
 
 /// Formats a database key as a SQLCipher hexadecimal key literal.
@@ -1687,7 +1682,7 @@ pub fn load_public_key_from_file(
         return Ok(key);
     }
 
-    let key_file = state.file_path("credential_public_key.bin");
+    let key_file = state.file_path(PUBLIC_KEY_FILE_NAME);
     if !key_file.exists() {
         return Err(CredentialError::KeyNotFound);
     }
@@ -1711,7 +1706,7 @@ pub fn save_public_key_to_file(
     state: &CredentialManagerState,
     public_key: &[u8],
 ) -> Result<(), CredentialError> {
-    let key_file = state.file_path("credential_public_key.bin");
+    let key_file = state.file_path(PUBLIC_KEY_FILE_NAME);
 
     // Create the parent directory before atomically writing the public key.
     if let Some(parent) = key_file.parent() {
@@ -2004,6 +1999,18 @@ mod tests {
             .unwrap();
         assert_eq!(content.len(), 64);
         assert_eq!(hex::decode(content).unwrap(), first);
+        let public = b"synthetic-public-key-blob";
+        let mut legacy = Sha256::new();
+        legacy.update(public);
+        legacy.update(b"CarbonPaper-Weak-DB-Key-v1");
+        assert_eq!(
+            derive_db_key_from_public_key(public),
+            legacy.finalize().to_vec()
+        );
+        assert_ne!(
+            derive_db_key_from_public_key(public),
+            derive_db_key_from_master(public)
+        );
     }
 
     #[test]

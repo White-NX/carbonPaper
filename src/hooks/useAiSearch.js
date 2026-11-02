@@ -10,7 +10,7 @@ let nextRequest = 0;
  * (the default service is remote and the user has not yet agreed to send
  * screenshot text to it). `steps` lists tool calls in the order they ran.
  */
-export function useAiSearch({ active }) {
+export function useAiSearch({ active, isAuthenticated = true }) {
   const [settings, setSettings] = useState(null);
   const [status, setStatus] = useState('idle');
   const [question, setQuestion] = useState('');
@@ -24,13 +24,23 @@ export function useAiSearch({ active }) {
   const [error, setError] = useState(null);
   const requestRef = useRef(null);
   const pendingQuestion = useRef('');
+  const authenticated = useRef(isAuthenticated);
+  authenticated.current = isAuthenticated;
+  const settingsRevision = useRef(0);
 
   const reloadSettings = useCallback(async () => {
-    try { setSettings(await getAiSettings()); } catch { setSettings({ providers: [] }); }
+    if (!authenticated.current) return;
+    const revision = ++settingsRevision.current;
+    try {
+      const next = await getAiSettings();
+      if (authenticated.current && settingsRevision.current === revision) setSettings(next);
+    } catch {
+      if (authenticated.current && settingsRevision.current === revision) setSettings({ providers: [] });
+    }
   }, []);
 
   // Settings can change in the settings window, so re-read on every visit.
-  useEffect(() => { if (active) reloadSettings(); }, [active, reloadSettings]);
+  useEffect(() => { if (active && isAuthenticated) reloadSettings(); }, [active, isAuthenticated, reloadSettings]);
 
   const provider = settings?.providers?.find((p) => p.id === settings.default_provider_id) ?? null;
 
@@ -67,7 +77,7 @@ export function useAiSearch({ active }) {
 
   const start = useCallback(async (text) => {
     const trimmed = text.trim();
-    if (!trimmed || requestRef.current) return;
+    if (!active || !authenticated.current || !trimmed || requestRef.current) return;
     const requestId = `ai-${Date.now()}-${++nextRequest}`;
     const startedAt = performance.now();
     requestRef.current = requestId;
@@ -120,14 +130,18 @@ export function useAiSearch({ active }) {
         requestRef.current = null;
       }
     }
-  }, [handleEvent, status, question, answer, steps, rounds, outcome, error, turns, elapsedMs, provider?.id]);
+  }, [active, handleEvent, status, question, answer, steps, rounds, outcome, error, turns, elapsedMs, provider?.id]);
 
-  const reset = useCallback(() => {
-    if (requestRef.current) return;
+  const clearConversation = useCallback(() => {
+    pendingQuestion.current = '';
+    roundRef.current = 0;
     setTurns([]); setRounds([]); setQuestion(''); setAnswer('');
     setSteps([]); setOutcome(null); setError(null); setStatus('idle');
     setElapsedMs(null);
   }, []);
+  const reset = useCallback(() => {
+    if (!requestRef.current) clearConversation();
+  }, [clearConversation]);
 
   const cancel = useCallback(() => {
     const requestId = requestRef.current;
@@ -135,9 +149,13 @@ export function useAiSearch({ active }) {
   }, []);
 
   const acceptConsent = useCallback(async () => {
+    if (!authenticated.current) return;
     try {
-      setSettings(await grantAiRemoteConsent());
+      const next = await grantAiRemoteConsent();
+      if (!authenticated.current) return;
+      setSettings(next);
     } catch (err) {
+      if (!authenticated.current) return;
       setError(err);
       setStatus('error');
       return;
@@ -147,9 +165,24 @@ export function useAiSearch({ active }) {
 
   const declineConsent = useCallback(() => setStatus('idle'), []);
 
+  // Revocation clears both the visible conversation and any response still in flight.
+  useEffect(() => {
+    if (isAuthenticated) return;
+    const requestId = requestRef.current;
+    requestRef.current = null;
+    settingsRevision.current += 1;
+    if (requestId) cancelAiSearch(requestId).catch(() => {});
+    clearConversation();
+    setSettings(null);
+  }, [isAuthenticated, clearConversation]);
+
+  useEffect(() => { if (!active) cancel(); }, [active, cancel]);
+
   // Leaving the page stops the run instead of letting it spend tokens unseen.
   useEffect(() => () => {
     const requestId = requestRef.current;
+    requestRef.current = null;
+    settingsRevision.current += 1;
     if (requestId) cancelAiSearch(requestId).catch(() => {});
   }, []);
 

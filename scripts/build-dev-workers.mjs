@@ -96,6 +96,8 @@ function semanticInputFiles() {
     path.join(tauriDir, 'src', 'ml_protocol.rs'),
     path.join(tauriDir, 'src', 'clip_preprocess.rs'),
     path.join(tauriDir, 'src', 'semantic_engine.rs'),
+    path.join(tauriDir, 'src', 'clip_text_model.rs'),
+    path.join(tauriDir, 'src', 'semantic_session_cache.rs'),
     path.join(tauriDir, 'src', 'semantic_cancellation.rs'),
     path.join(tauriDir, 'src', 'semantic_metrics.rs'),
     path.join(tauriDir, 'src', 'semantic_models.rs'),

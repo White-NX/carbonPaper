@@ -146,6 +146,37 @@ pub enum MlSemanticModel {
     BgeRerankerV2M3,
 }
 
+/// A model's executable branch. CLIP text queries never reuse image sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MlSemanticSession {
+    ChineseClipText,
+    ChineseClipImage,
+    MinilmL12,
+    BgeSmallZh,
+    BgeRerankerV2M3,
+}
+
+impl MlSemanticSession {
+    pub fn for_text(model: MlSemanticModel) -> Self {
+        match model {
+            MlSemanticModel::ChineseClip => Self::ChineseClipText,
+            MlSemanticModel::MinilmL12 => Self::MinilmL12,
+            MlSemanticModel::BgeSmallZh => Self::BgeSmallZh,
+            MlSemanticModel::BgeRerankerV2M3 => Self::BgeRerankerV2M3,
+        }
+    }
+
+    pub fn model(self) -> MlSemanticModel {
+        match self {
+            Self::ChineseClipText | Self::ChineseClipImage => MlSemanticModel::ChineseClip,
+            Self::MinilmL12 => MlSemanticModel::MinilmL12,
+            Self::BgeSmallZh => MlSemanticModel::BgeSmallZh,
+            Self::BgeRerankerV2M3 => MlSemanticModel::BgeRerankerV2M3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MlImageInput {
     pub width: u32,
@@ -285,6 +316,8 @@ pub enum MlResponse {
         dimensions: usize,
         vectors: Vec<Vec<f32>>,
         timings: MlSemanticTimings,
+        #[serde(default)]
+        resident_sessions: Vec<MlSemanticSession>,
     },
     TokenizationComplete {
         request_id: u64,
@@ -294,12 +327,16 @@ pub enum MlResponse {
         input_ids: Vec<i64>,
         attention_mask: Vec<i64>,
         token_type_ids: Vec<i64>,
+        #[serde(default)]
+        resident_sessions: Vec<MlSemanticSession>,
     },
     RerankComplete {
         request_id: u64,
         model: MlSemanticModel,
         scores: Vec<f32>,
         timings: MlSemanticTimings,
+        #[serde(default)]
+        resident_sessions: Vec<MlSemanticSession>,
     },
     SemanticStatus {
         request_id: u64,
@@ -308,6 +345,8 @@ pub enum MlResponse {
         model_id: Option<String>,
         model_revision: Option<String>,
         model_fingerprint: Option<String>,
+        #[serde(default)]
+        resident_sessions: Vec<MlSemanticSession>,
     },
     Unloaded {
         request_id: u64,
@@ -316,6 +355,8 @@ pub enum MlResponse {
         request_id: u64,
         kind: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resident_sessions: Vec<MlSemanticSession>,
     },
     ShuttingDown {
         request_id: u64,

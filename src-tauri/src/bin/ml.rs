@@ -210,6 +210,7 @@ fn run() -> Result<(), String> {
                                 request_id,
                                 kind: kind.to_string(),
                                 message: error.to_string(),
+                                resident_sessions: vec![],
                             },
                         )?;
                     }
@@ -222,6 +223,7 @@ fn run() -> Result<(), String> {
                         request_id: other.request_id(),
                         kind: "invalid_request".to_string(),
                         message: "semantic request was sent to the OCR worker".to_string(),
+                        resident_sessions: vec![],
                     },
                 )?;
             }
