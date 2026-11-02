@@ -29,19 +29,21 @@ describe('visual search controller', () => {
       Array.from({ length: 10 }, (_, index) => index + 1), { signal: expect.any(AbortSignal) }));
   });
 
-  it('adds ten more results per capsule action while retaining shared filters', async () => {
+  it('expands the summary by ten only once while retaining shared filters', async () => {
     searchScreenshots.mockImplementation(async (_query, _mode, options) => page(options.offset));
     const options = { ...props(), categories: ['development'], processNames: ['code.exe'], startTime: 100, endTime: 200 };
     const { result } = renderHook(useVisualSearchController, { initialProps: options });
     await waitFor(() => expect(result.current.summaryResults).toHaveLength(10));
+    expect(result.current.summaryExpanded).toBe(false);
     act(() => result.current.showMore());
     await waitFor(() => expect(result.current.summaryResults).toHaveLength(20));
+    expect(result.current.summaryExpanded).toBe(true);
     expect(searchScreenshots).toHaveBeenLastCalledWith('moon', 'nl', expect.objectContaining({
       offset: 10, limit: 10, categories: ['development'], processNames: ['code.exe'], startTime: 100, endTime: 200,
     }));
     act(() => result.current.showMore());
-    await waitFor(() => expect(result.current.summaryResults).toHaveLength(30));
-    expect(searchScreenshots.mock.calls.map(([, , options]) => options.offset)).toEqual([0, 10, 20]);
+    expect(result.current.summaryResults).toHaveLength(20);
+    expect(searchScreenshots.mock.calls.map(([, , options]) => options.offset)).toEqual([0, 10]);
   });
 
   it('keeps gallery paging separate from the summary and reuses its cached pages', async () => {
@@ -55,7 +57,7 @@ describe('visual search controller', () => {
     act(() => result.current.showMore());
     expect(result.current.summaryResults).toHaveLength(20);
     act(() => result.current.showMore());
-    expect(result.current.summaryResults).toHaveLength(30);
+    expect(result.current.summaryResults).toHaveLength(20);
     expect(searchScreenshots).toHaveBeenCalledTimes(3);
   });
 
@@ -120,7 +122,7 @@ describe('visual search controller', () => {
     expect(result.current.summaryResults).toHaveLength(11);
   });
 
-  it('shows cached pictures before exposing a gallery page error and reveals the next ten on retry', async () => {
+  it('reuses cached pictures and retries a page error without expanding beyond twenty', async () => {
     searchScreenshots.mockResolvedValueOnce(page()).mockResolvedValueOnce(page(10))
       .mockRejectedValueOnce(new Error('gallery page failed')).mockResolvedValueOnce(page(20));
     const { result } = renderHook(useVisualSearchController, { initialProps: props() });
@@ -134,7 +136,8 @@ describe('visual search controller', () => {
     expect(searchScreenshots).toHaveBeenCalledTimes(3);
     expect(result.current.summaryPageError).toBe(true);
     act(() => result.current.showMore());
-    await waitFor(() => expect(result.current.summaryResults).toHaveLength(30));
+    await waitFor(() => expect(result.current.results).toHaveLength(30));
+    expect(result.current.summaryResults).toHaveLength(20);
     expect(result.current.summaryPageError).toBe(false);
     expect(searchScreenshots.mock.calls.map(([, , options]) => options.offset)).toEqual([0, 10, 20, 20]);
   });
@@ -187,18 +190,26 @@ describe('visual search controller', () => {
     act(() => result.current.showMore());
     await waitFor(() => expect(result.current.pageError).toBe(true));
     expect(result.current.summaryResults).toHaveLength(10);
+    expect(result.current.summaryExpanded).toBe(true);
+    expect(result.current.pageErrorMessage).toBe('temporary failure');
     act(() => result.current.retry());
     await waitFor(() => expect(result.current.summaryResults).toHaveLength(11));
+    expect(result.current.pageError).toBe(false);
+    expect(result.current.pageErrorMessage).toBeNull();
     expect(searchScreenshots.mock.calls.map(([, , options]) => options.offset)).toEqual([0, 10, 10]);
   });
 
   it('resets the summary to ten on a new query and discards a pending gallery page', async () => {
     let finishPage;
-    searchScreenshots.mockResolvedValueOnce(page()).mockImplementationOnce(() => new Promise(resolve => { finishPage = resolve; }))
+    searchScreenshots.mockResolvedValueOnce(page()).mockResolvedValueOnce(page(10))
+      .mockImplementationOnce(() => new Promise(resolve => { finishPage = resolve; }))
       .mockResolvedValueOnce(page(100));
     const initial = props();
     const { result, rerender } = renderHook(useVisualSearchController, { initialProps: initial });
     await waitFor(() => expect(result.current.results).toHaveLength(10));
+    act(() => result.current.showMore());
+    await waitFor(() => expect(result.current.summaryResults).toHaveLength(20));
+    expect(result.current.summaryExpanded).toBe(true);
     act(() => { void result.current.loadGalleryPage(); });
     await waitFor(() => expect(finishPage).toEqual(expect.any(Function)));
     rerender({ ...initial, query: 'sun', debouncedQuery: 'sun' });
@@ -206,6 +217,7 @@ describe('visual search controller', () => {
     await act(async () => finishPage(page(10)));
     await waitFor(() => expect(result.current.results[0]?.screenshot_id).toBe(101));
     expect(result.current.summaryResults).toHaveLength(10);
+    expect(result.current.summaryExpanded).toBe(false);
     expect(result.current.results.map(item => item.screenshot_id)).not.toContain(11);
   });
 

@@ -8,7 +8,7 @@ const EMPTY_RESULTS = [];
 const EMPTY_THUMBNAILS = {};
 const emptyState = (key, phase = 'idle') => ({ key, phase, results: EMPTY_RESULTS,
   thumbnails: EMPTY_THUMBNAILS, offset: 0, summaryCount: VISUAL_SEARCH_SUMMARY_SIZE,
-  hasMore: false, loadingMore: false, pageError: false });
+  hasMore: false, loadingMore: false, pageError: false, pageErrorMessage: null });
 
 function normalizeResult(item) {
   const metadata = item.metadata || {};
@@ -65,7 +65,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
     const offset = restart ? 0 : current.offset;
     const pageKey = `${key}:${offset}:${limit}`;
     pageRequest.current = pageKey;
-    setState((previous) => ({ ...previous, loadingMore: true, pageError: false }));
+    setState((previous) => ({ ...previous, loadingMore: true, pageError: false, pageErrorMessage: null }));
     try {
       const items = await queue.run(pageKey, (signal) => searchScreenshots(normalized, 'nl', {
         limit, offset, processNames, categories, startTime, endTime,
@@ -83,7 +83,8 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
       });
     } catch (error) {
       if (generation.current === version && error?.name !== 'AbortError') {
-        setState((previous) => ({ ...previous, loadingMore: false, pageError: true }));
+        setState((previous) => ({ ...previous, loadingMore: false, pageError: true,
+          pageErrorMessage: error?.message || String(error) }));
       }
     } finally {
       if (pageRequest.current === pageKey) pageRequest.current = null;
@@ -97,16 +98,17 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
   const loadGalleryPage = useCallback(() => loadPage(VISUAL_SEARCH_PAGE_SIZE, current.offset < VISUAL_SEARCH_PAGE_SIZE),
     [loadPage, current.offset]);
   const galleryReady = current.offset >= VISUAL_SEARCH_PAGE_SIZE || !current.hasMore;
+  const summaryPageError = current.pageError && current.results.length <= current.summaryCount;
 
   const showMore = useCallback(() => {
     if (!ready || current.phase !== 'ready' || current.loadingMore || pageRequest.current) return;
-    const nextCount = current.summaryCount > current.results.length
-      ? current.summaryCount : current.summaryCount + VISUAL_SEARCH_SUMMARY_SIZE;
+    const nextCount = VISUAL_SEARCH_SUMMARY_SIZE * 2;
+    if (current.summaryCount >= nextCount && !summaryPageError) return;
     if (current.results.length <= current.summaryCount && !current.hasMore) return;
     setState((previous) => ({ ...previous, summaryCount: nextCount }));
-    if (current.results.length < nextCount) void loadMore();
+    if (current.results.length < nextCount || summaryPageError) void loadMore();
   }, [ready, current.phase, current.loadingMore, current.summaryCount, current.results.length,
-    current.hasMore, loadMore]);
+    current.hasMore, summaryPageError, loadMore]);
 
   useEffect(() => {
     if (!ready || current.results.length === 0) return undefined;
@@ -131,6 +133,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
   const thumbnails = useMemo(() => ready ? { ...sharedThumbnails, ...current.thumbnails } : EMPTY_THUMBNAILS,
     [ready, sharedThumbnails, current.thumbnails]);
   return { ...current, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
+    summaryExpanded: current.summaryCount > VISUAL_SEARCH_SUMMARY_SIZE,
     summaryHasMore: current.results.length > current.summaryCount || current.hasMore,
-    summaryPageError: current.pageError && current.results.length <= current.summaryCount, showMore, loadMore, retry };
+    summaryPageError, showMore, loadMore, retry };
 }

@@ -1618,7 +1618,6 @@
       "open": "View all visual results",
       "back": "Back to unified search",
       "hint": "Find screenshots by their visual content",
-      "loading": "Finding related screenshots…",
       "unavailable": "Visual search is unavailable",
       "empty": "No matching screenshots",
       "expand": "Expand",
@@ -1631,6 +1630,7 @@
       "count_more_one": "{{count}}+ images",
       "count_more_other": "{{count}}+ images",
       "more": "Show {{count}} more",
+      "view_more": "View more",
       "retry": "Retry",
       "retry_hint": "Unable to search visual content right now. Please try again.",
       "empty_hint": "Try a more specific scene description or adjust your filters.",
@@ -2060,13 +2060,36 @@
       "accept": "Allow and continue"
     },
     "landing": {
-      "title": "What would you like to find?",
-      "using": "Using {{name}}",
-      "examples": [
-        "What was I doing yesterday afternoon?",
-        "Which articles about async Rust did I read recently?",
-        "When did I last see that error message?"
-      ]
+      "title": "Start with a question",
+      "description": "Find answers in your screenshots and daily recaps.",
+      "placeholder": "What would you like to find?",
+      "preparing": "Preparing AI search…",
+      "cards": {
+        "day": {
+          "label": "Daily recap",
+          "title": "What was I doing yesterday?",
+          "description": "Piece together your day",
+          "question": "What was I doing yesterday?"
+        },
+        "reading": {
+          "label": "Things you read",
+          "title": "That article…\nWhere did I read it?",
+          "description": "Find clues in pages and screenshots",
+          "question": "Where did I read that article?"
+        },
+        "discussion": {
+          "label": "Past discussions",
+          "title": "How did we solve\nthat problem last week?",
+          "description": "Pick up the discussion and find the conclusion",
+          "question": "How did we solve that problem last week?"
+        },
+        "project": {
+          "label": "Work progress",
+          "title": "What have I done\nfor this project lately?",
+          "description": "Connect your work and review progress",
+          "question": "What have I done for this project lately?"
+        }
+      }
     },
     "reasoning": "Thinking",
     "followUp": "Ask a follow-up…",

@@ -12,7 +12,7 @@ vi.mock('../../lib/preference_store', () => ({ usePreference: () => 'preview' })
 const screenshot = { id: 42, screenshot_id: 42, image_path: 'memory://42', process_name: 'code.exe' };
 const controller = (overrides = {}) => ({ phase: 'ready', results: [screenshot], summaryResults: [screenshot],
   thumbnails: { 42: 'data:image/png;base64,preview' }, hasMore: false, summaryHasMore: false,
-  loadingMore: false, pageError: false, summaryPageError: false,
+  summaryExpanded: false, loadingMore: false, pageError: false, pageErrorMessage: null, summaryPageError: false,
   galleryReady: true, retry: vi.fn(), loadMore: vi.fn(), loadGalleryPage: vi.fn(), showMore: vi.fn(), ...overrides });
 
 afterEach(() => vi.unstubAllGlobals());
@@ -46,10 +46,11 @@ describe('visual search results', () => {
     expect(fetchThumbnail).not.toHaveBeenCalled();
   });
 
-  it('shows only the summary results and keeps the capsule as a paging action', () => {
+  it('expands the summary once and changes the capsule into a gallery action', () => {
     const results = Array.from({ length: 30 }, (_, index) => ({ ...screenshot, id: index + 1, screenshot_id: index + 1 }));
     const state = controller({ results, summaryResults: results.slice(0, 10), summaryHasMore: true });
-    const { rerender } = render(<VisualSearchCard controller={state} />);
+    const onOpenGallery = vi.fn();
+    const { rerender } = render(<VisualSearchCard controller={state} onOpenGallery={onOpenGallery} />);
     const region = screen.getByRole('region');
     expect(within(region).getAllByRole('button')).toHaveLength(11);
     const more = screen.getByRole('button', { name: 'advancedSearch.visual.more' });
@@ -57,8 +58,13 @@ describe('visual search results', () => {
     fireEvent.click(more);
     expect(state.showMore).toHaveBeenCalledOnce();
     expect(state.loadMore).not.toHaveBeenCalled();
-    rerender(<VisualSearchCard controller={{ ...state, summaryResults: results.slice(0, 20) }} />);
+    rerender(<VisualSearchCard controller={{ ...state, summaryResults: results.slice(0, 20),
+      summaryExpanded: true, summaryHasMore: false }} onOpenGallery={onOpenGallery} />);
     expect(within(region).getAllByRole('button')).toHaveLength(21);
+    expect(screen.queryByRole('button', { name: 'advancedSearch.visual.more' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.view_more' }));
+    expect(onOpenGallery).toHaveBeenCalledOnce();
+    expect(state.showMore).toHaveBeenCalledOnce();
   });
 
   it('aborts an original read when results are cleared and discards its late result', async () => {
@@ -80,7 +86,10 @@ describe('visual search results', () => {
     expect(screen.queryByText('advancedSearch.visual.page_error')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.more' }));
     expect(state.showMore).toHaveBeenCalledOnce();
-    rerender(<VisualSearchCard controller={{ ...state, summaryPageError: true }} />);
+    rerender(<VisualSearchCard controller={{ ...state, summaryExpanded: true, summaryPageError: true,
+      pageErrorMessage: 'temporary failure' }} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('advancedSearch.visual.page_error');
+    expect(screen.getByRole('alert')).toHaveTextContent('temporary failure');
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.retry' }));
     expect(state.showMore).toHaveBeenCalledTimes(2);
     expect(state.retry).not.toHaveBeenCalled();

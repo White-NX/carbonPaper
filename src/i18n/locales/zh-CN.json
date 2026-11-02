@@ -1618,7 +1618,6 @@
       "open": "查看全部画面",
       "back": "返回综合搜索",
       "hint": "按画面内容查找相关快照",
-      "loading": "正在查找相关画面…",
       "unavailable": "暂时无法查找画面",
       "empty": "没有找到相关画面",
       "expand": "展开",
@@ -1631,6 +1630,7 @@
       "count_more_one": "{{count}}+ 张",
       "count_more_other": "{{count}}+ 张",
       "more": "再显示 {{count}} 张",
+      "view_more": "查看更多",
       "retry": "重试",
       "retry_hint": "暂时无法查找画面，请稍后重试。",
       "empty_hint": "试试更具体的画面描述，或调整筛选条件。",
@@ -2060,12 +2060,36 @@
       "accept": "允许并继续"
     },
     "landing": {
-      "title": "描述你想找回的内容",
-      "using": "正在使用 {{name}}",
-      "examples": [
-        "我昨天下午在做什么？",
-        "最近看过的关于写作的文章有哪些？"
-      ]
+      "title": "从一个问题开始",
+      "description": "从你的截图和每日回顾里，找回答案。",
+      "placeholder": "想找什么，直接问…",
+      "preparing": "正在准备 AI 搜索…",
+      "cards": {
+        "day": {
+          "label": "每日回顾",
+          "title": "我昨天在干什么？",
+          "description": "串起一天的记录",
+          "question": "我昨天在干什么？"
+        },
+        "reading": {
+          "label": "看过的内容",
+          "title": "那篇文章，\n我在哪里看过？",
+          "description": "找回网页与截图里的线索",
+          "question": "那篇文章，我在哪里看过？"
+        },
+        "discussion": {
+          "label": "之前的讨论",
+          "title": "上周那个问题，\n我们怎么解决的？",
+          "description": "接着当时的讨论，找回结论",
+          "question": "上周那个问题，我们怎么解决的？"
+        },
+        "project": {
+          "label": "工作进展",
+          "title": "这几天，\n我为项目做了什么？",
+          "description": "串起相关工作，理清进展",
+          "question": "这几天，我为这个项目做了什么？"
+        }
+      }
     },
     "reasoning": "思考过程",
     "followUp": "追问……",

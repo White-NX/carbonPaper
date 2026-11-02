@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useRef } from 'react';
-import { ArrowLeft, ChevronDown, ChevronRight, Image as ImageIcon, Loader2, RefreshCw } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ChevronRight, Image as ImageIcon, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { VISUAL_SEARCH_PAGE_SIZE, VISUAL_SEARCH_SUMMARY_SIZE } from '../../hooks/useVisualSearchController';
 import { ThumbnailCard } from '../ThumbnailCard';
@@ -11,12 +11,13 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
   const { t, i18n } = useTranslation();
   const regionId = useId();
   const sentinelRef = useRef(null);
-  const { phase, results, summaryResults, hasMore, summaryHasMore,
-    loadingMore, pageError, summaryPageError, retry, loadGalleryPage, galleryReady, showMore } = controller;
+  const { phase, results, summaryResults, summaryExpanded, hasMore, summaryHasMore,
+    loadingMore, pageError, pageErrorMessage, summaryPageError, retry, loadGalleryPage, galleryReady, showMore } = controller;
   const waiting = phase === 'loading' || phase === 'idle';
   const visibleResults = fullPage ? results : summaryResults;
-  const canShowMore = fullPage ? hasMore : summaryHasMore;
   const pagingError = fullPage ? pageError : summaryPageError;
+  const openMore = !fullPage && summaryExpanded && !pagingError;
+  const canShowMore = fullPage ? hasMore || pagingError : summaryHasMore || summaryExpanded || pagingError;
   const pageSize = fullPage ? VISUAL_SEARCH_PAGE_SIZE : VISUAL_SEARCH_SUMMARY_SIZE;
   const dateFormatter = useMemo(() => new Intl.DateTimeFormat(i18n?.language, {
     month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
@@ -65,17 +66,13 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
         )}
       </h2>
 
-      <div id={regionId} role="region" aria-label={t('advancedSearch.visual.results')}>
-        {waiting ? <>
-          <p role="status" className="mb-3 flex items-center gap-1.5 text-xs text-ide-muted">
-            <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
-            {t('advancedSearch.visual.loading')}
-          </p>
+      <div id={regionId} role="region" aria-label={t('advancedSearch.visual.results')} aria-busy={waiting || loadingMore}>
+        {waiting ? (
           <div className={`visual-search-grid ${fullPage ? 'visual-search-gallery-grid' : 'visual-search-summary-grid'} grid gap-3`} aria-hidden="true">
             {Array.from({ length: pageSize }, (_, index) => <div key={index}
               className="aspect-video animate-pulse rounded border border-ide-border bg-ide-panel motion-reduce:animate-none" />)}
           </div>
-        </> : phase === 'error' ? (
+        ) : phase === 'error' ? (
           <div className="flex flex-wrap items-center gap-3 py-2">
             <p role="status" className="text-xs leading-relaxed text-ide-muted">{t('advancedSearch.visual.retry_hint')}</p>
             <Button size="xs" icon={RefreshCw} onClick={retry}>{t('advancedSearch.visual.retry')}</Button>
@@ -109,14 +106,17 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
           </div>
         )}
 
-        {pagingError && <p role="status" className="mt-3 text-xs text-ide-muted">{t('advancedSearch.visual.page_error')}</p>}
+        {pagingError && <p role="alert" className="mt-3 break-words text-xs text-ide-error">
+          {t('advancedSearch.visual.page_error')}
+          {pageErrorMessage && <span className="mt-1 block">{pageErrorMessage}</span>}
+        </p>}
         {phase === 'ready' && canShowMore && (
           <div className="mt-4 flex items-center gap-3">
             <span className="min-w-0 flex-1 border-t border-ide-border" aria-hidden="true" />
-            <Button size="xs" loading={loadingMore} icon={pagingError ? RefreshCw : ChevronDown}
-              onClick={fullPage ? loadGalleryPage : showMore} className="rounded-full px-4 py-1.5"
-              aria-controls={regionId}>
-              {t(pagingError ? 'advancedSearch.visual.retry' : 'advancedSearch.visual.more', { count: pageSize })}
+            <Button size="xs" loading={loadingMore} icon={pagingError ? RefreshCw : openMore ? ChevronRight : ChevronDown}
+              onClick={fullPage ? loadGalleryPage : openMore ? onOpenGallery : showMore} className="rounded-full px-4 py-1.5"
+              aria-controls={openMore ? undefined : regionId}>
+              {t(pagingError ? 'advancedSearch.visual.retry' : openMore ? 'advancedSearch.visual.view_more' : 'advancedSearch.visual.more', { count: pageSize })}
             </Button>
             <span className="min-w-0 flex-1 border-t border-ide-border" aria-hidden="true" />
           </div>

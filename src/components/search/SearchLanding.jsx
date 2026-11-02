@@ -57,9 +57,9 @@ export function SearchLanding({
   const totalCaptures = processes.reduce((sum, entry) => sum + (Number(entry.count) || 0), 0);
 
   return (
-    <div className="flex flex-1 flex-col gap-7 overflow-y-auto px-6 py-6 custom-scrollbar">
+    <div className="search-landing flex flex-1 flex-col gap-7 px-6 py-6">
       {recentQueries.length > 0 && (
-        <section className="flex flex-col gap-2.5">
+        <section className="search-landing-block flex flex-col gap-2.5" style={{ '--search-landing-order': 0 }}>
           <BlockHeading
             title={t('advancedSearch.landing.recent_queries')}
             action={(
@@ -84,7 +84,7 @@ export function SearchLanding({
       )}
 
       {topProcesses.length > 0 && (
-        <section className="flex flex-col gap-2.5">
+        <section className="search-landing-block flex flex-col gap-2.5" style={{ '--search-landing-order': 1 }}>
           <BlockHeading
             title={t('advancedSearch.landing.top_apps')}
           />
@@ -100,7 +100,7 @@ export function SearchLanding({
       )}
 
       {latest.length > 0 && (
-        <section className="flex flex-col gap-2.5">
+        <section className="search-landing-block flex flex-col gap-2.5" style={{ '--search-landing-order': 2 }}>
           <BlockHeading
             title={t('advancedSearch.landing.latest')}
             hint={totalCaptures > 0 ? t('advancedSearch.landing.latest_hint', { count: totalCaptures }) : null}
@@ -129,7 +129,7 @@ export function SearchLanding({
         </section>
       )}
 
-      <div className="mt-auto flex items-center gap-1.5 pt-4 text-[11px] text-ide-muted opacity-60">
+      <div className="search-landing-block mt-auto flex items-center gap-1.5 pt-4 text-[11px] text-ide-muted opacity-60" style={{ '--search-landing-order': 3 }}>
         <Lightbulb className="h-3 w-3" />
         {t('advancedSearch.search.did_you_know', { msg: eggMessage })}
       </div>

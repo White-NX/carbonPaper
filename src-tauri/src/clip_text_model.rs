@@ -207,7 +207,7 @@ fn encode_field(number: u32, value: &[u8], target: &mut Vec<u8>) {
     target.extend_from_slice(value);
 }
 
-fn extract_output(source: &[u8], output: &str) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn extract_output(source: &[u8], output: &str) -> Result<Vec<u8>, &'static str> {
     let model = fields(source)?;
     let graphs: Vec<_> = model.iter().filter(|field| field.number == 7).collect();
     if graphs.len() != 1 {

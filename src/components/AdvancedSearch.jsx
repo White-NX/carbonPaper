@@ -16,6 +16,9 @@ import { RecapSearchResultDetails, RecapSearchResultRow } from './search/RecapSe
 import { useRecapSourceAction } from './recap/RecapSources';
 import { VisualSearchCard } from './search/VisualSearchCard';
 import { useVisualSearchController } from '../hooks/useVisualSearchController';
+import { AiModeButton } from './search/AiModeButton';
+import { AiSearchLanding } from './search/AiSearchLanding';
+import { Button } from './ui/Button';
 
 export function AdvancedSearch({
   active,
@@ -28,9 +31,23 @@ export function AdvancedSearch({
 }) {
   const { t } = useTranslation();
   const [aiActive, setAiActive] = React.useState(false);
+  const [aiDraft, setAiDraft] = React.useState('');
+  const inputRef = React.useRef(null);
+  const [landingSnapshot, setLandingSnapshot] = React.useState(null);
+  const previousAiMode = React.useRef(false);
+  const aiMode = aiActive && isAuthenticated;
   React.useEffect(() => {
     setAiActive(false);
+    setAiDraft('');
+    setLandingSnapshot(null);
   }, [searchParams?.query, searchParams?.refreshKey]);
+  React.useEffect(() => {
+    if (!active || !isAuthenticated) {
+      setAiActive(false);
+      setAiDraft('');
+      setLandingSnapshot(null);
+    }
+  }, [active, isAuthenticated]);
   const {
     query,
     setQuery,
@@ -81,21 +98,33 @@ export function AdvancedSearch({
     visualEndTime,
     refreshKey,
   } = useAdvancedSearchController({
-    active: active && isAuthenticated && !aiActive,
+    active: active && isAuthenticated && !aiMode,
     searchParams,
     t,
   });
   const isMigrating = useHmacMigrationStatus();
-  const ai = useAiSearch({ active: active && isAuthenticated && aiActive });
+  const ai = useAiSearch({ active: active && isAuthenticated && aiMode, isAuthenticated });
+  const aiConversation = aiMode && ai.status !== 'idle';
+  const canAskAi = Boolean(ai.settings && ai.provider);
   const showVisual = isAuthenticated && Boolean(query.trim()) && searchTarget !== 'recaps' && !isMigrating;
   const visual = useVisualSearchController({
-    active: active && isAuthenticated && !aiActive && showVisual,
+    active: active && isAuthenticated && !aiMode && showVisual,
     query, debouncedQuery, processNames: selectedProcesses, categories: selectedCategories,
     startTime: visualStartTime, endTime: visualEndTime, refreshKey,
     sharedThumbnails: thumbnailCache,
   });
   const [gallerySearchKey, setGallerySearchKey] = React.useState(null);
   const visualGallery = showVisual && gallerySearchKey === visual.searchKey;
+  const showSearchControls = !aiMode && (Boolean(query.trim()) || hasFilters || searchTarget === 'recaps');
+  const showLandingStage = isAuthenticated && (aiMode || isLanding);
+  const landingThumbnails = React.useMemo(() => active && isAuthenticated
+    ? { ...landingSnapshot?.thumbnailCache, ...thumbnailCache } : {}, [active, isAuthenticated, landingSnapshot, thumbnailCache]);
+  React.useLayoutEffect(() => {
+    if (active && isAuthenticated && !aiConversation && (aiMode || previousAiMode.current)) {
+      inputRef.current?.focus({ preventScroll: true });
+    }
+    previousAiMode.current = aiMode;
+  }, [active, isAuthenticated, aiMode, aiConversation]);
   const scrollRef = React.useRef(null);
   const scrollPositions = React.useRef({ key: null, summary: 0, gallery: 0, wasGallery: false });
   React.useEffect(() => {
@@ -129,10 +158,21 @@ export function AdvancedSearch({
     if (visual.phase === 'ready' && hasVisualResults) rememberVisualQuery(debouncedQuery.trim());
   }, [visual.phase, visual.key, hasVisualResults, debouncedQuery, rememberVisualQuery]);
   const handleTabChange = (next) => {
+    if (next === 'ai' && !aiMode) {
+      // Hold the outgoing thumbnails while their retrieval controller pauses.
+      setLandingSnapshot(isLanding ? { recentQueries, processOptions, landingCaptures, thumbnailCache, rotatingMessage } : null);
+      if (!aiDraft.trim()) setAiDraft(query.trim());
+    }
     setGallerySearchKey(null);
     setAiActive(next === 'ai');
   };
-  const tabs = <SearchModeTabs mode={aiActive ? 'ai' : 'unified'} onChange={handleTabChange} />;
+  const tabs = <SearchModeTabs mode={aiMode ? 'ai' : 'unified'} onChange={handleTabChange} />;
+  const submitAi = (event) => {
+    event.preventDefault();
+    if (!active || !isAuthenticated || !canAskAi || ai.status !== 'idle' || !aiDraft.trim()) return;
+    void ai.start(aiDraft.trim());
+    setAiDraft('');
+  };
   const [hoveredMarkerIds, setHoveredMarkerIds] = React.useState([]);
   const [selectedRecap, setSelectedRecap] = React.useState(null);
   const currentRecap = selectedRecap && results.find((item) => item.kind === 'recap'
@@ -159,7 +199,7 @@ export function AdvancedSearch({
 
   React.useEffect(() => {
     const shouldShow = active
-      && isAuthenticated && !aiActive && !visualGallery
+      && isAuthenticated && !aiMode && !visualGallery
       && Boolean(query.trim())
       && !loading
       && !error
@@ -170,7 +210,7 @@ export function AdvancedSearch({
       hoveredIds: hoveredMarkerIds,
       fitKey: `ocr:${resultSetKey}`,
     } : null);
-  }, [active, isAuthenticated, aiActive, visualGallery, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
+  }, [active, isAuthenticated, aiMode, visualGallery, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
 
   React.useEffect(() => () => onTimelineSearchChange?.(null), [onTimelineSearchChange]);
 
@@ -201,7 +241,27 @@ export function AdvancedSearch({
     });
   } : undefined;
 
+  const renderLanding = () => {
+    const snapshot = aiMode ? landingSnapshot : null;
+    return <SearchLanding
+      recentQueries={snapshot?.recentQueries ?? recentQueries}
+      onUseQuery={applyRecentQuery}
+      onClearRecent={clearRecentQueries}
+      processes={snapshot?.processOptions ?? processOptions}
+      onUseProcess={applyProcessFilter}
+      latest={snapshot?.landingCaptures ?? landingCaptures}
+      thumbnailCache={landingThumbnails}
+      onSelectLatest={(item) => onSelectResult?.({
+        ...item,
+        id: item.screenshot_id || item.id,
+        path: item.image_path || item.metadata?.image_path || item.path,
+      })}
+      eggMessage={snapshot?.rotatingMessage ?? rotatingMessage}
+    />;
+  };
+
   const renderBody = () => {
+    if (!isAuthenticated) return null;
     if (loading) {
       return (
         <div className="flex items-center justify-center gap-2 py-16 text-ide-muted">
@@ -212,23 +272,7 @@ export function AdvancedSearch({
     }
 
     if (!hasResults) {
-      return isLanding ? (
-        <SearchLanding
-          recentQueries={recentQueries}
-          onUseQuery={applyRecentQuery}
-          onClearRecent={clearRecentQueries}
-          processes={processOptions}
-          onUseProcess={applyProcessFilter}
-          latest={landingCaptures}
-          thumbnailCache={thumbnailCache}
-          onSelectLatest={(item) => onSelectResult?.({
-            ...item,
-            id: item.screenshot_id || item.id,
-            path: item.image_path || item.metadata?.image_path || item.path,
-          })}
-          eggMessage={rotatingMessage}
-        />
-      ) : (
+      return (
         <SearchNoResults
           query={query.trim()}
           hasFilters={hasFilters}
@@ -262,7 +306,7 @@ export function AdvancedSearch({
 
   const pageClassName = `flex min-h-0 w-full flex-1 flex-col ${active ? 'opacity-100' : 'pointer-events-none opacity-0'} transition-opacity duration-200`;
 
-  if (aiActive) {
+  if (aiConversation) {
     return (
       <div className={pageClassName}>
         <AiSearchPanel controller={ai} tabs={tabs} onSelectResult={onSelectResult} header={PageHeader} />
@@ -292,10 +336,11 @@ export function AdvancedSearch({
 
       <PageHeader
         as="form"
-        onSubmit={handleSubmit}
-        bordered
-        flushBottom
-        secondaryRow={(
+        onSubmit={aiMode ? submitAi : handleSubmit}
+        bordered={showSearchControls}
+        flushBottom={showSearchControls}
+        className={showSearchControls ? '' : '!bg-ide-bg pt-8'}
+        secondaryRow={showSearchControls ? (
           <div className="flex w-full flex-wrap items-center gap-x-7 gap-y-2">
             {tabs}
 
@@ -334,39 +379,58 @@ export function AdvancedSearch({
               )}
             </div>
           </div>
-        )}
+        ) : undefined}
       >
-        <div className="flex h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
-          <input
+        <div className={`flex min-h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20 ${showSearchControls ? '' : 'mx-auto'}`}>
+          <Search className="mr-2 h-4 w-4 shrink-0 text-ide-muted" aria-hidden="true" />
+          {aiMode ? <textarea
+            ref={inputRef}
+            rows={1}
+            aria-label={t('aiSearch.landing.placeholder')}
+            placeholder={t('aiSearch.landing.placeholder')}
+            value={active ? aiDraft : ''}
+            onChange={(event) => setAiDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+                event.preventDefault();
+                submitAi(event);
+              }
+            }}
+            className="custom-scrollbar block max-h-[108px] min-h-9 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-1.5 text-sm leading-6 text-ide-text outline-none placeholder:text-ide-muted [field-sizing:content]"
+          /> : <input
+            ref={inputRef}
             type="text"
             className="min-w-0 flex-1 bg-transparent text-sm text-ide-text outline-none placeholder:text-ide-muted"
             placeholder={t(searchTarget === 'mixed' ? 'advancedSearch.search.placeholder_unified' : `advancedSearch.search.placeholder_${searchTarget}`)}
-            value={query}
+            value={isAuthenticated ? query : ''}
             onChange={(event) => setQuery(event.target.value)}
-          />
-          {query && (
-            <button
-              type="button"
-              onClick={() => setQuery('')}
-              title={t('advancedSearch.processes.clear')}
-              className="grid h-7 w-7 place-items-center rounded-md text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          )}
-          <button
-            type="submit"
-            title={t('advancedSearch.search.go')}
-            aria-label={t('advancedSearch.search.go')}
-            className="grid h-[30px] w-[30px] shrink-0 place-items-center rounded-md bg-ide-accent text-white transition hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60"
-          >
-            <Search className="h-4 w-4" />
-          </button>
+          />}
+          {!showSearchControls && <AiModeButton active={aiMode} disabled={!active || !isAuthenticated}
+            onClick={() => handleTabChange(aiMode ? 'unified' : 'ai')} />}
+          {(aiMode ? aiDraft : query) && <Button size="xs" variant="ghost" icon={<X className="h-3.5 w-3.5" aria-hidden="true" />}
+            onClick={() => aiMode ? setAiDraft('') : setQuery('')} title={t('advancedSearch.processes.clear')}
+            aria-label={t('advancedSearch.processes.clear')} className="h-7 w-7 p-0" />}
+          <Button type="submit" size="xs" variant="primary" icon={<Search className="h-4 w-4" aria-hidden="true" />}
+            title={t(aiMode ? 'aiSearch.send' : 'advancedSearch.search.go')}
+            aria-label={t(aiMode ? 'aiSearch.send' : 'advancedSearch.search.go')}
+            disabled={!active || !isAuthenticated || (aiMode && (!canAskAi || !aiDraft.trim()))}
+            className="h-[30px] w-[30px] p-0" />
         </div>
       </PageHeader>
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
-        <div className="search-overview" hidden={visualGallery}>
+        {showLandingStage ? <div className="search-landing-stage" data-mode={aiMode ? 'ai' : 'unified'}>
+          <div className="search-landing-view" aria-hidden={aiMode} inert={aiMode ? '' : undefined}>
+            {renderLanding()}
+          </div>
+          <div className="search-landing-view" aria-hidden={!aiMode} inert={!aiMode ? '' : undefined}>
+            <AiSearchLanding loading={aiMode && !ai.settings} needsSetup={aiMode && Boolean(ai.settings) && !ai.provider}
+              selectedQuestion={aiDraft} onChooseQuestion={(question) => {
+                setAiDraft(question);
+                inputRef.current?.focus({ preventScroll: true });
+              }} />
+          </div>
+        </div> : <div className="search-overview" hidden={visualGallery}>
           {showStats && (
             <SearchStatsBar count={totals?.complete === false ? results.length : totals?.total ?? results.length}
               totalKnown={Boolean(totals) && totals.complete !== false} elapsedMs={elapsedMs}
@@ -393,7 +457,7 @@ export function AdvancedSearch({
             )}
             {!loadingMore && !hasMore && hasResults && <span>{t('advancedSearch.no_more')}</span>}
           </div>
-        </div>
+        </div>}
         {visualGallery && <VisualSearchCard controller={visual} fullPage scrollRef={scrollRef}
           onBack={closeVisualGallery} onSelectResult={(payload) => onSelectResult?.(payload)}
           onOpenFloatingPreview={openVisualPreview} />}

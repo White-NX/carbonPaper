@@ -108,11 +108,24 @@ describe('AiSearchPanel', () => {
     expect(openSettingsWindow).toHaveBeenCalledWith('ai', 'ai-providers');
   });
 
-  it('starts a search from an example question', () => {
+  it('fills a guide question and waits for an explicit send', () => {
     const c = controller();
     render(<AiSearchPanel controller={c} header={Header} />);
-    fireEvent.click(screen.getByText('example question'));
-    expect(c.start).toHaveBeenCalledWith('example question');
+    fireEvent.click(screen.getByRole('button', { name: 'aiSearch.landing.cards.day.question' }));
+    expect(screen.getByRole('textbox')).toHaveValue('aiSearch.landing.cards.day.question');
+    expect(c.start).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /aiSearch.send/ }));
+    expect(c.start).toHaveBeenCalledWith('aiSearch.landing.cards.day.question');
+  });
+
+  it('keeps guide questions available before configuration while preventing requests', () => {
+    const c = controller({ settings: { providers: [] }, provider: null });
+    render(<AiSearchPanel controller={c} header={Header} />);
+    fireEvent.click(screen.getByRole('button', { name: 'aiSearch.landing.cards.day.question' }));
+    expect(screen.getByRole('textbox')).toHaveValue('aiSearch.landing.cards.day.question');
+    expect(screen.getByRole('button', { name: /aiSearch.send/ })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(c.start).not.toHaveBeenCalled();
   });
 
   it('opens the cited screenshot with the metadata the tools reported', () => {
