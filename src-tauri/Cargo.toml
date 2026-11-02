@@ -55,7 +55,7 @@ winreg = "0.52"
 which = "4.4"
 runas = "1.2"
 reqwest = { version = "0.11", features = ["blocking", "stream", "json"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 anyhow = "1.0.100"
 argon2 = "0.5"
 percent-encoding = "2.3.2"
