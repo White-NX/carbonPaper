@@ -12,6 +12,10 @@ use zip::write::SimpleFileOptions;
 const LEGACY_SQLCIPHER_3453_FIXTURE_BASE64: &str =
     include_str!("../fixtures/sqlcipher-3.45.3.db.b64");
 
+// Synthetic backup emitted by zip 2.4.2 with the former deflate-only settings.
+const LEGACY_ZIP_242_BACKUP_BASE64: &str =
+    include_str!("../fixtures/carbonpaper-zip-2.4.2-backup.zip.b64");
+
 fn write_legacy_sqlcipher_fixture(directory: &Path) -> PathBuf {
     let path = directory.join(DATABASE_FILE_NAME);
     let encoded = LEGACY_SQLCIPHER_3453_FIXTURE_BASE64
@@ -345,6 +349,35 @@ fn legacy_backup_without_manifest_is_delete_mode() {
 }
 
 #[test]
+fn legacy_zip_242_backup_preserves_non_ascii_payload_paths() {
+    let root = tempdir().unwrap();
+    let extraction_parent = tempdir().unwrap();
+    let zip_path = root.path().join("legacy-zip-2.4.2.zip");
+    let encoded = LEGACY_ZIP_242_BACKUP_BASE64
+        .split_whitespace()
+        .collect::<String>();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    std::fs::write(&zip_path, bytes).unwrap();
+
+    let extracted =
+        extract_backup_archive(&zip_path, extraction_parent.path(), |_, _, _| {}).unwrap();
+
+    assert!(extracted.legacy);
+    assert_eq!(extracted.manifest.journal_mode, "delete");
+    assert_eq!(extracted.encrypted_master_key, b"encrypted-key");
+    assert_eq!(
+        std::fs::read(extracted.path().join(DATABASE_FILE_NAME)).unwrap(),
+        b"legacy-database"
+    );
+    assert_eq!(
+        std::fs::read(extracted.path().join("screenshots/旧截图.enc")).unwrap(),
+        b"encrypted-image"
+    );
+}
+
+#[test]
 fn manifest_hash_and_size_mismatches_are_rejected() {
     for (size, hash) in [
         (99, hex::encode(Sha256::digest(b"database"))),
@@ -421,6 +454,82 @@ fn unsafe_duplicate_and_illegal_database_entries_are_rejected() {
         write_backup(&zip_path, &entries, None);
         assert!(extract_backup_archive(&zip_path, root.path(), |_, _, _| {}).is_err());
     }
+}
+
+#[test]
+fn inconsistent_backup_headers_are_rejected_before_staging() {
+    let root = tempdir().unwrap();
+    let extraction_parent = tempdir().unwrap();
+    let zip_path = root.path().join("cloaked.zip");
+    write_backup(&zip_path, &[(DATABASE_FILE_NAME, b"database")], None);
+
+    let header_start = {
+        let mut archive = zip::ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        let entry = archive.by_name(DATABASE_FILE_NAME).unwrap();
+        entry.header_start() as usize
+    };
+    let mut bytes = std::fs::read(&zip_path).unwrap();
+    // A ZIP local header has 30 fixed bytes before its filename. Keep the
+    // central-directory name unchanged, reproducing the cloaking differential.
+    let name_start = header_start + 30;
+    let cloaked_name = b"../outside.enc";
+    assert_eq!(cloaked_name.len(), DATABASE_FILE_NAME.len());
+    assert_eq!(
+        &bytes[name_start..name_start + DATABASE_FILE_NAME.len()],
+        DATABASE_FILE_NAME.as_bytes()
+    );
+    bytes[name_start..name_start + cloaked_name.len()].copy_from_slice(cloaked_name);
+    std::fs::write(&zip_path, bytes).unwrap();
+
+    let error =
+        extract_backup_archive(&zip_path, extraction_parent.path(), |_, _, _| {}).unwrap_err();
+
+    assert!(error.contains("Inconsistent backup ZIP headers"), "{error}");
+    assert!(std::fs::read_dir(extraction_parent.path())
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
+fn oversized_symlink_backup_is_rejected_without_reading_the_target() {
+    let root = tempdir().unwrap();
+    let extraction_parent = tempdir().unwrap();
+    let zip_path = root.path().join("symlink.zip");
+    let mut writer = zip::ZipWriter::new(File::create(&zip_path).unwrap());
+    writer
+        .add_symlink(
+            "screenshots/link.enc",
+            "../outside.enc",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let (local_start, central_start) = {
+        let mut archive = zip::ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        let entry = archive.by_index(0).unwrap();
+        (
+            entry.header_start() as usize,
+            entry.central_header_start() as usize,
+        )
+    };
+    let mut bytes = std::fs::read(&zip_path).unwrap();
+    // Keep both headers consistent but advertise a multi-gigabyte target in a
+    // tiny archive. Symlink rejection must happen before target allocation.
+    let oversized_size = 0x7fff_ffffu32.to_le_bytes();
+    bytes[local_start + 22..local_start + 26].copy_from_slice(&oversized_size);
+    bytes[central_start + 24..central_start + 28].copy_from_slice(&oversized_size);
+    std::fs::write(&zip_path, bytes).unwrap();
+
+    let error =
+        extract_backup_archive(&zip_path, extraction_parent.path(), |_, _, _| {}).unwrap_err();
+
+    assert!(error.contains("Symbolic links are not allowed"), "{error}");
+    assert!(std::fs::read_dir(extraction_parent.path())
+        .unwrap()
+        .next()
+        .is_none());
 }
 
 #[test]

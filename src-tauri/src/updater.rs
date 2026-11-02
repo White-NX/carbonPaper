@@ -577,26 +577,29 @@ async fn updater_extract_impl() -> Result<(), String> {
     let file = std::fs::File::open(&zip_path).map_err(|e| format!("Failed to open zip: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
+    archive
+        .validate_header_consistency()
+        .map_err(|e| format!("Inconsistent update ZIP headers: {}", e))?;
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("Failed to read zip entry: {}", e))?;
 
-        if entry
-            .unix_mode()
-            .map(|mode| mode & 0o170000 == 0o120000)
-            .unwrap_or(false)
-        {
+        let entry_name = entry
+            .name()
+            .map_err(|e| format!("Invalid update archive entry name: {}", e))?
+            .into_owned();
+        if entry.is_symlink() {
             return Err(format!(
                 "Update archive contains a symbolic link: {}",
-                entry.name()
+                entry_name
             ));
         }
 
         let enclosed = entry
             .enclosed_name()
-            .ok_or_else(|| format!("Unsafe update archive path: {}", entry.name()))?;
+            .ok_or_else(|| format!("Unsafe update archive path: {}", entry_name))?;
         let enclosed = safe_update_entry_path(enclosed.to_string_lossy().as_ref())?;
         let name = enclosed.to_string_lossy().to_string();
         let out_path = extract_dir.join(enclosed);
