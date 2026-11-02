@@ -606,12 +606,6 @@ fn validate_archive_payload_path(name: &str) -> Result<(), String> {
     Err(format!("Unsupported backup entry: {name}"))
 }
 
-fn is_zip_symlink(file: &zip::read::ZipFile<'_>) -> bool {
-    file.unix_mode()
-        .map(|mode| mode & 0o170000 == 0o120000)
-        .unwrap_or(false)
-}
-
 fn read_required_file(root: &Path, name: &str) -> Result<Vec<u8>, String> {
     let path = root.join(name);
     std::fs::read(&path).map_err(|error| format!("{name} missing or unreadable: {error}"))
@@ -708,6 +702,9 @@ where
     })?;
     let mut archive =
         zip::ZipArchive::new(archive_file).map_err(|error| format!("Invalid ZIP: {error}"))?;
+    archive
+        .validate_header_consistency()
+        .map_err(|error| format!("Inconsistent backup ZIP headers: {error}"))?;
     let directory = TemporaryDirectory::create(temporary_parent, "carbonpaper-restore-staging")?;
     let total = archive.len();
     let mut names = HashSet::new();
@@ -716,14 +713,18 @@ where
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Failed to read ZIP entry {index}: {error}"))?;
-        if is_zip_symlink(&entry) {
+        let raw_name = entry
+            .name()
+            .map_err(|error| format!("Invalid backup ZIP entry name: {error}"))?
+            .into_owned();
+        if entry.is_symlink() {
             return Err(format!(
                 "Symbolic links are not allowed in backups: {}",
-                entry.name()
+                raw_name
             ));
         }
-        let is_directory = entry.is_dir() || entry.name().ends_with('/');
-        let name = normalize_archive_name(entry.name(), is_directory)?;
+        let is_directory = entry.is_dir() || raw_name.ends_with('/');
+        let name = normalize_archive_name(&raw_name, is_directory)?;
         validate_archive_payload_path(&name)?;
         let duplicate_key = name.to_ascii_lowercase();
         if !names.insert(duplicate_key) {
