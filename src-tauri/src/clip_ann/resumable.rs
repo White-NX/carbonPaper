@@ -1,7 +1,9 @@
 //! Resumable ANN task. Frozen input, files and complete graph checkpoints each
 //! have their own commit boundary; queries keep using the previous generation.
 use super::*;
-use crate::ann_protocol::{AnnErrorKind, AnnReply, AnnRequest, ANN_WORKER_PROTOCOL};
+use crate::ann_protocol::{
+    AnnEncryptionKey, AnnErrorKind, AnnReply, AnnRequest, ANN_WORKER_PROTOCOL,
+};
 use crate::background_policy::{
     self as policy, CostKey, CostSample, ExecutionProfile, IO_BYTES_PER_SECOND, IO_CHUNK_BYTES,
 };
@@ -124,6 +126,11 @@ impl BuildWorker {
                     .map(|c| directory.join(&c.name).to_string_lossy().into_owned()),
                 checksum: state.complete.as_ref().map(|c| c.checksum.clone()),
                 checkpoint_rows: state.complete.as_ref().map_or(0, |c| c.rows),
+                encryption: AnnEncryptionKey::from_key(
+                    app.state::<Arc<StorageState>>()
+                        .protected_ann_resume_key(&state.encryption_key_id)?
+                        .as_ref(),
+                ),
             }
         } else {
             AnnRequest::Step {
@@ -227,7 +234,7 @@ fn ann_key(state: &AnnBuildCheckpoint, operation: &str) -> CostKey {
         operation,
         CLIP_VECTOR_SPACE_REVISION,
         state.expected_rows.max(state.frozen_rows),
-        "usearch-2.26.0:i8:m16:ef160:threads1:io256k:v1",
+        "usearch-2.26.0:i8:m16:ef160:threads1:io256k:aesgcm:v2",
     )
 }
 
@@ -237,7 +244,10 @@ fn check_checkpoint_name(state: &AnnBuildCheckpoint, name: &str) -> bool {
         && !name.contains(['/', '\\', ':'])
 }
 
-fn header(state: &AnnBuildCheckpoint) -> Result<Header, TaskError> {
+fn header(
+    state: &AnnBuildCheckpoint,
+    key: &carbonpaper_app_bound::payload::CipherKey,
+) -> Result<Header, TaskError> {
     Header::for_snapshot(
         state.generation,
         state.covered_epoch,
@@ -248,6 +258,8 @@ fn header(state: &AnnBuildCheckpoint) -> Result<Header, TaskError> {
         CLIP_VECTOR_SPACE_REVISION,
         expansion_search(state.frozen_rows as usize) as u32,
         state.key_bytes,
+        key,
+        &state.snapshot_id,
     )
     .map_err(Into::into)
 }
@@ -275,7 +287,8 @@ fn materialize_page(
     directory: &Path,
 ) -> Result<u64, TaskError> {
     let path = directory.join(format!(".{}.partial", state.flat_name()));
-    let h = header(state)?;
+    let encryption = storage.protected_ann_resume_key(&state.encryption_key_id)?;
+    let h = header(state, &encryption)?;
     if state.materialized_rows > 0 && !path.exists() {
         // Replay after a crash between final rename and cursor commit.
         state.materialized_rows = 0;
@@ -286,13 +299,14 @@ fn materialize_page(
         if path.exists() {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
-        FlatFileWriter::create(&path, h)?
+        FlatFileWriter::create(&path, h, encryption.clone())?
     } else {
         match FlatFileWriter::resume(
             &path,
             h,
             state.materialized_rows,
             state.materialized_key_bytes,
+            encryption,
         ) {
             Ok(writer) => writer,
             Err(error) if error == "ANN partial flat checkpoint mismatch" => {
@@ -309,7 +323,12 @@ fn materialize_page(
     let page = storage.frozen_ann_page(state, state.materialized_rows, 64)?;
     let bytes = page
         .iter()
-        .map(|r| r.vector_f32.len() as u64 + r.subject_key.len() as u64 + 8)
+        .map(|r| {
+            r.vector_f32.len() as u64
+                + carbonpaper_app_bound::payload::OVERHEAD as u64
+                + r.subject_key.len() as u64
+                + 8
+        })
         .sum();
     let mut written = state.materialized_rows;
     write_ann_snapshot_page(&mut writer, CLIP_DIMENSIONS as u32, &mut written, &page)?;
@@ -485,6 +504,16 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
         ann.resumable_worker.lock().await.take();
         state = None;
     }
+    if state.as_ref().is_some_and(|s| {
+        storage
+            .protected_ann_resume_key(&s.encryption_key_id)
+            .is_err()
+    }) {
+        // Preserve the archive and restart construction with a fresh write key
+        // when an old checkpoint has no immutable service grant.
+        ann.resumable_worker.lock().await.take();
+        state = None;
+    }
     if state.as_ref().is_none_or(|s| s.phase == "complete") {
         if !ann_retry_due(
             storage
@@ -514,6 +543,8 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
             runtime_generation: Some(db_generation),
             generation: next_generation_id()?,
             dataset_id: dataset,
+            encryption_key_id: storage.protected_ann_write_key()?.id.clone(),
+            snapshot_id: hex::encode(rand::random::<[u8; 16]>()),
             model_fingerprint: contract,
             covered_epoch: epoch,
             scan_upper: String::new(),
@@ -772,7 +803,11 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                 policy::check_current()?;
                 // Validation and all large I/O have finished. Only mmap setup,
                 // the manifest transaction and reader switch enter this guard.
-                let reader = open_generation_validated(&data_dir, manifest)?;
+                let reader = open_generation_validated(
+                    &data_dir,
+                    manifest,
+                    storage.protected_ann_resume_key(&state.encryption_key_id)?,
+                )?;
                 let _publish = storage.derived_generation_publish_guard();
                 policy::check_current()?;
                 if storage.db_generation() != db_generation
@@ -820,6 +855,8 @@ mod tests {
             runtime_generation: Some(0),
             generation: 7,
             dataset_id: "test".into(),
+            encryption_key_id: crate::ann_format::test_key().id.clone(),
+            snapshot_id: crate::ann_format::TEST_SNAPSHOT_ID.into(),
             model_fingerprint: "clip-test".into(),
             covered_epoch: 10,
             scan_upper: "last".into(),

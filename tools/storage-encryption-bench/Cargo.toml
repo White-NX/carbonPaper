@@ -1,0 +1,21 @@
+[package]
+name = "carbonpaper-storage-encryption-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+aes-gcm = "0.10"
+aes = { version = "0.8", features = ["zeroize"] }
+hex = "0.4"
+hmac = "0.12"
+memmap2 = "0.9"
+rand = "0.8"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+zeroize = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

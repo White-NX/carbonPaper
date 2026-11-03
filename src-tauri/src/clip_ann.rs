@@ -18,8 +18,8 @@ use crate::storage::{
     next_generation_id, DerivedAnnBuildState, DerivedAnnGeneration, DerivedAnnSnapshotRow,
     DerivedAnnTailRow, DerivedIndexKind, ScoredSubject, StorageState,
 };
+use carbonpaper_app_bound::payload::CipherKey;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
-use memmap2::MmapOptions;
 use sha2::{Digest, Sha256};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::BinaryHeap;
@@ -42,13 +42,14 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
+use zeroize::Zeroizing;
 
 mod query_snapshot;
 mod resumable;
 pub(crate) use query_snapshot::ClipAnnSnapshot;
 pub(crate) use resumable::run_scheduled_slice;
 
-const ANN_FILE_FORMAT_VERSION: u32 = 1;
+const ANN_FILE_FORMAT_VERSION: u32 = 2;
 const MAX_TAIL_ROWS: u64 = 20_000;
 const REBUILD_TAIL_ROWS: u64 = 5_000;
 const REBUILD_TAIL_PERCENT: u64 = 5;
@@ -279,10 +280,11 @@ struct GenerationReader {
     flat: MappedFlatIndex,
     data_dir: PathBuf,
     tail_cache: query_snapshot::TailCache,
-    // Drop the USearch view before the backing mmap it aliases.
+    // Drop the USearch view before the anonymous decrypted memory it aliases.
     index: Index,
-    _ann_map: memmap2::Mmap,
+    _ann_bytes: Zeroizing<Vec<u8>>,
     _ann_file: fs::File,
+    last_used: Mutex<Instant>,
 }
 
 struct PreparedGeneration {
@@ -406,6 +408,9 @@ impl BoundedTopK {
 }
 
 impl GenerationReader {
+    fn touch(&self) {
+        *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
     fn matches_storage(&self, storage: &StorageState) -> bool {
         let data_dir = storage
             .data_dir
@@ -445,6 +450,7 @@ impl ClipAnnState {
         // materialized. Publication takes the write side of this same lock
         // across manifest pruning and reader replacement.
         let tail = load_tail(generation)?;
+        generation.touch();
         Ok(Some((Arc::clone(generation), tail)))
     }
 
@@ -458,6 +464,7 @@ impl ClipAnnState {
             return Ok(None);
         }
         check_ann_deadline(deadline)?;
+        let authorization = storage.protected_query_session()?;
         let (generation, tail) = match self.generation_snapshot_with_tail(storage, |generation| {
             generation
                 .tail_cache
@@ -468,7 +475,7 @@ impl ClipAnnState {
             Err(error) if error.starts_with("ann_tail_too_large:") => return Ok(None),
             Err(error) => return Err(error),
         };
-        ClipAnnSnapshot::new(generation, tail, query, deadline).map(Some)
+        ClipAnnSnapshot::new(generation, tail, query, deadline, authorization).map(Some)
     }
 
     pub fn has_generation(&self) -> bool {
@@ -501,11 +508,32 @@ impl ClipAnnState {
         self.arm_tx.send_replace(ArmStatus::Idle);
     }
 
+    pub(crate) fn evict_reader_if_idle(&self, ttl: Duration) -> bool {
+        let mut generation = self.generation.write().unwrap_or_else(|e| e.into_inner());
+        if generation.as_ref().is_none_or(|reader| {
+            reader
+                .last_used
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                < ttl
+        }) {
+            return false;
+        }
+        *generation = None;
+        let mut arm = self.arm.lock().unwrap_or_else(|e| e.into_inner());
+        arm.token = arm.token.wrapping_add(1);
+        arm.status = ArmStatus::Idle;
+        self.arm_tx.send_replace(ArmStatus::Idle);
+        true
+    }
+
     pub(crate) fn reclaim_builder(&self, memory_pressure: bool) {
         if memory_pressure {
             if let Ok(generation) = self.generation.try_read() {
                 if let Some(generation) = generation.as_ref() {
                     generation.tail_cache.evict();
+                    generation.flat.clear_vector_cache();
                 }
             }
         }
@@ -786,7 +814,7 @@ fn ann_candidates_with_tail<'a>(
         let subject_key = generation.flat.key(ordinal)?;
         if !changed(subject_key) {
             top.push(
-                dot_product(query, generation.flat.vector(ordinal)?),
+                dot_product(query, &generation.flat.vector(ordinal)?),
                 subject_key,
             );
         }
@@ -841,7 +869,7 @@ fn exact_candidates_with_tail<'a>(
         }
         let key = generation.flat.key(ordinal)?;
         if !changed(key) {
-            top.push(dot_product(query, generation.flat.vector(ordinal)?), key);
+            top.push(dot_product(query, &generation.flat.vector(ordinal)?), key);
         }
     }
     for (index, (key, score)) in tail_scores.enumerate() {
@@ -1051,12 +1079,19 @@ fn load_current_generation(storage: &StorageState) -> Result<Option<GenerationRe
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    open_generation(&data_dir, manifest).map(Some)
+    let key_id = MappedFlatIndex::encryption_key_id(
+        &data_dir
+            .join("derived-indexes")
+            .join(&manifest.flat_file_name),
+    )?;
+    let encryption = storage.protected_ann_read_key(&key_id)?;
+    open_generation(&data_dir, manifest, encryption).map(Some)
 }
 
 fn open_generation(
     data_dir: &Path,
     manifest: DerivedAnnGeneration,
+    encryption: Arc<CipherKey>,
 ) -> Result<GenerationReader, String> {
     validate_manifest(&manifest)?;
     let directory = data_dir.join("derived-indexes");
@@ -1067,18 +1102,19 @@ fn open_generation(
     {
         return Err("ANN generation checksum mismatch".to_string());
     }
-    open_generation_validated(data_dir, manifest)
+    open_generation_validated(data_dir, manifest, encryption)
 }
 
 fn open_generation_validated(
     data_dir: &Path,
     manifest: DerivedAnnGeneration,
+    encryption: Arc<CipherKey>,
 ) -> Result<GenerationReader, String> {
     validate_manifest(&manifest)?;
     let directory = data_dir.join("derived-indexes");
     let flat_path = directory.join(&manifest.flat_file_name);
     let ann_path = directory.join(&manifest.ann_file_name);
-    let flat = MappedFlatIndex::open(&flat_path)?;
+    let flat = MappedFlatIndex::open(&flat_path, encryption.clone())?;
     if flat.header.generation != manifest.generation
         || flat.header.covered_epoch != manifest.covered_epoch
         || flat.header.row_count != manifest.row_count
@@ -1087,15 +1123,28 @@ fn open_generation_validated(
     {
         return Err("ANN flat header does not match manifest".to_string());
     }
-    let ann_file = fs::File::open(&ann_path)
+    let mut ann_file = fs::File::open(&ann_path)
         .map_err(|error| format!("Failed to open ANN graph {}: {error}", ann_path.display()))?;
-    let ann_map = unsafe { MmapOptions::new().map(&ann_file) }
-        .map_err(|error| format!("Failed to mmap ANN graph {}: {error}", ann_path.display()))?;
-    let metadata = Index::metadata_from_buffer(&ann_map)
+    let size = ann_file.metadata().map_err(|e| e.to_string())?.len();
+    if size > 512 * 1024 * 1024 {
+        return Err("ANN graph exceeds the read memory budget".into());
+    }
+    let mut encrypted = vec![0u8; size as usize];
+    ann_file
+        .read_exact(&mut encrypted)
+        .map_err(|e| e.to_string())?;
+    let mut extra = [0u8; 1];
+    if ann_file.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+        return Err("ANN graph changed while reading".into());
+    }
+    let ann_bytes =
+        encryption.open(&flat.header.graph_identity(manifest.row_count)?, &encrypted)?;
+    drop(encrypted);
+    let metadata = Index::metadata_from_buffer(&ann_bytes)
         .map_err(|error| format!("ANN metadata read failed: {error}"))?;
     let options: usearch::IndexOptions = metadata.into();
     let index = Index::new(&options).map_err(|error| format!("ANN view init failed: {error}"))?;
-    unsafe { index.view_from_buffer(&ann_map) }
+    unsafe { index.view_from_buffer(&ann_bytes) }
         .map_err(|error| format!("ANN buffer view failed: {error}"))?;
     apply_expansion_search(&index, manifest.expansion_search as usize)?;
     if index.expansion_search() != manifest.expansion_search as usize
@@ -1116,9 +1165,9 @@ fn open_generation_validated(
         let vectors_found = index
             .get(1, &mut recovered)
             .map_err(|error| format!("ANN probe recovery failed: {error}"))?;
-        let recovered_cosine = validate_ann_recovered_probe(probe, &recovered, vectors_found)?;
+        let recovered_cosine = validate_ann_recovered_probe(&probe, &recovered, vectors_found)?;
         let result = index
-            .search(probe, 1)
+            .search(&probe, 1)
             .map_err(|error| format!("ANN self-test failed: {error}"))?;
         validate_ann_search_result(&result.keys, &result.distances, manifest.row_count)?;
         tracing::info!(
@@ -1134,8 +1183,9 @@ fn open_generation_validated(
         data_dir: data_dir.to_path_buf(),
         tail_cache: query_snapshot::TailCache::default(),
         index,
-        _ann_map: ann_map,
+        _ann_bytes: ann_bytes,
         _ann_file: ann_file,
+        last_used: Mutex::new(Instant::now()),
     })
 }
 
@@ -1404,9 +1454,12 @@ mod tests {
             CLIP_VECTOR_SPACE_REVISION,
             96,
             key_bytes,
+            &crate::ann_format::test_key(),
+            crate::ann_format::TEST_SNAPSHOT_ID,
         )
         .unwrap();
-        let mut writer = FlatFileWriter::create(&flat_path, header).unwrap();
+        let mut writer =
+            FlatFileWriter::create(&flat_path, header, crate::ann_format::test_key()).unwrap();
         for key in keys {
             writer.push_key(key).unwrap();
         }
@@ -1414,7 +1467,7 @@ mod tests {
             writer.push_vector(vector).unwrap();
         }
         writer.finish().unwrap();
-        let flat = MappedFlatIndex::open(&flat_path).unwrap();
+        let flat = MappedFlatIndex::open(&flat_path, crate::ann_format::test_key()).unwrap();
 
         let mut options = usearch::IndexOptions::default();
         options.dimensions = dimensions as usize;
@@ -1434,15 +1487,22 @@ mod tests {
             .create_new(true)
             .open(&ann_path)
             .unwrap();
-        file.set_len(built.serialized_length() as u64).unwrap();
-        let mut ann_map = unsafe { MmapOptions::new().map_mut(&file) }.unwrap();
-        built.save_to_buffer(&mut ann_map).unwrap();
-        ann_map.flush().unwrap();
+        let mut ann_bytes = Zeroizing::new(vec![0u8; built.serialized_length()]);
+        built.save_to_buffer(&mut ann_bytes).unwrap();
+        fs::write(
+            &ann_path,
+            crate::ann_format::test_key()
+                .seal(
+                    &flat.header.graph_identity(keys.len() as u64).unwrap(),
+                    &ann_bytes,
+                )
+                .unwrap(),
+        )
+        .unwrap();
         drop(built);
-        let ann_map = ann_map.make_read_only().unwrap();
-        let metadata = Index::metadata_from_buffer(&ann_map).unwrap();
+        let metadata = Index::metadata_from_buffer(&ann_bytes).unwrap();
         let index = Index::new(&metadata.into()).unwrap();
-        unsafe { index.view_from_buffer(&ann_map) }.unwrap();
+        unsafe { index.view_from_buffer(&ann_bytes) }.unwrap();
         apply_expansion_search(&index, 96).unwrap();
 
         GenerationReader {
@@ -1451,8 +1511,9 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             tail_cache: query_snapshot::TailCache::default(),
             index,
-            _ann_map: ann_map,
+            _ann_bytes: ann_bytes,
             _ann_file: file,
+            last_used: Mutex::new(Instant::now()),
         }
     }
 
@@ -1900,13 +1961,16 @@ mod tests {
             CLIP_VECTOR_SPACE_REVISION,
             96,
             1,
+            &crate::ann_format::test_key(),
+            crate::ann_format::TEST_SNAPSHOT_ID,
         )
         .unwrap();
-        let mut writer = FlatFileWriter::create(&flat_path, header).unwrap();
+        let mut writer =
+            FlatFileWriter::create(&flat_path, header, crate::ann_format::test_key()).unwrap();
         writer.push_key("a").unwrap();
         writer.push_vector(&[1.0, 0.0]).unwrap();
         writer.finish().unwrap();
-        let flat = MappedFlatIndex::open(&flat_path).unwrap();
+        let flat = MappedFlatIndex::open(&flat_path, crate::ann_format::test_key()).unwrap();
         let mut options = usearch::IndexOptions::default();
         options.dimensions = 2;
         options.metric = MetricKind::IP;
@@ -1923,15 +1987,19 @@ mod tests {
             .create_new(true)
             .open(&ann_path)
             .unwrap();
-        file.set_len(built.serialized_length() as u64).unwrap();
-        let mut ann_map = unsafe { MmapOptions::new().map_mut(&file) }.unwrap();
-        built.save_to_buffer(&mut ann_map).unwrap();
-        ann_map.flush().unwrap();
+        let mut ann_bytes = Zeroizing::new(vec![0u8; built.serialized_length()]);
+        built.save_to_buffer(&mut ann_bytes).unwrap();
+        fs::write(
+            &ann_path,
+            crate::ann_format::test_key()
+                .seal(&flat.header.graph_identity(1).unwrap(), &ann_bytes)
+                .unwrap(),
+        )
+        .unwrap();
         drop(built);
-        let ann_map = ann_map.make_read_only().unwrap();
-        let metadata = Index::metadata_from_buffer(&ann_map).unwrap();
+        let metadata = Index::metadata_from_buffer(&ann_bytes).unwrap();
         let index = Index::new(&metadata.into()).unwrap();
-        unsafe { index.view_from_buffer(&ann_map) }.unwrap();
+        unsafe { index.view_from_buffer(&ann_bytes) }.unwrap();
 
         let state = ClipAnnState::default();
         state.install_for_test(GenerationReader {
@@ -1963,8 +2031,9 @@ mod tests {
             data_dir: temp.path().to_path_buf(),
             tail_cache: query_snapshot::TailCache::default(),
             index,
-            _ann_map: ann_map,
+            _ann_bytes: ann_bytes,
             _ann_file: file,
+            last_used: Mutex::new(Instant::now()),
         });
         let pinned = state.pin_generation().unwrap();
         state.disarm();
@@ -1995,5 +2064,23 @@ mod tests {
         apply_expansion_search(&restored, expansion).unwrap();
         assert_eq!(restored.expansion_search(), expansion);
         assert_eq!(restored.search(&[1.0f32, 0.0], 1).unwrap().keys, vec![1]);
+    }
+
+    #[test]
+    fn idle_reader_release_keeps_pinned_graph_valid_until_the_query_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = test_reader(temp.path(), 45, &["a"], &[vec![1.0, 0.0]]);
+        let state = ClipAnnState::default();
+        state.install_for_test(reader);
+        let pinned = state.pin_generation().unwrap();
+        let lifetime = Arc::downgrade(&pinned);
+        assert!(!state.evict_reader_if_idle(Duration::from_secs(300)));
+        *pinned.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(301);
+        assert!(state.evict_reader_if_idle(Duration::from_secs(300)));
+        assert!(!state.has_generation());
+        assert_eq!(pinned.index.search(&[1.0, 0.0], 1).unwrap().keys, vec![1]);
+        assert_eq!(&*pinned.flat.vector(0).unwrap(), &[1.0, 0.0]);
+        drop(pinned);
+        assert!(lifetime.upgrade().is_none());
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use sha2::Digest;
 
 #[path = "recap_tests.rs"]
 mod recap_tests;
@@ -35,6 +36,7 @@ struct TestBroker {
     online: AtomicBool,
     installed: AtomicBool,
     supported_consumers: AtomicU8,
+    supported_storage_keys: AtomicBool,
     acquisitions: AtomicUsize,
     inspected: Mutex<Vec<String>>,
 }
@@ -68,6 +70,7 @@ impl Broker for TestBroker {
         )?;
         if let Response::Status(status) = &mut response {
             status.supported_consumers = supported;
+            status.supported_storage_keys = self.supported_storage_keys.load(Ordering::SeqCst);
         }
         Ok(response)
     }
@@ -129,10 +132,11 @@ fn fixture() -> Fixture {
         online: AtomicBool::new(true),
         installed: AtomicBool::new(true),
         supported_consumers: AtomicU8::new(Consumer::ALL_MASK),
+        supported_storage_keys: AtomicBool::new(true),
         acquisitions: AtomicUsize::new(0),
         inspected: Mutex::new(Vec::new()),
     });
-    storage.processing_stage = ProcessingStaging::with_test_broker(broker.clone());
+    storage.replace_processing_stage_for_tests(ProcessingStaging::with_test_broker(broker.clone()));
     storage
         .processing_stage
         .initialize(
@@ -191,7 +195,7 @@ fn insert_input(storage: &StorageState, id: i64, consumers: u8) -> ProcessingInp
 
 fn restart_stage(dir: &std::path::Path, storage: &mut StorageState, broker: &Arc<TestBroker>) {
     storage.processing_stage.shutdown();
-    storage.processing_stage = ProcessingStaging::with_test_broker(broker.clone());
+    storage.replace_processing_stage_for_tests(ProcessingStaging::with_test_broker(broker.clone()));
     storage
         .processing_stage
         .initialize(
@@ -759,7 +763,7 @@ fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
     let old_dataset = storage.processing_dataset_id().unwrap();
     let snapshot = std::fs::read(dir.join(STAGING_FILE)).unwrap();
     storage.processing_stage.shutdown();
-    storage.processing_stage = ProcessingStaging::with_test_broker(broker.clone());
+    storage.replace_processing_stage_for_tests(ProcessingStaging::with_test_broker(broker.clone()));
     storage
         .processing_stage
         .initialize(dir, old_dataset.clone(), storage.db_generation())
@@ -774,7 +778,10 @@ fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
         .processing_stage
         .initialize(dir, old_dataset, storage.db_generation())
         .unwrap();
-    storage.processing_stage.refresh().unwrap();
+    assert_eq!(
+        storage.processing_stage.refresh().unwrap_err(),
+        "app_bound_dataset_mismatch"
+    );
     assert!(storage
         .processing_stage
         .claim(&storage, Consumer::Classification)
@@ -932,4 +939,138 @@ fn staged_vector_and_receipt_share_a_transaction_and_an_exact_subject() {
         .unwrap()
         .is_some());
     assert_eq!(storage.pending_staged_receipts().unwrap(), vec![receipt]);
+}
+
+#[test]
+fn protected_derived_history_survives_a_locked_restart_with_registered_keys() {
+    let mut fixture = fixture();
+    let (directory, storage, broker) = fixture.parts();
+    storage.credential_state.background_enabled_for_tests(true);
+    storage
+        .credential_state
+        .fixture_read_access_for_tests(false);
+    storage.credential_state.invalidate_session();
+    storage.protected.allow_plaintext_fixtures(false);
+    storage.publish_protected_keys().unwrap();
+    let cluster = storage
+        .create_smart_cluster("Protected background topic", 0.5, None, None)
+        .unwrap();
+    let ann_key = storage.protected_ann_write_key().unwrap();
+    assert_eq!(
+        storage.list_smart_clusters().unwrap()[0].anchor_text,
+        "Protected background topic"
+    );
+    storage.protected.reset();
+    restart_stage(directory, storage, broker);
+    {
+        let guard = storage.db.lock().unwrap();
+        storage
+            .protected
+            .initialize(guard.as_ref().unwrap())
+            .unwrap();
+    }
+    storage.publish_protected_keys().unwrap();
+    assert!(!storage.credential_state.protected_read_authorized());
+    assert!(get_cached_master_key(&storage.credential_state).is_none());
+    assert_eq!(storage.list_smart_clusters().unwrap()[0].id, cluster);
+    assert_eq!(
+        storage
+            .protected_ann_resume_key(&ann_key.id)
+            .unwrap()
+            .bytes(),
+        ann_key.bytes()
+    );
+    broker.online.store(false, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap_err();
+    assert!(storage
+        .list_smart_clusters()
+        .unwrap_err()
+        .contains("AUTH_REQUIRED"));
+    broker.online.store(true, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap();
+    broker.supported_storage_keys.store(false, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap();
+    storage.clear_protected_read_cache();
+    assert!(storage
+        .list_smart_clusters()
+        .unwrap_err()
+        .contains("AUTH_REQUIRED"));
+}
+
+#[test]
+fn read_only_storage_grants_never_resume_index_encryption_and_disable_clears_read_access() {
+    let mut fixture = fixture();
+    let (directory, storage, broker) = fixture.parts();
+    storage.credential_state.background_enabled_for_tests(true);
+    storage.publish_protected_keys().unwrap();
+    let old_key = storage.protected_ann_write_key().unwrap();
+    let mut binding = StorageKeyBinding {
+        key_id: "77".repeat(16),
+        dataset_id: storage.processing_dataset_id().unwrap(),
+        content_dataset_id: storage.protected_ann_write_key().unwrap().dataset.clone(),
+        public_key_fingerprint: hex::encode(sha2::Sha256::digest(
+            crate::credential_manager::get_cached_public_key(&storage.credential_state).unwrap(),
+        )),
+        purpose: "ann".into(),
+        wrapped_key_digest: String::new(),
+    };
+    let wrapped =
+        crate::credential_manager::wrap_storage_domain_key(&storage.credential_state, &[8; 32])
+            .unwrap();
+    binding.wrapped_key_digest = hex::encode(sha2::Sha256::digest(&wrapped));
+    {
+        let guard = storage.db.lock().unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "INSERT INTO protected_storage_keys VALUES(?1,'ann',?2,?3,?4)",
+                params![
+                    binding.key_id,
+                    binding.dataset_id,
+                    binding.public_key_fingerprint,
+                    wrapped
+                ],
+            )
+            .unwrap();
+    }
+    storage.protected.reset();
+    restart_stage(directory, storage, broker);
+    {
+        let guard = storage.db.lock().unwrap();
+        storage
+            .protected
+            .initialize(guard.as_ref().unwrap())
+            .unwrap();
+    }
+    storage
+        .credential_state
+        .fixture_read_access_for_tests(false);
+    storage.credential_state.invalidate_session();
+    broker
+        .call(Request::RegisterStorageKey {
+            binding: binding.clone(),
+            key: TaskKey(vec![8; 32]),
+            write_origin: false,
+        })
+        .unwrap();
+    assert!(storage.protected_ann_read_key(&binding.key_id).is_ok());
+    assert!(storage.protected_ann_resume_key(&binding.key_id).is_err());
+    storage
+        .processing_stage
+        .set_policy(false, Limits::default())
+        .unwrap();
+    storage.clear_protected_read_cache();
+    assert!(storage
+        .protected_ann_read_key(&old_key.id)
+        .unwrap_err()
+        .contains("AUTH_REQUIRED"));
+    storage
+        .processing_stage
+        .set_policy(true, Limits::default())
+        .unwrap();
+    assert!(storage
+        .protected_ann_read_key(&old_key.id)
+        .unwrap_err()
+        .contains("AUTH_REQUIRED"));
 }

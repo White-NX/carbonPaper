@@ -141,6 +141,7 @@ pub(crate) struct ProcessingStaging {
     status: Mutex<ProcessingStatus>,
     available: AtomicBool,
     supported_consumers: AtomicU8,
+    supported_storage_keys: AtomicBool,
     broker: Arc<dyn Broker>,
     // Only receipts issued by this process can authorize a new archive write.
     // Python and user-writable SQLite rows cannot change their screenshot scope.
@@ -157,6 +158,7 @@ impl ProcessingStaging {
             status: Mutex::new(ProcessingStatus::default()),
             available: AtomicBool::new(false),
             supported_consumers: AtomicU8::new(Consumer::LEGACY_MASK),
+            supported_storage_keys: AtomicBool::new(false),
             broker: Arc::new(NativeBroker),
             issued: Mutex::new(HashMap::new()),
             scan_cursor: Mutex::new(String::new()),
@@ -280,8 +282,31 @@ impl ProcessingStaging {
         self.available.load(Ordering::Acquire)
     }
 
+    pub(crate) fn storage_keys_available(&self) -> bool {
+        self.available() && self.supported_storage_keys.load(Ordering::Acquire)
+    }
+
     pub(crate) fn supports(&self, consumer: Consumer) -> bool {
         self.available() && self.supported_consumers.load(Ordering::Acquire) & consumer.bit() != 0
+    }
+
+    pub(crate) fn storage_key_request(&self, request: Request) -> protocol::Result<Response> {
+        if !matches!(
+            request,
+            Request::RegisterStorageKey { .. } | Request::AcquireStorageKey { .. }
+        ) {
+            return Err(BrokerError::InvalidRequest);
+        }
+        if !self.available() {
+            self.refresh().map_err(|_| BrokerError::Unavailable)?;
+        }
+        if !self.available() {
+            return Err(BrokerError::Disabled);
+        }
+        if !self.supported_storage_keys.load(Ordering::Acquire) {
+            return Err(BrokerError::VersionMismatch);
+        }
+        self.call_broker_logged(request, None)
     }
 
     pub fn refresh(&self) -> Result<(), String> {
@@ -336,6 +361,8 @@ impl ProcessingStaging {
         })();
         match result {
             Ok(broker) => {
+                self.supported_storage_keys
+                    .store(broker.supported_storage_keys, Ordering::Release);
                 self.supported_consumers.store(
                     broker.supported_consumers & Consumer::ALL_MASK,
                     Ordering::Release,

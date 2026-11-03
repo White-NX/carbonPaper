@@ -1,4 +1,20 @@
 {
+  "storageStartup": {
+    "title": "Preparing your history",
+    "tip": "You can continue when preparation finishes. A large history may take a few minutes.",
+    "error": "Preparation could not finish. Please try again.",
+    "phases": {
+      "credentials": "Checking data protection",
+      "opening": "Opening your history",
+      "schema": "Preparing your history",
+      "metadata": "Protecting history information",
+      "vectors": "Protecting search data",
+      "processes": "Protecting app information",
+      "cleanup": "Cleaning up old search data",
+      "compacting": "Organizing your history",
+      "finalizing": "Finishing preparation"
+    }
+  },
   "mainPreview": {
     "emptyHint": "Select a screenshot from the timeline above, or search your history."
   },

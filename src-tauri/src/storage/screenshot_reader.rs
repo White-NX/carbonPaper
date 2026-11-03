@@ -100,7 +100,7 @@ impl<'a> ScreenshotReader<'a> {
             let conn = guard.as_ref().ok_or("Database not initialized")?;
             let mut statement = conn
                 .prepare(
-                    "SELECT id, image_path, window_title, process_name,
+                    "SELECT id, image_path, window_title, cp_process(process_name),
                             window_title_enc, process_name_enc, content_key_encrypted,
                             category, created_at
                      FROM screenshots

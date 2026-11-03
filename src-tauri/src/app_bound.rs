@@ -285,14 +285,23 @@ pub async fn app_bound_set_policy(
     let storage = storage.inner().clone();
     let recap_app = app.clone();
     tokio::task::spawn_blocking(move || {
+        let was_enabled = storage.processing_stage.status().enabled;
         storage.processing_stage.set_policy(enabled, limits)?;
+        storage.clear_protected_read_cache();
         if enabled {
+            if !was_enabled {
+                storage.rotate_protected_write_keys()?;
+            }
+            storage.publish_protected_keys()?;
             crate::ai::recap::protected::sync_after_unlock(&recap_app)?;
         }
         storage.processing_stage.reconcile(&storage)
     })
     .await
     .map_err(|e| e.to_string())??;
+    if let Some(ann) = app.try_state::<crate::clip_ann::ClipAnnState>() {
+        ann.disarm();
+    }
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {

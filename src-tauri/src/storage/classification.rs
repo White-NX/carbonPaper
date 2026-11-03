@@ -1,5 +1,5 @@
 //! Native anchors, durable user feedback, and fenced classification commits.
-//! The legacy anchor file is read once and retained. Feedback stores references
+//! The legacy anchor file is imported into encrypted storage and removed. Feedback stores references
 //! to encrypted archive inputs, never copies of screenshot text.
 
 use super::StorageState;
@@ -34,7 +34,7 @@ pub(crate) struct ClassificationFeedback {
 fn anchors_on_conn(conn: &Connection, generation: u64) -> Result<Option<AnchorSnapshot>, String> {
     let row: Option<(i64, i64, String)> = conn
         .query_row(
-            "SELECT schema_version,revision,anchors_json FROM classification_anchors WHERE id=1",
+            "SELECT schema_version,revision,cp_text(anchors_json,'classification_anchors:1') FROM classification_anchors WHERE id=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -60,7 +60,7 @@ fn write_anchors(conn: &Connection, revision: i64, anchors: &Anchors) -> Result<
     validate_anchors(anchors)?;
     let next = revision.checked_add(1).ok_or("anchor revision overflow")?;
     let json = serde_json::to_string(anchors).map_err(|e| e.to_string())?;
-    let changed=conn.execute("UPDATE classification_anchors SET anchors_json=?1,revision=?2 WHERE id=1 AND revision=?3 AND schema_version=1",params![json,next,revision]).map_err(|e|e.to_string())?;
+    let changed=conn.execute("UPDATE classification_anchors SET anchors_json=cp_seal_text(?1,'classification_anchors:1'),revision=?2 WHERE id=1 AND revision=?3 AND schema_version=1",params![json,next,revision]).map_err(|e|e.to_string())?;
     if changed != 1 {
         return Err("classification anchors changed; retry the operation".into());
     }
@@ -81,6 +81,45 @@ fn revisions(conn: &Connection, id: i64) -> Result<Option<(i64, i64)>, String> {
 }
 
 impl StorageState {
+    pub(super) fn import_legacy_anchors(&self, conn: &Connection) -> Result<(), String> {
+        let path = self
+            .data_dir
+            .lock()
+            .map_err(|_| "data directory lock poisoned")?
+            .join("anchors.json");
+        let contents = match std::fs::metadata(&path) {
+            Ok(meta) => {
+                if meta.len() > 16 * 1024 * 1024 {
+                    return Err("legacy anchors.json exceeds the import limit".into());
+                }
+                Some(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| format!("cannot read legacy anchors: {e}"))?,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("cannot inspect legacy anchors: {error}")),
+        };
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM classification_anchors WHERE id=1)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            let anchors = import_anchors(contents.as_deref())?;
+            let json = serde_json::to_string(&anchors).map_err(|e| e.to_string())?;
+            let encrypted = self.protected.text("classification_anchors:1", &json)?;
+            conn.execute("INSERT INTO classification_anchors(id,schema_version,revision,anchors_json) VALUES(1,1,1,?1)", [encrypted]).map_err(|e| e.to_string())?;
+        }
+        if contents.is_some() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("cannot retire legacy anchors: {e}"))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn init_classification_schema(&self, conn: &Connection) -> Result<(), String> {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS classification_anchors(
                 id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL,
@@ -109,32 +148,12 @@ impl StorageState {
                 return Ok(snapshot);
             }
         }
-        let path = self
-            .data_dir
-            .lock()
-            .map_err(|_| "data directory lock poisoned")?
-            .join("anchors.json");
-        let contents = match std::fs::metadata(&path) {
-            Ok(meta) => {
-                if meta.len() > 16 * 1024 * 1024 {
-                    return Err("legacy anchors.json exceeds the import limit".into());
-                }
-                Some(
-                    std::fs::read_to_string(&path)
-                        .map_err(|e| format!("cannot read legacy anchors: {e}"))?,
-                )
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(format!("cannot inspect legacy anchors: {error}")),
-        };
-        let anchors = import_anchors(contents.as_deref())?;
-        let json = serde_json::to_string(&anchors).map_err(|e| e.to_string())?;
         let guard = self.get_connection_named("import_classification_anchors")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         if self.db_generation() != generation {
             return Err("database changed during anchor import".into());
         }
-        conn.execute("INSERT OR IGNORE INTO classification_anchors(id,schema_version,revision,anchors_json) VALUES(1,1,1,?1)",[json]).map_err(|e|e.to_string())?;
+        self.import_legacy_anchors(conn)?;
         anchors_on_conn(conn, generation)?.ok_or_else(|| "anchor import did not commit".into())
     }
 

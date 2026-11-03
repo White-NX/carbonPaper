@@ -77,6 +77,7 @@ mod sensitive_filter;
 mod settings_window;
 mod smart_cluster_scoring;
 mod storage;
+mod storage_startup;
 mod task_error;
 mod updater;
 
@@ -890,6 +891,7 @@ pub fn run() {
         .manage(Arc::new(SensitiveFilterState::default()))
         .manage(credential_state)
         .manage(storage_state)
+        .manage(Arc::new(storage_startup::StorageStartupState::new(start_hidden)))
         .manage(lightweight_state.clone())
         .manage(Arc::new(PowerState::new()))
         .manage(Arc::new(IdleState::new()))
@@ -923,7 +925,6 @@ pub fn run() {
                 // Finish preference migrations before exposing runtime controls
                 // or spawning any task that can start an inference worker.
                 commands::utility::migrate_dml_config();
-                ai::recap::start_scheduler(app.handle().clone());
 
                 build_tray(app)?;
 
@@ -986,131 +987,7 @@ pub fn run() {
     "#
                 );
 
-                let credential_state = app.state::<Arc<CredentialManagerState>>();
-
-                let public_key_ready =
-                    match credential_manager::load_public_key_from_file(&credential_state) {
-                        Ok(public_key) => {
-                            tracing::info!(
-                                "Public key loaded from file, length: {}",
-                                public_key.len()
-                            );
-                            true
-                        }
-                        Err(credential_manager::CredentialError::KeyNotFound) => {
-                            tracing::info!("Public key file missing, exporting from CNG...");
-
-                            match credential_manager::export_or_get_public_key(&credential_state) {
-                                Ok(public_key) => {
-                                    tracing::info!(
-                                        "CNG public key exported, length: {}",
-                                        public_key.len()
-                                    );
-                                    if let Err(e) = credential_manager::save_public_key_to_file(
-                                        &credential_state,
-                                        &public_key,
-                                    ) {
-                                        tracing::error!("Failed to save public key: {}", e);
-                                    }
-                                    true
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to export CNG public key: {:?}", e);
-                                    false
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to load public key: {:?}", e);
-                            false
-                        }
-                    };
-
-                let storage = app.state::<Arc<StorageState>>();
-                if public_key_ready {
-                    if let Err(e) = storage.initialize() {
-                        tracing::error!("Failed to initialize storage: {}", e);
-                    } else {
-                        // Storage publishes its primary connection only after
-                        // the startup journal-mode policy has completed. Start
-                        // Office observation after that boundary so no worker
-                        // can create a read connection during conversion.
-                        let office_runtime = app
-                            .state::<Arc<office_runtime::OfficeRuntimeState>>()
-                            .inner()
-                            .clone();
-                        let office_storage = storage.inner().clone();
-                        office_runtime.start(app.handle().clone(), office_storage);
-
-                        match storage.recover_incomplete_ocr_postprocess() {
-                            Ok(recovered) if recovered > 0 => tracing::info!(
-                                "[ML:POSTPROCESS] recovered {} incomplete rows from the previous application process",
-                                recovered
-                            ),
-                            Ok(_) => {}
-                            Err(error) => tracing::warn!(
-                                "[ML:POSTPROCESS] failed to recover incomplete startup rows: {}",
-                                error
-                            ),
-                        }
-
-                        // Repair the text-search postings before any other
-                        // sentinel-gated migration is allowed to take maintenance.
-                        blind_index_repair::spawn_blind_index_auto_repair(
-                            app.handle().clone(),
-                        );
-
-                        // Settle the derived-index sentinels by explicit
-                        // discard of the retired Chroma collections. Needs
-                        // neither an unlocked vault nor maintenance mode.
-                        legacy_vector_discard::spawn_legacy_vector_discard(
-                            app.handle().clone(),
-                        );
-                        clip_ann::spawn_startup_arm(app.handle().clone());
-
-                        let app_handle_cleanup = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            run_delete_queue_maintenance_loop(app_handle_cleanup).await;
-                        });
-                        let app_handle_postprocess = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            ml_runtime::run_postprocess_retry_loop(app_handle_postprocess).await;
-                        });
-
-                        // The resident MiniLM matrix only earns its ~14 MiB
-                        // while the user is running NL cluster queries; release
-                        // it once they stop. The frontend does not report when
-                        // the view closes, so this polls instead of subscribing.
-                        let storage_cache = storage.inner().clone();
-                        tauri::async_runtime::spawn(async move {
-                            let mut ticker =
-                                tokio::time::interval(std::time::Duration::from_secs(60));
-                            loop {
-                                ticker.tick().await;
-                                storage_cache.evict_semantic_vector_cache_if_idle(
-                                    storage::SEMANTIC_CACHE_IDLE_TTL,
-                                );
-                            }
-                        });
-
-                        // One scheduler arbitrates all four automatic model
-                        // tasks. Their business queues remain durable in
-                        // SQLite; only admission and slice ordering live
-                        // in this loop.
-                        let scheduler = app
-                            .state::<Arc<background_scheduler::BackgroundSchedulerState>>()
-                            .inner()
-                            .clone();
-                        scheduler.start(app.handle().clone());
-                    }
-                } else {
-                    tracing::error!("Storage initialization deferred: public key unavailable");
-                }
-
-                if registry_config::get_bool("game_mode_enabled").unwrap_or(false) {
-                    tracing::info!("Restoring game mode monitor on startup");
-                    monitor::start_game_mode_monitor(app.handle().clone());
-                }
+                storage_startup::spawn(app.handle().clone());
 
                 // Start power monitor (power saving mode)
                 power::start_power_monitor(app.handle().clone());
@@ -1124,91 +1001,7 @@ pub fn run() {
 
                 commands::utility::migrate_extension_enhancement_config();
 
-                {
-                    let data_dir_clone = data_dir.clone();
-                    let storage_for_nmh = storage.inner().clone();
-                    let capture_for_nmh = app.state::<Arc<CaptureState>>().inner().clone();
-                    let app_handle_for_nmh = app.handle().clone();
-                    std::thread::spawn(move || {
-                        match reverse_ipc::generate_nmh_auth_token(&data_dir_clone) {
-                            Ok(token) => {
-                                let mut nmh_server = reverse_ipc::NmhPipeServer::new();
-                                if let Err(e) = nmh_server.start(
-                                    storage_for_nmh,
-                                    capture_for_nmh,
-                                    app_handle_for_nmh,
-                                    token,
-                                ) {
-                                    tracing::error!("Failed to start NMH pipe server: {}", e);
-                                }
-                                std::mem::forget(nmh_server);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to generate NMH auth token: {}", e);
-                            }
-                        }
-                    });
-                }
-
-                {
-                    let filter_state = app.state::<Arc<SensitiveFilterState>>();
-                    filter_state.load_dicts(app.handle());
-                    if let Ok(policy) = storage.load_policy() {
-                        if let Some(filter_config) = policy.get("sensitive_filter") {
-                            if let Ok(config) = serde_json::from_value::<
-                                sensitive_filter::SensitiveFilterConfig,
-                            >(filter_config.clone())
-                            {
-                                filter_state.update_config(config.upgraded());
-                            }
-                        }
-                    }
-                }
-
-                {
-                    let app_handle_mcp = app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        use tauri::Manager;
-                        let storage = app_handle_mcp.state::<Arc<StorageState>>();
-                        let credential = app_handle_mcp.state::<Arc<CredentialManagerState>>();
-                        let mcp_runtime = app_handle_mcp.state::<mcp_server::McpRuntimeState>();
-
-                        if let Ok(policy) = storage.load_policy() {
-                            if policy
-                                .get("mcp_enabled")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                            {
-                                match mcp_server::auto_start(
-                                    app_handle_mcp.clone(),
-                                    &credential,
-                                    &storage,
-                                    &mcp_runtime,
-                                )
-                                .await
-                                {
-                                    Ok(()) => tracing::info!("MCP server auto-started"),
-                                    Err(e) => tracing::error!("MCP auto-start failed: {}", e),
-                                }
-                            }
-                        }
-                    });
-                }
-
                 ml_runtime::schedule_ocr_model_health_notification(app.handle().clone());
-
-                // 轻量模式下自动启动监控。新用户完成首次向导之前不自动记录。
-                if start_hidden
-                    && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true)
-                    && !onboarding::capture_held()
-                {
-                    let app_handle = app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = monitor::control(&app_handle, monitor::MonitorAction::Start).await {
-                            tracing::error!("Failed to auto-start monitor: {}", e);
-                        }
-                    });
-                }
 
                 Ok(())
             }
@@ -1284,6 +1077,8 @@ pub fn run() {
             commands::storage::storage_update_category,
             commands::storage::storage_get_categories_from_db,
             commands::storage::storage_batch_get_categories,
+            storage_startup::storage_get_initialization_status,
+            storage_startup::storage_retry_initialization,
             commands::migration::storage_get_startup_vacuum_status,
             commands::migration::storage_is_startup_vacuum_in_progress,
             commands::migration::storage_run_startup_vacuum_if_needed,

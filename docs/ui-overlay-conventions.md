@@ -29,6 +29,7 @@ or a fatal surface.
 | Windows Hello lock (`auth`) | Each window, `AuthMask` / `OverlayShell`, `gate` | User unlocks explicitly; no dismissal. |
 | Fatal error (`fatal`) | Main window, `ErrorWindow`, `fatal` | Restart/exit and presentation switch only; covers the title bar too. |
 | Rust index maintenance (`maintenance`) and startup database cleanup (`vacuum`) | Main window, `OverlayShell`, `maintenance` | Complete automatically; maintenance offers its own unlock action when required. |
+| Storage initialization (`storageInitialization`) | Main window, `StorageInitializationOverlay` / `OverlayShell`, `maintenance` | Completes before the login flow; failed preparation offers an explicit retry. Recreated hidden-start windows read the current application-owned job before requesting progress; application access stays gated until readiness is confirmed. |
 | First-run onboarding and What's New (`onboarding`) | Main window, `OnboardingOverlay` / `OverlayShell`, `prompt` | Wizard navigation follows its step state; What's New can defer while idle. Applying choices blocks dismissal. |
 | Update offer/progress (`update`) | Main window, `UpdateModal` / `OverlayShell`, `prompt` | Explicit later/hide/retry controls; hiding progress leaves the operation running. |
 | Required-model download (`modelDownload`) | Main window, `Mask` / `OverlayShell`, `prompt` | Explicit background/retry actions; shares the download controller with onboarding. |
@@ -126,7 +127,7 @@ when it leaves. A component never shows itself on its own authority, and
 A new startup overlay needs an id in `OVERLAY_PRIORITY`, placed with a comment
 that says why it ranks where it does.
 
-The current grant order is `fatal`, `maintenance`, `vacuum`, `auth`,
+The current grant order is `fatal`, `storageInitialization`, `maintenance`, `vacuum`, `auth`,
 `onboarding`, `update`, `modelDownload`, `hmac`, `clipBackfill`, then `appBound`.
 This controls which startup view renders; CSS layer bands control stacking
 against ordinary dialogs and the explicit settings discard decision.

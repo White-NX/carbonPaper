@@ -7,7 +7,7 @@ use std::collections::HashMap;
 #[derive(Clone)]
 struct TailRow {
     key: Arc<str>,
-    vector: Option<Arc<Vec<f32>>>,
+    vector: Option<Arc<Zeroizing<Vec<f32>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -48,7 +48,7 @@ impl CachedTail {
             // pins this version, never the entire f32 matrix.
             let data = Arc::make_mut(&mut self.data);
             for change in changes {
-                let vector = change.vector.map(Arc::new);
+                let vector = change.vector.map(|vector| Arc::new(Zeroizing::new(vector)));
                 if let Some(&position) = data.positions.get(change.subject_key.as_str()) {
                     data.rows[position].vector = vector;
                 } else {
@@ -107,11 +107,17 @@ impl TailCache {
     }
 }
 
+type QueryAuthorization = Option<(
+    std::sync::Weak<crate::credential_manager::CredentialManagerState>,
+    Instant,
+)>;
+
 pub(crate) struct ClipAnnSnapshot {
     generation: Arc<GenerationReader>,
     tail: Arc<TailData>,
-    query: Vec<f32>,
+    query: Zeroizing<Vec<f32>>,
     tail_scores: Vec<(usize, f32)>,
+    authorization: QueryAuthorization,
 }
 
 impl ClipAnnSnapshot {
@@ -120,24 +126,45 @@ impl ClipAnnSnapshot {
         tail: Arc<TailData>,
         query: &[f32],
         deadline: Option<Instant>,
+        authorization: QueryAuthorization,
     ) -> Result<Self, String> {
-        let mut tail_scores = Vec::with_capacity(tail.rows.len());
-        for (index, row) in tail.rows.iter().enumerate() {
+        let mut snapshot = Self {
+            generation,
+            tail_scores: Vec::with_capacity(tail.rows.len()),
+            tail,
+            query: Zeroizing::new(query.to_vec()),
+            authorization,
+        };
+        snapshot.check_authorization()?;
+        for (index, row) in snapshot.tail.rows.iter().enumerate() {
             if index % 64 == 0 {
                 check_ann_deadline(deadline)?;
+                snapshot.check_authorization()?;
             }
             if let Some(vector) = &row.vector {
                 if vector.len() == query.len() {
-                    tail_scores.push((index, dot_product(query, vector)));
+                    snapshot
+                        .tail_scores
+                        .push((index, dot_product(query, vector)));
                 }
             }
         }
-        Ok(Self {
-            generation,
-            tail,
-            query: query.to_vec(),
-            tail_scores,
-        })
+        snapshot.check_authorization()?;
+        Ok(snapshot)
+    }
+
+    fn check_authorization(&self) -> Result<(), String> {
+        if let Some((credentials, marker)) = &self.authorization {
+            let credentials = credentials.upgrade().ok_or("AUTH_REQUIRED")?;
+            if !credentials.is_session_valid()
+                || credentials.silent_read_auth_required()
+                || credentials.session_marker() != Some(*marker)
+            {
+                return Err("AUTH_REQUIRED".into());
+            }
+        }
+        self.generation.touch();
+        Ok(())
     }
 
     fn scores(&self) -> impl Iterator<Item = (&str, f32)> {
@@ -151,6 +178,7 @@ impl ClipAnnSnapshot {
         k: usize,
         deadline: Option<Instant>,
     ) -> Result<ClipAnnQuery, String> {
+        self.check_authorization()?;
         let candidates = ann_candidates_with_tail(
             &self.generation,
             &self.query,
@@ -159,6 +187,7 @@ impl ClipAnnSnapshot {
             |key| self.tail.positions.contains_key(key),
             self.scores(),
         )?;
+        self.check_authorization()?;
         Ok(ClipAnnQuery {
             candidates,
             mode: "ann",
@@ -171,6 +200,7 @@ impl ClipAnnSnapshot {
         k: usize,
         deadline: Option<Instant>,
     ) -> Result<ClipAnnQuery, String> {
+        self.check_authorization()?;
         let candidates = exact_candidates_with_tail(
             &self.generation,
             &self.query,
@@ -179,6 +209,7 @@ impl ClipAnnSnapshot {
             |key| self.tail.positions.contains_key(key),
             self.scores(),
         )?;
+        self.check_authorization()?;
         Ok(ClipAnnQuery {
             candidates,
             mode: "flat_exact",
@@ -251,13 +282,14 @@ mod tests {
         ];
         let mut cache = CachedTail::default();
         let tail = cache.apply(1, rows.clone(), 10).unwrap();
-        let snapshot = ClipAnnSnapshot::new(Arc::clone(&reader), tail, &[1.0, 0.0], None).unwrap();
+        let snapshot =
+            ClipAnnSnapshot::new(Arc::clone(&reader), tail, &[1.0, 0.0], None, None).unwrap();
         let expected = ann_candidates(&reader, &rows, &[1.0, 0.0], 10, None).unwrap();
         cache.apply(2, vec![row("new", None)], 10).unwrap();
         assert_eq!(snapshot.query(10, None).unwrap().candidates, expected);
         assert_eq!(snapshot.exact(10, None).unwrap().candidates, expected);
         let next =
-            ClipAnnSnapshot::new(reader, Arc::clone(&cache.data), &[1.0, 0.0], None).unwrap();
+            ClipAnnSnapshot::new(reader, Arc::clone(&cache.data), &[1.0, 0.0], None, None).unwrap();
         assert_eq!(next.query(10, None).unwrap().candidates.len(), 1);
     }
 
@@ -280,5 +312,55 @@ mod tests {
             .unwrap()
             .contains("storage_generation_changed"));
         assert!(pinned.rows.is_empty());
+    }
+
+    #[test]
+    fn admitted_native_query_cannot_cross_lock_or_a_later_unlock() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = crate::credential_manager::cng_tests::storage_credentials(temp.path());
+        let storage = StorageState::new(temp.path().into(), credentials.clone());
+        let reader = Arc::new(super::super::tests::test_reader(
+            temp.path(),
+            46,
+            &["a"],
+            &[vec![1.0, 0.0]],
+        ));
+        let admitted = storage.protected_query_session().unwrap();
+        assert!(admitted.is_some());
+        let snapshot = ClipAnnSnapshot::new(
+            Arc::clone(&reader),
+            Arc::new(TailData::default()),
+            &[1.0, 0.0],
+            None,
+            admitted.clone(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.query(1, None).unwrap().candidates.len(), 1);
+        credentials.invalidate_session();
+        assert_eq!(snapshot.query(1, None).unwrap_err(), "AUTH_REQUIRED");
+        assert_eq!(snapshot.exact(1, None).unwrap_err(), "AUTH_REQUIRED");
+        credentials.update_auth_time();
+        assert_eq!(snapshot.query(1, None).unwrap_err(), "AUTH_REQUIRED");
+        assert_eq!(
+            ClipAnnSnapshot::new(
+                Arc::clone(&reader),
+                Arc::new(TailData::default()),
+                &[1.0, 0.0],
+                None,
+                admitted,
+            )
+            .err()
+            .unwrap(),
+            "AUTH_REQUIRED"
+        );
+        let renewed = ClipAnnSnapshot::new(
+            reader,
+            Arc::new(TailData::default()),
+            &[1.0, 0.0],
+            None,
+            storage.protected_query_session().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renewed.exact(1, None).unwrap().candidates.len(), 1);
     }
 }

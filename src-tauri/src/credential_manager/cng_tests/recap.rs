@@ -41,7 +41,8 @@ pub(crate) fn storage_credentials(data_dir: PathBuf) -> Arc<CredentialManagerSta
     }
     .unwrap();
     public_key.truncate(length as usize);
-    *state.cached_public_key.lock().unwrap() = Some(public_key);
+    state.fixture_public_key(&public_key);
+    save_public_key_to_file(&state, &public_key).unwrap();
     *state.cached_private_key.lock().unwrap() = Some(key);
     Arc::new(state)
 }

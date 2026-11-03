@@ -680,7 +680,11 @@ impl StorageState {
                 request.width,
                 request.height,
                 Option::<String>::None,
-                request.process_name.clone(), // plaintext for fast aggregation
+                request
+                    .process_name
+                    .as_deref()
+                    .map(|name| self.protected.process_token(conn, name))
+                    .transpose()?,
                 Option::<String>::None,
                 window_title_enc,
                 process_name_enc,
@@ -898,7 +902,11 @@ impl StorageState {
                 request.width,
                 request.height,
                 Option::<String>::None,
-                request.process_name.clone(), // plaintext for fast aggregation
+                request
+                    .process_name
+                    .as_deref()
+                    .map(|name| self.protected.process_token(conn, name))
+                    .transpose()?,
                 Option::<String>::None,
                 window_title_enc,
                 process_name_enc,
@@ -1431,7 +1439,7 @@ impl StorageState {
                 check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), process_name, category
+                    "SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), cp_process(process_name), category
                      FROM screenshots WHERE is_deleted = 0 AND image_hash IN ({placeholders})
                      ORDER BY created_at DESC, id DESC"
                 );
@@ -1662,7 +1670,7 @@ impl StorageState {
                 .map_err(BackgroundReadError::Other)?;
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(
-                "SELECT id, window_title, process_name, window_title_enc,
+                "SELECT id, window_title, cp_process(process_name), window_title_enc,
                         process_name_enc, content_key_encrypted,
                         strftime('%s', created_at) AS timestamp, category
                  FROM screenshots
@@ -2169,10 +2177,17 @@ impl StorageState {
 
         let normalized_month = month.map(|m| m.trim().to_string());
 
-        let mut filter_plain = String::from("process_name = ?1 AND is_deleted = 0");
-        let mut filter_alias = String::from("s.process_name = ?1 AND s.is_deleted = 0");
-        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(normalized_process.to_string())];
+        let process_tokens = self
+            .protected
+            .process_tokens(&[normalized_process.to_string()])?;
+        let mut filter_plain =
+            String::from("process_name IN (SELECT value FROM json_each(?1)) AND is_deleted = 0");
+        let mut filter_alias = String::from(
+            "s.process_name IN (SELECT value FROM json_each(?1)) AND s.is_deleted = 0",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(
+            serde_json::to_string(&process_tokens).map_err(|e| e.to_string())?,
+        )];
 
         if let Some(ref month_key) = normalized_month {
             let zone =

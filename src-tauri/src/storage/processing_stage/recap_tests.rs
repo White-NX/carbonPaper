@@ -312,8 +312,6 @@ fn locked_recap_writes_use_public_key_encryption_and_leave_public_reads_locked()
     assert!(storage
         .recap_read_background::<Value>("batch", "test", None)
         .is_err());
-    storage.credential_state =
-        crate::credential_manager::cng_tests::recap::storage_credentials(dir.to_path_buf());
     storage.credential_state.invalidate_session();
     storage.credential_state.revoke_background_lease();
     storage

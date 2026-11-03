@@ -1,13 +1,13 @@
-//! Native regressions use an unnamed, unprotected RSA key. They never open the
+//! Native regressions use unnamed, unprotected RSA keys. They never open the
 //! user's persisted CarbonPaper key or require an authentication dialog.
 
 use super::*;
 pub(crate) mod recap;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Security::Cryptography::{
-    NCryptCreatePersistedKey, NCryptEncrypt, NCryptFinalizeKey, NCryptFreeObject,
+    NCryptCreatePersistedKey, NCryptEncrypt, NCryptExportKey, NCryptFinalizeKey, NCryptFreeObject,
     NCryptOpenStorageProvider, CERT_KEY_SPEC, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
-    NCRYPT_PAD_PKCS1_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_RSA_ALGORITHM,
+    NCRYPT_PAD_PKCS1_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_RSA_ALGORITHM, NCRYPT_SILENT_FLAG,
 };
 
 fn ephemeral_key() -> CngKeyHandle {
@@ -85,6 +85,361 @@ fn native_fixture() -> (CredentialManagerState, Vec<u8>) {
     let ciphertext = wrap_for_test(&key, &[7; MASTER_KEY_LEN]);
     *state.cached_private_key.lock().unwrap() = Some(key);
     (state, ciphertext)
+}
+
+fn public_blob(key: &CngKeyHandle) -> Vec<u8> {
+    let blob = HSTRING::from("RSAPUBLICBLOB");
+    let mut length = 0;
+    // SAFETY: the unnamed test key and blob type are live; this queries size only.
+    unsafe {
+        NCryptExportKey(
+            key.key,
+            NCRYPT_KEY_HANDLE::default(),
+            &blob,
+            None,
+            None,
+            &mut length,
+            NCRYPT_SILENT_FLAG,
+        )
+    }
+    .unwrap();
+    let mut bytes = vec![0; length as usize];
+    // SAFETY: the output is the queried size, and all inputs stay live.
+    unsafe {
+        NCryptExportKey(
+            key.key,
+            NCRYPT_KEY_HANDLE::default(),
+            &blob,
+            None,
+            Some(&mut bytes),
+            &mut length,
+            NCRYPT_SILENT_FLAG,
+        )
+    }
+    .unwrap();
+    bytes.truncate(length as usize);
+    bytes
+}
+
+pub(crate) fn storage_credentials(directory: &std::path::Path) -> Arc<CredentialManagerState> {
+    let state = Arc::new(CredentialManagerState::new(directory.into()));
+    state.set_session_timeout(-1);
+    state.background_enabled_for_tests(false);
+    let key = ephemeral_key();
+    let public = public_blob(&key);
+    state.fixture_public_key(&public);
+    save_public_key_to_file(&state, &public).unwrap();
+    std::fs::write(
+        state.file_path(MASTER_KEY_FILE_NAME),
+        encode_master_key_file(&wrap_for_test(&key, &[3; MASTER_KEY_LEN])),
+    )
+    .unwrap();
+    *state.cached_private_key.lock().unwrap() = Some(key);
+    state.cache_master_key_for_tests(vec![3; MASTER_KEY_LEN]);
+    state.update_auth_time();
+    state
+}
+
+#[test]
+fn public_export_can_open_before_enforcing_silence_on_public_operations() {
+    let key = ephemeral_key();
+    let expected = public_blob(&key);
+    let exported =
+        windows_impl::export_public_key_with_open(CngKeyAccess::Existing, |access, flags| {
+            assert!(matches!(access, CngKeyAccess::Existing));
+            // Model the Software KSP denial observed on high-protection cold opens.
+            // Do not create a protected persisted key, which prompts for a password.
+            if flags.contains(NCRYPT_SILENT_FLAG) {
+                return Err(CredentialError::AuthRequired);
+            }
+            Ok(key)
+        })
+        .unwrap();
+    assert_eq!(exported, expected);
+}
+
+fn cold_storage_credentials(
+    directory: &std::path::Path,
+    authority: &[u8],
+) -> Arc<CredentialManagerState> {
+    let state = Arc::new(CredentialManagerState::new(directory.into()));
+    state.background_enabled_for_tests(false);
+    *state.test_public_key_authority.lock().unwrap() = Some(authority.to_vec());
+    state
+}
+
+#[test]
+fn cold_start_initializes_storage_and_captures_without_unlocking() {
+    let directory = tempfile::tempdir().unwrap();
+    let public = public_blob(&ephemeral_key());
+    std::fs::write(directory.path().join(PUBLIC_KEY_FILE_NAME), &public).unwrap();
+    let wrapped_master = encrypt_with_exported_public_key(&public, &[3; MASTER_KEY_LEN]).unwrap();
+    std::fs::write(
+        directory.path().join(MASTER_KEY_FILE_NAME),
+        encode_master_key_file(&wrapped_master),
+    )
+    .unwrap();
+    let mut image = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut image, image::ImageFormat::Png)
+        .unwrap();
+
+    for restart in 0..2 {
+        let credentials = cold_storage_credentials(directory.path(), &public);
+        assert!(get_cached_public_key(&credentials).is_none());
+        assert_eq!(initialize_public_key(&credentials).unwrap(), public);
+        ensure_master_key_created(&credentials).unwrap();
+        let storage =
+            crate::storage::StorageState::new(directory.path().into(), credentials.clone());
+        storage.initialize().unwrap();
+        assert!(storage.is_initialized());
+
+        let request = crate::storage::SaveScreenshotRequest {
+            image_data: String::new(),
+            image_hash: format!("protected-cold-capture-{restart}"),
+            width: 2,
+            height: 2,
+            window_title: Some("Synthetic protected capture".into()),
+            process_name: Some("Editor.exe".into()),
+            metadata: None,
+            ocr_results: None,
+            source: Some("capture".into()),
+            page_url: None,
+            page_icon: None,
+            visible_links: None,
+        };
+        let saved = storage
+            .save_screenshot_temp_bytes(&request, image.get_ref())
+            .unwrap();
+        assert!(saved.screenshot_id.is_some());
+        let image_path = directory.path().join(saved.image_path.unwrap());
+        assert_ne!(std::fs::read(image_path).unwrap(), *image.get_ref());
+        assert!(storage.screenshot_exists(&request.image_hash).unwrap());
+        assert!(matches!(
+            decrypt_row_key_with_cng_silent(&credentials, &wrapped_master),
+            Err(CredentialError::AuthRequired)
+        ));
+        assert!(!credentials.is_session_valid());
+        assert!(!credentials.protected_read_authorized());
+        assert!(get_cached_master_key(&credentials).is_none());
+        assert!(credentials.cached_private_key.lock().unwrap().is_none());
+        storage.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn cold_public_validation_rejects_substitution_before_and_after_caching() {
+    let directory = tempfile::tempdir().unwrap();
+    let public = public_blob(&ephemeral_key());
+    let substitute = public_blob(&ephemeral_key());
+    let credentials = cold_storage_credentials(directory.path(), &public);
+    let public_path = directory.path().join(PUBLIC_KEY_FILE_NAME);
+    let master_path = directory.path().join(MASTER_KEY_FILE_NAME);
+    let master = encode_master_key_file(
+        &encrypt_with_exported_public_key(&public, &[3; MASTER_KEY_LEN]).unwrap(),
+    );
+    std::fs::write(&master_path, &master).unwrap();
+    std::fs::write(&public_path, &substitute).unwrap();
+
+    assert!(matches!(
+        initialize_public_key(&credentials),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    assert!(get_cached_public_key(&credentials).is_none());
+    let storage = crate::storage::StorageState::new(directory.path().into(), credentials.clone());
+    assert!(storage.initialize().is_err());
+    assert!(!storage.is_initialized());
+    assert!(!directory.path().join("screenshots.db").exists());
+
+    std::fs::write(&public_path, &public).unwrap();
+    assert_eq!(initialize_public_key(&credentials).unwrap(), public);
+    storage.initialize().unwrap();
+    std::fs::write(&public_path, &substitute).unwrap();
+    assert!(matches!(
+        wrap_storage_domain_key(&credentials, &[7; MASTER_KEY_LEN]),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    assert_eq!(std::fs::read(master_path).unwrap(), master);
+    assert_eq!(std::fs::read(public_path).unwrap(), substitute);
+    assert!(!credentials.is_session_valid());
+    assert!(credentials.cached_private_key.lock().unwrap().is_none());
+    storage.shutdown().unwrap();
+}
+
+#[test]
+fn public_key_substitution_is_rejected_even_with_an_unlocked_original_private_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = storage_credentials(directory.path());
+    let original = get_cached_public_key(&state).unwrap();
+    let master = std::fs::read(state.file_path(MASTER_KEY_FILE_NAME)).unwrap();
+    let handle = state
+        .cached_private_key
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .key
+        .0;
+    let attacker = public_blob(&ephemeral_key());
+    assert_ne!(attacker, original);
+    // Prove this is a valid substitute, not a malformed-file test.
+    encrypt_with_exported_public_key(&attacker, &[7; 32]).unwrap();
+    std::fs::write(state.file_path(PUBLIC_KEY_FILE_NAME), &attacker).unwrap();
+    assert!(matches!(
+        load_public_key_from_file(&state),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    assert!(matches!(
+        wrap_storage_domain_key(&state, &[7; 32]),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    assert!(matches!(
+        initialize_public_key(&state),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    assert!(matches!(
+        save_public_key_to_file(&state, &original),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    std::fs::write(
+        directory.path().join("screenshots.db"),
+        b"original database sentinel",
+    )
+    .unwrap();
+    let storage = crate::storage::StorageState::new(directory.path().into(), state.clone());
+    assert!(storage.initialize().is_err());
+    assert_eq!(
+        std::fs::read(directory.path().join("screenshots.db")).unwrap(),
+        b"original database sentinel"
+    );
+    assert_eq!(
+        std::fs::read(state.file_path(PUBLIC_KEY_FILE_NAME)).unwrap(),
+        attacker
+    );
+    assert_eq!(
+        std::fs::read(state.file_path(MASTER_KEY_FILE_NAME)).unwrap(),
+        master
+    );
+    assert_eq!(
+        state
+            .cached_private_key
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .key
+            .0,
+        handle
+    );
+    assert!(state.is_session_valid());
+}
+
+#[test]
+fn existing_dataset_with_missing_public_or_cng_key_never_enters_first_use_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = storage_credentials(directory.path());
+    let original = get_cached_public_key(&state).unwrap();
+    let master = std::fs::read(state.file_path(MASTER_KEY_FILE_NAME)).unwrap();
+    let handle = state
+        .cached_private_key
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .key
+        .0;
+    *state.cached_public_key.lock().unwrap() = None;
+    state
+        .test_existing_key_missing
+        .store(true, Ordering::Relaxed);
+    assert!(matches!(
+        initialize_public_key(&state),
+        Err(CredentialError::KeyNotFound)
+    ));
+    assert_eq!(
+        std::fs::read(state.file_path(PUBLIC_KEY_FILE_NAME)).unwrap(),
+        original
+    );
+    state
+        .test_existing_key_missing
+        .store(false, Ordering::Relaxed);
+    std::fs::remove_file(state.file_path(PUBLIC_KEY_FILE_NAME)).unwrap();
+    assert!(matches!(
+        initialize_public_key(&state),
+        Err(CredentialError::KeyNotFound)
+    ));
+    assert!(!state.file_path(PUBLIC_KEY_FILE_NAME).exists());
+    assert_eq!(
+        std::fs::read(state.file_path(MASTER_KEY_FILE_NAME)).unwrap(),
+        master
+    );
+    assert_eq!(
+        state
+            .cached_private_key
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .key
+            .0,
+        handle
+    );
+}
+
+#[test]
+fn first_use_master_wrap_uses_validated_public_material_without_replacing_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = CredentialManagerState::new(directory.path().into());
+    let key = ephemeral_key();
+    let public = public_blob(&key);
+    state.fixture_public_key(&public);
+    save_public_key_to_file(&state, &public).unwrap();
+    assert!(!state.is_session_valid());
+    assert!(state.cached_private_key.lock().unwrap().is_none());
+    ensure_master_key_created(&state).unwrap();
+    let original = std::fs::read(state.master_key_file_path()).unwrap();
+    assert_eq!(
+        key.unwrap_row_key(&decode_master_key_file(&original).unwrap())
+            .unwrap(),
+        get_cached_master_key(&state).unwrap()
+    );
+    assert!(!state.is_session_valid());
+    assert!(state.cached_private_key.lock().unwrap().is_none());
+    assert!(
+        !persist_new_credential_file(&state.master_key_file_path(), b"replacement master").unwrap()
+    );
+    assert_eq!(
+        std::fs::read(state.master_key_file_path()).unwrap(),
+        original
+    );
+    *state.cached_master_key.lock().unwrap() = None;
+    ensure_master_key_created(&state).unwrap();
+    assert!(get_cached_master_key(&state).is_none());
+    assert_eq!(
+        std::fs::read(state.master_key_file_path()).unwrap(),
+        original
+    );
+
+    std::fs::remove_file(state.master_key_file_path()).unwrap();
+    let database = directory.path().join("screenshots.db");
+    std::fs::write(&database, b"existing dataset sentinel").unwrap();
+    assert!(matches!(
+        ensure_master_key_created(&state),
+        Err(CredentialError::KeyNotFound)
+    ));
+    assert!(!state.master_key_file_path().exists());
+    std::fs::remove_file(database).unwrap();
+    let substitute = public_blob(&ephemeral_key());
+    std::fs::write(state.file_path(PUBLIC_KEY_FILE_NAME), &substitute).unwrap();
+    assert!(matches!(
+        ensure_master_key_created(&state),
+        Err(CredentialError::PublicKeyMismatch)
+    ));
+    assert!(!state.master_key_file_path().exists());
+    assert_eq!(
+        std::fs::read(state.file_path(PUBLIC_KEY_FILE_NAME)).unwrap(),
+        substitute
+    );
 }
 
 #[test]

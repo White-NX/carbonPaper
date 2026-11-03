@@ -6,7 +6,7 @@ use super::{
 };
 
 impl StorageState {
-    /// List active process names with counts from the stored plaintext column.
+    /// Aggregate opaque process identifiers through the existing covering index.
     pub fn list_distinct_processes(&self) -> Result<Vec<(String, i64)>, String> {
         let fn_start = std::time::Instant::now();
         let mut results = {
@@ -16,7 +16,7 @@ impl StorageState {
             // matching screenshot from the main table or build a temp B-tree.
             let mut stmt = reader
                 .prepare(
-                    "SELECT process_name, COUNT(*) FROM screenshots
+                    "SELECT cp_process(process_name), COUNT(*) FROM screenshots
                         INDEXED BY idx_screenshots_process_deleted_created_at
                      WHERE is_deleted = 0
                        AND process_name IS NOT NULL AND process_name != ''
@@ -31,12 +31,20 @@ impl StorageState {
             let results = rows
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Failed to read process statistics: {e}"))?;
-            results
+            let mut grouped = std::collections::HashMap::<String, i64>::new();
+            for (name, count) in results {
+                if name.is_empty() {
+                    continue;
+                }
+                *grouped.entry(name).or_default() += count;
+            }
+            grouped.into_iter().collect::<Vec<_>>()
         };
 
         results.sort_by(|a, b| {
             b.1.cmp(&a.1)
                 .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+                .then_with(|| a.0.cmp(&b.0))
         });
 
         let total_dur = fn_start.elapsed();
@@ -90,14 +98,17 @@ impl StorageState {
         let offset = safe_page
             .checked_mul(safe_page_size)
             .ok_or("Invalid page")?;
+        let process_tokens =
+            serde_json::to_string(&self.protected.process_tokens(&[process_name.to_owned()])?)
+                .map_err(|e| e.to_string())?;
 
         let guard = self.get_connection_named("get_process_monthly_thumbnails")?;
         let conn = guard.as_ref().unwrap();
 
         let total: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM screenshots WHERE is_deleted = 0 AND process_name = ?1",
-                [process_name],
+                "SELECT COUNT(*) FROM screenshots WHERE is_deleted = 0 AND process_name IN (SELECT value FROM json_each(?1))",
+                [&process_tokens],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to count process screenshots: {}", e))?;
@@ -106,7 +117,7 @@ impl StorageState {
             .prepare(
                 "SELECT id, image_path, strftime('%s', created_at) AS ts
                  FROM screenshots
-                 WHERE is_deleted = 0 AND process_name = ?1
+                 WHERE is_deleted = 0 AND process_name IN (SELECT value FROM json_each(?1))
                  ORDER BY created_at DESC
                  LIMIT ?2 OFFSET ?3",
             )
@@ -115,7 +126,7 @@ impl StorageState {
         let items: Vec<ProcessMonthlyThumbnailItem> = stmt
             .query_map(
                 [
-                    &process_name as &dyn rusqlite::ToSql,
+                    &process_tokens as &dyn rusqlite::ToSql,
                     &safe_page_size,
                     &offset,
                 ],

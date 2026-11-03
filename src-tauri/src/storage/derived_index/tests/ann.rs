@@ -92,9 +92,9 @@ fn resumed_ann_freezing_keeps_its_bound_and_concurrent_changes_in_the_tail() {
 fn ann_frozen_pages_survive_connection_restart_and_reject_a_replaced_dataset() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("ann-checkpoint.db");
+    let credential = Arc::new(CredentialManagerState::new(directory.path().to_path_buf()));
     let open = || {
-        let credential = Arc::new(CredentialManagerState::new(directory.path().to_path_buf()));
-        let storage = StorageState::new(directory.path().to_path_buf(), credential);
+        let storage = StorageState::new(directory.path().to_path_buf(), credential.clone());
         let connection = Connection::open(&database).unwrap();
         storage.init_tables(&connection).unwrap();
         *storage.db.lock().unwrap() = Some(connection);
@@ -135,6 +135,62 @@ fn ann_frozen_pages_survive_connection_restart_and_reject_a_replaced_dataset() {
         .frozen_ann_page(&restored, 0, 1)
         .unwrap_err()
         .is_pause());
+}
+
+#[test]
+fn startup_cleanup_preserves_active_encrypted_builds_and_retires_unreferenced_files() {
+    let (temp, storage) = test_storage();
+    let directory = temp.path().join("derived-indexes");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut checkpoint = ann_checkpoint(&storage, 47);
+    storage.begin_ann_build(&mut checkpoint).unwrap();
+    checkpoint.phase = "write".into();
+    checkpoint.complete = Some(crate::storage::AnnCheckpointFile {
+        name: "clip_image-47.checkpoint-2-1.cpdann".into(),
+        checksum: "a".repeat(64),
+        rows: 2,
+    });
+    checkpoint.previous = Some(crate::storage::AnnCheckpointFile {
+        name: "clip_image-47.checkpoint-1-1.cpdann".into(),
+        checksum: "b".repeat(64),
+        rows: 1,
+    });
+    storage.save_ann_build_checkpoint(&checkpoint).unwrap();
+    let preserved = [
+        checkpoint.flat_name(),
+        checkpoint.ann_name(),
+        format!(".{}.partial", checkpoint.flat_name()),
+        format!(".{}.partial", checkpoint.ann_name()),
+        checkpoint.complete.as_ref().unwrap().name.clone(),
+        checkpoint.previous.as_ref().unwrap().name.clone(),
+        "other-application.partial".into(),
+    ];
+    let key = storage.protected_ann_write_key().unwrap();
+    let encrypted = key
+        .seal("synthetic cleanup fixture", b"synthetic index bytes")
+        .unwrap();
+    for name in &preserved {
+        std::fs::write(directory.join(name), &encrypted).unwrap();
+    }
+    let discarded = [
+        "clip_image-46.cpdvec",
+        "clip_image-46.checkpoint-1-1.cpdann",
+        ".clip_image-46.cpdvec.partial",
+        "semantic_text-1.cpdvec",
+    ];
+    for name in &discarded {
+        std::fs::write(directory.join(name), &encrypted).unwrap();
+    }
+    let guard = storage.db.lock().unwrap();
+    storage
+        .cleanup_derived_index_sidecars_at_startup(guard.as_ref().unwrap(), temp.path())
+        .unwrap();
+    for name in preserved {
+        assert_eq!(std::fs::read(directory.join(name)).unwrap(), encrypted);
+    }
+    for name in discarded {
+        assert!(!directory.join(name).exists());
+    }
 }
 
 #[test]

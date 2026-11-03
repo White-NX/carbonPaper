@@ -92,6 +92,8 @@ impl StorageState {
         tx.execute("DELETE FROM app_bound_revocations", [])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+        self.protected.reset();
+        self.protected.initialize(conn)?;
         self.bump_db_generation();
         drop(guard);
         let directory = self
@@ -103,7 +105,8 @@ impl StorageState {
             &directory,
             self.processing_dataset_id()?,
             self.db_generation(),
-        )
+        )?;
+        self.publish_protected_keys()
     }
 
     pub(crate) fn finish_staged_deletions(&self) -> Result<(), String> {

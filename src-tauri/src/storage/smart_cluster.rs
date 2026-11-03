@@ -123,22 +123,25 @@ const SMART_CLUSTER_STATUS_SQL: &str = "SELECT
 /// The `la` join picks that single most recent assignment through the table's
 /// own primary key rather than a window function, so it stays one index lookup
 /// per cluster instead of a scan over every assignment ever made.
-const SMART_CLUSTER_PROJECTION: &str = "SELECT sc.id, sc.anchor_text, sc.threshold, sc.enabled, \
+const SMART_CLUSTER_PROJECTION: &str = "SELECT sc.id, cp_text(sc.anchor_text, 'cluster_anchor:' || sc.id), sc.threshold, sc.enabled, \
             sc.dominant_color, sc.created_at, sc.updated_at, \
             COALESCE(\
                 (SELECT COUNT(*) FROM smart_cluster_assignments a \
                  JOIN screenshots s ON s.id = a.screenshot_id \
                  WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt, \
-            ss.smart_cluster_id, ss.title, ss.summary, ss.ocr_summary, \
-            ss.key_points_json, ss.evidence_json, ss.source_snapshot_count, \
-            ss.source_hash, ss.model_provider, ss.model_name, ss.prompt_version, \
+            ss.smart_cluster_id, cp_text(ss.title, 'cluster_summary:' || sc.id || ':title'), \
+            cp_text(ss.summary, 'cluster_summary:' || sc.id || ':summary'), \
+            cp_text(ss.ocr_summary, 'cluster_summary:' || sc.id || ':ocr_summary'), \
+            cp_text(ss.key_points_json, 'cluster_summary:' || sc.id || ':key_points_json'), \
+            cp_text(ss.evidence_json, 'cluster_summary:' || sc.id || ':evidence_json'), ss.source_snapshot_count, \
+            cp_text(ss.source_hash, 'cluster_summary:' || sc.id || ':source_hash'), ss.model_provider, ss.model_name, ss.prompt_version, \
             ss.created_at, ss.updated_at, \
             COALESCE(\
                 (SELECT COUNT(*) FROM smart_cluster_assignments ra \
                  JOIN screenshots rs ON rs.id = ra.screenshot_id \
                  WHERE ra.smart_cluster_id = sc.id AND rs.is_deleted = 0 \
                    AND ra.assigned_at >= datetime('now', '-7 days')), 0) AS recent_cnt, \
-            la.assigned_at, ls.process_name, ls.window_title, sc.display_name \
+            la.assigned_at, cp_process(ls.process_name), ls.window_title, cp_text(sc.display_name, 'cluster_name:' || sc.id) \
      FROM smart_clusters sc \
      LEFT JOIN smart_cluster_summaries ss ON ss.smart_cluster_id = sc.id \
      LEFT JOIN smart_cluster_assignments la \
@@ -467,13 +470,22 @@ impl StorageState {
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
-        conn.execute(
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
             "INSERT INTO smart_clusters (anchor_text, threshold, dominant_color, display_name, enabled) \
-             VALUES (?, ?, ?, ?, 1)",
-            params![anchor_text, threshold, dominant_color, display_name],
+             VALUES ('', ?, ?, NULL, 1)",
+            params![threshold, dominant_color],
         )
         .map_err(|e| format!("Failed to create smart cluster: {}", e))?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE smart_clusters SET anchor_text=cp_seal_text(?1,'cluster_anchor:'||id),
+            display_name=cp_seal_text(?2,'cluster_name:'||id) WHERE id=?3",
+            params![anchor_text, display_name, id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
     }
 
     pub fn list_smart_clusters(&self) -> Result<Vec<SmartClusterRecord>, String> {
@@ -554,7 +566,7 @@ impl StorageState {
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
-            "UPDATE smart_clusters SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_clusters SET display_name = cp_seal_text(?1,'cluster_name:'||id), updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
             params![name, id],
         )
         .map_err(|e| format!("Failed to update smart cluster name: {}", e))?;
@@ -655,6 +667,12 @@ impl StorageState {
         model_revision: &str,
     ) -> Result<(), String> {
         let blob = encode_vector(vector)?;
+        let blob = self
+            .protected
+            .seal("vectors", &format!("cluster_anchor_vector:{id}"), &blob)?;
+        let source_hash = self
+            .protected
+            .text(&format!("cluster_anchor_hash:{id}"), source_hash)?;
         let dimensions = i64::try_from(vector.len())
             .map_err(|_| "Anchor vector dimensions exceed SQLite range".to_string())?;
         let guard = self.get_connection_named("update_smart_cluster_anchor_vector")?;
@@ -693,10 +711,11 @@ impl StorageState {
     ) -> Result<Vec<SmartClusterScoringTarget>, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, anchor_text, threshold, threshold_model_id, \
+                "SELECT id, cp_text(anchor_text,'cluster_anchor:'||id), threshold, threshold_model_id, \
                         threshold_model_revision, threshold_variant, threshold_provider, \
                         threshold_rederive_failed_scorer, \
-                        anchor_vector, anchor_vector_dimensions, anchor_vector_source_hash, \
+                        cp_unseal(anchor_vector,'vectors','cluster_anchor_vector:'||id), anchor_vector_dimensions, \
+                        cp_text(anchor_vector_source_hash,'cluster_anchor_hash:'||id), \
                         anchor_vector_model_id, anchor_vector_model_revision \
                  FROM smart_clusters WHERE enabled = 1 ORDER BY id",
             )
@@ -867,7 +886,7 @@ impl StorageState {
             .ok_or_else(|| "Database connection is None".to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT a.screenshot_id, a.rerank_score, s.image_path, s.process_name, \
+                "SELECT a.screenshot_id, a.rerank_score, s.image_path, cp_process(s.process_name), \
                         s.window_title, s.created_at, s.category, a.assigned_at \
                  FROM smart_cluster_assignments a \
                  JOIN screenshots s ON s.id = a.screenshot_id \
@@ -984,8 +1003,12 @@ impl StorageState {
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         match conn.query_row(
-            "SELECT smart_cluster_id, title, summary, ocr_summary, key_points_json, \
-                    evidence_json, source_snapshot_count, source_hash, model_provider, \
+            "SELECT smart_cluster_id, cp_text(title,'cluster_summary:'||smart_cluster_id||':title'), \
+                    cp_text(summary,'cluster_summary:'||smart_cluster_id||':summary'), \
+                    cp_text(ocr_summary,'cluster_summary:'||smart_cluster_id||':ocr_summary'), \
+                    cp_text(key_points_json,'cluster_summary:'||smart_cluster_id||':key_points_json'), \
+                    cp_text(evidence_json,'cluster_summary:'||smart_cluster_id||':evidence_json'), source_snapshot_count, \
+                    cp_text(source_hash,'cluster_summary:'||smart_cluster_id||':source_hash'), model_provider, \
                     model_name, prompt_version, created_at, updated_at \
              FROM smart_cluster_summaries WHERE smart_cluster_id = ?",
             params![cluster_id],
@@ -1039,7 +1062,12 @@ impl StorageState {
                  (smart_cluster_id, title, summary, ocr_summary, key_points_json, \
                   evidence_json, source_snapshot_count, source_hash, model_provider, \
                   model_name, prompt_version, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+                  VALUES (?1,cp_seal_text(?2,'cluster_summary:'||?1||':title'), \
+                    cp_seal_text(?3,'cluster_summary:'||?1||':summary'), \
+                    cp_seal_text(?4,'cluster_summary:'||?1||':ocr_summary'), \
+                    cp_seal_text(?5,'cluster_summary:'||?1||':key_points_json'), \
+                    cp_seal_text(?6,'cluster_summary:'||?1||':evidence_json'),?7, \
+                    cp_seal_text(?8,'cluster_summary:'||?1||':source_hash'),?9,?10,?11,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) \
                  ON CONFLICT(smart_cluster_id) DO UPDATE SET \
                    title = excluded.title, \
                    summary = excluded.summary, \

@@ -272,7 +272,7 @@ impl RawScreenshotRow {
     /// Full screenshot projection and joins, in the order decoded by `from_row`.
     pub(super) const SELECT: &'static str = "SELECT
         s.id, s.image_path, s.image_hash, s.width, s.height,
-        s.window_title, s.process_name, s.metadata,
+        s.window_title, cp_process(s.process_name), s.metadata,
         s.window_title_enc, s.process_name_enc, s.metadata_enc,
         s.content_key_encrypted,
         strftime('%s', s.created_at) AS timestamp, s.created_at,

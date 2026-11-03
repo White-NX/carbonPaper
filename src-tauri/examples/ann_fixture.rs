@@ -4,6 +4,16 @@
 mod ann_format;
 use ann_format::{FlatFileWriter, Header};
 fn main() {
+    // A deliberately public fixture key for synthetic test data only.
+    let encryption = std::sync::Arc::new(
+        carbonpaper_app_bound::payload::CipherKey::new(
+            "11".repeat(16),
+            "synthetic-ann-fixture".into(),
+            "ann".into(),
+            &[0x6b; 32],
+        )
+        .unwrap(),
+    );
     let path = std::path::PathBuf::from(
         std::env::args_os()
             .nth(1)
@@ -30,9 +40,11 @@ fn main() {
         "rev",
         96,
         3,
+        &encryption,
+        "22222222222222222222222222222222",
     )
     .unwrap();
-    let mut writer = FlatFileWriter::create(&path, header).unwrap();
+    let mut writer = FlatFileWriter::create(&path, header, encryption).unwrap();
     writer
         .push_keys(&keys.iter().map(String::as_str).collect::<Vec<_>>())
         .unwrap();

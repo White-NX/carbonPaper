@@ -43,6 +43,47 @@ pub(crate) const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 /// transaction.
 pub(crate) const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
+/// Full compaction runs under exclusive database maintenance, with no decrypted
+/// projections or active TEMP tables. SQLCipher's anonymous ATTACH inherits the
+/// main key, so its working database can spill encrypted pages to disk instead
+/// of retaining the entire archive in RAM. Ordinary queries keep MEMORY.
+pub(super) fn full_vacuum(conn: &Connection) -> std::result::Result<(), String> {
+    struct TempStoreGuard<'a> {
+        conn: &'a Connection,
+        original: i64,
+        restored: bool,
+    }
+    impl Drop for TempStoreGuard<'_> {
+        fn drop(&mut self) {
+            if !self.restored {
+                if let Err(error) = self.conn.pragma_update(None, "temp_store", self.original) {
+                    tracing::error!("Failed to restore temporary storage after VACUUM: {error}");
+                }
+            }
+        }
+    }
+
+    let original = conn
+        .pragma_query_value(None, "temp_store", |row| row.get(0))
+        .map_err(|error| format!("Failed to inspect VACUUM temporary storage: {error}"))?;
+    conn.pragma_update(None, "temp_store", 1i64)
+        .map_err(|error| format!("Failed to configure disk-backed VACUUM: {error}"))?;
+    let mut policy = TempStoreGuard {
+        conn,
+        original,
+        restored: false,
+    };
+    let started = Instant::now();
+    tracing::info!("[DB] Full VACUUM started with encrypted disk-backed working storage");
+    let result = conn.execute_batch("VACUUM;");
+    conn.pragma_update(None, "temp_store", original)
+        .map_err(|error| format!("Failed to restore temporary storage after VACUUM: {error}"))?;
+    policy.restored = true;
+    result.map_err(|error| format!("Full VACUUM failed after {:?}: {error}", started.elapsed()))?;
+    tracing::info!("[DB] Full VACUUM completed in {:?}", started.elapsed());
+    Ok(())
+}
+
 /// Preserve FULL durability in both WAL and DELETE mode, including syncing
 /// the WAL at each commit.
 const SYNCHRONOUS_FULL: &str = "FULL";
@@ -339,6 +380,10 @@ pub(crate) fn configure_sqlcipher_connection(
 pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<ConnectionStatus> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    // Decrypted projections must never spill into SQLite temporary files or
+    // be usable by a schema supplied from the public bootstrap database.
+    conn.pragma_update(None, "trusted_schema", false)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "synchronous", SYNCHRONOUS_FULL)?;
     conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
     conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
@@ -532,6 +577,94 @@ mod tests {
     use rusqlite::{Connection, OpenFlags};
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn anonymous_disk_working_database_inherits_sqlcipher_encryption() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("encrypted.db")).unwrap();
+        configure_sqlcipher_connection(&conn, &[0x7b; 32]).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sample(value); PRAGMA temp_store=FILE;
+            ATTACH '' AS vacuum_probe; PRAGMA vacuum_probe.cache_size=1;
+            CREATE TABLE vacuum_probe.sample(value TEXT);",
+        )
+        .unwrap();
+        let text = "protected-working-page".repeat(4096);
+        conn.execute("INSERT INTO vacuum_probe.sample VALUES(?1)", [&text])
+            .unwrap();
+
+        let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
+        // SAFETY: the live connection owns this attached pager. SQLite writes
+        // its borrowed file pointer into the correctly sized out-parameter.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                b"vacuum_probe\0".as_ptr().cast(),
+                rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&mut file as *mut *mut rusqlite::ffi::sqlite3_file).cast(),
+            )
+        };
+        assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+        assert!(!file.is_null());
+        // SAFETY: the pager remains attached to the live connection.
+        let methods = unsafe { (*file).pMethods };
+        assert!(
+            !methods.is_null(),
+            "working database must use a disk VFS file"
+        );
+        let mut header = [0u8; 16];
+        // SAFETY: no SQL or detach occurs while the borrowed VFS file is read.
+        // xRead bypasses the pager codec and reads the actual disk bytes.
+        let read = unsafe {
+            ((*methods).xRead.unwrap())(file, header.as_mut_ptr().cast(), header.len() as i32, 0)
+        };
+        assert_eq!(
+            read,
+            rusqlite::ffi::SQLITE_OK,
+            "working pages must reach disk"
+        );
+        assert_ne!(
+            &header, b"SQLite format 3\0",
+            "disk working pages must be encrypted"
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM vacuum_probe.sample", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn full_vacuum_restores_memory_policy_on_success_and_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("encrypted.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlcipher_connection(&conn, &[0x7b; 32]).unwrap();
+            conn.execute_batch("CREATE TABLE sample(value); INSERT INTO sample VALUES(7)")
+                .unwrap();
+            full_vacuum(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value(None, "temp_store", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                conn.query_row("SELECT value FROM sample", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                7
+            );
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        configure_sqlcipher_connection(&conn, &[0x7b; 32]).unwrap();
+        assert!(full_vacuum(&conn).is_err());
+        assert_eq!(
+            conn.pragma_query_value(None, "temp_store", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn shared_pragmas_are_explicit_and_reported() {

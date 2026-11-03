@@ -14,6 +14,8 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
  */
 export const OVERLAY_PRIORITY = [
   'fatal',
+  // Database startup must settle before authentication and index maintenance.
+  'storageInitialization',
   'maintenance',
   'vacuum',
   'auth',
