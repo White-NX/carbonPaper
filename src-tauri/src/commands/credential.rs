@@ -23,25 +23,22 @@ pub async fn credential_initialize(
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
-        credential_manager::initialize_public_key(&credential_state)
-            .map_err(|e| format!("Failed to validate credentials: {e}"))?;
-
-        credential_manager::ensure_master_key_created(&credential_state)
-            .map_err(|e| format!("Failed to create master key: {}", e))?;
-
-        storage_state.initialize()?;
-        // First-run initialization can happen after the Tauri setup callback
-        // failed to load/export the public key. Start Office observation at the
-        // same post-storage boundary used by the normal startup path.
-        if let Some(office_runtime) =
-            app.try_state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
-        {
-            office_runtime.start(app.clone(), storage_state.inner().clone());
-        }
-        if let Some(scheduler) =
-            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-        {
-            scheduler.start(app.clone());
+        let already_initialized = storage_state.is_initialized();
+        // Join the application-owned blocking job. Unlock and setup must never
+        // validate, migrate or start the storage services concurrently.
+        crate::storage_startup::ensure_initialized(app).await?;
+        if already_initialized {
+            // Joining an already-ready job must not skip the explicit unlock
+            // flow's existing authority/master-file validation.
+            let credentials = credential_state.inner().clone();
+            tokio::task::spawn_blocking(move || {
+                credential_manager::initialize_public_key(&credentials)
+                    .map_err(|error| format!("Failed to validate credentials: {error}"))?;
+                credential_manager::ensure_master_key_created(&credentials)
+                    .map_err(|error| format!("Failed to create master key: {error}"))
+            })
+            .await
+            .map_err(|error| format!("Credential validation task failed: {error}"))??;
         }
 
         Ok("Credentials initialized successfully".to_string())

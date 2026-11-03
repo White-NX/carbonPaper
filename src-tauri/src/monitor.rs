@@ -84,6 +84,15 @@ impl MonitorState {
             .map(|_| session)
     }
 
+    /// Storage initialization includes credential validation and migration.
+    /// A UI unlock is separate: a ready archive may capture while it is locked.
+    fn claim_capture_session(&self, storage: &StorageState) -> Result<Option<u64>, String> {
+        if !storage.is_initialized() {
+            return Err("Database not initialized".into());
+        }
+        Ok(self.claim_session())
+    }
+
     /// Takes whichever session owns the monitor over for a stop. Returns
     /// `false` when there is none; the stop then only drains and leaves the
     /// lifecycle alone, so it cannot end a session claimed in the meantime.
@@ -596,7 +605,8 @@ async fn start_capture(app: &AppHandle) -> Result<String, String> {
 
     // Power may have changed while the model check was awaiting I/O.
     crate::power::check_capture_allowed(app)?;
-    let Some(session) = state.claim_session() else {
+    let storage = app.state::<Arc<StorageState>>();
+    let Some(session) = state.claim_capture_session(&storage)? else {
         return Ok("Monitor is already running".into());
     };
     state.stopping.store(false, Ordering::SeqCst);
@@ -1237,6 +1247,36 @@ pub fn stop_game_mode_monitor(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_admission_waits_for_storage_without_requiring_a_ui_unlock() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials =
+            crate::credential_manager::cng_tests::storage_credentials(directory.path());
+        let storage = StorageState::new(directory.path().into(), credentials.clone());
+        let monitor = MonitorState::new();
+
+        assert_eq!(
+            monitor.claim_capture_session(&storage).unwrap_err(),
+            "Database not initialized"
+        );
+        assert!(!monitor.is_running());
+
+        storage.initialize().unwrap();
+        credentials.invalidate_session();
+        assert!(!credentials.is_session_valid());
+        let session = monitor.claim_capture_session(&storage).unwrap().unwrap();
+        assert!(monitor.is_running());
+        assert!(monitor.take_over_exited_session(session));
+        monitor.finish_drain();
+
+        storage.shutdown().unwrap();
+        assert!(monitor.claim_capture_session(&storage).is_err());
+        assert!(!monitor.is_running());
+        storage.initialize().unwrap();
+        assert!(!credentials.is_session_valid());
+        assert!(monitor.claim_capture_session(&storage).unwrap().is_some());
+    }
 
     #[test]
     fn directml_policy_requires_both_preference_and_clear_game_mode() {

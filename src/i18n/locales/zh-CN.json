@@ -1,4 +1,20 @@
 {
+  "storageStartup": {
+    "title": "正在准备历史记录",
+    "tip": "准备完成后即可继续使用。历史记录较多时可能需要几分钟。",
+    "error": "无法完成准备，请重试。",
+    "phases": {
+      "credentials": "检查数据保护",
+      "opening": "打开历史记录",
+      "schema": "准备历史记录",
+      "metadata": "保护历史信息",
+      "vectors": "保护搜索数据",
+      "processes": "保护应用信息",
+      "cleanup": "清理旧的搜索数据",
+      "compacting": "整理历史记录",
+      "finalizing": "完成准备"
+    }
+  },
   "mainPreview": {
     "emptyHint": "选择上方时间轴中的截图，或搜索历史内容"
   },

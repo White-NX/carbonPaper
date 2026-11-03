@@ -315,7 +315,7 @@ impl StorageState {
                 break;
             }
 
-            if !*self.initialized.lock().unwrap_or_else(|e| e.into_inner()) {
+            if !self.is_initialized() {
                 std::thread::sleep(std::time::Duration::from_millis(2000));
                 continue;
             }

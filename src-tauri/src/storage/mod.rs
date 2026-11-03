@@ -17,6 +17,7 @@ mod derived_migration;
 mod document_ref;
 mod encryption;
 mod image_io;
+mod initialization;
 mod link_scoring;
 pub mod migration;
 mod mode;
@@ -50,6 +51,7 @@ pub use derived_migration::*;
 pub use document_ref::STALE_DOCUMENT_REF_GENERATION;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
+pub(crate) use initialization::{InitializationPhase, InitializationProgress};
 pub(crate) use mode::database_mode_policy_from_environment;
 pub(crate) use policy::disk_totals_for_path;
 pub(crate) use screenshot_reader::ScreenshotReader;
@@ -100,7 +102,7 @@ pub struct StorageState {
     /// Journal mode selected once for this process. The default constructor
     /// intentionally remains DELETE for tests and all non-experimental paths.
     database_mode_policy: mode::DatabaseModePolicy,
-    initialized: Mutex<bool>,
+    initialized: AtomicBool,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
     hmac_migration_in_progress: AtomicBool,
@@ -236,7 +238,7 @@ impl StorageState {
             screenshot_dir: Mutex::new(screenshot_dir),
             credential_state,
             database_mode_policy,
-            initialized: Mutex::new(false),
+            initialized: AtomicBool::new(false),
             migration_cancel_requested: AtomicBool::new(false),
             migration_in_progress: AtomicBool::new(false),
             hmac_migration_in_progress: AtomicBool::new(false),
@@ -386,10 +388,7 @@ impl StorageState {
     }
 
     pub(crate) fn is_initialized(&self) -> bool {
-        *self
-            .initialized
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        self.initialized.load(Ordering::Acquire)
     }
 
     /// Acquire DB connection with caller identification for diagnostic logging.

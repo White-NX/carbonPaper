@@ -1,12 +1,14 @@
 //! Database initialization, table creation, and schema migration.
 
 use crate::credential_manager::{derive_db_key_from_public_key, load_public_key_from_file};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use super::policy::disk_totals_for_path;
-use super::{connection, database_snapshot, StorageState};
+use super::{
+    connection, database_snapshot, InitializationPhase, InitializationProgress, StorageState,
+};
 
 const WORKER_BUDGET_RECOVERY_KEY: &str = "worker_budget_invalid_argument_recovery_v1";
 
@@ -15,17 +17,33 @@ impl StorageState {
 
     /// Initialize storage (create directories and database).
     pub fn initialize(&self) -> Result<(), String> {
+        self.initialize_with_progress(|_| {})
+    }
+
+    pub(crate) fn initialize_with_progress(
+        &self,
+        progress: impl Fn(InitializationProgress),
+    ) -> Result<(), String> {
         let _maintenance = self.database_maintenance("initialize");
-        self.initialize_under_maintenance()
+        self.initialize_under_maintenance_with_progress(&progress)
     }
 
     /// Initialize while the caller already owns the database maintenance gate.
     pub(crate) fn initialize_under_maintenance(&self) -> Result<(), String> {
+        self.initialize_under_maintenance_with_progress(&|_| {})
+    }
+
+    fn initialize_under_maintenance_with_progress(
+        &self,
+        progress: &dyn Fn(InitializationProgress),
+    ) -> Result<(), String> {
         let init_start = std::time::Instant::now();
-        let mut initialized = self.initialized.lock().unwrap_or_else(|e| e.into_inner());
-        if *initialized {
+        // The maintenance gate serializes opens/closes. Readiness remains an
+        // atomic read while migration owns that gate for minutes.
+        if self.is_initialized() {
             return Ok(());
         }
+        progress(InitializationProgress::phase(InitializationPhase::Opening));
         // Belt-and-braces against a stale resident matrix from a previous
         // connection; `shutdown` already clears it on the normal path.
         self.reset_semantic_vector_cache();
@@ -85,19 +103,25 @@ impl StorageState {
 
         // Initialize table schema
         let t3 = std::time::Instant::now();
+        progress(InitializationProgress::phase(InitializationPhase::Schema));
         self.init_tables(&conn)?;
+        let tables_dur = t3.elapsed();
+        let protected_started = std::time::Instant::now();
         #[cfg(test)]
         self.protected
             .allow_plaintext_fixtures(self.credential_state.storage_fixture_for_tests());
         self.protected.initialize(&conn)?;
         self.protected.register_functions(&conn)?;
-        self.migrate_protected_content(&conn)?;
+        self.migrate_protected_content_with_progress(&conn, progress)?;
+        let protected_dur = protected_started.elapsed();
+        progress(InitializationProgress::phase(
+            InitializationPhase::Finalizing,
+        ));
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         if let Err(error) = self.trim_oversized_wal_under_maintenance(&conn) {
             tracing::warn!("[DB] Deferring oversized WAL cleanup at startup: {error}");
         }
         database_snapshot::mark_storage_initialized(&data_dir)?;
-        let tables_dur = t3.elapsed();
 
         {
             let mut db_guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,8 +146,6 @@ impl StorageState {
             }
         }
 
-        *initialized = true;
-
         // Staging contains only independently encrypted inputs. Failure cannot
         // prevent the primary archive from opening or capturing new content.
         if let Ok(dataset_id) = self.processing_dataset_id() {
@@ -138,12 +160,15 @@ impl StorageState {
             self.processing_stage.shutdown();
             *self.db.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.protected.reset();
-            *initialized = false;
             return Err(error);
         }
 
+        // Publish readiness only after the protected write keys and staging
+        // boundary are settled, so capture cannot enter a half-open archive.
+        self.initialized.store(true, Ordering::Release);
+
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?}, protected_content={:?})",
             init_start.elapsed(),
             env!("CARGO_PKG_VERSION"),
             key_derive_dur,
@@ -155,7 +180,8 @@ impl StorageState {
             connection_status.engine.sqlite_source_id,
             connection_status.engine.cipher_version,
             connection_status.synchronous,
-            tables_dur
+            tables_dur,
+            protected_dur
         );
 
         Ok(())
@@ -169,6 +195,7 @@ impl StorageState {
 
     /// Close the primary connection while the maintenance gate is already held.
     pub(crate) fn shutdown_under_maintenance(&self) -> Result<(), String> {
+        self.initialized.store(false, Ordering::Release);
         self.processing_stage.shutdown();
         self.lazy_indexer_shutdown.store(true, Ordering::SeqCst);
         // The resident semantic matrix belongs to the connection being closed.
@@ -184,11 +211,6 @@ impl StorageState {
         if db_guard.is_some() {
             *db_guard = None;
         }
-        let mut init = self
-            .initialized
-            .lock()
-            .map_err(|e| format!("lock error: {}", e))?;
-        *init = false;
         Ok(())
     }
 
@@ -891,7 +913,38 @@ impl StorageState {
                 available, required, group_size
             ));
         }
+        // Anonymous disk-backed working databases use the OS temporary volume,
+        // which may differ from the archive's volume.
+        let temporary = std::env::temp_dir();
+        let temporary_required = group_size.saturating_add(Self::VACUUM_SAFETY_FREE_BYTES);
+        let temporary_free = disk_totals_for_path(&temporary)
+            .map(|(_, free)| free)
+            .ok_or("Unable to determine free space for encrypted VACUUM working storage")?;
+        if temporary_free < temporary_required {
+            return Err(format!("Insufficient free space for encrypted VACUUM working storage: available={temporary_free} required={temporary_required}"));
+        }
         Ok(())
+    }
+
+    /// The primary connection can contain decrypted TEMP projections. Keep its
+    /// MEMORY policy untouched even if compaction or policy restoration fails.
+    /// This private connection lives entirely inside exclusive maintenance and
+    /// closes before that permit is released.
+    pub(super) fn full_vacuum_under_maintenance(&self, primary: &Connection) -> Result<(), String> {
+        let path = primary.path().filter(|path| !path.is_empty());
+        #[cfg(test)]
+        if path.is_none() {
+            return connection::full_vacuum(primary);
+        }
+        let path = path.ok_or("Full compaction requires a file-backed database")?;
+        let key = self.database_key()?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|error| format!("Failed to open VACUUM maintenance connection: {error}"))?;
+        connection::configure_sqlcipher_connection(&conn, &key).map_err(|error| {
+            format!("Failed to configure VACUUM maintenance connection: {error}")
+        })?;
+        Self::set_auto_vacuum_incremental(&conn)?;
+        connection::full_vacuum(&conn)
     }
 
     fn set_auto_vacuum_incremental(conn: &Connection) -> Result<(), String> {
@@ -932,8 +985,9 @@ impl StorageState {
     }
 
     pub(super) fn checkpoint_wal_after_vacuum(conn: &Connection) -> Result<(), String> {
-        let status = connection::inspect_connection(conn)
-            .map_err(|error| format!("Failed to inspect journal mode after VACUUM: {error}"))?;
+        let status = connection::inspect_connection(conn).map_err(|error| {
+            format!("Failed to inspect journal mode for compaction checkpoint: {error}")
+        })?;
         if status.journal_mode != "wal" {
             return Ok(());
         }
@@ -941,12 +995,12 @@ impl StorageState {
         let checkpoint = connection::checkpoint_wal_truncate(conn)?;
         if checkpoint.busy != 0 {
             return Err(format!(
-                "WAL TRUNCATE checkpoint after VACUUM was busy: status={}, log_frames={}, checkpointed_frames={}",
+                "WAL TRUNCATE checkpoint was busy: status={}, log_frames={}, checkpointed_frames={}",
                 checkpoint.busy, checkpoint.log_frames, checkpoint.checkpointed_frames
             ));
         }
         tracing::info!(
-            "[DB] WAL TRUNCATE checkpoint after VACUUM completed: log_frames={}, checkpointed_frames={}",
+            "[DB] WAL TRUNCATE checkpoint completed: log_frames={}, checkpointed_frames={}",
             checkpoint.log_frames,
             checkpoint.checkpointed_frames
         );
@@ -1058,7 +1112,7 @@ impl StorageState {
             tracing::info!(
                 "[DB] Converting database to incremental auto_vacuum with a one-time full VACUUM"
             );
-            conn.execute_batch("VACUUM;").map_err(|e| {
+            self.full_vacuum_under_maintenance(conn).map_err(|e| {
                 format!(
                     "Failed to run full VACUUM for incremental auto_vacuum: {}",
                     e
@@ -1104,7 +1158,7 @@ impl StorageState {
             self.vacuum_space_check()?;
 
             tracing::info!("[DB] Manual VACUUM started from settings");
-            conn.execute_batch("VACUUM;")
+            self.full_vacuum_under_maintenance(conn)
                 .map_err(|e| format!("Failed to run manual VACUUM: {}", e))?;
             if let Err(error) = Self::checkpoint_wal_after_vacuum(conn) {
                 tracing::warn!(
@@ -1707,6 +1761,41 @@ impl StorageState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn readiness_does_not_wait_for_startup_maintenance() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let credentials =
+            crate::credential_manager::cng_tests::storage_credentials(directory.path());
+        let storage = Arc::new(super::StorageState::new(
+            directory.path().into(),
+            credentials,
+        ));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_storage = storage.clone();
+        let worker = std::thread::spawn(move || {
+            worker_storage.initialize_with_progress(|progress| {
+                if progress.phase == super::InitializationPhase::Opening {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader_storage = storage.clone();
+        let reader =
+            std::thread::spawn(move || ready_tx.send(reader_storage.is_initialized()).unwrap());
+        let readiness = ready_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        assert!(!readiness.expect("readiness must remain responsive during migration"));
+        reader.join().unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(storage.is_initialized());
+    }
     use super::*;
     use crate::credential_manager::CredentialManagerState;
     use std::sync::Arc;

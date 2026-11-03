@@ -1,12 +1,65 @@
 //! Restartable encryption of legacy derived rows. No protected history is read:
 //! only the legacy plaintext fields are sealed with fresh public-key-wrapped keys.
-use super::StorageState;
+use super::{InitializationPhase, InitializationProgress, StorageState};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use carbonpaper_app_bound::payload::payload_key_id;
 use rusqlite::{params, Connection, OptionalExtension};
 
+struct PhaseProgress<'a> {
+    phase: InitializationPhase,
+    processed: u64,
+    total: u64,
+    started: std::time::Instant,
+    report: &'a dyn Fn(InitializationProgress),
+}
+
+impl<'a> PhaseProgress<'a> {
+    fn new(
+        phase: InitializationPhase,
+        total: u64,
+        report: &'a dyn Fn(InitializationProgress),
+    ) -> Self {
+        tracing::info!("[DB:PROTECT] {phase:?} started: rows={total}");
+        report(InitializationProgress::new(phase, 0, total));
+        Self {
+            phase,
+            processed: 0,
+            total,
+            started: std::time::Instant::now(),
+            report,
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.processed += count as u64;
+        (self.report)(InitializationProgress::new(
+            self.phase,
+            self.processed,
+            self.total,
+        ));
+    }
+
+    fn finish(&self) {
+        tracing::info!(
+            "[DB:PROTECT] {:?} completed: rows={} elapsed={:?}",
+            self.phase,
+            self.processed,
+            self.started.elapsed()
+        );
+    }
+}
+
 impl StorageState {
+    #[cfg(test)]
     pub(super) fn migrate_protected_content(&self, conn: &Connection) -> Result<(), String> {
+        self.migrate_protected_content_with_progress(conn, &|_| {})
+    }
+
+    pub(super) fn migrate_protected_content_with_progress(
+        &self,
+        conn: &Connection,
+        report: &dyn Fn(InitializationProgress),
+    ) -> Result<(), String> {
         let version: Option<String> = conn
             .query_row(
                 "SELECT value FROM app_metadata WHERE key='protected_content_version'",
@@ -18,10 +71,20 @@ impl StorageState {
         if version.as_deref() == Some("1") {
             return self.import_legacy_anchors(conn);
         }
+        tracing::info!(
+            "[DB:PROTECT] Protected-content migration is required; capture waits for completion"
+        );
         self.vacuum_space_check()?;
         conn.execute_batch("PRAGMA secure_delete=ON;")
             .map_err(|e| e.to_string())?;
         self.import_legacy_anchors(conn)?;
+        let metadata_total = conn.query_row(
+            "SELECT (SELECT count(anchor_text)+count(display_name)+count(anchor_vector_source_hash) FROM smart_clusters)
+                +(SELECT count(title)+count(summary)+count(ocr_summary)+count(key_points_json)+count(evidence_json)+count(source_hash) FROM smart_cluster_summaries)
+                +(SELECT count(anchors_json) FROM classification_anchors)", [], |row| row.get::<_, i64>(0).map(|count| count as u64))
+            .map_err(|error| error.to_string())?;
+        let mut metadata =
+            PhaseProgress::new(InitializationPhase::Metadata, metadata_total, report);
         for (table, id, columns, prefix) in [
             (
                 "smart_clusters",
@@ -64,6 +127,7 @@ impl StorageState {
                     if rows.is_empty() {
                         break;
                     }
+                    let batch_size = rows.len();
                     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
                     for (row_id, text) in rows {
                         cursor = row_id;
@@ -79,9 +143,14 @@ impl StorageState {
                         .map_err(|e| e.to_string())?;
                     }
                     tx.commit().map_err(|e| e.to_string())?;
+                    metadata.advance(batch_size);
                 }
             }
         }
+        metadata.finish();
+        let vector_total = conn.query_row("SELECT (SELECT count(anchor_vector) FROM smart_clusters)+(SELECT count(*) FROM derived_embeddings)", [], |row| row.get::<_, i64>(0).map(|count| count as u64))
+            .map_err(|error| error.to_string())?;
+        let mut vectors = PhaseProgress::new(InitializationPhase::Vectors, vector_total, report);
         for (table, id, column, purpose, prefix) in [(
             "smart_clusters",
             "id",
@@ -103,6 +172,7 @@ impl StorageState {
                 if rows.is_empty() {
                     break;
                 }
+                let batch_size = rows.len();
                 let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
                 for (row_id, bytes) in rows {
                     cursor = row_id;
@@ -119,6 +189,7 @@ impl StorageState {
                     .map_err(|e| e.to_string())?;
                 }
                 tx.commit().map_err(|e| e.to_string())?;
+                vectors.advance(batch_size);
             }
         }
         let mut cursor = 0i64;
@@ -140,6 +211,7 @@ impl StorageState {
             if rows.is_empty() {
                 break;
             }
+            let batch_size = rows.len();
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             for (row_id, kind, subject, bytes) in rows {
                 cursor = row_id;
@@ -156,7 +228,16 @@ impl StorageState {
                 .map_err(|e| e.to_string())?;
             }
             tx.commit().map_err(|e| e.to_string())?;
+            vectors.advance(batch_size);
         }
+        vectors.finish();
+        let process_total = conn
+            .query_row("SELECT count(process_name) FROM screenshots", [], |row| {
+                row.get::<_, i64>(0).map(|count| count as u64)
+            })
+            .map_err(|error| error.to_string())?;
+        let mut processes =
+            PhaseProgress::new(InitializationPhase::Processes, process_total, report);
         let mut cursor = 0i64;
         loop {
             let mut query=conn.prepare("SELECT id,process_name FROM screenshots WHERE id>?1 AND process_name IS NOT NULL ORDER BY id LIMIT 2048").map_err(|e|e.to_string())?;
@@ -171,6 +252,7 @@ impl StorageState {
             if rows.is_empty() {
                 break;
             }
+            let batch_size = rows.len();
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             // This is a representation change, not a new source revision.
             // DDL and the page update share a transaction so a crash or error
@@ -207,7 +289,9 @@ impl StorageState {
             self.init_processing_stage_schema(&tx)?;
             Self::init_recap_tables(&tx)?;
             tx.commit().map_err(|e| e.to_string())?;
+            processes.advance(batch_size);
         }
+        processes.finish();
         let has_task_labels: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='label')",
@@ -225,6 +309,8 @@ impl StorageState {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
             drop(statement);
+            let mut labels =
+                PhaseProgress::new(InitializationPhase::Metadata, rows.len() as u64, report);
             for (id, label) in rows {
                 if !is_text_envelope(&label) {
                     let encrypted = self.protected.text(&format!("task_label:{id}"), &label)?;
@@ -234,8 +320,11 @@ impl StorageState {
                     )
                     .map_err(|e| e.to_string())?;
                 }
+                labels.advance(1);
             }
+            labels.finish();
         }
+        report(InitializationProgress::phase(InitializationPhase::Cleanup));
         // Construction inputs and old sidecars are rebuildable, unlike summaries.
         conn.execute_batch(
             "DELETE FROM ann_build_inputs; DELETE FROM ann_build_checkpoints;
@@ -250,17 +339,25 @@ impl StorageState {
         retire_legacy_sidecars(&data_dir)?;
         // Sealing columns alone leaves plaintext in freed pages and previous WALs.
         // Keep the version marker absent until physical compaction succeeds.
+        report(InitializationProgress::phase(
+            InitializationPhase::Compacting,
+        ));
+        tracing::info!("[DB:PROTECT] Compaction started; truncating the pre-compaction WAL");
         Self::checkpoint_wal_after_vacuum(conn)?;
-        conn.execute_batch("VACUUM;").map_err(|e| {
+        self.full_vacuum_under_maintenance(conn).map_err(|e| {
             format!("Protected-content compaction must finish before capture resumes: {e}")
         })?;
         Self::checkpoint_wal_after_vacuum(conn)?;
+        report(InitializationProgress::phase(
+            InitializationPhase::Finalizing,
+        ));
         conn.execute(
             "INSERT OR REPLACE INTO app_metadata(key,value) VALUES('protected_content_version','1')",
             [],
         )
         .map_err(|e| e.to_string())?;
         Self::checkpoint_wal_after_vacuum(conn)?;
+        tracing::info!("[DB:PROTECT] Protected-content migration completed and checkpointed");
         Ok(())
     }
 }

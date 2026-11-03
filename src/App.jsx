@@ -15,6 +15,7 @@ import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
+import StorageInitializationOverlay from './components/StorageInitializationOverlay';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange, warmupThumbnails } from './lib/monitor_api';
@@ -23,6 +24,7 @@ import { useAppTheme } from './hooks/useAppTheme';
 import { useAppWindowActions, usePowerSavingState, useWindowMaximizedState } from './hooks/useAppWindowState';
 import { useAppNotifications } from './hooks/useAppNotifications';
 import { useAuthSession } from './hooks/useAuthSession';
+import { useStorageInitialization } from './hooks/useStorageInitialization';
 import { DialogVisibilityContext } from './hooks/useDialogFocus';
 import { useCriticalErrors } from './hooks/useCriticalErrors';
 import { useMonitorLifecycle } from './hooks/useMonitorLifecycle';
@@ -41,6 +43,7 @@ import { OverlayCoordinatorProvider, useOverlayCoordinator } from './components/
 function App() {
   const { t } = useTranslation();
   const overlays = useOverlayCoordinator();
+  const initialization = useStorageInitialization();
 
   useEffect(() => initAuthListeners(), []);
 
@@ -119,7 +122,7 @@ function App() {
   });
   const requiredSizeMb = downloadSizeMb(missingRequiredModels(missingModels));
   const onboarding = useOnboarding({
-    isAuthenticated,
+    isAuthenticated: isAuthenticated && initialization.ready,
     requiredModelsReady: modelsCheckDone && !modelsNeedDownload,
     requiredDownload,
     pushNotification,
@@ -140,7 +143,7 @@ function App() {
   } = useMonitorLifecycle({
     modelsCheckDone,
     modelsNeedDownload,
-    captureHeld: onboarding.captureHeld,
+    captureHeld: onboarding.captureHeld || !initialization.ready,
     powerSavingSuppressed,
     powerStatusReady,
     formatErrorDetails,
@@ -177,7 +180,7 @@ function App() {
     onClosed: refreshRequiredModels,
     onError: (error) => reportBackendError(t('settings.title'), String(error)),
   });
-  useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: isAuthenticated });
+  useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: isAuthenticated && initialization.ready });
   const {
     updateModalVisible,
     updateInfo,
@@ -222,7 +225,7 @@ function App() {
 
   return (
     <OverlayCoordinatorProvider value={overlays.value}>
-    <DialogVisibilityContext.Provider value={isAuthenticated}>
+    <DialogVisibilityContext.Provider value={isAuthenticated && initialization.ready}>
     <div
       data-tauri-drag-region
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
@@ -247,10 +250,11 @@ function App() {
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
         isAuthenticated={isAuthenticated}
-        interfaceLocked={overlays.active !== null}
+        interfaceLocked={overlays.active !== null || !initialization.ready}
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
+        <StorageInitializationOverlay initialization={initialization} />
         <Mask
           modelsNeedDownload={modelsNeedDownload}
           sizeMb={requiredSizeMb}
@@ -258,7 +262,7 @@ function App() {
         />
 
         <AuthMask
-          isVisible={!isAuthenticated}
+          isVisible={initialization.ready && !isAuthenticated}
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
@@ -272,15 +276,15 @@ function App() {
           onExit={exitApp}
         />
 
-        <StartupVacuumDialog />
+        {initialization.ready && <StartupVacuumDialog />}
 
         {/* Startup overlays share this content area and the coordinator shows
             one at a time (components/overlay/coordinator.js). The top bar is
             locked while any of them is on screen. */}
-        <VectorMigrationOverlay />
+        {initialization.ready && <VectorMigrationOverlay />}
 
-        {isAuthenticated && <HmacMigrationDialog />}
-        {isAuthenticated && <ClipBackfillDialog />}
+        {initialization.ready && isAuthenticated && <HmacMigrationDialog />}
+        {initialization.ready && isAuthenticated && <ClipBackfillDialog />}
 
         <OnboardingOverlay
           onboarding={onboarding}
@@ -304,7 +308,7 @@ function App() {
           onClose={() => setUpdateModalVisible(false)}
         />
 
-        <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings} />
+        <AppBoundUpgradePrompt visible={initialization.ready && isAuthenticated && !showSettings} />
 
         <main className="flex-1 min-h-0 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
           <ActivityBar
@@ -315,6 +319,7 @@ function App() {
           />
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {initialization.ready && <>
             <WorkspaceTimelines
               activeTab={activeTab}
               onSelectEvent={(evt) => {
@@ -367,6 +372,7 @@ function App() {
               }}
               onCopyText={handleCopyText}
             />
+            </>}
           </div>
         </main>
       </div>

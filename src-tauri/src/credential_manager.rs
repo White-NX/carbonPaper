@@ -706,18 +706,33 @@ pub fn db_key_to_hex(key: &[u8]) -> String {
 mod windows_impl {
     use super::*;
 
-    /// Export an existing key silently. Validation must never create a key.
+    /// Export only public material silently. Validation must never create a key.
     pub fn export_cng_public_key() -> Result<Vec<u8>, CredentialError> {
         export_cng_public_key_with_access(CngKeyAccess::Existing)
     }
 
     fn export_cng_public_key_with_access(access: CngKeyAccess) -> Result<Vec<u8>, CredentialError> {
+        export_public_key_with_open(access, |access, flags| {
+            open_cng_key_with_flags(access, flags).map(|key| CngKeyHandle { key })
+        })
+    }
+
+    pub(super) fn export_public_key_with_open(
+        access: CngKeyAccess,
+        open: impl FnOnce(
+            CngKeyAccess,
+            windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
+        ) -> Result<CngKeyHandle, CredentialError>,
+    ) -> Result<Vec<u8>, CredentialError> {
         use windows::core::HSTRING;
         use windows::Win32::Security::Cryptography::{
-            NCryptExportKey, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
+            NCryptExportKey, NCRYPT_FLAGS, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
         };
 
-        let key = open_cng_key_with_flags(access, NCRYPT_SILENT_FLAG)?;
+        // The Software KSP rejects a silent open of a high-protection key even
+        // for public-only access. Opening its handle does not authenticate it;
+        // keep the no-UI requirement on both public-export calls below instead.
+        let key = open(access, NCRYPT_FLAGS(0))?;
 
         let blob_type = HSTRING::from("RSAPUBLICBLOB");
         let blob_pcwstr = windows::core::PCWSTR::from_raw(blob_type.as_ptr());
@@ -728,7 +743,7 @@ mod windows_impl {
         // pointer remain valid for the synchronous size query, which has no output buffer.
         unsafe {
             NCryptExportKey(
-                key,
+                key.key,
                 NCRYPT_KEY_HANDLE::default(),
                 blob_pcwstr,
                 None,
@@ -737,18 +752,14 @@ mod windows_impl {
                 NCRYPT_SILENT_FLAG,
             )
         }
-        .map_err(|e| {
-            // SAFETY: `key` is still owned by this function and has not been freed.
-            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-            CredentialError::SystemError(format!("NCryptExportKey size failed: {}", e))
-        })?;
+        .map_err(|e| CredentialError::SystemError(format!("NCryptExportKey size failed: {e}")))?;
 
         let mut output = vec![0u8; out_len as usize];
         // SAFETY: the output slice owns at least the size reported by CNG and remains
         // live and uniquely mutable for the synchronous export call.
         unsafe {
             NCryptExportKey(
-                key,
+                key.key,
                 NCRYPT_KEY_HANDLE::default(),
                 blob_pcwstr,
                 None,
@@ -757,14 +768,7 @@ mod windows_impl {
                 NCRYPT_SILENT_FLAG,
             )
         }
-        .map_err(|e| {
-            // SAFETY: `key` is still owned by this function and has not been freed.
-            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-            CredentialError::SystemError(format!("NCryptExportKey failed: {}", e))
-        })?;
-
-        // SAFETY: this is the final use of the owned CNG key handle.
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+        .map_err(|e| CredentialError::SystemError(format!("NCryptExportKey failed: {e}")))?;
         output.truncate(out_len as usize);
         Ok(output)
     }

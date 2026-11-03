@@ -9,6 +9,106 @@ use base64::Engine;
 use carbonpaper_app_bound::payload::is_sealed;
 
 struct OfflineBroker;
+
+#[test]
+fn manual_compaction_preserves_primary_memory_projections() {
+    let (_directory, storage) = fixture();
+    {
+        let guard = storage.db.lock().unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TABLE protected_projection(value TEXT);
+             INSERT INTO protected_projection VALUES('decrypted-ephemeral');",
+            )
+            .unwrap();
+    }
+    storage.run_manual_vacuum().unwrap();
+    let guard = storage.db.lock().unwrap();
+    let conn = guard.as_ref().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT value FROM protected_projection", [], |row| row
+            .get::<_, String>(
+            0
+        ))
+        .unwrap(),
+        "decrypted-ephemeral"
+    );
+    assert_eq!(
+        conn.pragma_query_value(None, "temp_store", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn legacy_conversion_reports_committed_batches_before_compaction() {
+    use crate::storage::{InitializationPhase, InitializationProgress};
+    let (_directory, storage) = fixture();
+    let guard = storage.db.lock().unwrap();
+    let conn = guard.as_ref().unwrap();
+    conn.execute_batch(
+        "DELETE FROM app_metadata WHERE key='protected_content_version';
+        INSERT INTO screenshots(id,image_path,image_hash,process_name,created_at,status)
+        VALUES(7,'fixture','legacy-hash','Legacy.exe','2026-10-15 12:00:00','committed');",
+    )
+    .unwrap();
+    {
+        let tx = conn.unchecked_transaction().unwrap();
+        let bytes = 0.1234567f32.to_le_bytes();
+        for id in 1..=513 {
+            tx.execute("INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,model_id,model_revision,embedding_version,source_fingerprint)
+                VALUES('semantic_text',?1,1,?2,'synthetic','1',1,'fixture')", params![id.to_string(), bytes.as_slice()]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let progress = std::cell::RefCell::new(Vec::<InitializationProgress>::new());
+    storage
+        .migrate_protected_content_with_progress(conn, &|next| progress.borrow_mut().push(next))
+        .unwrap();
+    let progress = progress.into_inner();
+    let vectors = progress
+        .iter()
+        .filter(|next| next.phase == InitializationPhase::Vectors)
+        .map(|next| (next.processed, next.total))
+        .collect::<Vec<_>>();
+    assert_eq!(vectors, vec![(0, 513), (512, 513), (513, 513)]);
+    assert!(progress
+        .iter()
+        .any(|next| next.phase == InitializationPhase::Processes
+            && next.processed == 1
+            && next.total == 1));
+    let compacting = progress
+        .iter()
+        .position(|next| next.phase == InitializationPhase::Compacting)
+        .unwrap();
+    assert_eq!(
+        progress[compacting].total, 0,
+        "compaction must not invent a percentage"
+    );
+    assert!(progress[..compacting]
+        .iter()
+        .any(|next| next.phase == InitializationPhase::Vectors && next.processed == 513));
+    assert_eq!(
+        progress.last().unwrap().phase,
+        InitializationPhase::Finalizing
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM app_metadata WHERE key='protected_content_version'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        conn.pragma_query_value(None, "temp_store", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
 impl crate::processing_stage::Broker for OfflineBroker {
     fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
         Ok(false)

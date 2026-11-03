@@ -7,10 +7,9 @@ encryption and authorization rules; keyword HMAC indexing resumes through the
 existing unlock path without waiting for an idle window.
 
 Derived topics, summaries, evidence, process labels, embeddings and ANN files
-use the [storage encryption domains](storage-encryption-domains.md). That document
-describes public-key authority checks, explicit historical-key grants, migration
-and measured cache/decryption costs. These grants are separate from pending
-capture-input leases and preserve the archive's existing screenshot/OCR rules.
+use separate metadata, vector and ANN content keys. Historical-key grants are
+distinct from pending capture-input leases and preserve the archive's existing
+screenshot/OCR authorization rules.
 
 Source snapshot: application version `0.8.5`, branch
 `feat/rust-task-vectors-classification`, baseline `693d45a` plus the native
