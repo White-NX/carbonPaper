@@ -1039,6 +1039,7 @@ pub fn run() {
             clip_index::clip_index_stop_now,
             clip_index::get_clip_backfill_offer,
             clip_index::set_clip_backfill_decision,
+            clip_ann::get_clip_search_status,
             clip_ann::clip_ann_retry_now,
             clip_ann::clip_ann_take_failure_notification,
             clip_ann::clip_ann_ack_failure_notification,

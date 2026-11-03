@@ -195,10 +195,20 @@ impl ClipAnnSnapshot {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn exact(
         &self,
         k: usize,
         deadline: Option<Instant>,
+    ) -> Result<ClipAnnQuery, String> {
+        self.exact_with_metrics(k, deadline, None)
+    }
+
+    pub(crate) fn exact_with_metrics(
+        &self,
+        k: usize,
+        deadline: Option<Instant>,
+        metrics: Option<&crate::storage::VectorQueryMetrics>,
     ) -> Result<ClipAnnQuery, String> {
         self.check_authorization()?;
         let candidates = exact_candidates_with_tail(
@@ -208,6 +218,7 @@ impl ClipAnnSnapshot {
             deadline,
             |key| self.tail.positions.contains_key(key),
             self.scores(),
+            metrics,
         )?;
         self.check_authorization()?;
         Ok(ClipAnnQuery {

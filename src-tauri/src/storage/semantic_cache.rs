@@ -51,6 +51,7 @@ pub(super) struct TopKOptions {
     pub(super) deadline: Option<Instant>,
     /// Override the resident-memory budget for focused scan regressions.
     pub(super) resident_budget: Option<usize>,
+    pub(super) metrics: Option<std::sync::Arc<super::VectorQueryMetrics>>,
 }
 
 /// Idle window after which the resident matrix is released. One NL cluster
@@ -595,11 +596,16 @@ fn scan_visible_embedding_pages<F>(
     conn: &Connection,
     index_kind: DerivedIndexKind,
     deadline: Option<Instant>,
+    metrics: Option<&super::VectorQueryMetrics>,
     mut on_row: F,
 ) -> Result<(u32, usize), String>
 where
     F: FnMut(String, Vec<f32>) -> Result<(), String>,
 {
+    let started = Instant::now();
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| progress.phase = "vector_scan");
+    }
     let mut statement = conn
         .prepare(&visible_embedding_page_sql())
         .map_err(|error| format!("Failed to prepare resident vector scan: {error}"))?;
@@ -640,9 +646,25 @@ where
                 total_rows = total_rows
                     .checked_add(1)
                     .ok_or_else(|| "Resident vector row count overflow".to_string())?;
+                // Publish counters in small batches, rather than locking once per vector.
+                if total_rows % 256 == 0 {
+                    if let Some(metrics) = metrics {
+                        metrics.update(|progress| {
+                            progress.rows_scanned = total_rows;
+                            progress.scan_ms = elapsed_ms(started);
+                        });
+                    }
+                }
             }
         }
         pages = pages.saturating_add(1);
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| {
+                progress.rows_scanned = total_rows;
+                progress.pages_scanned = pages;
+                progress.scan_ms = elapsed_ms(started);
+            });
+        }
         if page_rows < SCAN_PAGE_ROWS as usize {
             break;
         }
@@ -698,6 +720,13 @@ impl StorageState {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let metrics = options.metrics.as_deref();
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| {
+                progress.phase = "epoch_read";
+                progress.cache_budget_bytes = Some(resident_budget);
+            });
+        }
         let authorization = self.protected_query_session()?;
         let check_authorization = || -> Result<(), String> {
             if let Some((credentials, marker)) = &authorization {
@@ -723,6 +752,9 @@ impl StorageState {
             return Err("storage_changed_during_vector_scan".to_string());
         }
         let epoch_ms = elapsed_ms(started);
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| progress.epoch_ms = epoch_ms);
+        }
 
         let want = k.saturating_add(VISIBILITY_MARGIN);
         let mut candidates = {
@@ -730,7 +762,22 @@ impl StorageState {
             match guard.as_ref() {
                 Some(cache) if cache.epoch == current_epoch => {
                     check_query_dimensions(query, cache)?;
-                    Some(cache.top_candidates(query, want.min(cache.rows())))
+                    if let Some(metrics) = metrics {
+                        metrics.update(|progress| {
+                            progress.mode = "resident_hit";
+                            progress.phase = "resident_score";
+                            progress.total_rows = Some(cache.rows());
+                        });
+                    }
+                    let scoring_started = Instant::now();
+                    let scored = cache.top_candidates(query, want.min(cache.rows()));
+                    if let Some(metrics) = metrics {
+                        metrics.update(|progress| {
+                            progress.rows_scanned = cache.rows();
+                            progress.scan_ms = elapsed_ms(scoring_started);
+                        });
+                    }
+                    Some(scored)
                 }
                 _ => None,
             }
@@ -738,17 +785,31 @@ impl StorageState {
 
         let mut mode = "resident_hit";
         if candidates.is_none() {
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| progress.phase = "cache_load_wait");
+            }
             // A concurrent first query should wait for one loader and then use
             // its result rather than materialising a second full matrix.
+            let load_wait_started = Instant::now();
             let _load_guard = self
                 .cache_load_lock(index_kind)
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| {
+                    progress.load_wait_ms = elapsed_ms(load_wait_started);
+                    progress.phase = "epoch_reload";
+                });
+            }
+            let reload_started = Instant::now();
             current_epoch = {
                 let guard = self.get_connection_named("semantic_cache_epoch_reload")?;
                 let conn = guard.as_ref().ok_or("Database not initialized")?;
                 read_derived_data_epoch(conn, index_kind)?
             };
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| progress.epoch_ms += elapsed_ms(reload_started));
+            }
             if self.semantic_cache_reset_generation.load(Ordering::Acquire) != reset_generation {
                 return Err("storage_changed_during_vector_scan".to_string());
             }
@@ -757,7 +818,22 @@ impl StorageState {
                 match guard.as_ref() {
                     Some(cache) if cache.epoch == current_epoch => {
                         check_query_dimensions(query, cache)?;
-                        Some(cache.top_candidates(query, want.min(cache.rows())))
+                        if let Some(metrics) = metrics {
+                            metrics.update(|progress| {
+                                progress.mode = "resident_hit";
+                                progress.phase = "resident_score";
+                                progress.total_rows = Some(cache.rows());
+                            });
+                        }
+                        let scoring_started = Instant::now();
+                        let scored = cache.top_candidates(query, want.min(cache.rows()));
+                        if let Some(metrics) = metrics {
+                            metrics.update(|progress| {
+                                progress.rows_scanned = cache.rows();
+                                progress.scan_ms = elapsed_ms(scoring_started);
+                            });
+                        }
+                        Some(scored)
                     }
                     _ => None,
                 }
@@ -786,6 +862,7 @@ impl StorageState {
                     want,
                     resident_budget,
                     deadline,
+                    metrics,
                 )?;
                 check_authorization()?;
                 if self.semantic_cache_reset_generation.load(Ordering::Acquire) != reset_generation
@@ -856,9 +933,17 @@ impl StorageState {
         }
         check_authorization()?;
         let score_ms = elapsed_ms(started) - epoch_ms;
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| {
+                progress.mode = mode;
+            });
+        }
 
         let candidates = candidates.unwrap_or_default();
         if candidates.is_empty() {
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| progress.phase = "complete");
+            }
             return Ok(Vec::new());
         }
 
@@ -869,6 +954,10 @@ impl StorageState {
         // is cached: re-parsing it per candidate dominated the whole query in an
         // unoptimized dev build, where the bundled SQLCipher is also built -O0.
         let candidate_count = candidates.len();
+        let visibility_started = Instant::now();
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| progress.phase = "visibility");
+        }
         let visible = {
             let guard = self.get_connection_named("semantic_cache_visibility")?;
             let conn = guard.as_ref().ok_or("Database not initialized")?;
@@ -917,6 +1006,12 @@ impl StorageState {
             return Err("storage_changed_during_vector_scan".to_string());
         }
         check_authorization()?;
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| {
+                progress.phase = "complete";
+                progress.visibility_ms = elapsed_ms(visibility_started);
+            });
+        }
         tracing::debug!(
             "[SEMANTIC] {} topk k={k} epoch={epoch_ms:.1}ms score={score_ms:.1}ms visibility={:.1}ms mode={mode} candidates={candidate_count} returned={}",
             index_kind.as_str(),
@@ -953,8 +1048,20 @@ impl StorageState {
         want: usize,
         resident_budget: usize,
         deadline: Option<Instant>,
+        metrics: Option<&super::VectorQueryMetrics>,
     ) -> Result<CacheQueryMode, String> {
+        let read_started = Instant::now();
+        if let Some(metrics) = metrics {
+            metrics.update(|progress| progress.phase = "read_connection");
+        }
         self.with_vector_scan_connection("load_semantic_vector_cache", |conn| {
+            let stats_started = Instant::now();
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| {
+                    progress.read_open_ms = elapsed_ms(read_started);
+                    progress.phase = "vector_stats";
+                });
+            }
             let stats = read_visible_cache_stats(conn, index_kind)?;
             if let Some(dimensions) = stats.dimensions {
                 if query.len() != dimensions {
@@ -976,6 +1083,14 @@ impl StorageState {
                 stats.subject_key_bytes,
             )
             .unwrap_or(usize::MAX);
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| {
+                    progress.total_rows = Some(stats.rows);
+                    progress.estimated_cache_bytes = Some(estimated_bytes);
+                    progress.stats_ms = elapsed_ms(stats_started);
+                    progress.phase = "cache_reservation";
+                });
+            }
             // `stats` is a point-in-time admission hint. A writer may add rows
             // after it completes, so the scan below also refuses any append
             // that would need a backing-container growth.
@@ -1001,12 +1116,16 @@ impl StorageState {
             let top_want = want.min(stats.rows);
             let mut top = TopK::new(top_want);
             let mut skipped = 0u64;
-            let (pages, rows) = scan_visible_embedding_pages(conn, index_kind, deadline, |subject, vector| {
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| progress.mode = if cache.is_some() { "resident_load" } else { "streaming" });
+            }
+            let (pages, rows) = scan_visible_embedding_pages(conn, index_kind, deadline, metrics, |subject, vector| {
                 if vector.len() != query.len() {
                     skipped = skipped.saturating_add(1);
                     return Ok(());
                 }
                 let score = dot_product_wide(query, &vector);
+                let was_resident = cache.is_some();
                 if let Some(resident) = cache.as_ref() {
                     peak_cache_bytes = peak_cache_bytes.max(resident.allocated_bytes());
                     top.push_with_key(score, &subject, || subject.clone());
@@ -1045,6 +1164,11 @@ impl StorageState {
                 } else {
                     let tie_key = subject.clone();
                     top.push_with_key(score, &tie_key, || subject);
+                }
+                if was_resident && cache.is_none() {
+                    if let Some(metrics) = metrics {
+                        metrics.update(|progress| progress.mode = "streaming");
+                    }
                 }
                 Ok(())
             })?;
@@ -1412,6 +1536,7 @@ mod tests {
             &conn,
             DerivedIndexKind::ClipImage,
             Some(Instant::now()),
+            None,
             |_, _| Ok(()),
         )
         .unwrap_err();

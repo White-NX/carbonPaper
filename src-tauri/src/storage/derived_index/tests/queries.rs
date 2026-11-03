@@ -515,6 +515,53 @@ fn idle_eviction_releases_the_resident_matrix() {
 }
 
 #[test]
+fn query_metrics_report_cache_modes_without_changing_vector_ranking() {
+    let (_temp, storage) = test_storage();
+    for (key, vector) in [
+        ("image-a", vec![1.0, 0.0]),
+        ("image-b", vec![0.8, 0.6]),
+        ("image-c", vec![0.0, 1.0]),
+    ] {
+        commit_vector(&storage, job(DerivedIndexKind::ClipImage, key), vector).unwrap();
+    }
+    let mut reference = None;
+    for (budget, mode) in [
+        (1, "streaming"),
+        (65_536, "resident_load"),
+        (65_536, "resident_hit"),
+    ] {
+        let metrics = std::sync::Arc::new(crate::storage::VectorQueryMetrics::default());
+        let ranked = storage
+            .semantic_topk_resident(
+                DerivedIndexKind::ClipImage,
+                &[1.0, 0.0],
+                3,
+                TopKOptions {
+                    resident_budget: Some(budget),
+                    metrics: Some(metrics.clone()),
+                    ..TopKOptions::default()
+                },
+            )
+            .unwrap();
+        if let Some(expected) = &reference {
+            assert_eq!(&ranked, expected);
+        } else {
+            reference = Some(ranked);
+        }
+        let progress = metrics.snapshot();
+        assert_eq!(progress.mode, mode);
+        assert_eq!(progress.phase, "complete");
+        assert_eq!(progress.total_rows, Some(3));
+        assert_eq!(progress.rows_scanned, 3);
+        assert_eq!(progress.cache_budget_bytes, Some(budget));
+        assert_eq!(progress.pages_scanned, u32::from(mode != "resident_hit"));
+        if mode == "streaming" {
+            assert!(progress.estimated_cache_bytes.unwrap() > budget);
+        }
+    }
+}
+
+#[test]
 fn indexed_rows_remain_searchable_while_pending_work_is_reported() {
     let (_temp, storage) = test_storage();
     commit_vector(

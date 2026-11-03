@@ -1649,6 +1649,7 @@
       "view_more": "View more",
       "retry": "Retry",
       "retry_hint": "Unable to search visual content right now. Please try again.",
+      "index_pending": "The search index is not ready yet. Searches may be slower.",
       "empty_hint": "Try a more specific scene description or adjust your filters.",
       "page_error": "Unable to load more screenshots right now.",
       "order": "More relevant images appear first",

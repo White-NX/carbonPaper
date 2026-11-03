@@ -11,9 +11,12 @@ use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, ScoredSubjec
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
+
+mod diagnostics;
+use diagnostics::{observe_query, query_stage, query_stage_async, QueryDiagnostics};
 
 /// Minimum cosine similarity for a hit, frozen by the M2.1 oracle
 /// (`clip_vector_search.min_similarity`). Cross-modal scores are low in
@@ -24,8 +27,10 @@ pub const CLIP_MIN_SIMILARITY: f32 = 0.32;
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(15);
 /// End-to-end Rust query budget. This covers model encoding, ANN/exact
 /// selection, SQL hydration, decryption, filtering, and pagination.
-const QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// A persisted generation is already being checksummed and mmap-opened at
+const QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Report slow work while it is still running, before the hard query deadline.
+const QUERY_SLOW_WARN_AFTER: Duration = Duration::from_secs(20);
+/// A persisted generation is already being verified and decrypted at
 /// startup. Let that single-flight finish instead of racing it with the exact
 /// scan this feature exists to remove.
 const QUERY_ANN_ARM_WAIT: Duration = Duration::from_secs(10);
@@ -294,47 +299,58 @@ async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> 
         return ClipQueryOutcome::Served(Vec::new());
     }
 
-    // Announce the query before anything slow, so the background passes stop
-    // submitting to the single semantic worker while this one is on its way to
-    // it. Dropped by the guard on every path out of this function.
+    // Stop background submissions to the semantic worker while this query is active.
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let _foreground = semantic.foreground_lease();
-
-    // A migration is rewriting the derived store; reading it would race the
-    // rewrite, so report the temporary unavailability explicitly.
-    if crate::maintenance::is_active() {
-        return unavailable("maintenance_in_progress");
-    }
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
-    let settled = tokio::task::spawn_blocking(move || migration_settled(&storage))
-        .await
-        .unwrap_or(false);
-    if !settled {
-        return unavailable("migration_incomplete");
-    }
-
-    match run_rust_clip_query(app, trimmed, &request).await {
-        Ok(results) if results.is_empty() => {
-            // The 0.32 floor makes an empty result legitimate for a query
-            // nothing matches, so this is not conclusive on its own — but an
-            // unmigrated machine returns empty for *every* query, and serving
-            // that silently would break visual search for that user. Checking
-            // the store rather than the result distinguishes the two.
-            let storage = app.state::<Arc<StorageState>>().inner().clone();
-            let empty = tokio::task::spawn_blocking(move || {
-                storage
-                    .count_query_visible_embeddings(DerivedIndexKind::ClipImage)
-                    .map(|count| count == 0)
-                    .unwrap_or(true)
-            })
-            .await
-            .unwrap_or(true);
-            if empty {
-                return unavailable("rust_index_empty");
+    let ann = app.state::<Arc<crate::clip_ann::ClipAnnState>>();
+    let diagnostics = Arc::new(QueryDiagnostics::new(&request, ann.search_status()));
+    let deadline = diagnostics.started.into_std() + QUERY_TOTAL_TIMEOUT;
+    let result = observe_query(
+        async {
+            if crate::maintenance::is_active() {
+                return Err("maintenance_in_progress".into());
             }
-            observe_served();
-            ClipQueryOutcome::Served(Vec::new())
-        }
+            let storage = app.state::<Arc<StorageState>>().inner().clone();
+            let settled = query_stage_async(&diagnostics, "migration_check", async {
+                Ok(
+                    tokio::task::spawn_blocking(move || migration_settled(&storage))
+                        .await
+                        .unwrap_or(false),
+                )
+            })
+            .await?;
+            if !settled {
+                return Err("migration_incomplete".into());
+            }
+
+            let results =
+                run_rust_clip_query(app, trimmed, &request, diagnostics.clone(), deadline).await?;
+            if results.is_empty() {
+                // Distinguish a legitimate empty match from an archive with no searchable vectors.
+                let storage = app.state::<Arc<StorageState>>().inner().clone();
+                let empty = query_stage_async(&diagnostics, "empty_index_check", async {
+                    Ok(tokio::task::spawn_blocking(move || {
+                        storage
+                            .count_query_visible_embeddings(DerivedIndexKind::ClipImage)
+                            .map(|count| count == 0)
+                            .unwrap_or(true)
+                    })
+                    .await
+                    .unwrap_or(true))
+                })
+                .await?;
+                if empty {
+                    return Err("rust_index_empty".into());
+                }
+            }
+            Ok(results)
+        },
+        &diagnostics,
+        QUERY_SLOW_WARN_AFTER,
+        QUERY_TOTAL_TIMEOUT,
+    )
+    .await;
+    match result {
         Ok(results) => {
             observe_served();
             ClipQueryOutcome::Served(results)
@@ -352,6 +368,8 @@ async fn run_rust_clip_query(
     app: &AppHandle,
     query: &str,
     request: &ClipQueryRequest<'_>,
+    diagnostics: Arc<QueryDiagnostics>,
+    deadline: Instant,
 ) -> Result<Vec<serde_json::Value>, String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
@@ -360,20 +378,21 @@ async fn run_rust_clip_query(
         .inner()
         .clone();
 
-    let started = Instant::now();
-    let deadline = started + QUERY_TOTAL_TIMEOUT;
-    let embedding = semantic
-        .embed_text(
-            app.clone(),
-            MlSemanticModel::ChineseClip,
-            vec![query.to_string()],
-            QUERY_EMBED_TIMEOUT,
-            // CPU, matching the image encoder. `clip_index.rs` records why.
-            false,
-        )
-        .await
-        .map_err(|error| format!("embed_failed: {error}"))?;
-    let embed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let embedding = query_stage_async(&diagnostics, "embedding", async {
+        semantic
+            .embed_text(
+                app.clone(),
+                MlSemanticModel::ChineseClip,
+                vec![query.to_string()],
+                QUERY_EMBED_TIMEOUT,
+                // CPU, matching the image encoder. clip_index.rs records why.
+                false,
+            )
+            .await
+            .map_err(|error| format!("embed_failed: {error}"))
+    })
+    .await?;
+    diagnostics.embedding(embedding.timings);
     let query_vec = embedding
         .vectors
         .into_iter()
@@ -386,22 +405,23 @@ async fn run_rust_clip_query(
         ));
     }
 
-    let arm_started = Instant::now();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if !remaining.is_zero() {
-        let _ = ann_state
-            .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
-            .await;
-    }
-    let arm_ms = arm_started.elapsed().as_secs_f64() * 1000.0;
+    query_stage_async(&diagnostics, "ann_arm", async {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = ann_state
+                .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
+                .await;
+        }
+        Ok(())
+    })
+    .await?;
+    diagnostics.ann_status(ann_state.search_status());
 
-    // Python's over-fetch, preserved exactly: enough candidates that the
-    // post-scan process and time filters still have a full page to paginate.
+    // Preserve over-fetch and pagination so process/time filters still have a full page.
     let limit = request.limit.max(1) as usize;
     let offset = bounded_clip_offset(request.offset);
     let target = limit.saturating_add(offset).max(limit);
     let fetch = target.saturating_mul(2).max(target.saturating_add(20));
-
     let scan_storage = storage.clone();
     let process_names: Vec<String> = request
         .process_names
@@ -409,34 +429,40 @@ async fn run_rust_clip_query(
         .filter(|name| !name.trim().is_empty())
         .cloned()
         .collect();
-    let start_time = request.start_time;
     let categories: Vec<String> = request
         .categories
         .iter()
         .filter(|category| !category.trim().is_empty())
         .cloned()
         .collect();
+    let start_time = request.start_time;
     let end_time = request.end_time;
     let include_ocr = request.include_ocr;
 
-    // Keep synchronous database reads and CNG work off the async runtime. OCR
-    // is presentation data: decrypt it only after filtering and pagination.
-    let stage = Arc::new(Mutex::new("queued"));
-    let scan_stage = Arc::clone(&stage);
+    // Keep synchronous database/CNG work off the async runtime. Decrypt OCR after pagination.
+    diagnostics.begin("queued");
+    let queued_at = Instant::now();
+    let scan_diagnostics = Arc::clone(&diagnostics);
     let scan_task = tokio::task::spawn_blocking(move || {
+        scan_diagnostics.finish("queued", queued_at.elapsed(), None);
         if Instant::now() >= deadline {
             return Err("query_deadline_exceeded_before_scan".to_string());
         }
-        let scan_started = Instant::now();
-        *scan_stage.lock().unwrap_or_else(|error| error.into_inner()) = "database_wait";
-        let _foreground_db = scan_storage.foreground_db_read();
-        let ann_snapshot = match query_stage(&scan_stage, "ann_snapshot", || {
-            ann_state.prepare_query(&scan_storage, &query_vec, Some(deadline))
+        let _foreground_db = query_stage(&scan_diagnostics, "database_wait", || {
+            Ok(scan_storage.foreground_db_read())
+        })?;
+        let ann_snapshot = match query_stage(&scan_diagnostics, "ann_snapshot", || {
+            ann_state.prepare_query_with_reason(&scan_storage, &query_vec, Some(deadline))
         }) {
-            Ok(snapshot) => snapshot,
+            Ok((snapshot, reason)) => {
+                if snapshot.is_none() {
+                    scan_diagnostics.fallback(reason);
+                }
+                snapshot
+            }
             Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
-            Err(error) => {
-                tracing::warn!("[CLIP:ANN] snapshot unavailable, using exact fallback: {error}");
+            Err(_) => {
+                scan_diagnostics.fallback("ann_snapshot_failed");
                 ann_state.disarm();
                 None
             }
@@ -449,95 +475,71 @@ async fn run_rust_clip_query(
             target,
             deadline,
             |requested| {
-                query_stage(&scan_stage, "ann", || {
-                    app_ann_query(
-                        &ann_state,
-                        ann_snapshot.as_ref(),
-                        &scan_storage,
-                        &query_vec,
-                        requested,
-                        deadline,
-                    )
-                })
+                app_ann_query(
+                    &ann_state,
+                    ann_snapshot.as_ref(),
+                    &scan_storage,
+                    &query_vec,
+                    requested,
+                    deadline,
+                    &scan_diagnostics,
+                )
             },
             |scored| {
-                candidate_filter.filter(scored, |hashes| {
-                    query_stage(&scan_stage, "candidate_metadata", || {
+                let filtered = candidate_filter.filter(scored, |hashes| {
+                    query_stage(&scan_diagnostics, "candidate_metadata", || {
                         if process_names.is_empty() && categories.is_empty() {
                             scan_storage.clip_candidate_metadata(hashes, deadline)
                         } else {
                             load_candidate_summaries(&scan_storage, hashes, deadline)
                         }
                     })
-                })
+                })?;
+                scan_diagnostics.filtered(filtered.len());
+                Ok(filtered)
             },
             || {
-                query_stage(&scan_stage, "exact", || {
+                scan_diagnostics.fallback_if_unset(
+                    if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
+                        "deep_pagination"
+                    } else {
+                        "filtered_candidates_insufficient"
+                    },
+                );
+                query_stage(&scan_diagnostics, "exact", || {
                     app_exact_query(
                         ann_snapshot.as_ref(),
                         &scan_storage,
                         &query_vec,
                         fetch,
                         deadline,
+                        &scan_diagnostics,
                     )
                 })
             },
         )?;
+        scan_diagnostics.filtered(filtered.len());
         let page = paginate(filtered, offset, limit);
         let page = resolve_page_metadata(page, |ids| {
-            query_stage(&scan_stage, "metadata", || {
+            query_stage(&scan_diagnostics, "metadata", || {
                 scan_storage
                     .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
                     .map_err(|error| format!("hydrate_failed: {error}"))
             })
         })?;
         let results = hydrate_page(page, 0, limit, deadline, |ids| {
-            query_stage(&scan_stage, "ocr", || {
+            query_stage(&scan_diagnostics, "ocr", || {
                 load_page_texts(&scan_storage, ids, deadline, include_ocr)
             })
         })?;
         if Instant::now() >= deadline {
             return Err("query_deadline_exceeded_after_hydrate".to_string());
         }
-        Ok::<_, String>((results, scan_started.elapsed().as_secs_f64() * 1000.0))
+        Ok::<_, String>(results)
     });
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let (results, scan_ms) = tokio::time::timeout(remaining, scan_task)
+    scan_task
         .await
-        .map_err(|_| {
-            let stage = *stage.lock().unwrap_or_else(|error| error.into_inner());
-            tracing::warn!(
-                "[CLIP] query deadline exceeded stage={stage} embed={embed_ms:.1}ms arm={arm_ms:.1}ms total={:.1}ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-            "query_deadline_exceeded".to_string()
-        })?
-        .map_err(|error| format!("scan_task_failed: {error}"))??;
-
-    tracing::debug!(
-        "[CLIP] rust nl query embed={embed_ms:.1}ms arm={arm_ms:.1}ms scan={scan_ms:.1}ms returned={}",
-        results.len()
-    );
-    Ok(results)
-}
-
-fn query_stage<T>(
-    progress: &Mutex<&'static str>,
-    stage: &'static str,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    *progress.lock().unwrap_or_else(|error| error.into_inner()) = stage;
-    let started = Instant::now();
-    let result = operation();
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    if result.is_err() {
-        // Also record cooperative deadline failures that finish just before
-        // the async timeout fires. Do not copy private read errors into logs.
-        tracing::warn!("[CLIP] query stage failed stage={stage} elapsed={elapsed_ms:.1}ms");
-    } else {
-        tracing::debug!("[CLIP] stage={stage} elapsed={elapsed_ms:.1}ms");
-    }
-    result
+        .map_err(|error| format!("scan_task_failed: {error}"))?
 }
 
 fn app_ann_query(
@@ -547,24 +549,25 @@ fn app_ann_query(
     query: &[f32],
     fetch: usize,
     deadline: Instant,
+    diagnostics: &QueryDiagnostics,
 ) -> Result<CandidateSource, String> {
     let Some(snapshot) = snapshot else {
         return Ok(CandidateSource::Unavailable);
     };
-    match snapshot.query(fetch, Some(deadline)) {
+    diagnostics.retrieval("ann");
+    diagnostics.ann_attempt();
+    match query_stage(diagnostics, "ann", || snapshot.query(fetch, Some(deadline))) {
         Ok(result) => {
-            tracing::debug!(
-                "[CLIP:ANN] query mode={} tail={} candidates={}",
-                result.mode,
-                result.tail_rows,
-                result.candidates.len()
-            );
+            diagnostics.retrieval(result.mode);
+            diagnostics.ann_candidates(result.candidates.len(), result.tail_rows);
             Ok(CandidateSource::Ann(result.candidates))
         }
         Err(error) if error.starts_with("query_deadline_exceeded") => Err(error),
-        Err(error) => {
-            tracing::warn!("[CLIP:ANN] query failed, using exact fallback: {error}");
-            let fallback = app_exact_query(Some(snapshot), storage, query, fetch, deadline);
+        Err(_) => {
+            diagnostics.fallback("ann_query_failed");
+            let fallback = query_stage(diagnostics, "exact", || {
+                app_exact_query(Some(snapshot), storage, query, fetch, deadline, diagnostics)
+            });
             state.disarm();
             fallback.map(CandidateSource::ExactFallback)
         }
@@ -577,21 +580,29 @@ fn app_exact_query(
     query: &[f32],
     fetch: usize,
     deadline: Instant,
+    diagnostics: &QueryDiagnostics,
 ) -> Result<Vec<crate::storage::ScoredSubject>, String> {
+    diagnostics.retrieval(if snapshot.is_some() {
+        "flat_exact"
+    } else {
+        "sql_exact"
+    });
     match snapshot
-        .map(|snapshot| snapshot.exact(fetch, Some(deadline)))
+        .map(|snapshot| {
+            snapshot.exact_with_metrics(fetch, Some(deadline), Some(&diagnostics.vectors))
+        })
         .transpose()?
     {
         Some(result) => {
-            tracing::debug!(
-                "[CLIP:ANN] query mode={} tail={} candidates={}",
-                result.mode,
-                result.tail_rows,
-                result.candidates.len()
-            );
+            diagnostics.retrieval(result.mode);
             Ok(result.candidates)
         }
-        None => storage.clip_image_topk_with_deadline(query, fetch, deadline),
+        None => storage.clip_image_topk_with_deadline(
+            query,
+            fetch,
+            deadline,
+            Some(diagnostics.vectors.clone()),
+        ),
     }
 }
 

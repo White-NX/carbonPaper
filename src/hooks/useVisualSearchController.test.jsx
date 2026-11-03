@@ -1,9 +1,11 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useVisualSearchController } from './useVisualSearchController';
 import { fetchThumbnailBatch, searchScreenshots } from '../lib/monitor_api';
+import { getClipSearchStatus } from '../lib/semantic_api';
 
 vi.mock('../lib/monitor_api', () => ({ searchScreenshots: vi.fn(), fetchThumbnailBatch: vi.fn() }));
+vi.mock('../lib/semantic_api', () => ({ getClipSearchStatus: vi.fn() }));
 
 const item = (id) => ({ id: `clip-${id}`, image_path: `memory://${id}`,
   metadata: { screenshot_id: id, process_name: 'code.exe', created_at: '2026-10-31T00:00:00Z' } });
@@ -14,8 +16,37 @@ const props = () => ({ active: true, query: 'moon', debouncedQuery: 'moon', proc
 
 describe('visual search controller', () => {
   beforeEach(() => {
+    getClipSearchStatus.mockReset().mockResolvedValue({ ready: true });
     searchScreenshots.mockReset().mockResolvedValue([]);
     fetchThumbnailBatch.mockReset().mockImplementation(async (ids) => Object.fromEntries(ids.map((id) => [id, `thumbnail-${id}`])));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('reports pending readiness while retrieval runs and refreshes it without restarting the search', async () => {
+    vi.useFakeTimers();
+    searchScreenshots.mockImplementation(() => new Promise(() => {}));
+    getClipSearchStatus.mockResolvedValueOnce({ ready: false }).mockResolvedValue({ ready: true });
+    const { result, unmount } = renderHook(useVisualSearchController, { initialProps: props() });
+    await act(async () => {});
+    expect(result.current.phase).toBe('loading');
+    expect(result.current.indexReady).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(result.current.indexReady).toBe(true);
+    expect(result.current.phase).toBe('loading');
+    expect(searchScreenshots).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it('discards a readiness reply from an inactive search', async () => {
+    let finishStatus;
+    getClipSearchStatus.mockImplementationOnce(() => new Promise(resolve => { finishStatus = resolve; }))
+      .mockImplementation(() => new Promise(() => {}));
+    const initial = props();
+    const { result, rerender } = renderHook(useVisualSearchController, { initialProps: initial });
+    rerender({ ...initial, active: false });
+    await act(async () => finishStatus({ ready: false }));
+    rerender(initial);
+    expect(result.current.indexReady).toBeNull();
   });
 
   it('starts with ten results and preloads their thumbnails', async () => {

@@ -427,7 +427,53 @@ pub struct ClipAnnQuery {
     pub tail_rows: usize,
 }
 
+/// In-memory retrieval readiness; reading this never opens the database or index files.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClipSearchStatus {
+    pub ready: bool,
+    pub ann_state: &'static str,
+    pub ann_generation: Option<u64>,
+    pub fallback_reason: Option<&'static str>,
+}
+
+/// Public, read-only readiness for the visual search notice. Contains no user content.
+#[tauri::command]
+pub async fn get_clip_search_status(
+    state: tauri::State<'_, Arc<ClipAnnState>>,
+) -> Result<ClipSearchStatus, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.search_status())
+        .await
+        .map_err(|error| format!("Failed to read CLIP search readiness: {error}"))
+}
+
 impl ClipAnnState {
+    pub(crate) fn search_status(&self) -> ClipSearchStatus {
+        self.search_status_enabled(enabled())
+    }
+
+    fn search_status_enabled(&self, enabled: bool) -> ClipSearchStatus {
+        let generation = self.generation.read().unwrap_or_else(|e| e.into_inner());
+        let (ann_state, fallback_reason) = if !enabled {
+            ("disabled", Some("ann_disabled"))
+        } else if generation.is_some() {
+            ("armed", None)
+        } else {
+            match *self.arm_tx.borrow() {
+                ArmStatus::Loading => ("arming", Some("generation_loading")),
+                ArmStatus::Missing => ("exact_fallback", Some("generation_missing")),
+                ArmStatus::Failed => ("failed", Some("generation_load_failed")),
+                ArmStatus::Idle | ArmStatus::Ready => ("exact_fallback", Some("reader_unloaded")),
+            }
+        };
+        ClipSearchStatus {
+            ready: enabled && generation.is_some(),
+            ann_state,
+            ann_generation: generation.as_ref().map(|reader| reader.manifest.generation),
+            fallback_reason,
+        }
+    }
+
     fn generation_snapshot_with_tail<F, T>(
         &self,
         storage: &StorageState,
@@ -454,14 +500,17 @@ impl ClipAnnState {
         Ok(Some((Arc::clone(generation), tail)))
     }
 
-    pub(crate) fn prepare_query(
+    pub(crate) fn prepare_query_with_reason(
         &self,
         storage: &StorageState,
         query: &[f32],
         deadline: Option<Instant>,
-    ) -> Result<Option<ClipAnnSnapshot>, String> {
-        if !enabled() || query.len() != CLIP_DIMENSIONS {
-            return Ok(None);
+    ) -> Result<(Option<ClipAnnSnapshot>, &'static str), String> {
+        if !enabled() {
+            return Ok((None, "ann_disabled"));
+        }
+        if query.len() != CLIP_DIMENSIONS {
+            return Ok((None, "dimension_mismatch"));
         }
         check_ann_deadline(deadline)?;
         let authorization = storage.protected_query_session()?;
@@ -471,11 +520,21 @@ impl ClipAnnState {
                 .load(storage, generation.manifest.covered_epoch, deadline)
         }) {
             Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return Ok(None),
-            Err(error) if error.starts_with("ann_tail_too_large:") => return Ok(None),
+            Ok(None) => {
+                return Ok((
+                    None,
+                    self.search_status()
+                        .fallback_reason
+                        .unwrap_or("generation_unusable"),
+                ))
+            }
+            Err(error) if error.starts_with("ann_tail_too_large:") => {
+                return Ok((None, "tail_limit_exceeded"))
+            }
             Err(error) => return Err(error),
         };
-        ClipAnnSnapshot::new(generation, tail, query, deadline, authorization).map(Some)
+        ClipAnnSnapshot::new(generation, tail, query, deadline, authorization)
+            .map(|snapshot| (Some(snapshot), "none"))
     }
 
     pub fn has_generation(&self) -> bool {
@@ -849,6 +908,7 @@ fn exact_candidates(
                 .filter(|v| v.len() == query.len())
                 .map(|v| (row.subject_key.as_str(), dot_product(query, v)))
         }),
+        None,
     )
 }
 
@@ -859,9 +919,26 @@ fn exact_candidates_with_tail<'a>(
     deadline: Option<Instant>,
     changed: impl Fn(&str) -> bool,
     tail_scores: impl Iterator<Item = (&'a str, f32)>,
+    metrics: Option<&crate::storage::VectorQueryMetrics>,
 ) -> Result<Vec<ScoredSubject>, String> {
+    let started = Instant::now();
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| {
+            progress.mode = "flat_exact";
+            progress.phase = "vector_scan";
+            progress.total_rows = Some(generation.flat.rows());
+        });
+    }
     let mut top = BoundedTopK::new(k);
     for ordinal in 0..generation.flat.rows() {
+        if ordinal % 256 == 0 {
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| {
+                    progress.rows_scanned = ordinal;
+                    progress.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+                });
+            }
+        }
         if ordinal % 4096 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
@@ -872,6 +949,13 @@ fn exact_candidates_with_tail<'a>(
             top.push(dot_product(query, &generation.flat.vector(ordinal)?), key);
         }
     }
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| {
+            progress.rows_scanned = generation.flat.rows();
+            progress.phase = "tail_merge";
+            progress.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+        });
+    }
     for (index, (key, score)) in tail_scores.enumerate() {
         if index % 1024 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
@@ -879,6 +963,12 @@ fn exact_candidates_with_tail<'a>(
             return Err("query_deadline_exceeded_during_flat_exact".to_string());
         }
         top.push(score, key);
+    }
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| {
+            progress.phase = "complete";
+            progress.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+        });
     }
     Ok(top.into_sorted())
 }
@@ -2082,5 +2172,32 @@ mod tests {
         assert_eq!(&*pinned.flat.vector(0).unwrap(), &[1.0, 0.0]);
         drop(pinned);
         assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn search_readiness_distinguishes_missing_and_unloaded_readers() {
+        let state = ClipAnnState::default();
+        let token = state.begin_arm().unwrap();
+        assert_eq!(
+            state.search_status_enabled(true).fallback_reason,
+            Some("generation_loading")
+        );
+        state.finish_arm(token, ArmStatus::Missing);
+        let missing = state.search_status_enabled(true);
+        assert!(!missing.ready);
+        assert_eq!(missing.fallback_reason, Some("generation_missing"));
+
+        let temp = tempfile::tempdir().unwrap();
+        state.install_for_test(test_reader(temp.path(), 46, &["a"], &[vec![1.0, 0.0]]));
+        let ready = state.search_status_enabled(true);
+        assert!(ready.ready);
+        assert_eq!(ready.ann_generation, Some(46));
+        assert_eq!(ready.fallback_reason, None);
+        assert!(!state.search_status_enabled(false).ready);
+        assert!(state.evict_reader_if_idle(Duration::ZERO));
+        assert_eq!(
+            state.search_status_enabled(true).fallback_reason,
+            Some("reader_unloaded")
+        );
     }
 }

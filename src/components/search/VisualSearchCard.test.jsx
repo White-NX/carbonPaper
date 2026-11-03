@@ -29,6 +29,15 @@ describe('visual search results', () => {
     });
   });
 
+  it.each([false, true])('shows the pending index notice during retrieval and removes it when ready (gallery=%s)', (fullPage) => {
+    const state = controller({ phase: 'loading', results: [], summaryResults: [], indexReady: false });
+    const { rerender } = render(<VisualSearchCard controller={state} fullPage={fullPage} />);
+    expect(screen.getByRole('status')).toHaveTextContent('advancedSearch.visual.index_pending');
+    expect(screen.getByRole('region')).toHaveAttribute('aria-busy', 'true');
+    rerender(<VisualSearchCard controller={{ ...state, indexReady: true }} fullPage={fullPage} />);
+    expect(screen.queryByText('advancedSearch.visual.index_pending')).not.toBeInTheDocument();
+  });
+
   it('shows inline results, loads only visible originals, and opens the gallery from the title', async () => {
     fetchSearchImage.mockResolvedValue('data:image/jpeg;base64,original');
     const onSelectResult = vi.fn(), onOpenGallery = vi.fn();

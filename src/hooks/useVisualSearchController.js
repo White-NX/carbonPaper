@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchThumbnailBatch, searchScreenshots } from '../lib/monitor_api';
 import { createLatestTaskQueue } from '../lib/latest_task_queue';
+import { getClipSearchStatus } from '../lib/semantic_api';
+import { usePolling } from './usePolling';
 
 export const VISUAL_SEARCH_SUMMARY_SIZE = 10;
 export const VISUAL_SEARCH_PAGE_SIZE = 50;
@@ -33,6 +35,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
   const searchKey = JSON.stringify([normalized, processNames, categories, startTime, endTime, refreshKey]);
   const key = JSON.stringify([searchKey, retryRevision]);
   const [state, setState] = useState(() => emptyState(key));
+  const [indexReady, setIndexReady] = useState(null);
   const current = ready && state.key === key ? state : emptyState(key, active && normalized ? 'loading' : 'idle');
 
   useEffect(() => {
@@ -58,6 +61,13 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
     });
     return () => { generation.current += 1; queue.cancel(); };
   }, [active, ready, key, normalized, processNames, categories, startTime, endTime, queue]);
+
+  usePolling(async () => {
+    const version = generation.current;
+    const status = await getClipSearchStatus();
+    if (generation.current !== version) return;
+    setIndexReady(typeof status?.ready === 'boolean' ? status.ready : null);
+  }, { intervalMs: 5000, enabled: ready });
 
   const loadPage = useCallback(async (limit, restart = false) => {
     if (!ready || current.phase !== 'ready' || !current.hasMore || current.loadingMore || pageRequest.current) return;
@@ -132,7 +142,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
 
   const thumbnails = useMemo(() => ready ? { ...sharedThumbnails, ...current.thumbnails } : EMPTY_THUMBNAILS,
     [ready, sharedThumbnails, current.thumbnails]);
-  return { ...current, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
+  return { ...current, indexReady: ready ? indexReady : null, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
     summaryExpanded: current.summaryCount > VISUAL_SEARCH_SUMMARY_SIZE,
     summaryHasMore: current.results.length > current.summaryCount || current.hasMore,
     summaryPageError, showMore, loadMore, retry };

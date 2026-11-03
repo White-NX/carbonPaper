@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { VISUAL_SEARCH_PAGE_SIZE, VISUAL_SEARCH_SUMMARY_SIZE } from '../../hooks/useVisualSearchController';
 import { ThumbnailCard } from '../ThumbnailCard';
 import { Button, focusStyle } from '../ui/Button';
+import { Banner } from '../ui/Banner';
 
 /** Inline visual results lead into a gallery under the same search. */
 export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPreview,
@@ -65,6 +66,10 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
           </button>
         )}
       </h2>
+
+      {controller.indexReady === false && <Banner className="mb-3">
+        <p role="status">{t('advancedSearch.visual.index_pending')}</p>
+      </Banner>}
 
       <div id={regionId} role="region" aria-label={t('advancedSearch.visual.results')} aria-busy={waiting || loadingMore}>
         {waiting ? (
