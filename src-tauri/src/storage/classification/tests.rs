@@ -49,7 +49,7 @@ fn permit_retry(storage: &StorageState) {
 }
 
 #[test]
-fn legacy_import_is_atomic_resumable_and_keeps_the_source_file() {
+fn legacy_import_keeps_the_source_on_failure_and_retires_it_after_commit() {
     let (dir, storage) = fixture();
     let path = dir.path().join("anchors.json");
     std::fs::write(&path, "broken json").unwrap();
@@ -60,13 +60,22 @@ fn legacy_import_is_atomic_resumable_and_keeps_the_source_file() {
     let loaded = storage.load_classification_anchors().unwrap();
     assert_eq!(loaded.anchors["custom"][1].added_at, "old-date");
     assert_eq!(loaded.anchors["custom"][1].weight, 2.0);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert!(!path.exists());
     *storage.db.lock().unwrap() = None;
-    *storage.db.lock().unwrap() = Some(Connection::open(dir.path().join("test.db")).unwrap());
+    let conn = Connection::open(dir.path().join("test.db")).unwrap();
+    storage.protected.register_functions(&conn).unwrap();
+    *storage.db.lock().unwrap() = Some(conn);
     std::fs::write(&path, "legacy file is no longer the owner").unwrap();
     let reopened = storage.load_classification_anchors().unwrap();
     assert_eq!(loaded.anchors, reopened.anchors);
     assert_eq!(loaded.revision, reopened.revision);
+    // A restored legacy file cannot replace committed encrypted anchors. Startup
+    // retires it even when the protected-content migration is already complete.
+    let guard = storage.db.lock().unwrap();
+    storage
+        .import_legacy_anchors(guard.as_ref().unwrap())
+        .unwrap();
+    assert!(!path.exists());
 }
 
 #[test]

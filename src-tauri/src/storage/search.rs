@@ -325,7 +325,7 @@ const SEARCH_RESULT_COLUMNS: &str =
     "r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
          r.box_x1, r.box_y1, r.box_x2, r.box_y2,
          r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-         s.image_path, s.window_title_enc, s.process_name,
+         s.image_path, s.window_title_enc, cp_process(s.process_name),
          s.content_key_encrypted,
          CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
          CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
@@ -880,6 +880,11 @@ impl StorageState {
         let requested = (offset as usize).saturating_add(limit as usize);
 
         let hmac_key = self.credential_state.get_hmac_key()?;
+        let process_tokens = process_names
+            .as_deref()
+            .filter(|names| !names.is_empty())
+            .map(|names| self.protected.process_tokens(names))
+            .transpose()?;
         let conn = self.open_read_connection_named("search_text")?;
         telemetry.stages.setup += watch.lap();
 
@@ -893,7 +898,7 @@ impl StorageState {
         if plan.phrase.is_empty() {
             telemetry.tier = "recent";
             let (sql, params) = build_empty_search_sql(
-                process_names.as_deref(),
+                process_tokens.as_deref(),
                 start_time,
                 end_time,
                 categories.as_deref(),
@@ -951,7 +956,7 @@ impl StorageState {
 
         let allowed = allowed_ocr_rows(
             &conn,
-            process_names.as_deref(),
+            process_tokens.as_deref(),
             categories.as_deref(),
             start_time,
             end_time,
@@ -1314,6 +1319,13 @@ mod tests {
                  ON ocr_results(is_deleted, screenshot_id);",
         )
         .expect("search fixture schema");
+        conn.create_scalar_function(
+            "cp_process",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_DIRECTONLY,
+            |args| args.get::<Option<String>>(0),
+        )
+        .unwrap();
         conn
     }
 

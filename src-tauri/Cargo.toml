@@ -65,6 +65,7 @@ rand = "0.8"
 rusqlite = { version = "=0.40.2", default-features = false, features = [
     "cache",
     "hooks",
+    "functions",
     "bundled-sqlcipher-vendored-openssl",
 ] }
 base64 = "0.22"

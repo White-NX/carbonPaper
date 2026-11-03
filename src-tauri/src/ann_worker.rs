@@ -3,14 +3,15 @@
 use crate::ann_format::{self, Header, MappedFlatIndex};
 use crate::ann_protocol::*;
 use crate::semantic_metrics::cpu_ms;
+use carbonpaper_app_bound::payload::CipherKey;
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+use zeroize::Zeroizing;
 
 #[derive(Default)]
 struct Control(Mutex<(u64, bool)>);
@@ -87,10 +88,17 @@ struct Session {
     graph_bytes: Vec<u8>,
     output: Option<(PathBuf, File, usize)>,
     phase: Phase,
+    encryption: Arc<CipherKey>,
 }
 
 impl Session {
-    fn new(flat: String, checkpoint: Option<String>, checksum: Option<String>, rows: u64) -> Self {
+    fn new(
+        flat: String,
+        checkpoint: Option<String>,
+        checksum: Option<String>,
+        rows: u64,
+        encryption: Arc<CipherKey>,
+    ) -> Self {
         Self {
             flat_path: flat.into(),
             flat_bytes: Vec::new(),
@@ -107,6 +115,7 @@ impl Session {
             graph_bytes: Vec::new(),
             output: None,
             phase: Phase::Flat,
+            encryption,
         }
     }
     fn options(&self) -> IndexOptions {
@@ -121,36 +130,29 @@ impl Session {
             ..Default::default()
         }
     }
-    fn vector(&self, ordinal: usize) -> Result<Cow<'_, [f32]>, AnnError> {
-        if let Some(mapped) = &self.flat_map {
-            return mapped
-                .vector(ordinal)
-                .map(Cow::Borrowed)
-                .map_err(Into::into);
-        }
-        let h = self.header.as_ref().ok_or("ANN flat header missing")?;
-        if ordinal >= h.row_count as usize {
-            return Err("ANN ordinal outside frozen input".into());
-        }
-        let start = h.vectors_offset as usize + ordinal * h.dimensions as usize * 4;
-        let bytes = self
-            .flat_bytes
-            .get(start..start + h.dimensions as usize * 4)
-            .ok_or("truncated ANN input")?;
-        Ok(Cow::Owned(
-            bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect(),
-        ))
+    fn vector(&self, ordinal: usize) -> Result<ann_format::VectorGuard, AnnError> {
+        self.flat_map
+            .as_ref()
+            .ok_or("ANN flat input missing")?
+            .vector_uncached(ordinal)
+            .map_err(Into::into)
     }
     fn new_index(&self) -> Result<Index, AnnError> {
         Index::new(&self.options()).map_err(|e| AnnError::from(e.to_string()))
     }
     fn restore_index(&self, bytes: &[u8], rows: u64) -> Result<Index, AnnError> {
+        let identity = self
+            .header
+            .as_ref()
+            .ok_or("ANN flat header missing")?
+            .graph_identity(rows)?;
+        let plaintext = self
+            .encryption
+            .open(&identity, bytes)
+            .map_err(AnnError::InvalidCheckpoint)?;
         let index = self.new_index()?;
         index
-            .load_from_buffer(bytes)
+            .load_from_buffer(&plaintext)
             .map_err(|e| AnnError::InvalidCheckpoint(e.to_string()))?;
         index.change_expansion_search(self.options().expansion_search);
         if index.size() as u64 != rows
@@ -187,17 +189,18 @@ impl Session {
                     if background {
                         return Err(AnnError::Paused("ANN input exceeds B limit"));
                     }
-                    let flat = MappedFlatIndex::open(&self.flat_path)?;
+                    let flat = MappedFlatIndex::open(&self.flat_path, self.encryption.clone())?;
                     self.header = Some(flat.header.clone());
                     self.flat_map = Some(flat);
                 } else {
                     io_bytes = read_chunk(&self.flat_path, &mut self.flat_bytes)?;
                     if self.flat_bytes.len() as u64 == size {
-                        let h = Header::decode(&self.flat_bytes)?;
-                        if h.file_len()? != size {
-                            return Err("ANN input length mismatch".into());
-                        }
-                        self.header = Some(h);
+                        let flat = MappedFlatIndex::from_bytes(
+                            std::mem::take(&mut self.flat_bytes),
+                            self.encryption.clone(),
+                        )?;
+                        self.header = Some(flat.header.clone());
+                        self.flat_map = Some(flat);
                     }
                 }
                 if self.header.is_some() {
@@ -294,10 +297,12 @@ impl Session {
                 if background && size > 64 * 1024 * 1024 {
                     return Err(AnnError::Paused("ANN graph exceeds B limit"));
                 }
-                self.graph_bytes.resize(size, 0);
+                let mut plaintext = Zeroizing::new(vec![0u8; size]);
                 index
-                    .save_to_buffer(&mut self.graph_bytes)
+                    .save_to_buffer(&mut plaintext)
                     .map_err(|e| e.to_string())?;
+                let identity = self.header.as_ref().unwrap().graph_identity(self.built)?;
+                self.graph_bytes = self.encryption.seal(&identity, &plaintext)?;
                 control.check()?;
                 let path = self
                     .flat_path
@@ -392,6 +397,9 @@ impl Session {
             .index
             .as_ref()
             .map_or(0, |i| i.serialized_length() as u64);
+        if reply.graph_bytes != 0 {
+            reply.graph_bytes += carbonpaper_app_bound::payload::OVERHEAD as u64;
+        }
         reply.phase = self.phase.operation().into();
         // Throttling is intentionally outside execution measurements.
         control.throttle(io_bytes, background)?;
@@ -424,7 +432,7 @@ pub fn run() -> Result<(), String> {
         let stdin = std::io::stdin();
         let mut reader = BufReader::new(stdin.lock());
         loop {
-            let mut line = String::new();
+            let mut line = Zeroizing::new(String::new());
             if reader
                 .by_ref()
                 .take(16 * 1024)
@@ -471,12 +479,19 @@ pub fn run() -> Result<(), String> {
                 checkpoint,
                 checksum,
                 checkpoint_rows,
+                encryption,
                 ..
             } => {
                 if protocol != ANN_WORKER_PROTOCOL {
                     Err("ANN worker protocol mismatch".into())
                 } else {
-                    session = Some(Session::new(flat, checkpoint, checksum, checkpoint_rows));
+                    session = Some(Session::new(
+                        flat,
+                        checkpoint,
+                        checksum,
+                        checkpoint_rows,
+                        encryption.into_key()?,
+                    ));
                     Ok(())
                 }
             }
@@ -525,9 +540,12 @@ mod tests {
             "revision",
             96,
             keys.iter().map(|k| k.len() as u64).sum(),
+            &ann_format::test_key(),
+            ann_format::TEST_SNAPSHOT_ID,
         )
         .unwrap();
-        let mut writer = ann_format::FlatFileWriter::create(&path, header).unwrap();
+        let mut writer =
+            ann_format::FlatFileWriter::create(&path, header, ann_format::test_key()).unwrap();
         for (i, key) in keys.iter().enumerate() {
             writer.push_key(key).unwrap();
             let mut vector = vec![0.0f32; 8];
@@ -569,7 +587,13 @@ mod tests {
         let path = input(directory.path(), 5100);
         let control = Control::default();
         control.begin(1);
-        let mut session = Session::new(path.to_string_lossy().into_owned(), None, None, 0);
+        let mut session = Session::new(
+            path.to_string_lossy().into_owned(),
+            None,
+            None,
+            0,
+            ann_format::test_key(),
+        );
         let first = checkpoint(&mut session, &control);
         assert_eq!(first.built, CHECKPOINT_ROWS);
         let first_path = first.checkpoint.clone().unwrap();
@@ -583,6 +607,7 @@ mod tests {
             Some(first_path.clone()),
             Some(first_digest.clone()),
             CHECKPOINT_ROWS,
+            ann_format::test_key(),
         );
         let final_checkpoint = checkpoint(&mut resumed, &control);
         assert_eq!(final_checkpoint.built, 5100);
@@ -614,7 +639,13 @@ mod tests {
         let path = input(directory.path(), 5020);
         let control = Control::default();
         control.begin(1);
-        let mut first = Session::new(path.to_string_lossy().into_owned(), None, None, 0);
+        let mut first = Session::new(
+            path.to_string_lossy().into_owned(),
+            None,
+            None,
+            0,
+            ann_format::test_key(),
+        );
         let committed = checkpoint(&mut first, &control);
         drop(first);
         let checkpoint_path = committed.checkpoint.unwrap();
@@ -636,6 +667,7 @@ mod tests {
                     Some(checkpoint_path.clone()),
                     Some(checksum.clone()),
                     CHECKPOINT_ROWS,
+                    ann_format::test_key(),
                 )
             };
             let mut interrupted = reopen();
@@ -667,7 +699,13 @@ mod tests {
         let path = input(directory.path(), 5050);
         let control = Control::default();
         control.begin(1);
-        let mut session = Session::new(path.to_string_lossy().into_owned(), None, None, 0);
+        let mut session = Session::new(
+            path.to_string_lossy().into_owned(),
+            None,
+            None,
+            0,
+            ann_format::test_key(),
+        );
         let first = checkpoint(&mut session, &control);
         session.step(false, &control, &mut reply()).unwrap(); // insert suffix
         session.step(false, &control, &mut reply()).unwrap(); // serialize scratch
@@ -689,6 +727,7 @@ mod tests {
             first.checkpoint,
             first.checksum,
             first.built,
+            ann_format::test_key(),
         );
         control.begin(2);
         let mut failure = None;

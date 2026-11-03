@@ -339,6 +339,10 @@ pub(crate) fn configure_sqlcipher_connection(
 pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<ConnectionStatus> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    // Decrypted projections must never spill into SQLite temporary files or
+    // be usable by a schema supplied from the public bootstrap database.
+    conn.pragma_update(None, "trusted_schema", false)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "synchronous", SYNCHRONOUS_FULL)?;
     conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
     conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;

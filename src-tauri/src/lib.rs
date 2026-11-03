@@ -988,43 +988,21 @@ pub fn run() {
 
                 let credential_state = app.state::<Arc<CredentialManagerState>>();
 
-                let public_key_ready =
-                    match credential_manager::load_public_key_from_file(&credential_state) {
-                        Ok(public_key) => {
-                            tracing::info!(
-                                "Public key loaded from file, length: {}",
-                                public_key.len()
-                            );
-                            true
-                        }
-                        Err(credential_manager::CredentialError::KeyNotFound) => {
-                            tracing::info!("Public key file missing, exporting from CNG...");
-
-                            match credential_manager::export_or_get_public_key(&credential_state) {
-                                Ok(public_key) => {
-                                    tracing::info!(
-                                        "CNG public key exported, length: {}",
-                                        public_key.len()
-                                    );
-                                    if let Err(e) = credential_manager::save_public_key_to_file(
-                                        &credential_state,
-                                        &public_key,
-                                    ) {
-                                        tracing::error!("Failed to save public key: {}", e);
-                                    }
-                                    true
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to export CNG public key: {:?}", e);
-                                    false
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to load public key: {:?}", e);
-                            false
-                        }
-                    };
+                let public_key_ready = match credential_manager::initialize_public_key(&credential_state) {
+                    Ok(_) => {
+                        #[cfg(windows)]
+                        { match credential_manager::ensure_master_key_created(&credential_state) {
+                            Ok(()) => true,
+                            Err(error) => { tracing::error!("Credential recovery is required: {error}"); false }
+                        } }
+                        #[cfg(not(windows))]
+                        { false }
+                    },
+                    Err(error) => {
+                        tracing::error!("Credential validation failed; capture writes are stopped: {error}");
+                        false
+                    }
+                };
 
                 let storage = app.state::<Arc<StorageState>>();
                 if public_key_ready {
@@ -1082,6 +1060,7 @@ pub fn run() {
                         // it once they stop. The frontend does not report when
                         // the view closes, so this polls instead of subscribing.
                         let storage_cache = storage.inner().clone();
+                        let cache_app = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
                             let mut ticker =
                                 tokio::time::interval(std::time::Duration::from_secs(60));
@@ -1090,6 +1069,9 @@ pub fn run() {
                                 storage_cache.evict_semantic_vector_cache_if_idle(
                                     storage::SEMANTIC_CACHE_IDLE_TTL,
                                 );
+                                if let Some(ann) = cache_app.try_state::<clip_ann::ClipAnnState>() {
+                                    ann.evict_reader_if_idle(storage::SEMANTIC_CACHE_IDLE_TTL);
+                                }
                             }
                         });
 

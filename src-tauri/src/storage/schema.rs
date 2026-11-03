@@ -1,8 +1,6 @@
 //! Database initialization, table creation, and schema migration.
 
-use crate::credential_manager::{
-    derive_db_key_from_public_key, get_cached_public_key, load_public_key_from_file,
-};
+use crate::credential_manager::{derive_db_key_from_public_key, load_public_key_from_file};
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -31,6 +29,7 @@ impl StorageState {
         // Belt-and-braces against a stale resident matrix from a previous
         // connection; `shutdown` already clears it on the normal path.
         self.reset_semantic_vector_cache();
+        self.protected.reset();
         // `shutdown` parks the lazy indexer; without this the thread would stay
         // parked for the rest of the process after any backup or data-directory
         // switch, and its backlog would never be worked off again.
@@ -57,9 +56,8 @@ impl StorageState {
 
         let t0 = std::time::Instant::now();
         // Derive weak database key from public key (no user authentication required)
-        let public_key = get_cached_public_key(&self.credential_state)
-            .or_else(|| load_public_key_from_file(&self.credential_state).ok())
-            .ok_or_else(|| "Public key not initialized".to_string())?;
+        let public_key =
+            load_public_key_from_file(&self.credential_state).map_err(|error| error.to_string())?;
         let db_key = derive_db_key_from_public_key(&public_key);
         let key_derive_dur = t0.elapsed();
 
@@ -88,6 +86,12 @@ impl StorageState {
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
+        #[cfg(test)]
+        self.protected
+            .allow_plaintext_fixtures(self.credential_state.storage_fixture_for_tests());
+        self.protected.initialize(&conn)?;
+        self.protected.register_functions(&conn)?;
+        self.migrate_protected_content(&conn)?;
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         if let Err(error) = self.trim_oversized_wal_under_maintenance(&conn) {
             tracing::warn!("[DB] Deferring oversized WAL cleanup at startup: {error}");
@@ -130,6 +134,13 @@ impl StorageState {
                 tracing::warn!("Processing staging is unavailable: {error}");
             }
         }
+        if let Err(error) = self.publish_protected_keys() {
+            self.processing_stage.shutdown();
+            *self.db.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.protected.reset();
+            *initialized = false;
+            return Err(error);
+        }
 
         tracing::info!(
             "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
@@ -164,6 +175,7 @@ impl StorageState {
         // Its freshness epoch is per-database, so carrying it into whatever
         // connection comes next can silently score against the old file.
         self.reset_semantic_vector_cache();
+        self.protected.reset();
         let mut db_guard = self.db.lock().map_err(|e| format!("lock error: {}", e))?;
         // Every id collected against this connection stops being meaningful the
         // moment it closes, whether the next `initialize` reopens the same file
@@ -182,6 +194,11 @@ impl StorageState {
 
     /// Initialize database tables.
     pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+        #[cfg(test)]
+        if crate::credential_manager::get_cached_public_key(&self.credential_state).is_none() {
+            self.credential_state
+                .fixture_public_key(b"in-memory-schema-fixture");
+        }
         super::blind_index::check_supported_format(conn)?;
         // Must run before the CREATE batch below, or `IF NOT EXISTS` would
         // create the new empty tables first and leave the legacy rows stranded
@@ -825,6 +842,12 @@ impl StorageState {
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
         super::blind_index::ensure_schema(conn)?;
+        #[cfg(test)]
+        {
+            self.protected.allow_plaintext_fixtures(true);
+            self.protected.initialize(conn)?;
+            self.protected.register_functions(conn)?;
+        }
 
         Ok(())
     }
@@ -844,7 +867,7 @@ impl StorageState {
         .sum()
     }
 
-    fn vacuum_space_check(&self) -> Result<(), String> {
+    pub(super) fn vacuum_space_check(&self) -> Result<(), String> {
         let data_dir = self
             .data_dir
             .lock()
@@ -908,7 +931,7 @@ impl StorageState {
         Ok(true)
     }
 
-    fn checkpoint_wal_after_vacuum(conn: &Connection) -> Result<(), String> {
+    pub(super) fn checkpoint_wal_after_vacuum(conn: &Connection) -> Result<(), String> {
         let status = connection::inspect_connection(conn)
             .map_err(|error| format!("Failed to inspect journal mode after VACUUM: {error}"))?;
         if status.journal_mode != "wal" {
@@ -1672,7 +1695,7 @@ impl StorageState {
         Ok(())
     }
 
-    fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
+    pub(super) fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
             [table],

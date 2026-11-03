@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 mod verification;
 use verification::VerificationCoordinator;
@@ -36,6 +36,9 @@ pub enum CredentialError {
     /// The requested key does not exist.
     #[error("Credential key not found")]
     KeyNotFound,
+    /// Persisted public material does not belong to the existing CNG key.
+    #[error("Credential public key does not match the existing Windows key; recovery is required")]
+    PublicKeyMismatch,
     /// An authenticated session is required.
     #[error("Authentication required")]
     AuthRequired,
@@ -101,6 +104,15 @@ pub struct CredentialManagerState {
     cached_db_key: Mutex<Option<Vec<u8>>>,
     /// Cached public key used to encrypt new data without user interaction.
     cached_public_key: Mutex<Option<Vec<u8>>>,
+    /// Unit fixtures inject an authority rather than opening a persisted user key.
+    #[cfg(test)]
+    test_public_key_authority: Mutex<Option<Vec<u8>>>,
+    #[cfg(test)]
+    test_existing_key_missing: AtomicBool,
+    #[cfg(test)]
+    test_fixture_read_access: AtomicBool,
+    #[cfg(test)]
+    test_storage_wrapping_key: zeroize::Zeroizing<[u8; 32]>,
     /// Cached master key used by background data encryption.
     cached_master_key: Mutex<Option<Vec<u8>>>,
     /// Private-key context authenticated by the explicit unlock. All readers
@@ -141,6 +153,29 @@ pub(crate) struct CredentialImportSnapshot {
 }
 
 impl CredentialManagerState {
+    #[cfg(test)]
+    pub(crate) fn fixture_public_key(&self, key: &[u8]) {
+        *self.test_public_key_authority.lock().unwrap() = Some(key.to_vec());
+        *self.cached_public_key.lock().unwrap() = Some(key.to_vec());
+        self.test_fixture_read_access
+            .store(!key.starts_with(b"RSA1"), Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    pub(crate) fn storage_fixture_for_tests(&self) -> bool {
+        self.test_fixture_read_access.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_read_access_for_tests(&self, allowed: bool) {
+        self.test_fixture_read_access
+            .store(allowed, Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    pub(crate) fn background_enabled_for_tests(&self, enabled: bool) {
+        *self.background_processing_enabled.lock().unwrap() = enabled;
+        if !enabled {
+            self.revoke_background_lease();
+        }
+    }
     pub fn get_hmac_key(&self) -> Result<Vec<u8>, String> {
         let guard = self.cached_master_key.lock().unwrap();
         if let Some(key) = &*guard {
@@ -186,6 +221,14 @@ impl CredentialManagerState {
             verification: Arc::new(VerificationCoordinator::default()),
             cached_db_key: Mutex::new(None),
             cached_public_key: Mutex::new(None),
+            #[cfg(test)]
+            test_public_key_authority: Mutex::new(None),
+            #[cfg(test)]
+            test_existing_key_missing: AtomicBool::new(false),
+            #[cfg(test)]
+            test_fixture_read_access: AtomicBool::new(false),
+            #[cfg(test)]
+            test_storage_wrapping_key: zeroize::Zeroizing::new(rand::random()),
             cached_master_key: Mutex::new(None),
             #[cfg(windows)]
             cached_private_key: Mutex::new(None),
@@ -461,6 +504,12 @@ impl CredentialManagerState {
 
     pub fn set_data_dir(&self, data_dir: PathBuf) {
         let mut guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard != data_dir {
+            *self
+                .cached_public_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         *guard = data_dir;
     }
 
@@ -541,7 +590,7 @@ impl CredentialManagerState {
             )));
         }
 
-        let ciphertext = encrypt_master_key_with_cng(master_key)?;
+        let ciphertext = wrap_storage_domain_key(self, master_key)?;
         Ok(encode_master_key_file(&ciphertext))
     }
 
@@ -657,14 +706,18 @@ pub fn db_key_to_hex(key: &[u8]) -> String {
 mod windows_impl {
     use super::*;
 
-    /// Exports the CNG RSA public key without invoking protected private-key UI.
+    /// Export an existing key silently. Validation must never create a key.
     pub fn export_cng_public_key() -> Result<Vec<u8>, CredentialError> {
+        export_cng_public_key_with_access(CngKeyAccess::Existing)
+    }
+
+    fn export_cng_public_key_with_access(access: CngKeyAccess) -> Result<Vec<u8>, CredentialError> {
         use windows::core::HSTRING;
         use windows::Win32::Security::Cryptography::{
-            NCryptExportKey, NCryptFreeObject, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
+            NCryptExportKey, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_SILENT_FLAG,
         };
 
-        let key = open_cng_key(CngKeyAccess::CreateIfMissing)?;
+        let key = open_cng_key_with_flags(access, NCRYPT_SILENT_FLAG)?;
 
         let blob_type = HSTRING::from("RSAPUBLICBLOB");
         let blob_pcwstr = windows::core::PCWSTR::from_raw(blob_type.as_ptr());
@@ -681,7 +734,7 @@ mod windows_impl {
                 None,
                 None,
                 &mut out_len,
-                NCRYPT_FLAGS(0),
+                NCRYPT_SILENT_FLAG,
             )
         }
         .map_err(|e| {
@@ -701,7 +754,7 @@ mod windows_impl {
                 None,
                 Some(output.as_mut_slice()),
                 &mut out_len,
-                NCRYPT_FLAGS(0),
+                NCRYPT_SILENT_FLAG,
             )
         }
         .map_err(|e| {
@@ -714,6 +767,10 @@ mod windows_impl {
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
         output.truncate(out_len as usize);
         Ok(output)
+    }
+
+    pub(super) fn create_public_key_for_new_dataset() -> Result<Vec<u8>, CredentialError> {
+        export_cng_public_key_with_access(CngKeyAccess::CreateIfMissing)
     }
 
     /// Encrypt with an exported RSAPUBLICBLOB only.
@@ -810,36 +867,6 @@ mod windows_impl {
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
         output.truncate(out_len as usize);
         Ok(output)
-    }
-
-    /// Returns the cached exported public key without showing authentication UI.
-    pub fn export_or_get_public_key(
-        state: &CredentialManagerState,
-    ) -> Result<Vec<u8>, CredentialError> {
-        // Prefer the in-memory public key cache.
-        {
-            let cached = state
-                .cached_public_key
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref key) = *cached {
-                return Ok(key.clone());
-            }
-        }
-
-        // Export from CNG only on a cache miss.
-        let public_key = export_cng_public_key()?;
-
-        // Cache the immutable public blob for background encryption.
-        {
-            let mut cached = state
-                .cached_public_key
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *cached = Some(public_key.clone());
-        }
-
-        Ok(public_key)
     }
 
     /// Forces user verification and unlocks the master key.
@@ -1004,15 +1031,6 @@ mod windows_impl {
 pub use windows_impl::*;
 
 #[cfg(not(windows))]
-pub fn export_or_get_public_key(
-    _state: &CredentialManagerState,
-) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError(
-        "CNG is only available on Windows".to_string(),
-    ))
-}
-
-#[cfg(not(windows))]
 pub fn encrypt_with_exported_public_key(
     _public_key: &[u8],
     _plaintext: &[u8],
@@ -1038,29 +1056,28 @@ pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), C
         // A persisted key will be unlocked later by `credential_verify_user`.
         return Ok(());
     }
-
-    // First use: generate a master key and wrap it with the public key without UI.
-    let mut master_key = vec![0u8; MASTER_KEY_LEN];
-    rand::thread_rng().fill_bytes(&mut master_key);
-
-    let ciphertext = encrypt_master_key_with_cng(&master_key)?;
-    let file_data = encode_master_key_file(&ciphertext);
-
-    if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CredentialError::SystemError(format!("Failed to create directory: {}", e))
-        })?;
+    if state.file_path("screenshots.db").exists() {
+        return Err(CredentialError::KeyNotFound);
     }
 
-    std::fs::write(&key_file, file_data)
-        .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
+    // First use: generate a master key and wrap it with the public key without UI.
+    let mut master_key = Zeroizing::new(vec![0u8; MASTER_KEY_LEN]);
+    rand::thread_rng().fill_bytes(&mut master_key);
+
+    let ciphertext = wrap_storage_domain_key(state, &master_key)?;
+    let file_data = encode_master_key_file(&ciphertext);
+    if !persist_new_credential_file(&key_file, &file_data)? {
+        // Another initializer committed the durable authority first. Do not
+        // cache this process's different master key as the dataset authority.
+        return Ok(());
+    }
 
     {
         let mut cached = state
             .cached_master_key
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *cached = Some(master_key.clone());
+        *cached = Some(master_key.to_vec());
     }
 
     Ok(())
@@ -1075,37 +1092,11 @@ pub async fn ensure_master_key_ready(
         return Ok(key);
     }
 
-    let key_file = state.master_key_file_path();
-    if key_file.exists() {
-        let master_key = unlock_master_key(state).await?;
-        return Ok(master_key);
+    ensure_master_key_created(state)?;
+    if let Some(key) = get_cached_master_key(state) {
+        return Ok(key);
     }
-
-    // Generate a new master key and wrap it with the exported CNG public key.
-    let mut master_key = vec![0u8; MASTER_KEY_LEN];
-    rand::thread_rng().fill_bytes(&mut master_key);
-
-    let ciphertext = encrypt_master_key_with_cng(&master_key)?;
-    let file_data = encode_master_key_file(&ciphertext);
-
-    if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CredentialError::SystemError(format!("Failed to create directory: {}", e))
-        })?;
-    }
-
-    std::fs::write(&key_file, file_data)
-        .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
-
-    {
-        let mut cached = state
-            .cached_master_key
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *cached = Some(master_key.clone());
-    }
-
-    Ok(master_key)
+    unlock_master_key(state).await
 }
 
 /// Returns whether protected UI access requires authentication.
@@ -1227,6 +1218,17 @@ impl CngKeyAccess {
 fn open_cng_key(
     access: CngKeyAccess,
 ) -> Result<windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE, CredentialError> {
+    open_cng_key_with_flags(
+        access,
+        windows::Win32::Security::Cryptography::NCRYPT_FLAGS(0),
+    )
+}
+
+#[cfg(windows)]
+fn open_cng_key_with_flags(
+    access: CngKeyAccess,
+    open_flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
+) -> Result<windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE, CredentialError> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Security::Cryptography::{
         NCryptCreatePersistedKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
@@ -1254,15 +1256,8 @@ fn open_cng_key(
     let key_pcwstr = PCWSTR::from_raw(key_name.as_ptr());
     // SAFETY: provider and key-name storage remain live; `key` is valid writable output
     // storage and CNG does not retain any Rust pointer.
-    let open_result = unsafe {
-        NCryptOpenKey(
-            provider,
-            &mut key,
-            key_pcwstr,
-            CERT_KEY_SPEC(0),
-            NCRYPT_FLAGS(0),
-        )
-    };
+    let open_result =
+        unsafe { NCryptOpenKey(provider, &mut key, key_pcwstr, CERT_KEY_SPEC(0), open_flags) };
 
     match open_result {
         Ok(()) => {
@@ -1368,59 +1363,6 @@ fn open_cng_key(
     // SAFETY: provider ownership ends here; the finalized persisted key handle remains valid.
     let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
     Ok(new_key)
-}
-
-#[cfg(windows)]
-fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::{
-        NCryptEncrypt, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
-    };
-
-    let key = open_cng_key(CngKeyAccess::CreateIfMissing)?;
-
-    // Use PKCS#1 v1.5 padding for compatibility and query the output size first.
-    let mut out_len: u32 = 0;
-    // SAFETY: key and master-key input are live; the null output buffer requests only
-    // the required ciphertext length.
-    unsafe {
-        NCryptEncrypt(
-            key,
-            Some(master_key),
-            None,
-            None,
-            &mut out_len,
-            NCRYPT_PAD_PKCS1_FLAG,
-        )
-    }
-    .map_err(|e| {
-        // SAFETY: key ownership remains local when encryption fails.
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        CredentialError::SystemError(format!("NCryptEncrypt size failed: {}", e))
-    })?;
-
-    let mut output = vec![0u8; out_len as usize];
-    // SAFETY: output is uniquely mutable and sized from CNG's query; key and input remain
-    // live for the synchronous encryption call.
-    unsafe {
-        NCryptEncrypt(
-            key,
-            Some(master_key),
-            None,
-            Some(output.as_mut_slice()),
-            &mut out_len,
-            NCRYPT_PAD_PKCS1_FLAG,
-        )
-    }
-    .map_err(|e| {
-        // SAFETY: key ownership remains local when encryption fails.
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        CredentialError::SystemError(format!("NCryptEncrypt failed: {}", e))
-    })?;
-
-    // SAFETY: this is the final use of the owned key handle.
-    let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-    output.truncate(out_len as usize);
-    Ok(output)
 }
 
 #[cfg(windows)]
@@ -1674,21 +1616,40 @@ pub fn decode_master_key_file(data: &[u8]) -> Result<Vec<u8>, CredentialError> {
     Ok(data[MASTER_KEY_FILE_MAGIC.len()..].to_vec())
 }
 
-/// Loads and caches the public key file without user interaction.
+/// Loads public material only after comparing it with the existing CNG key.
 pub fn load_public_key_from_file(
     state: &CredentialManagerState,
 ) -> Result<Vec<u8>, CredentialError> {
-    if let Some(key) = get_cached_public_key(state) {
-        return Ok(key);
+    let cached = get_cached_public_key(state);
+    #[cfg(test)]
+    if let Some(key) = cached.as_ref().filter(|key| !key.starts_with(b"RSA1")) {
+        return Ok(key.clone());
     }
-
     let key_file = state.file_path(PUBLIC_KEY_FILE_NAME);
-    if !key_file.exists() {
-        return Err(CredentialError::KeyNotFound);
+    let public_key = (|| {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&key_file)?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    })()
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CredentialError::KeyNotFound
+        } else {
+            CredentialError::SystemError(format!("Failed to read public key: {e}"))
+        }
+    })?;
+    if public_key.len() > 4096 {
+        return Err(CredentialError::PublicKeyMismatch);
     }
-
-    let public_key = std::fs::read(&key_file)
-        .map_err(|e| CredentialError::SystemError(format!("Failed to read public key: {}", e)))?;
+    if let Some(authority) = cached {
+        validate_public_key_material(&public_key, &authority)?;
+        return Ok(authority);
+    }
+    let authority = existing_public_key_authority(state)?;
+    validate_public_key_material(&public_key, &authority)?;
 
     {
         let mut cached = state
@@ -1701,24 +1662,200 @@ pub fn load_public_key_from_file(
     Ok(public_key)
 }
 
+fn validate_public_key_material(saved: &[u8], authority: &[u8]) -> Result<(), CredentialError> {
+    if saved.is_empty() || saved != authority {
+        return Err(CredentialError::PublicKeyMismatch);
+    }
+    Ok(())
+}
+
+fn existing_public_key_authority(
+    _state: &CredentialManagerState,
+) -> Result<Vec<u8>, CredentialError> {
+    #[cfg(test)]
+    if _state.test_existing_key_missing.load(Ordering::Relaxed) {
+        return Err(CredentialError::KeyNotFound);
+    }
+    #[cfg(test)]
+    if let Some(key) = _state.test_public_key_authority.lock().unwrap().as_ref() {
+        return Ok(key.clone());
+    }
+    #[cfg(windows)]
+    {
+        export_cng_public_key()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(CredentialError::WindowsHelloNotAvailable)
+    }
+}
+
+/// First-use setup is separate from validation and never repairs an existing dataset.
+pub fn initialize_public_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+    match load_public_key_from_file(state) {
+        Ok(key) => return Ok(key),
+        Err(CredentialError::KeyNotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let directory = state
+        .data_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if directory.join(MASTER_KEY_FILE_NAME).exists() || directory.join("screenshots.db").exists() {
+        return Err(CredentialError::KeyNotFound);
+    }
+    #[cfg(windows)]
+    {
+        let key = windows_impl::create_public_key_for_new_dataset()?;
+        save_public_key_to_file(state, &key)?;
+        *state
+            .cached_public_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(key.clone());
+        Ok(key)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(CredentialError::WindowsHelloNotAvailable)
+    }
+}
+
+pub(crate) fn wrap_storage_domain_key(
+    state: &CredentialManagerState,
+    key: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
+    let public_key = load_public_key_from_file(state)?;
+    #[cfg(test)]
+    if !public_key.starts_with(b"RSA1") {
+        let mut wrapped = b"CPTESTKEY".to_vec();
+        wrapped.extend(encrypt_with_master_key(
+            &*state.test_storage_wrapping_key,
+            key,
+        )?);
+        return Ok(wrapped);
+    }
+    encrypt_with_exported_public_key(&public_key, key)
+}
+
+pub(crate) fn unwrap_storage_domain_key(
+    state: &CredentialManagerState,
+    wrapped: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
+    #[cfg(test)]
+    if let Some(ciphertext) = wrapped.strip_prefix(b"CPTESTKEY") {
+        return decrypt_with_master_key(&*state.test_storage_wrapping_key, ciphertext);
+    }
+    decrypt_row_key_with_cng_silent(state, wrapped)
+}
+
 /// Persists the public key for future unattended encryption.
 pub fn save_public_key_to_file(
     state: &CredentialManagerState,
     public_key: &[u8],
 ) -> Result<(), CredentialError> {
+    #[cfg(test)]
+    {
+        let mut authority = state.test_public_key_authority.lock().unwrap();
+        if authority.is_none() {
+            *authority = Some(public_key.to_vec());
+            state
+                .test_fixture_read_access
+                .store(!public_key.starts_with(b"RSA1"), Ordering::Relaxed);
+        }
+    }
+    validate_public_key_material(public_key, &existing_public_key_authority(state)?)?;
     let key_file = state.file_path(PUBLIC_KEY_FILE_NAME);
 
-    // Create the parent directory before atomically writing the public key.
+    match std::fs::read(&key_file) {
+        Ok(saved) => return validate_public_key_material(&saved, public_key),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CredentialError::SystemError(format!(
+                "Failed to inspect public key: {error}"
+            )))
+        }
+    }
+
+    if persist_new_credential_file(&key_file, public_key)? {
+        return Ok(());
+    }
+    let saved = std::fs::read(&key_file)
+        .map_err(|e| CredentialError::SystemError(format!("Failed to inspect public key: {e}")))?;
+    validate_public_key_material(&saved, public_key)
+}
+
+/// Atomically publish a fully synced credential without replacing an earlier
+/// file. `false` means another initializer already owns the durable authority.
+fn persist_new_credential_file(
+    key_file: &std::path::Path,
+    contents: &[u8],
+) -> Result<bool, CredentialError> {
+    // Create the parent directory before atomically writing the credential.
     if let Some(parent) = key_file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             CredentialError::SystemError(format!("Failed to create directory: {}", e))
         })?;
     }
 
-    std::fs::write(&key_file, public_key)
-        .map_err(|e| CredentialError::SystemError(format!("Failed to save public key: {}", e)))?;
-
-    Ok(())
+    // Publish the fully synced file without replacing an existing credential.
+    // The write-through move fails if another writer won the race and also
+    // works on volumes without hard-link support.
+    let temporary =
+        key_file.with_extension(format!("{}.tmp", hex::encode(rand::random::<[u8; 16]>())));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| {
+                CredentialError::SystemError(format!("Failed to stage credential: {e}"))
+            })?;
+        file.write_all(contents)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| CredentialError::SystemError(format!("Failed to save credential: {e}")))?;
+        drop(file);
+        #[cfg(windows)]
+        let publish = {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::core::PCWSTR;
+            use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+            let source = temporary
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let target = key_file
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            // SAFETY: both paths are live, NUL terminated buffers. Omitting
+            // REPLACE_EXISTING prevents this first-use write from replacing a key.
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(source.as_ptr()),
+                    PCWSTR(target.as_ptr()),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(|_| std::io::Error::last_os_error())
+        };
+        #[cfg(not(windows))]
+        let publish = std::fs::hard_link(&temporary, &key_file);
+        if let Err(error) = publish {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(false);
+            }
+            return Err(CredentialError::SystemError(format!(
+                "Failed to publish credential: {error}"
+            )));
+        }
+        Ok(true)
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
 #[cfg(all(test, windows))]

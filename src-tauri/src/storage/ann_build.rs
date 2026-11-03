@@ -18,6 +18,8 @@ pub(crate) struct AnnBuildCheckpoint {
     pub runtime_generation: Option<u64>,
     pub generation: u64,
     pub dataset_id: String,
+    pub encryption_key_id: String,
+    pub snapshot_id: String,
     pub model_fingerprint: String,
     pub covered_epoch: u64,
     pub scan_upper: String,
@@ -45,7 +47,8 @@ impl AnnBuildCheckpoint {
     pub(crate) fn flat_bytes(&self) -> u64 {
         8192 + (self.expected_rows.max(self.frozen_rows) + 1) * 8
             + self.key_bytes
-            + self.expected_rows.max(self.frozen_rows) * 512 * 4
+            + self.expected_rows.max(self.frozen_rows)
+                * (512 * 4 + carbonpaper_app_bound::payload::OVERHEAD as u64)
     }
     pub(crate) fn small(&self) -> bool {
         self.expected_rows.max(self.frozen_rows) <= crate::background_policy::SMALL_ANN_ROWS
@@ -182,8 +185,13 @@ impl StorageState {
             if row.dimensions != 512 || row.vector_f32.len() != 2048 {
                 return Err("ANN frozen input contract mismatch".into());
             }
+            let encrypted = self.protected.seal(
+                "vectors",
+                &format!("clip_image:{}", row.subject_key),
+                &row.vector_f32,
+            )?;
             tx.execute("INSERT INTO ann_build_inputs(generation,ordinal,subject_key,vector_f32) VALUES(?1,?2,?3,?4)",
-                params![sql_integer(next.generation)?, sql_integer(next.frozen_rows)?, row.subject_key, row.vector_f32]).map_err(|e| e.to_string())?;
+                params![sql_integer(next.generation)?, sql_integer(next.frozen_rows)?, row.subject_key, encrypted]).map_err(|e| e.to_string())?;
             next.frozen_rows += 1;
             next.key_bytes += row.subject_key.len() as u64;
             next.scan_cursor = row.subject_key;
@@ -204,7 +212,7 @@ impl StorageState {
         self.check_ann_runtime(state)?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         current_dataset(conn, &state.dataset_id)?;
-        let mut stmt = conn.prepare("SELECT subject_key,vector_f32 FROM ann_build_inputs WHERE generation=?1 AND ordinal>=?2 ORDER BY ordinal LIMIT ?3").map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT subject_key,cp_unseal(vector_f32,'vectors','clip_image:'||subject_key) FROM ann_build_inputs WHERE generation=?1 AND ordinal>=?2 ORDER BY ordinal LIMIT ?3").map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(
                 params![sql_integer(state.generation)?, sql_integer(after)?, limit],

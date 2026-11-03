@@ -23,6 +23,8 @@ mod mode;
 mod policy;
 mod process;
 mod processing_stage;
+mod protected;
+mod protected_migration;
 mod recap;
 mod recap_protected;
 mod recap_search;
@@ -57,8 +59,7 @@ pub use timeline::TimelineRecord;
 pub use types::*;
 
 use crate::credential_manager::{
-    derive_db_key_from_public_key, get_cached_public_key, load_public_key_from_file,
-    CredentialManagerState,
+    derive_db_key_from_public_key, load_public_key_from_file, CredentialManagerState,
 };
 use rusqlite::{Connection, OpenFlags};
 use std::ops::{Deref, DerefMut};
@@ -87,7 +88,8 @@ impl From<String> for BackgroundReadError {
 /// It provides methods for initializing storage, saving/loading screenshots and OCR results,
 /// and migrating the data directory.
 pub struct StorageState {
-    pub(crate) processing_stage: crate::processing_stage::ProcessingStaging,
+    pub(crate) processing_stage: Arc<crate::processing_stage::ProcessingStaging>,
+    protected: Arc<protected::ProtectedStorage>,
     /// Database connection
     db: Mutex<Option<Connection>>,
     /// Data directory (contains database, screenshots, logs, etc.)
@@ -220,9 +222,15 @@ impl StorageState {
         database_mode_policy: mode::DatabaseModePolicy,
     ) -> Self {
         let screenshot_dir = data_dir.join("screenshots");
+        let processing_stage = Arc::new(crate::processing_stage::ProcessingStaging::new());
+        let protected = Arc::new(protected::ProtectedStorage::new(
+            credential_state.clone(),
+            processing_stage.clone(),
+        ));
 
         Self {
-            processing_stage: crate::processing_stage::ProcessingStaging::new(),
+            processing_stage,
+            protected,
             db: Mutex::new(None),
             data_dir: Mutex::new(data_dir),
             screenshot_dir: Mutex::new(screenshot_dir),
@@ -357,9 +365,8 @@ impl StorageState {
     }
 
     pub(crate) fn database_key(&self) -> Result<Vec<u8>, String> {
-        let public_key = get_cached_public_key(&self.credential_state)
-            .or_else(|| load_public_key_from_file(&self.credential_state).ok())
-            .ok_or_else(|| "Public key not initialized".to_string())?;
+        let public_key =
+            load_public_key_from_file(&self.credential_state).map_err(|error| error.to_string())?;
         Ok(derive_db_key_from_public_key(&public_key))
     }
 
@@ -460,9 +467,8 @@ impl StorageState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let public_key = get_cached_public_key(&self.credential_state)
-            .or_else(|| load_public_key_from_file(&self.credential_state).ok())
-            .ok_or_else(|| "Public key not initialized".to_string())?;
+        let public_key =
+            load_public_key_from_file(&self.credential_state).map_err(|error| error.to_string())?;
         let db_key = derive_db_key_from_public_key(&public_key);
         let db_path = data_dir.join("screenshots.db");
         let conn = Connection::open_with_flags(
@@ -472,6 +478,7 @@ impl StorageState {
         .map_err(|e| format!("Failed to open read database connection: {}", e))?;
         let status = connection::configure_sqlcipher_connection(&conn, &db_key)
             .map_err(|e| format!("Failed to configure read database connection: {}", e))?;
+        self.protected.register_functions(&conn)?;
 
         let elapsed = started.elapsed();
         if elapsed.as_millis() >= 250 {

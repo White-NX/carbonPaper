@@ -214,6 +214,151 @@ async fn native_dpapi_keys_survive_ledger_reopen_and_finish_all_consumers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_storage_domains_preserve_dpapi_grants_scope_and_write_provenance() {
+    use crate::payload::CipherKey;
+
+    let mut fixture = NativeBrokerFixture::new(true);
+    fixture
+        .request(Request::AttachDataset {
+            dataset_id: fixture.dataset.clone(),
+        })
+        .await
+        .unwrap();
+    let Response::Status(status) = fixture.request(Request::Status {}).await.unwrap() else {
+        panic!("expected broker capabilities");
+    };
+    assert!(status.supported_storage_keys);
+
+    let mut domains = Vec::new();
+    for (index, purpose) in ["metadata", "vectors", "ann"].into_iter().enumerate() {
+        let binding = StorageKeyBinding {
+            key_id: format!("{:032x}", index + 1),
+            dataset_id: fixture.dataset.clone(),
+            content_dataset_id: fixture.dataset.clone(),
+            public_key_fingerprint: "a".repeat(64),
+            purpose: purpose.into(),
+            wrapped_key_digest: format!("{:064x}", index + 1),
+        };
+        let key = vec![index as u8 + 7; 32];
+        fixture
+            .request(Request::RegisterStorageKey {
+                binding: binding.clone(),
+                key: TaskKey(key.clone()),
+                write_origin: purpose != "metadata",
+            })
+            .await
+            .expect("register a domain through real impersonation and DPAPI");
+        let cipher = CipherKey::new(
+            binding.key_id.clone(),
+            binding.content_dataset_id.clone(),
+            purpose.into(),
+            &key,
+        )
+        .unwrap();
+        let encrypted = cipher
+            .seal("synthetic:1", b"synthetic protected history")
+            .unwrap();
+        domains.push((binding, key, encrypted));
+    }
+    fixture.reopen_ledger();
+    for (binding, expected, ciphertext) in &domains {
+        let Response::StorageKey(grant) = fixture
+            .request(Request::AcquireStorageKey {
+                binding: binding.clone(),
+            })
+            .await
+            .expect("recover the persisted domain key")
+        else {
+            panic!("expected a domain grant");
+        };
+        assert_eq!(&grant.binding, binding);
+        assert_eq!(&grant.key.0, expected);
+        assert_eq!(grant.write_origin, binding.purpose != "metadata");
+        let cipher = CipherKey::new(
+            binding.key_id.clone(),
+            binding.content_dataset_id.clone(),
+            binding.purpose.clone(),
+            &grant.key.0,
+        )
+        .unwrap();
+        assert_eq!(
+            cipher.open("synthetic:1", ciphertext).unwrap().as_slice(),
+            b"synthetic protected history"
+        );
+        let mut changed = binding.clone();
+        changed.content_dataset_id = random_id();
+        assert_eq!(
+            fixture
+                .request(Request::AcquireStorageKey { binding: changed })
+                .await
+                .unwrap_err(),
+            BrokerError::Integrity
+        );
+    }
+    let (binding, key, _) = &domains[2];
+    for (enabled, expected) in [(false, BrokerError::Disabled), (true, BrokerError::Retired)] {
+        fixture
+            .request(Request::SetPolicy {
+                enabled,
+                limits: Limits::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .request(Request::AcquireStorageKey {
+                    binding: binding.clone()
+                })
+                .await
+                .unwrap_err(),
+            expected
+        );
+    }
+    fixture.reopen_ledger();
+    assert_eq!(
+        fixture
+            .request(Request::RegisterStorageKey {
+                binding: binding.clone(),
+                key: TaskKey(key.clone()),
+                write_origin: true,
+            })
+            .await
+            .unwrap_err(),
+        BrokerError::Retired
+    );
+    assert_eq!(
+        fixture
+            .request(Request::RegisterStorageKey {
+                binding: binding.clone(),
+                key: TaskKey(vec![0x42; 32]),
+                write_origin: false,
+            })
+            .await
+            .unwrap_err(),
+        BrokerError::Integrity
+    );
+    fixture
+        .request(Request::RegisterStorageKey {
+            binding: binding.clone(),
+            key: TaskKey(key.clone()),
+            write_origin: false,
+        })
+        .await
+        .expect("an authenticated runtime may restore the exact original key");
+    let Response::StorageKey(restored) = fixture
+        .request(Request::AcquireStorageKey {
+            binding: binding.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected restored domain grant");
+    };
+    assert!(restored.write_origin);
+    assert_eq!(&restored.key.0, key);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_disable_revokes_keys_and_returns_errors_over_the_pipe() {
     let fixture = NativeBrokerFixture::new(true);
     let (task, ciphertext) = fixture.prepare(b"synthetic input to revoke").await;

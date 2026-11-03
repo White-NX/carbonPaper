@@ -43,6 +43,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -738,6 +739,7 @@ dependencies = [
 name = "carbonpaper-app-bound"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "base64 0.22.1",
  "ed25519-dalek",

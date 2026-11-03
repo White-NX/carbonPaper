@@ -211,6 +211,13 @@ pub(super) struct SemanticVectorCache {
     epoch: i64,
 }
 
+impl Drop for SemanticVectorCache {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.matrix.zeroize();
+    }
+}
+
 impl SemanticVectorCache {
     fn new(epoch: i64) -> Self {
         Self {
@@ -691,6 +698,19 @@ impl StorageState {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let authorization = self.protected_query_session()?;
+        let check_authorization = || -> Result<(), String> {
+            if let Some((credentials, marker)) = &authorization {
+                let credentials = credentials.upgrade().ok_or("AUTH_REQUIRED")?;
+                if !credentials.is_session_valid()
+                    || credentials.silent_read_auth_required()
+                    || credentials.session_marker() != Some(*marker)
+                {
+                    return Err("AUTH_REQUIRED".into());
+                }
+            }
+            Ok(())
+        };
         let started = Instant::now();
         let (cache_lock, used_at) = self.cache_slot(index_kind);
         let reset_generation = self.semantic_cache_reset_generation.load(Ordering::Acquire);
@@ -767,6 +787,7 @@ impl StorageState {
                     resident_budget,
                     deadline,
                 )?;
+                check_authorization()?;
                 if self.semantic_cache_reset_generation.load(Ordering::Acquire) != reset_generation
                 {
                     return Err("storage_changed_during_vector_scan".to_string());
@@ -833,6 +854,7 @@ impl StorageState {
         if mode == "resident_hit" {
             used_at.store(now_ms(), Ordering::Relaxed);
         }
+        check_authorization()?;
         let score_ms = elapsed_ms(started) - epoch_ms;
 
         let candidates = candidates.unwrap_or_default();
@@ -894,6 +916,7 @@ impl StorageState {
         if self.semantic_cache_reset_generation.load(Ordering::Acquire) != reset_generation {
             return Err("storage_changed_during_vector_scan".to_string());
         }
+        check_authorization()?;
         tracing::debug!(
             "[SEMANTIC] {} topk k={k} epoch={epoch_ms:.1}ms score={score_ms:.1}ms visibility={:.1}ms mode={mode} candidates={candidate_count} returned={}",
             index_kind.as_str(),
@@ -1354,6 +1377,13 @@ mod tests {
     #[test]
     fn expired_deadline_stops_streaming_exact_before_scoring_rows() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.create_scalar_function(
+            "cp_unseal",
+            3,
+            rusqlite::functions::FunctionFlags::SQLITE_DIRECTONLY,
+            |args| args.get::<Vec<u8>>(0),
+        )
+        .unwrap();
         conn.execute_batch(
             r#"
             CREATE TABLE derived_index_jobs (

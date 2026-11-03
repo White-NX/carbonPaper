@@ -2,8 +2,8 @@
 
 use crate::credential_manager::{
     decrypt_row_key_with_cng, decrypt_row_key_with_cng_silent, decrypt_with_master_key,
-    encrypt_with_exported_public_key, encrypt_with_master_key, get_cached_public_key,
-    load_public_key_from_file, CredentialError,
+    encrypt_with_exported_public_key, encrypt_with_master_key, load_public_key_from_file,
+    CredentialError,
 };
 use rand::RngCore;
 
@@ -96,8 +96,6 @@ impl StorageState {
 
     /// Get public key (for backward-compatible IPC/interface).
     pub fn get_public_key(&self) -> Result<Vec<u8>, String> {
-        get_cached_public_key(&self.credential_state)
-            .or_else(|| load_public_key_from_file(&self.credential_state).ok())
-            .ok_or_else(|| "Public key not initialized".to_string())
+        load_public_key_from_file(&self.credential_state).map_err(|error| error.to_string())
     }
 }

@@ -13,6 +13,7 @@ const requiredTests = [
   'windows::transport::tests::empty_connected_pipe_waits_until_deadline',
   'windows::service::native_tests::native_policy_round_trip_uses_client_and_server',
   'windows::service::native_tests::native_dpapi_keys_survive_ledger_reopen_and_finish_all_consumers',
+  'windows::service::native_tests::native_storage_domains_preserve_dpapi_grants_scope_and_write_provenance',
   'windows::service::native_tests::native_disable_revokes_keys_and_returns_errors_over_the_pipe',
   'windows::service::native_tests::native_unapproved_process_is_rejected_before_the_request',
   'windows::service::native_tests::native_dpapi_rejects_a_different_pipe_token_sid',
