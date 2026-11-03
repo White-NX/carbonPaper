@@ -1,118 +1,21 @@
 //! Windows named-pipe service for browser native messaging.
 //!
-//! Browser-extension screenshot ingestion and capture-session registration
-//! use the NMH pipe in this module.
-//!
+//! The shared single-instance pipe negotiates an independent single-instance
+//! channel for each OS-verified NMH. Capture/session traffic uses those channels.
+
 use crate::capture::CaptureState;
+use crate::nmh_pipe::{self, PeerRole, PeerVerifier, PipeSide};
+use crate::nmh_protocol::{self, IPC_PROTOCOL_VERSION, RESPONSE_ACK};
 use crate::reverse_ipc_protocol::{read_ipc_frame, write_ipc_frame, StorageResponse};
 use crate::storage::{SaveScreenshotRequest, StorageState};
+use crate::windows_platform::{self, ProcessIdentity};
 use rand::RngCore;
 use serde::Serialize;
 use std::os::windows::io::AsRawHandle;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
-
-use windows::Win32::Security::GetTokenInformation;
-use windows::Win32::Security::{
-    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-};
-use windows::Win32::Storage::FileSystem::{
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX,
-};
-
-/// Holds pre-built security descriptor and ACL buffers whose addresses are referenced
-/// by the SECURITY_ATTRIBUTES pointer fields. Bundling them in a struct guarantees
-/// the backing memory lives as long as the SA is in use.
-struct PipeSecurityContext {
-    sa: SECURITY_ATTRIBUTES,
-    _sd: Box<SECURITY_DESCRIPTOR>,
-    _acl_buffer: Vec<u8>,
-}
-
-/// Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe.
-fn get_security_context() -> Result<PipeSecurityContext, String> {
-    let token = crate::windows_platform::current_process_token()
-        .map_err(|error| format!("OpenProcessToken failed: {error}"))?;
-    get_security_context_inner(token.0)
-}
-
-/// The caller owns the token through the complete security-context query.
-fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContext, String> {
-    // SAFETY: `token_handle` is live for this call; queried buffer sizes determine every
-    // allocation, SID/ACL pointers refer into owned buffers retained by the returned
-    // context, and Windows does not retain temporary Rust pointers beyond each call.
-    unsafe {
-        let mut return_length = 0u32;
-        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
-
-        let mut token_buffer = vec![0u8; return_length as usize];
-        GetTokenInformation(
-            token_handle,
-            TokenUser,
-            Some(token_buffer.as_mut_ptr() as *mut _),
-            return_length,
-            &mut return_length,
-        )
-        .map_err(|e| format!("GetTokenInformation failed: {}", e))?;
-
-        let token_user = &*(token_buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER);
-        let user_sid = token_user.User.Sid;
-
-        let sid_len = windows::Win32::Security::GetLengthSid(user_sid);
-        let acl_size = std::mem::size_of::<ACL>()
-            + std::mem::size_of::<windows::Win32::Security::ACCESS_ALLOWED_ACE>()
-            + sid_len as usize
-            - 4;
-        let mut acl_buffer = vec![0u8; acl_size];
-        let p_acl = acl_buffer.as_mut_ptr() as *mut ACL;
-
-        windows::Win32::Security::InitializeAcl(
-            p_acl,
-            acl_size as u32,
-            windows::Win32::Security::ACE_REVISION(ACL_REVISION.0),
-        )
-        .map_err(|e| format!("InitializeAcl failed: {}", e))?;
-
-        windows::Win32::Security::AddAccessAllowedAce(
-            p_acl,
-            windows::Win32::Security::ACE_REVISION(ACL_REVISION.0),
-            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-            user_sid,
-        )
-        .map_err(|e| format!("AddAccessAllowedAce failed: {}", e))?;
-
-        let mut sd = Box::new(SECURITY_DESCRIPTOR::default());
-        InitializeSecurityDescriptor(
-            PSECURITY_DESCRIPTOR(sd.as_mut() as *mut _ as *mut _),
-            windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION,
-        )
-        .map_err(|e| format!("InitializeSecurityDescriptor failed: {}", e))?;
-
-        SetSecurityDescriptorDacl(
-            PSECURITY_DESCRIPTOR(sd.as_mut() as *mut _ as *mut _),
-            true,
-            Some(p_acl),
-            false,
-        )
-        .map_err(|e| format!("SetSecurityDescriptorDacl failed: {}", e))?;
-
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.as_mut() as *mut _ as *mut _,
-            bInheritHandle: false.into(),
-        };
-
-        Ok(PipeSecurityContext {
-            sa,
-            _sd: sd,
-            _acl_buffer: acl_buffer,
-        })
-    }
-}
 
 /// Return whether `pid` is `expected_ancestor_pid` or a bounded-depth descendant.
 fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
@@ -138,24 +41,6 @@ fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
     }
     false
 }
-
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut diff = 0u8;
-    for (left, right) in a.iter().zip(b.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
-}
-
-// NMH Pipe Server
-
-use std::path::PathBuf;
 
 /// Compute deterministic NMH pipe name from current user's Windows SID.
 /// Both CarbonPaper and carbonpaper-nmh.exe use this same formula.
@@ -188,7 +73,7 @@ pub fn read_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
         .map(|s| s.trim().to_string())
 }
 
-/// NMH pipe server state
+/// NMH pipe server state.
 pub struct NmhPipeServer {
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
@@ -198,116 +83,56 @@ impl NmhPipeServer {
         Self { shutdown_tx: None }
     }
 
-    /// Start the NMH pipe server with auth token validation
     pub fn start(
         &mut self,
         storage: Arc<StorageState>,
         capture_state: Arc<CaptureState>,
-        app_handle: tauri::AppHandle,
+        app: tauri::AppHandle,
         auth_token: String,
     ) -> Result<(), String> {
         let pipe_name = compute_nmh_pipe_name()?;
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let verifier = PeerVerifier::new(PeerRole::NativeHost)?;
+        let file = nmh_pipe::create_server_file(&pipe_name, true)
+            .map_err(|e| format!("Cannot create NMH bootstrap pipe: {e}"))?;
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
-
-        tracing::info!("Starting NMH pipe server on {}", pipe_name);
-
+        let handler: nmh_pipe::RequestHandler = Arc::new(move |peer, request| {
+            let storage = storage.clone();
+            let capture = capture_state.clone();
+            let app = app.clone();
+            Box::pin(
+                async move { process_nmh_request(&request, &peer, storage, capture, app).await },
+            )
+        });
+        let on_close: nmh_pipe::CloseHandler = Arc::new(|peer| {
+            let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            remove_peer_sessions(&mut sessions, peer, None);
+        });
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    tracing::error!("Failed to create NMH runtime: {}", e);
+                    tracing::error!("Cannot create NMH runtime: {e}");
                     return;
                 }
             };
-
             rt.block_on(async move {
-                let wide_pipe_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
-                let mut first_pipe_instance = true;
-
-                loop {
-                    // Apply the same current-user ACL as the storage pipe and
-                    // reject remote clients. Claim first-instance on the
-                    // initial create so a squatted pipe name fails loudly.
-                    let sec_ctx = match get_security_context() {
-                        Ok(ctx) => ctx,
-                        Err(e) => {
-                            tracing::error!("Failed to get NMH pipe security attributes: {}", e);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    };
-
-                    let open_mode = if first_pipe_instance {
-                        PIPE_ACCESS_DUPLEX
-                            | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
-                            | windows::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE
-                    } else {
-                        PIPE_ACCESS_DUPLEX
-                            | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
-                    };
-
-                    // SAFETY: the pipe name is NUL-terminated; `sec_ctx` retains the
-                    // security descriptor and ACL backing memory for the entire call.
-                    let handle = unsafe {
-                        windows::Win32::System::Pipes::CreateNamedPipeW(
-                            windows::core::PCWSTR(wide_pipe_name.as_ptr()),
-                            open_mode,
-                            windows::Win32::System::Pipes::PIPE_TYPE_BYTE | windows::Win32::System::Pipes::PIPE_READMODE_BYTE | windows::Win32::System::Pipes::PIPE_WAIT | windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS,
-                            windows::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
-                            1024 * 1024,
-                            1024 * 1024,
-                            0,
-                            Some(&sec_ctx.sa),
+                match nmh_pipe::async_server(file) {
+                    Ok(server) => {
+                        nmh_pipe::serve_broker(
+                            server,
+                            verifier,
+                            shutdown_rx,
+                            auth_token,
+                            handler,
+                            on_close,
                         )
-                    };
-
-                    if handle.is_invalid() {
-                        // SAFETY: `GetLastError` reads thread-local Win32 state and takes
-                        // no pointers or handles.
-                        tracing::error!("Failed to create NMH pipe server: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        continue;
+                        .await
                     }
-                    first_pipe_instance = false;
-
-                    // SAFETY: `handle` is valid and uniquely owned. On success ownership
-                    // transfers to `NamedPipeServer`; on failure it is closed below.
-                    let server = unsafe {
-                        match NamedPipeServer::from_raw_handle(handle.0) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!("Failed to convert raw handle to NMH pipe server: {}", e);
-                                let _ = windows::Win32::Foundation::CloseHandle(handle);
-                                continue;
-                            }
-                        }
-                    };
-
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => {
-                            tracing::info!("NMH pipe server shutting down");
-                            break;
-                        }
-                        result = server.connect() => {
-                            if let Err(e) = result {
-                                tracing::error!("NMH client connection failed: {}", e);
-                                continue;
-                            }
-
-                            let storage_clone = storage.clone();
-                            let capture_clone = capture_state.clone();
-                            let app_clone = app_handle.clone();
-                            let token_clone = auth_token.clone();
-                            tokio::spawn(async move {
-                                handle_nmh_client(server, storage_clone, capture_clone, app_clone, token_clone).await;
-                            });
-                        }
-                    }
+                    Err(e) => tracing::error!("Cannot attach NMH bootstrap pipe: {e}"),
                 }
             });
         });
-
         Ok(())
     }
 
@@ -319,76 +144,55 @@ impl NmhPipeServer {
     }
 }
 
-/// Handle a single NMH client connection
-async fn handle_nmh_client(
-    mut server: NamedPipeServer,
-    storage: Arc<StorageState>,
-    capture_state: Arc<CaptureState>,
-    app_handle: tauri::AppHandle,
-    expected_token: String,
+fn registration_claims_match(
+    request: &serde_json::Value,
+    peer: &ProcessIdentity,
+    browser: &ProcessIdentity,
+) -> bool {
+    let browser_name = browser.image.file_name().map(|name| name.to_string_lossy());
+    request["ipc_protocol_version"] == IPC_PROTOCOL_VERSION
+        && nmh_protocol::request_pid(request, "nmh_pid") == Some(peer.pid)
+        && nmh_protocol::request_pid(request, "browser_pid") == Some(browser.pid)
+        && browser.pid != peer.pid
+        && browser.created_at <= peer.created_at
+        && browser.user_sid == peer.user_sid
+        && nmh_protocol::valid_private_pipe_name(
+            request["cmd_pipe_name"].as_str().unwrap_or(""),
+            nmh_protocol::CMD_PIPE_PREFIX,
+        )
+        && request["browser_exe_path"]
+            .as_str()
+            .is_some_and(|path| nmh_pipe::path_matches(std::path::Path::new(path), &browser.image))
+        && browser_name.is_some_and(|actual| {
+            request["browser_exe_name"]
+                .as_str()
+                .is_some_and(|claimed| claimed.eq_ignore_ascii_case(&actual))
+        })
+}
+
+fn remove_peer_sessions(
+    sessions: &mut Vec<NmhSession>,
+    peer: &ProcessIdentity,
+    pipe: Option<&str>,
 ) {
-    // SAFETY: Tokio owns a live pipe handle for the duration of the call and `pid` points
-    // to writable stack storage that Windows fills synchronously.
-    let client_pid = unsafe {
-        let mut pid: u32 = 0;
-        let handle = HANDLE(server.as_raw_handle() as *mut _);
-        if GetNamedPipeClientProcessId(handle, &mut pid).is_ok() {
-            Some(pid)
-        } else {
-            None
-        }
-    };
-
-    let buf = match read_ipc_frame(&mut server).await {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!("NMH read error: {}", e);
-            let response = StorageResponse::error(&e);
-            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-            let _ = write_ipc_frame(&mut server, &response_bytes).await;
-            return;
-        }
-    };
-
-    if buf.is_empty() {
-        return;
-    }
-
-    let response = match serde_json::from_slice::<serde_json::Value>(&buf) {
-        Ok(req) => {
-            // Validate auth token
-            let provided_token = req.get("auth_token").and_then(|t| t.as_str()).unwrap_or("");
-            if !constant_time_eq(provided_token, &expected_token) {
-                tracing::warn!("NMH auth token mismatch");
-                StorageResponse::error("Authentication failed")
-            } else {
-                process_nmh_request(
-                    &req,
-                    client_pid,
-                    storage.clone(),
-                    capture_state.clone(),
-                    app_handle.clone(),
-                )
-                .await
-            }
-        }
-        Err(e) => StorageResponse::error(&format!("Invalid JSON: {} (bytes={})", e, buf.len())),
-    };
-
-    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-    if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
-        tracing::error!("NMH write error: {}", e);
-    }
+    sessions.retain(|session| {
+        !(session.nmh_peer == *peer && pipe.is_none_or(|pipe| session.cmd_pipe_name == pipe))
+    });
 }
 
 /// Process an NMH request (save_extension_screenshot)
 async fn process_nmh_request(
     req: &serde_json::Value,
-    client_pid: Option<u32>,
+    peer: &ProcessIdentity,
     storage: Arc<StorageState>,
     capture_state: Arc<CaptureState>,
     app_handle: tauri::AppHandle,
 ) -> StorageResponse {
+    if req["ipc_protocol_version"] != IPC_PROTOCOL_VERSION
+        || nmh_protocol::request_pid(req, "nmh_pid") != Some(peer.pid)
+    {
+        return StorageResponse::error("Invalid NMH client identity");
+    }
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
 
     if crate::maintenance::is_active() && !crate::maintenance::reverse_ipc_command_allowed(command)
@@ -398,89 +202,72 @@ async fn process_nmh_request(
 
     match command {
         "register_nmh" => {
-            let browser_pid = req.get("browser_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let nmh_pid = req.get("nmh_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let cmd_pipe_name = req
-                .get("cmd_pipe_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let browser_exe_path = req
-                .get("browser_exe_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let browser_exe_name = req
-                .get("browser_exe_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            if browser_pid == 0 || nmh_pid == 0 || !cmd_pipe_name.starts_with(NMH_CMD_PIPE_PREFIX) {
-                return StorageResponse::error("Invalid register_nmh request");
-            }
-
-            // The NMH connects to this pipe itself and is spawned by the
-            // browser it claims (directly or via the cmd.exe NM launcher
-            // wrapper), so the caller must sit below the claimed browser PID.
-            let Some(client_pid) = client_pid else {
-                return StorageResponse::error("Cannot verify NMH client process");
+            let Some(browser) = windows_platform::browser_ancestor(peer.pid) else {
+                return StorageResponse::error("Cannot verify NMH browser ancestor");
             };
-            if !is_pid_descendant_of(client_pid, browser_pid) {
-                tracing::warn!(
-                    "[SECURITY] register_nmh rejected: client PID {} is not a descendant of claimed browser PID {}",
-                    client_pid,
-                    browser_pid
-                );
+            let browser_name = browser
+                .image
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let cmd_pipe_name = req["cmd_pipe_name"].as_str().unwrap_or("");
+            if !registration_claims_match(req, peer, &browser) {
                 return StorageResponse::error("Invalid register_nmh request");
             }
-
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            {
-                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-                upsert_session(
-                    &mut sessions,
-                    NmhSession {
-                        browser_pid,
-                        browser_exe_path,
-                        browser_exe_name: browser_exe_name.clone(),
-                        nmh_pid,
-                        cmd_pipe_name,
-                        registered_at_ms: now_ms,
-                        last_seen_ms: now_ms,
-                    },
-                );
+            // The declared endpoint must actually belong to this connected NMH.
+            // Its pinned single server instance makes the server-PID check meaningful.
+            let cmd_pipe = match nmh_pipe::open_async_client(cmd_pipe_name).await {
+                Ok(pipe) => pipe,
+                Err(e) => {
+                    return StorageResponse::error(&format!("Cannot open NMH command pipe: {e}"))
+                }
+            };
+            let verifier = match PeerVerifier::new(PeerRole::NativeHost) {
+                Ok(verifier) => verifier,
+                Err(e) => return StorageResponse::error(&e),
+            };
+            if let Err(e) = verifier.verify(
+                HANDLE(cmd_pipe.as_raw_handle()),
+                PipeSide::Client,
+                Some(peer),
+            ) {
+                return StorageResponse::error(&e);
             }
-            tracing::info!(
-                "NMH session registered: browser={} pid={} nmh_pid={}",
-                browser_exe_name,
-                browser_pid,
-                nmh_pid
+            drop(cmd_pipe);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let session = NmhSession {
+                browser_pid: browser.pid,
+                browser_exe_path: browser.image.to_string_lossy().into_owned(),
+                browser_exe_name: browser_name,
+                nmh_pid: peer.pid,
+                cmd_pipe_name: cmd_pipe_name.to_string(),
+                registered_at_ms: now_ms,
+                last_seen_ms: now_ms,
+                nmh_peer: peer.clone(),
+                browser_created_at: browser.created_at,
+            };
+            upsert_session(
+                &mut NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()),
+                session,
             );
             StorageResponse::success(serde_json::json!({"registered": true}))
         }
         "unregister_nmh" => {
-            let nmh_pid = req.get("nmh_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let cmd_pipe_name = req
-                .get("cmd_pipe_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            {
-                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-                remove_session(&mut sessions, nmh_pid, cmd_pipe_name);
-            }
-            tracing::info!("NMH session unregistered: nmh_pid={}", nmh_pid);
+            let cmd_pipe_name = req["cmd_pipe_name"].as_str().unwrap_or("");
+            let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            remove_peer_sessions(&mut sessions, peer, Some(cmd_pipe_name));
             StorageResponse::success(serde_json::json!({"unregistered": true}))
         }
         "save_extension_screenshot" => {
-            // Keep the sender's session fresh (liveness signal)
-            if let Some(nmh_pid) = req.get("nmh_pid").and_then(|v| v.as_u64()) {
-                let now_ms = chrono::Utc::now().timestamp_millis();
+            // Only the OS-verified owner can refresh this session.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            {
                 let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-                for s in sessions.iter_mut() {
-                    if s.nmh_pid == nmh_pid as u32 {
-                        s.last_seen_ms = now_ms;
-                    }
+                for session in sessions
+                    .iter_mut()
+                    .filter(|session| session.nmh_peer == *peer)
+                {
+                    session.last_seen_ms = now_ms;
                 }
             }
 
@@ -743,24 +530,20 @@ pub struct NmhSession {
     pub cmd_pipe_name: String,
     pub registered_at_ms: i64,
     pub last_seen_ms: i64,
+    #[serde(skip)]
+    nmh_peer: ProcessIdentity,
+    #[serde(skip)]
+    browser_created_at: u64,
 }
 
 static NMH_SESSIONS: once_cell::sync::Lazy<std::sync::Mutex<Vec<NmhSession>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
-
-/// Only accept command pipes created by our NMH (random-suffix namespace).
-const NMH_CMD_PIPE_PREFIX: &str = r"\\.\pipe\carbon_nmh_cmd_r_";
 
 /// Insert or replace a session, keyed by nmh_pid (an NMH re-registering —
 /// e.g. after an app restart rotated the token — replaces its old entry).
 fn upsert_session(sessions: &mut Vec<NmhSession>, session: NmhSession) {
     sessions.retain(|s| s.nmh_pid != session.nmh_pid);
     sessions.push(session);
-}
-
-/// Remove a session by nmh_pid + cmd_pipe_name.
-fn remove_session(sessions: &mut Vec<NmhSession>, nmh_pid: u32, cmd_pipe_name: &str) {
-    sessions.retain(|s| !(s.nmh_pid == nmh_pid && s.cmd_pipe_name == cmd_pipe_name));
 }
 
 /// Pick the session serving a foreground window: exact browser-PID match
@@ -792,17 +575,19 @@ fn select_session<'a>(
         .max_by_key(|s| s.last_seen_ms)
 }
 
-use crate::windows_platform::process_image_path as query_process_image_path;
-
 /// Drop sessions whose browser process is gone, or whose PID now belongs to
 /// a different executable (PID-reuse guard).
 pub fn prune_dead_sessions() {
     let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    sessions.retain(|s| match query_process_image_path(s.browser_pid) {
-        Some(path) => {
-            s.browser_exe_path.is_empty() || path.eq_ignore_ascii_case(&s.browser_exe_path)
-        }
-        None => false,
+    sessions.retain(|session| {
+        windows_platform::process_is_same(&session.nmh_peer)
+            && windows_platform::inspect_process(session.browser_pid).is_ok_and(|browser| {
+                browser.created_at == session.browser_created_at
+                    && nmh_pipe::path_matches(
+                        &browser.image,
+                        std::path::Path::new(&session.browser_exe_path),
+                    )
+            })
     });
 }
 
@@ -866,29 +651,27 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
     );
 
     let round_trip = async {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
-        let mut pipe = ClientOptions::new()
-            .open(&pipe_name)
-            .map_err(|e| format!("Cannot open NMH cmd pipe: {}", e))?;
-
-        let request = serde_json::json!({"command": "request_capture"});
-        let data =
-            serde_json::to_vec(&request).map_err(|e| format!("Serialization failed: {}", e))?;
-
-        pipe.write_all(&data)
+        let mut pipe = nmh_pipe::open_async_client(&pipe_name)
             .await
-            .map_err(|e| format!("Pipe write failed: {}", e))?;
-
-        // The NMH replies ok only after successfully forwarding the request
-        // to the extension over its Native Messaging port.
-        let mut response_buf = vec![0u8; 1024];
-        let n = pipe
-            .read(&mut response_buf)
+            .map_err(|e| format!("Cannot open NMH cmd pipe: {e}"))?;
+        let verifier = PeerVerifier::new(PeerRole::NativeHost)?;
+        verifier.verify(
+            HANDLE(pipe.as_raw_handle()),
+            PipeSide::Client,
+            Some(&session.nmh_peer),
+        )?;
+        let request = serde_json::json!({
+            "command": "request_capture", "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        });
+        let data = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+        write_ipc_frame(&mut pipe, &data).await?;
+        let response: serde_json::Value = serde_json::from_slice(&read_ipc_frame(&mut pipe).await?)
+            .map_err(|e| format!("Invalid NMH cmd response: {e}"))?;
+        pipe.write_all(&[RESPONSE_ACK])
             .await
-            .map_err(|e| format!("Pipe read failed: {}", e))?;
-        let response: serde_json::Value = serde_json::from_slice(&response_buf[..n])
-            .map_err(|e| format!("Invalid NMH cmd response: {}", e))?;
+            .map_err(|e| e.to_string())?;
         if response.get("status").and_then(|s| s.as_str()) == Some("ok") {
             Ok(())
         } else {
@@ -911,7 +694,11 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
 
     if result.is_err() {
         let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-        remove_session(&mut sessions, session.nmh_pid, &session.cmd_pipe_name);
+        remove_peer_sessions(
+            &mut sessions,
+            &session.nmh_peer,
+            Some(&session.cmd_pipe_name),
+        );
     }
     result
 }
@@ -986,6 +773,13 @@ mod tests {
             cmd_pipe_name: format!(r"\\.\pipe\carbon_nmh_cmd_r_{:032x}", nmh_pid),
             registered_at_ms: last_seen_ms,
             last_seen_ms,
+            nmh_peer: ProcessIdentity {
+                pid: nmh_pid,
+                created_at: 1,
+                user_sid: String::new(),
+                image: PathBuf::new(),
+            },
+            browser_created_at: 1,
         }
     }
 
@@ -1009,11 +803,13 @@ mod tests {
     fn test_remove_session_matches_both_keys() {
         let mut sessions = vec![make_session(100, 1, 1000), make_session(200, 2, 2000)];
         let pipe = sessions[0].cmd_pipe_name.clone();
-        remove_session(&mut sessions, 1, &pipe);
+        let first = sessions[0].nmh_peer.clone();
+        let second = sessions[1].nmh_peer.clone();
+        remove_peer_sessions(&mut sessions, &first, Some(&pipe));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].nmh_pid, 2);
         // Wrong pipe name doesn't remove
-        remove_session(&mut sessions, 2, r"\\.\pipe\other");
+        remove_peer_sessions(&mut sessions, &second, Some(r"\\.\pipe\other"));
         assert_eq!(sessions.len(), 1);
     }
 
@@ -1088,5 +884,72 @@ mod tests {
         ));
         let resized = resize_extension_ocr_image(image);
         assert_eq!(resized.dimensions(), (1200, 800));
+    }
+    #[test]
+    fn registration_binds_claims_to_the_os_nmh_and_browser() {
+        let peer = ProcessIdentity {
+            pid: 200,
+            created_at: 20,
+            user_sid: "fixture-user".into(),
+            image: PathBuf::from(r"C:\runtime\carbonpaper-nmh.exe"),
+        };
+        let browser = ProcessIdentity {
+            pid: 100,
+            created_at: 10,
+            user_sid: peer.user_sid.clone(),
+            image: PathBuf::from(r"C:\browsers\360chromex.exe"),
+        };
+        let valid = serde_json::json!({
+            "ipc_protocol_version": IPC_PROTOCOL_VERSION, "nmh_pid": peer.pid,
+            "browser_pid": browser.pid,
+            "browser_exe_path": browser.image.to_string_lossy(),
+            "browser_exe_name": "360chromex.exe",
+            "cmd_pipe_name": format!("{}{}", nmh_protocol::CMD_PIPE_PREFIX, "ab".repeat(16)),
+        });
+        assert!(registration_claims_match(&valid, &peer, &browser));
+        for (field, forged) in [
+            ("nmh_pid", serde_json::json!(201)),
+            ("nmh_pid", serde_json::json!((u32::MAX as u64) + 201)),
+            ("browser_pid", serde_json::json!(peer.pid)),
+            (
+                "browser_exe_path",
+                serde_json::json!(r"C:\browsers\other.exe"),
+            ),
+            ("browser_exe_name", serde_json::json!("chrome.exe")),
+            (
+                "cmd_pipe_name",
+                serde_json::json!(r"\\.\pipe\carbon_nmh_cmd_r_abc"),
+            ),
+        ] {
+            let mut request = valid.clone();
+            request[field] = forged;
+            assert!(
+                !registration_claims_match(&request, &peer, &browser),
+                "{field}"
+            );
+        }
+        let mut reused_browser = browser.clone();
+        reused_browser.created_at = peer.created_at + 1;
+        assert!(!registration_claims_match(&valid, &peer, &reused_browser));
+    }
+
+    #[test]
+    fn peer_cleanup_preserves_other_nmh_and_reused_pid_sessions() {
+        let old = make_session(100, 1, 1000);
+        let mut replacement = old.clone();
+        replacement.nmh_peer.created_at += 1;
+        let other = make_session(100, 2, 2000);
+        let mut sessions = vec![replacement.clone(), other.clone()];
+        remove_peer_sessions(&mut sessions, &old.nmh_peer, None);
+        assert_eq!(sessions.len(), 2);
+        remove_peer_sessions(&mut sessions, &replacement.nmh_peer, Some("wrong-pipe"));
+        assert_eq!(sessions.len(), 2);
+        remove_peer_sessions(
+            &mut sessions,
+            &replacement.nmh_peer,
+            Some(&replacement.cmd_pipe_name),
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].nmh_pid, other.nmh_pid);
     }
 }

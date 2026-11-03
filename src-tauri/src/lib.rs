@@ -53,6 +53,7 @@ mod ml_runtime;
 mod model_management;
 mod monitor;
 mod native_messaging;
+mod nmh_pipe;
 mod nmh_protocol;
 mod office_protocol;
 mod office_runtime;
