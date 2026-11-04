@@ -11,6 +11,20 @@ struct Fixture {
     release: Release,
 }
 
+fn write_signed_release(directory: &Path, manifest: &ReleaseManifest) -> Release {
+    let signing_key = SigningKey::from_bytes(&[9; 32]);
+    let bytes = serde_json::to_vec(manifest).unwrap();
+    let mut payload = manifest::SIGNING_CONTEXT.to_vec();
+    payload.extend_from_slice(&bytes);
+    let signature =
+        base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&payload).to_bytes());
+    let key =
+        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes());
+    fs::write(directory.join(MANIFEST_NAME), &bytes).unwrap();
+    fs::write(directory.join(SIGNATURE_NAME), signature).unwrap();
+    read_release(directory, &key).unwrap()
+}
+
 fn fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("package");
@@ -43,17 +57,9 @@ fn fixture() -> Fixture {
         service_protocol: 1,
         files,
     };
-    let signing_key = SigningKey::from_bytes(&[9; 32]);
-    let bytes = serde_json::to_vec(&manifest).unwrap();
-    let mut payload = manifest::SIGNING_CONTEXT.to_vec();
-    payload.extend_from_slice(&bytes);
-    let signature =
-        base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&payload).to_bytes());
-    let key =
-        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes());
-    fs::write(source.join(MANIFEST_NAME), &bytes).unwrap();
-    fs::write(source.join(SIGNATURE_NAME), signature).unwrap();
-    let release = read_release(&source, &key).unwrap();
+    let key = base64::engine::general_purpose::STANDARD
+        .encode(SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes());
+    let release = write_signed_release(&source, &manifest);
     Fixture {
         _root: root,
         source,
@@ -157,6 +163,21 @@ fn launch_validation_rejects_a_different_file_at_the_installed_path() {
 }
 
 #[test]
+fn replacement_works_with_read_only_locks_on_mutable_ancestors() {
+    let fixture = fixture();
+    let _ancestors = DirectoryLocks::for_execution(fixture.destination.parent().unwrap()).unwrap();
+    let mut transaction =
+        Transaction::prepare(&fixture.source, &fixture.destination, &fixture.release).unwrap();
+    transaction.commit().unwrap();
+    transaction.finish();
+    drop(transaction);
+    assert_eq!(
+        fs::read(fixture.destination.join("carbonpaper.exe")).unwrap(),
+        b"new carbonpaper.exe"
+    );
+}
+
+#[test]
 fn failed_replacement_rolls_back_files_already_installed() {
     let fixture = fixture();
     let blocked = fixture.destination.join("carbonpaper-ml.exe");
@@ -216,4 +237,91 @@ fn locked_verified_executable_can_be_renamed_and_started() {
     assert!(fs::write(&target, b"changed").is_err());
     drop(file);
     drop(locks);
+}
+
+#[test]
+#[ignore = "requires an administrator process to create an isolated protected installation"]
+fn elevated_update_rejects_corruption_and_preserves_protected_acls() {
+    assert!(elevation_status().unwrap());
+    let mut fixture = fixture();
+    let mut current_manifest = fixture.release.manifest.clone();
+    current_manifest.version = "1.2.2".into();
+    for (name, hash) in &mut current_manifest.files {
+        *hash = hex::encode(Sha256::digest(
+            fs::read(fixture.destination.join(name)).unwrap(),
+        ));
+    }
+    let current = write_signed_release(&fixture.destination, &current_manifest);
+    // A newly introduced nested resource exercises explicit ACL assignment on
+    // both the directories and the verified object moved into the installation.
+    fs::create_dir(fixture.source.join("resources")).unwrap();
+    fs::write(fixture.source.join("resources/new.dat"), b"new resource").unwrap();
+    fixture.release.manifest.files.insert(
+        "resources/new.dat".into(),
+        hex::encode(Sha256::digest(b"new resource")),
+    );
+    fixture.release = write_signed_release(&fixture.source, &fixture.release.manifest);
+    identity::protect_path(&fixture.destination, true).unwrap();
+    for name in current_manifest
+        .files
+        .keys()
+        .map(String::as_str)
+        .chain([MANIFEST_NAME, SIGNATURE_NAME])
+    {
+        identity::protect_path(&fixture.destination.join(name), true).unwrap();
+    }
+    let executable = fixture.destination.join("carbonpaper.exe");
+    fs::write(&executable, b"corrupted installed executable").unwrap();
+    assert!(Transaction::prepare_protected(
+        &fixture.source,
+        &fixture.destination,
+        &fixture.release,
+        &current
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(&executable).unwrap(),
+        b"corrupted installed executable"
+    );
+    assert_eq!(
+        fs::read(fixture.destination.join("carbonpaper-ml.exe")).unwrap(),
+        b"old carbonpaper-ml.exe"
+    );
+    fs::write(&executable, b"old carbonpaper.exe").unwrap();
+    let mut transaction = Transaction::prepare_protected(
+        &fixture.source,
+        &fixture.destination,
+        &fixture.release,
+        &current,
+    )
+    .unwrap();
+    identity::assert_protected(&transaction.staging).unwrap();
+    identity::assert_protected(&transaction.staging.join("prepared/resources/new.dat")).unwrap();
+    transaction.commit().unwrap();
+    let execution = transaction.execution_locks().unwrap();
+    for path in [
+        "carbonpaper.exe",
+        "resources",
+        "resources/new.dat",
+        MANIFEST_NAME,
+        SIGNATURE_NAME,
+    ] {
+        identity::assert_protected(&fixture.destination.join(path)).unwrap();
+    }
+    assert_eq!(
+        fs::read(fixture.destination.join("resources/new.dat")).unwrap(),
+        b"new resource"
+    );
+    assert_eq!(
+        fs::read(fixture.destination.join("user-data.txt")).unwrap(),
+        b"preserve this"
+    );
+    drop(execution);
+    transaction.rollback().unwrap();
+    assert_eq!(fs::read(&executable).unwrap(), b"old carbonpaper.exe");
+    identity::assert_protected(&executable).unwrap();
+    transaction.commit().unwrap();
+    transaction.finish();
+    drop(transaction);
+    read_release(&fixture.destination, &fixture.key).unwrap();
 }

@@ -233,13 +233,14 @@ does not start elevation.
 | `app_bound_install` (enable or repair) | Verifies the packaged setup executable, then uses `runas` in `app_bound.rs`. Windows cancellation maps to `APP_BOUND_CANCELLED`; the caller remains available for an explicit retry. |
 | `app_bound_uninstall` | Verifies the installed setup helper, then uses the same UAC/cancellation contract. |
 | `updater_install` for a protected installation | Installs through `app_bound::install_runtime` before stopping capture. Cancelling UAC keeps the current application and monitor running. |
-| `updater_install` for an ordinary installation | An unelevated native helper prepares the signed files before capture stops, then waits for the requesting process to exit before replacement. Preparation failure leaves the application running; insufficient directory permissions offer the official installer in the existing update view. |
+| `updater_install` for an ordinary installation | A native helper prepares signed files before capture stops and waits for the requesting process to exit before replacement. An administrator-owned installation requests UAC when directory permissions are insufficient; cancellation leaves the application and capture running. The application restarts with the original user's ordinary permissions. Unsupported package metadata or mutable installation ownership offers the official installer. |
 
 These service and updater paths remain Rust-owned. Python installation and
 executable selection are not part of the current product. Interactive checks
 must distinguish protected installation updates from ordinary native updates:
-the protected installer owns UAC, while ordinary preparation failures return to
-the existing update view.
+the protected installer installs the protected runtime and service; ordinary
+elevation only replaces signed application files. Preparation failures and UAC
+cancellation return to the existing update view.
 
 ## Enforcement
 

@@ -6,7 +6,7 @@ import { APP_VERSION } from '../../lib/version';
 import appIcon from '../../../src-tauri/icons/128x128.png';
 import { SettingsButton } from './SettingsControls';
 import { SettingsDivider, SettingsErrorBanner, SettingsGroup, SettingsRow, SettingsStatus } from './SettingsPrimitives';
-import { INSTALLER_REQUIRED } from '../../lib/update_api';
+import { ELEVATION_CANCELLED, INSTALLER_REQUIRED } from '../../lib/update_api';
 
 export default function AboutSection({ checking, upToDate, onCheckUpdate, updateInfo, updateError, downloading, downloadProgress, onDownloadUpdate, onOpenDownloads }) {
   const { t } = useTranslation();
@@ -21,7 +21,7 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate, update
     <SettingsGroup className="space-y-3">
       <SettingsRow label={t('settings.about.updates')} description={updateInfo ? t('settings.about.available', { version: updateInfo.version }) : upToDate ? t('settings.about.latest') : APP_VERSION}
         control={<SettingsButton icon={RefreshCw} onClick={onCheckUpdate} disabled={checking || downloading}>{t(checking ? 'settings.about.checking' : 'settings.about.check')}</SettingsButton>} />
-      {updateError && <SettingsErrorBanner>{requiresInstaller ? t('updateModal.installerRequired') : updateError}</SettingsErrorBanner>}
+      {updateError && <SettingsErrorBanner>{requiresInstaller ? t('updateModal.installerRequired') : updateError === ELEVATION_CANCELLED ? t('updateModal.elevationCancelled') : updateError}</SettingsErrorBanner>}
       {downloading ? <div className="space-y-2">
         <SettingsStatus>{t(phase === 'applying' ? 'updateModal.applying' : phase === 'extracting' ? 'updateModal.extracting' : 'updateModal.downloading')}</SettingsStatus>
         <progress className="h-1.5 w-full accent-ide-accent" max={1} value={phase === 'downloading' ? progress : undefined} aria-label={t('settings.about.download')} />

@@ -7,8 +7,10 @@ import { performance } from 'node:perf_hooks';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const manifest = path.join(root, 'src-tauri', 'app-bound', 'Cargo.toml');
 const serviceTest = 'windows::install::tests::existing_service_repair_reapplies_restart_policy';
+const updaterTest = 'windows::update::tests::elevated_update_rejects_corruption_and_preserves_protected_acls';
 const requiredTests = [
   serviceTest,
+  updaterTest,
   'windows::transport::tests::delayed_fragmented_reply_is_read_in_full',
   'windows::transport::tests::empty_connected_pipe_waits_until_deadline',
   'windows::service::native_tests::native_policy_round_trip_uses_client_and_server',
@@ -80,14 +82,16 @@ async function main() {
       }
     });
     stage('Run protocol, real-pipe, DPAPI and storage tests', () => run(executable, []));
-    stage('Check existing-service repair permissions (administrator access)', () => {
+    stage('Check service repair and ordinary update permissions (administrator access)', () => {
       const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
       run(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         path.join(root, 'scripts', 'check-app-bound-service.ps1'),
         '-TestBinary', executable, '-OutputDirectory', reportDirectory]);
-      const result = JSON.parse(readFileSync(path.join(reportDirectory, 'service-result.json'), 'utf8').replace(/^\uFEFF/, ''));
-      if (result.exit_code !== 0 || result.tests_passed !== 1 || result.test !== serviceTest) {
-        throw new Error('The administrator service regression did not complete successfully');
+      for (const [prefix, test] of [['service', serviceTest], ['updater', updaterTest]]) {
+        const result = JSON.parse(readFileSync(path.join(reportDirectory, `${prefix}-result.json`), 'utf8').replace(/^\uFEFF/, ''));
+        if (result.exit_code !== 0 || result.tests_passed !== 1 || result.test !== test) {
+          throw new Error(`The administrator ${prefix} regression did not complete successfully`);
+        }
       }
     });
     stage('Check package signatures and privileged imports', () => run(process.execPath, [

@@ -21,6 +21,12 @@ fn run() -> carbonpaper_app_bound::Result<()> {
     let launch_args = std::env::args().skip(1).collect::<Vec<_>>();
     if launch_args
         .first()
+        .is_some_and(|s| s == "--apply-elevated-update")
+    {
+        return carbonpaper_app_bound::windows::update::run_elevated(&launch_args[1..]);
+    }
+    if launch_args
+        .first()
         .is_some_and(|s| s == "--apply-unprotected-update")
     {
         return carbonpaper_app_bound::windows::update::run(&launch_args[1..]);

@@ -1,4 +1,4 @@
-//! Unelevated portable updates. Only signed package files can be installed, and
+//! Signed ordinary updates. Only signed package files can be installed, and
 //! verified file handles remain locked through replacement and application launch.
 use super::identity::{self, OwnedHandle};
 use crate::{
@@ -7,6 +7,7 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{BufRead, Read, Seek, Write},
     os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
@@ -25,6 +26,11 @@ use windows::Win32::{
 
 pub const HELPER_NAME: &str = "carbonpaper-protected-setup.exe";
 pub const READY: &str = "READY";
+pub const ELEVATION_CANCELLED: &str = "UPDATER_ELEVATION_CANCELLED";
+pub const ELEVATING: &str = "ELEVATING";
+
+mod elevation;
+pub use elevation::{check_local_path, run_elevated};
 
 /// Pin every directory component, including mutable ancestors, against deletion.
 /// Open reparse points themselves, then inspect the handle so validation cannot
@@ -90,13 +96,16 @@ impl DirectoryLocks {
 }
 
 pub fn is_elevated() -> bool {
+    elevation_status().unwrap_or(true)
+}
+
+fn elevation_status() -> Result<bool> {
     // SAFETY: the process and owned token handles stay live, and elevation is a
     // correctly sized output buffer. Unavailable token information fails closed.
     unsafe {
         let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return true;
-        }
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|_| BrokerError::AccessDenied)?;
         let token = OwnedHandle(token);
         let mut elevation = TOKEN_ELEVATION::default();
         let mut length = 0;
@@ -107,8 +116,8 @@ pub fn is_elevated() -> bool {
             std::mem::size_of_val(&elevation) as u32,
             &mut length,
         )
-        .is_err()
-            || elevation.TokenIsElevated != 0
+        .map_err(|_| BrokerError::AccessDenied)?;
+        Ok(elevation.TokenIsElevated != 0)
     }
 }
 
@@ -270,10 +279,44 @@ struct Transaction {
     locks: DirectoryLocks,
     created_directories: Vec<PathBuf>,
     committed: bool,
+    protected_files: Option<BTreeMap<PathBuf, String>>,
 }
 
 impl Transaction {
     fn prepare(source: &Path, destination: &Path, release: &Release) -> Result<Self> {
+        Self::prepare_with_policy(source, destination, release, None)
+    }
+
+    fn prepare_protected(
+        source: &Path,
+        destination: &Path,
+        release: &Release,
+        current: &Release,
+    ) -> Result<Self> {
+        identity::assert_protected(destination)?;
+        let mut files = current
+            .manifest
+            .files
+            .iter()
+            .map(|(name, hash)| Ok((manifest::safe_relative_path(name)?, hash.clone())))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        files.insert(
+            PathBuf::from(MANIFEST_NAME),
+            hex::encode(Sha256::digest(&current.bytes)),
+        );
+        files.insert(
+            PathBuf::from(SIGNATURE_NAME),
+            hex::encode(Sha256::digest(&current.signature)),
+        );
+        Self::prepare_with_policy(source, destination, release, Some(files))
+    }
+
+    fn prepare_with_policy(
+        source: &Path,
+        destination: &Path,
+        release: &Release,
+        protected_files: Option<BTreeMap<PathBuf, String>>,
+    ) -> Result<Self> {
         let mut locks = DirectoryLocks::default();
         locks.pin(source)?;
         locks.pin(destination)?;
@@ -282,6 +325,9 @@ impl Transaction {
             rand::random::<u128>()
         ));
         fs::create_dir(&staging).map_err(|_| BrokerError::Storage)?;
+        if protected_files.is_some() {
+            identity::protect_path(&staging, true)?;
+        }
         let mut transaction = Self {
             destination: destination.to_path_buf(),
             staging: staging.clone(),
@@ -289,6 +335,7 @@ impl Transaction {
             locks,
             created_directories: vec![staging],
             committed: false,
+            protected_files,
         };
         transaction.locks.pin(&transaction.staging.clone())?;
         for (relative, expected) in &release.manifest.files {
@@ -306,6 +353,18 @@ impl Transaction {
             let hash = hex::encode(Sha256::digest(bytes));
             transaction.stage(Path::new(name), &mut &bytes[..], &hash)?;
         }
+        if transaction.protected_files.is_some() {
+            for index in 0..transaction.replacements.len() {
+                let relative = transaction.replacements[index].relative.clone();
+                let target = destination.join(&relative);
+                if target.try_exists().map_err(|_| BrokerError::Storage)? {
+                    transaction.ensure_parent(&target, false)?;
+                    // Detect corrupt files and delete-access failures while the
+                    // requesting application is still running.
+                    drop(transaction.previous_file(&relative)?);
+                }
+            }
+        }
         Ok(transaction)
     }
 
@@ -318,8 +377,14 @@ impl Transaction {
                 }
                 fs::create_dir(directory).map_err(|_| BrokerError::Storage)?;
                 self.created_directories.push(directory.to_path_buf());
+                if self.protected_files.is_some() && directory.starts_with(&self.destination) {
+                    identity::protect_path(directory, true)?;
+                }
             }
             self.locks.pin(directory)?;
+            if self.protected_files.is_some() && directory.starts_with(&self.destination) {
+                identity::assert_protected(directory)?;
+            }
         }
         Ok(())
     }
@@ -339,6 +404,10 @@ impl Transaction {
             return Err(BrokerError::LimitExceeded);
         }
         output.sync_all().map_err(|_| BrokerError::Storage)?;
+        if self.protected_files.is_some() {
+            identity::protect_path(&path, true)?;
+            identity::assert_protected(&path)?;
+        }
         drop(output);
         let mut file = movable_file(&path)?;
         identity::verify_file(&mut file, hash)?;
@@ -358,8 +427,7 @@ impl Transaction {
             let backup = self.staging.join("previous").join(&relative);
             self.ensure_parent(&target, true)?;
             self.ensure_parent(&backup, true)?;
-            if target.try_exists().map_err(|_| BrokerError::Storage)? {
-                let file = movable_file(&target)?;
+            if let Some(file) = self.previous_file(&relative)? {
                 rename_locked(
                     &file,
                     &backup,
@@ -375,6 +443,22 @@ impl Transaction {
             self.replacements[index].installed = true;
         }
         Ok(())
+    }
+
+    fn previous_file(&self, relative: &Path) -> Result<Option<File>> {
+        let target = self.destination.join(relative);
+        if !target.try_exists().map_err(|_| BrokerError::Storage)? {
+            return Ok(None);
+        }
+        let mut file = movable_file(&target)?;
+        if let Some(expected) = &self.protected_files {
+            identity::assert_protected(&target)?;
+            identity::verify_file(
+                &mut file,
+                expected.get(relative).ok_or(BrokerError::Integrity)?,
+            )?;
+        }
+        Ok(Some(file))
     }
 
     fn finish(&mut self) {
@@ -456,6 +540,10 @@ impl Drop for Transaction {
 }
 
 fn parent_pid() -> Result<u32> {
+    parent_pid_of(std::process::id())
+}
+
+fn parent_pid_of(pid: u32) -> Result<u32> {
     // SAFETY: the snapshot is owned, and PROCESSENTRY32W is correctly sized.
     unsafe {
         let snapshot = OwnedHandle(
@@ -468,7 +556,7 @@ fn parent_pid() -> Result<u32> {
         };
         Process32FirstW(snapshot.0, &mut entry).map_err(|_| BrokerError::AccessDenied)?;
         loop {
-            if entry.th32ProcessID == std::process::id() {
+            if entry.th32ProcessID == pid {
                 return Ok(entry.th32ParentProcessID);
             }
             if Process32NextW(snapshot.0, &mut entry).is_err() {
@@ -484,7 +572,8 @@ pub fn run(args: &[String]) -> Result<()> {
     if cfg!(feature = "development-runtime") || is_elevated() {
         return Err(BrokerError::AccessDenied);
     }
-    if args.len() != 6
+    let elevate = args.len() == 7 && args[6] == "--elevate";
+    if (!elevate && args.len() != 6)
         || args[0] != "--source"
         || args[2] != "--caller-pid"
         || args[4] != "--version"
@@ -544,6 +633,9 @@ pub fn run(args: &[String]) -> Result<()> {
             .get(HELPER_NAME)
             .ok_or(BrokerError::Integrity)?,
     )?;
+    // Retain the verified execution namespace through any UAC prompt and the
+    // lifetime of the elevated copy process.
+    let _execution_paths = DirectoryLocks::for_execution(&source)?;
     // SAFETY: this retains a waitable handle to the already authenticated live
     // parent. Holding the original process handle prevents PID reuse.
     let parent = unsafe {
@@ -556,6 +648,9 @@ pub fn run(args: &[String]) -> Result<()> {
             .map_err(|_| BrokerError::AccessDenied)?,
         )
     };
+    if elevate {
+        return elevation::coordinate(&source, destination, &current, &release, pid, parent.0);
+    }
     let mut transaction = Transaction::prepare(&source, destination, &release)?;
     // The app learns that all bytes are verified and prepared through an
     // anonymous pipe owned by its exact child, before stopping capture or exiting.
@@ -622,6 +717,10 @@ mod development_tests {
     fn development_helper_disables_native_updates_before_argument_or_source_processing() {
         assert!(matches!(
             super::run(&[]),
+            Err(crate::protocol::BrokerError::AccessDenied)
+        ));
+        assert!(matches!(
+            super::run_elevated(&[]),
             Err(crate::protocol::BrokerError::AccessDenied)
         ));
     }

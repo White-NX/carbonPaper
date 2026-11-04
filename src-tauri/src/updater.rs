@@ -114,8 +114,9 @@ impl UpdaterState {
 fn staging_dir() -> Result<PathBuf, String> {
     let base = identity::local_app_data_directory()
         .map_err(|e| e.to_string())?
-        .join("CarbonPaper")
-        .join("update_staging");
+        // UAC execution locks can outlive the app. Keep their ancestors out of
+        // its storage directory so a pending prompt cannot freeze data renames.
+        .join("CarbonPaperUpdates");
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     cleanup_previous_staging(&base);
     let directory = base.join(format!("update-{:032x}", rand::random::<u128>()));
@@ -365,7 +366,12 @@ async fn stop_monitor(app: &AppHandle) {
     .await;
 }
 
-fn ordinary_installation_access() -> Result<update::DirectoryLocks, String> {
+struct OrdinaryInstallation {
+    _paths: update::DirectoryLocks,
+    elevate: bool,
+}
+
+fn ordinary_installation_access() -> Result<OrdinaryInstallation, String> {
     if update::is_elevated() {
         return Err("UPDATER_INSTALLER_REQUIRED".into());
     }
@@ -402,7 +408,7 @@ fn ordinary_installation_access() -> Result<update::DirectoryLocks, String> {
         ".carbonpaper-write-{:032x}",
         rand::random::<u128>()
     ));
-    let file = OpenOptions::new()
+    let probe_result = OpenOptions::new()
         .write(true)
         .create_new(true)
         .access_mode(
@@ -410,10 +416,27 @@ fn ordinary_installation_access() -> Result<update::DirectoryLocks, String> {
                 | windows::Win32::Storage::FileSystem::DELETE.0,
         )
         .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE.0)
-        .open(probe)
-        .map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
-    drop(file);
-    Ok(locks)
+        .open(probe);
+    let elevate = match probe_result {
+        Ok(file) => {
+            drop(file);
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            update::check_local_path(directory)
+                .map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
+            // Elevation is only useful for an existing administrator-owned
+            // installation; mutable/custom ownership needs installer repair.
+            identity::assert_protected(directory)
+                .map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
+            true
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(OrdinaryInstallation {
+        _paths: locks,
+        elevate,
+    })
 }
 
 async fn updater_apply_impl(
@@ -421,6 +444,7 @@ async fn updater_apply_impl(
     package: &ExtractedUpdate,
     version: &str,
     protected: bool,
+    elevate: bool,
 ) -> Result<(), String> {
     let _runtime_control = crate::maintenance::runtime_control_guard()?;
     if protected {
@@ -430,9 +454,12 @@ async fn updater_apply_impl(
         stop_monitor(&app).await;
         return crate::app_bound::schedule_restart(&app);
     }
-    let helper = package.directory.join(update::HELPER_NAME);
     let _execution_paths =
         update::DirectoryLocks::for_execution(&package.directory).map_err(|e| e.to_string())?;
+    if elevate {
+        update::check_local_path(&package.directory).map_err(|e| e.to_string())?;
+    }
+    let helper = package.directory.join(update::HELPER_NAME);
     let mut executable = update::locked_file(&helper).map_err(|e| e.to_string())?;
     verify_downloaded_file(&mut executable, &package.helper_hash)?;
     use std::os::windows::process::CommandExt;
@@ -449,8 +476,13 @@ async fn updater_apply_impl(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .creation_flags(0x08000000);
+    if elevate {
+        command.arg("--elevate");
+    }
     let mut child = tokio::process::Command::from(command)
-        .kill_on_drop(true)
+        // A pending UAC prompt must retain the coordinator's executable locks,
+        // even if the application closes or this command's future is dropped.
+        .kill_on_drop(!elevate)
         .spawn()
         .map_err(|e| format!("Failed to start update installer: {e}"))?;
     let stdout = child
@@ -466,6 +498,16 @@ async fn updater_apply_impl(
     .await
     .map_err(|_| "Update preparation timed out".to_string())?
     .map_err(|e| e.to_string())?;
+    if elevate && response.trim_end() == update::ELEVATING {
+        response.clear();
+        reader
+            .read_line(&mut response)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if response.trim_end() == update::ELEVATION_CANCELLED {
+        return Err(update::ELEVATION_CANCELLED.into());
+    }
     if response.trim_end() != update::READY {
         return Err("Update preparation failed".into());
     }
@@ -521,6 +563,9 @@ pub async fn updater_install(
     } else {
         Some(ordinary_installation_access()?)
     };
+    let elevate = _application_paths
+        .as_ref()
+        .is_some_and(|installation| installation.elevate);
     let _ = app.emit(
         "updater-phase",
         serde_json::json!({ "phase": "downloading" }),
@@ -532,7 +577,7 @@ pub async fn updater_install(
     );
     let package = updater_extract_impl(&mut download)?;
     let _ = app.emit("updater-phase", serde_json::json!({ "phase": "applying" }));
-    updater_apply_impl(app, &package, &manifest.version, protected).await
+    updater_apply_impl(app, &package, &manifest.version, protected, elevate).await
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ import { Download, RefreshCw, AlertCircle, ArrowUpCircle } from 'lucide-react';
 import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
-import { INSTALLER_REQUIRED } from '../lib/update_api';
+import { ELEVATION_CANCELLED, INSTALLER_REQUIRED } from '../lib/update_api';
 
 export function UpdateModal({
   isVisible,
@@ -25,6 +25,7 @@ export function UpdateModal({
 
   const { version, body, critical } = updateInfo;
   const requiresInstaller = downloadError === INSTALLER_REQUIRED;
+  const elevationCancelled = downloadError === ELEVATION_CANCELLED;
   const phase = downloadProgress?.phase || 'downloading';
   const hasValidTotal = downloadProgress && downloadProgress.contentLength > 0;
   const progressPercent = hasValidTotal
@@ -83,7 +84,7 @@ export function UpdateModal({
       </div>
 
       {downloadError && (
-        <Banner tone="error" className="shrink-0">{requiresInstaller ? t('updateModal.installerRequired') : t('updateModal.downloadFailed', { error: downloadError })}</Banner>
+        <Banner tone={elevationCancelled ? 'info' : 'error'} className="shrink-0">{requiresInstaller ? t('updateModal.installerRequired') : elevationCancelled ? t('updateModal.elevationCancelled') : t('updateModal.downloadFailed', { error: downloadError })}</Banner>
       )}
 
       {downloading && (

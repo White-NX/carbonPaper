@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
 export const INSTALLER_REQUIRED = 'UPDATER_INSTALLER_REQUIRED';
+export const ELEVATION_CANCELLED = 'UPDATER_ELEVATION_CANCELLED';
 
 export function openUpdateDownloadPage() {
   return openUrl('https://github.com/White-NX/carbonPaper/releases/latest');

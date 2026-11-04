@@ -130,7 +130,7 @@ jobs:
       - name: Run native update regressions
         shell: pwsh
         run: |
-          cargo test --manifest-path src-tauri/app-bound/Cargo.toml --lib windows::update::tests
+          cargo test --manifest-path src-tauri/app-bound/Cargo.toml --lib windows::update
           if ($LASTEXITCODE -ne 0) { throw "Native update regressions failed" }
           cargo test --manifest-path src-tauri/Cargo.toml --lib updater::tests
           if ($LASTEXITCODE -ne 0) { throw "Update verifier regressions failed" }

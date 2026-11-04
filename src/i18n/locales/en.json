@@ -1267,6 +1267,7 @@
     "applying": "Applying update...",
     "downloadFailed": "Download failed: {{error}}",
     "installerRequired": "Use the installer to update this copy of CarbonPaper. Download the latest installer from the release page.",
+    "elevationCancelled": "Update cancelled. CarbonPaper is still running. You can retry when you are ready.",
     "openDownloads": "Open release page",
     "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
   },
