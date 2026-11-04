@@ -367,6 +367,25 @@ function checkRuntimeControlInvariants() {
   }
 }
 
+function checkProtectedStartupBoundary() {
+  const imageDirectory = commandFunctionBody('app_bound::executable_directory');
+  if (!imageDirectory.includes('identity::inspect_process(std::process::id())')) {
+    throw new Error('Protected startup must classify the same kernel image path as the service');
+  }
+  const startup = commandFunctionBody('app_bound::delegate_startup');
+  const boundary = startup.indexOf('delegate_startup_in_directory(');
+  const delegate = startup.indexOf('try_delegate_startup(');
+  if (boundary < 0 || delegate < boundary) {
+    throw new Error('Production startup must delegate through the protected environment boundary');
+  }
+  const guarded = commandFunctionBody('app_bound::delegate_startup_in_directory');
+  const sanitize = guarded.indexOf('sanitize_runtime_environment(directory)?;');
+  const recoverableStartup = guarded.indexOf('match delegate()');
+  if (sanitize < 0 || recoverableStartup < sanitize) {
+    throw new Error('Protected environment sanitization must succeed before startup or repair fallback');
+  }
+}
+
 function checkDomSinks() {
   const sinkPattern = /\b(dangerouslySetInnerHTML|innerHTML|insertAdjacentHTML|eval\s*\(|new\s+Function\s*\()/;
   const offenders = walk(path.join(ROOT, 'src'))
@@ -439,6 +458,7 @@ checkProtectedRecapBoundary();
 checkCommandPolicies();
 checkCommandGuardImplementations();
 checkRuntimeControlInvariants();
+checkProtectedStartupBoundary();
 checkDomSinks();
 checkBrowserDialogs();
 console.log('Security guards passed');
