@@ -377,6 +377,9 @@ async fn run_rust_clip_query(
         .state::<Arc<crate::clip_ann::ClipAnnState>>()
         .inner()
         .clone();
+    // Verify/decrypt an evicted persistent reader while the query text model
+    // loads. Missing or damaged generations remain owned by the builder.
+    crate::clip_ann::ensure_reader_loaded(app);
 
     let embedding = query_stage_async(&diagnostics, "embedding", async {
         semantic
@@ -406,6 +409,7 @@ async fn run_rust_clip_query(
     }
 
     query_stage_async(&diagnostics, "ann_arm", async {
+        crate::clip_ann::ensure_reader_loaded(app);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
             let _ = ann_state

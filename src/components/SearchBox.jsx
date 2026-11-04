@@ -4,6 +4,7 @@ import { Image as ImageIcon, Search, Loader2, X, Square, CornerDownLeft } from '
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 import { ProgressBar } from './overlay/ProgressBlock';
+import { Banner } from './ui/Banner';
 
 export function SearchBox({ onSelectResult, onSubmit, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
     const { t } = useTranslation();
@@ -32,6 +33,8 @@ export function SearchBox({ onSelectResult, onSubmit, monitorPaused, handlePause
         semanticIndexTaskLabel,
         hasClipIndexTask,
         clipIndexTaskLabel,
+        hasAnnIndexTask,
+        annIndexTaskLabel,
         showProgressBar,
         progressFillPercent,
         progressActive,
@@ -149,6 +152,12 @@ export function SearchBox({ onSelectResult, onSubmit, monitorPaused, handlePause
                                 </button>
                             )}
                         </div>
+                    )}
+                    {hasAnnIndexTask && (
+                        <Banner icon={ImageIcon} title={t('search.task.annIndexRunningTitle')}
+                            className="shrink-0 rounded-none border-x-0 border-t-0">
+                            <p role="status">{annIndexTaskLabel}</p>
+                        </Banner>
                     )}
                     {hasSemanticIndexTask && (
                         <div className="p-3 bg-amber-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">

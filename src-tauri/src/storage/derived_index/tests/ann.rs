@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn frozen_input_cursor_bounds_keep_the_job_join_on_a_covering_point_lookup() {
+    let (_temp, storage) = test_storage();
+    let guard = storage.db.lock().unwrap();
+    let conn = guard.as_ref().unwrap();
+    let sql = crate::storage::ann_build::frozen_input_page_sql();
+    let plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(params!["clip_image", "a", 64, "z"], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("COVERING INDEX idx_derived_jobs_completed_visibility")),
+        "freezing must not scan job payload pages: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .filter(|step| step.starts_with("SEARCH "))
+            .last()
+            .is_some_and(|step| step.contains("subject_key=?")),
+        "the inner join must seek one subject, rather than repeat a bounded range: {plan:?}"
+    );
+    assert!(!plan.iter().any(|step| step.contains("TEMP B-TREE")));
+}
+
+#[test]
 fn ann_generation_zero_is_a_real_fence_and_stale_builds_cannot_write() {
     let (_temp, storage) = test_storage();
     let mut state = ann_checkpoint(&storage, 78);

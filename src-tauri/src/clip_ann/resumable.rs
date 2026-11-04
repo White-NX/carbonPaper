@@ -17,6 +17,10 @@ use std::process::ChildStdin;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
+pub(super) fn model_fingerprint() -> String {
+    format!("{CLIP_VECTOR_SPACE_REVISION}:{ANN_IMPLEMENTATION_VERSION}:{FORMAT_VERSION}:{ANN_WORKER_PROTOCOL}")
+}
+
 pub(super) struct BuildWorker {
     generation: u64,
     db_generation: u64,
@@ -492,15 +496,36 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
     let lifecycle = ann.lifecycle_token();
     let db_generation = storage.db_generation();
     let dataset = storage.processing_dataset_id()?;
+    let persistent = storage.get_derived_ann_generation(DerivedIndexKind::ClipImage)?;
+    if persistent.is_none() {
+        ann.require_rebuild(lifecycle);
+    }
+    if !manual && !ann.rebuild_required() && !ann.has_generation() {
+        // A valid on-disk generation needs a reader, not another full build.
+        drop(_build);
+        ensure_reader_loaded(app);
+        return Ok(ScheduledSliceResult::skipped("ann_reader_loading"));
+    }
     let mut state = match storage.ann_build_checkpoint() {
         Err(error) if matches!(error, TaskError::InvalidCheckpoint(_)) => None,
         result => result?,
     };
-    let contract = format!("{CLIP_VECTOR_SPACE_REVISION}:{ANN_IMPLEMENTATION_VERSION}:{FORMAT_VERSION}:{ANN_WORKER_PROTOCOL}");
+    let contract = model_fingerprint();
     if state
         .as_ref()
         .is_some_and(|s| s.dataset_id != dataset || s.model_fingerprint != contract)
     {
+        ann.resumable_worker.lock().await.take();
+        state = None;
+    }
+    if ann.rebuild_required()
+        && persistent
+            .as_ref()
+            .zip(state.as_ref())
+            .is_some_and(|(ready, checkpoint)| ready.generation == checkpoint.generation)
+    {
+        // A ready manifest can outlive missing/corrupt files. Its published
+        // checkpoint must not skip reconstruction or merely clean up inputs.
         ann.resumable_worker.lock().await.take();
         state = None;
     }
@@ -524,7 +549,8 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
         ) {
             return Ok(ScheduledSliceResult::skipped("retry_wait"));
         }
-        if !rebuild_needed(&storage, manual || !ann.has_generation())? {
+        if !rebuild_needed(&storage, manual || ann.rebuild_required())? {
+            ann.clear_build_progress(app, lifecycle);
             return Ok(ScheduledSliceResult::complete(false));
         }
         if policy::is_background() {
@@ -608,6 +634,8 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
     if storage.db_generation() != db_generation {
         return Err(TaskError::Paused("database_changed"));
     }
+    ann.update_build_progress(app, lifecycle, &state, true, None);
+    let mut live_built = None;
     let result: Result<ScheduledSliceResult, TaskError> = async {
         match state.phase.as_str() {
             "freeze" => {
@@ -674,7 +702,9 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                     if result.is_err() {
                         slot.take();
                     }
-                    result?;
+                    let opened = result?;
+                    live_built = Some(opened.built);
+                    ann.update_build_progress(app, lifecycle, &state, true, live_built);
                 }
                 let result = slot
                     .as_mut()
@@ -688,8 +718,20 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                         // scratch buffer. Recreate the worker from a complete
                         // checkpoint; the authoritative frozen rows survive.
                         slot.take();
+                        live_built = Some(
+                            state
+                                .complete
+                                .as_ref()
+                                .map_or(0, |checkpoint| checkpoint.rows),
+                        );
                         if matches!(error, TaskError::InvalidCheckpoint(_)) && !error.is_pause() {
                             state.complete = state.previous.take();
+                            live_built = Some(
+                                state
+                                    .complete
+                                    .as_ref()
+                                    .map_or(0, |checkpoint| checkpoint.rows),
+                            );
                             storage.save_ann_build_checkpoint(&state)?;
                             return Ok(ScheduledSliceResult::skipped("checkpoint_recovery"));
                         }
@@ -700,6 +742,8 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                     slot.take();
                     return Err(error);
                 }
+                live_built = Some(reply.built);
+                ann.update_build_progress(app, lifecycle, &state, true, live_built);
                 if let (Some(path), Some(checksum)) = (reply.checkpoint, reply.checksum) {
                     let expected = directory
                         .join(state.flat_name())
@@ -807,7 +851,8 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
                     &data_dir,
                     manifest,
                     storage.protected_ann_resume_key(&state.encryption_key_id)?,
-                )?;
+                )
+                .map_err(|error| error.into_parts().0)?;
                 let _publish = storage.derived_generation_publish_guard();
                 policy::check_current()?;
                 if storage.db_generation() != db_generation
@@ -838,6 +883,7 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
         Ok(ScheduledSliceResult::complete(true))
     }
     .await;
+    ann.update_build_progress(app, lifecycle, &state, false, live_built);
     if let Err(error) = &result {
         if !error.is_pause() {
             record_ann_build_failure(app, &storage, &ann, lifecycle, &error.to_string())?;

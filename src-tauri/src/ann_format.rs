@@ -413,6 +413,14 @@ pub struct MappedFlatIndex {
     cache: Mutex<VectorCache>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AnnReadError {
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
 enum FlatBacking {
     Mapped(Mmap),
     Owned(Vec<u8>),
@@ -456,12 +464,14 @@ struct VectorCache {
 impl MappedFlatIndex {
     /// Read only the nonsecret key identity. The complete header is verified
     /// with that key before any vector or graph bytes are accepted.
-    pub fn encryption_key_id(path: &Path) -> Result<String, String> {
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
+    pub(crate) fn encryption_key_id(path: &Path) -> Result<String, AnnReadError> {
+        let mut file = File::open(path)?;
         let mut bytes = [0u8; HEADER_BYTES as usize];
-        file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        file.read_exact(&mut bytes)?;
         if &bytes[..8] != MAGIC {
-            return Err("Encrypted ANN sidecar format is required".into());
+            return Err(AnnReadError::Invalid(
+                "Encrypted ANN sidecar format is required".into(),
+            ));
         }
         Ok(hex::encode(
             &bytes[FIELD_ENCRYPTION_KEY..FIELD_ENCRYPTION_KEY + 16],
@@ -469,11 +479,18 @@ impl MappedFlatIndex {
     }
 
     pub fn open(path: &Path, encryption: Arc<CipherKey>) -> Result<Self, String> {
-        let file = File::open(path)
-            .map_err(|error| format!("Failed to open ANN sidecar {}: {error}", path.display()))?;
-        let map = unsafe { MmapOptions::new().map(&file) }
-            .map_err(|error| format!("Failed to mmap ANN sidecar {}: {error}", path.display()))?;
+        Self::open_checked(path, encryption)
+            .map_err(|error| format!("Failed to load ANN sidecar {}: {error}", path.display()))
+    }
+
+    pub(crate) fn open_checked(
+        path: &Path,
+        encryption: Arc<CipherKey>,
+    ) -> Result<Self, AnnReadError> {
+        let file = File::open(path)?;
+        let map = unsafe { MmapOptions::new().map(&file) }?;
         Self::from_backing(Some(file), FlatBacking::Mapped(map), encryption)
+            .map_err(AnnReadError::Invalid)
     }
 
     pub fn from_bytes(bytes: Vec<u8>, encryption: Arc<CipherKey>) -> Result<Self, String> {

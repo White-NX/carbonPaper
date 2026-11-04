@@ -61,11 +61,11 @@ pub const SEMANTIC_CACHE_IDLE_TTL: Duration = Duration::from_secs(300);
 
 /// Hard resident-cache budgets. They bound the private heap even when the
 /// corresponding durable index has no retention window. The CLIP budget is
-/// intentionally large enough for the current ~52k-row corpus, while a larger
+/// intentionally large enough for roughly 100k image vectors, while a larger
 /// history uses the paged exact-scan path below instead of silently truncating
 /// the searchable set.
 pub const SEMANTIC_TEXT_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
-pub const CLIP_IMAGE_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub const CLIP_IMAGE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Conservative allocator overhead used by the admission estimate. Rust does
 /// not expose an allocator's per-allocation bookkeeping, so the estimate errs

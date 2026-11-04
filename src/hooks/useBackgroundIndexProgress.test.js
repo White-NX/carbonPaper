@@ -91,4 +91,18 @@ describe('useBackgroundIndexProgress', () => {
     await act(async () => { reply({ semantic: idle, clip }); await fresh; });
     expect(getBackgroundIndexProgress).toHaveBeenCalledTimes(2);
   });
+
+  it('keeps completed ANN recovery from being resurrected by an older poll', async () => {
+    let reply;
+    getBackgroundIndexProgress.mockReturnValueOnce(new Promise((resolve) => { reply = resolve; }));
+    const hook = renderHook(() => useBackgroundIndexProgress());
+    await act(async () => {});
+    const ann = { phase: 'running', running: true, recovery_needed: true, stage: 'build', percent: 68, revision: 4 };
+    act(() => events['clip-ann-build-progress']({ payload: ann }));
+    expect(hook.result.current.progress.ann.percent).toBe(68);
+    act(() => events['clip-ann-build-progress']({ payload: { ...ann, phase: 'idle', running: false, recovery_needed: false, percent: 100, revision: 5 } }));
+    await act(async () => { reply({ ann: { ...ann, revision: 3 } }); });
+    expect(hook.result.current.progress.ann.recovery_needed).toBe(false);
+    expect(hook.result.current.progress.ann.percent).toBe(100);
+  });
 });

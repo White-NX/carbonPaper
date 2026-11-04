@@ -2071,6 +2071,7 @@ pub struct BackgroundIndexProgress {
     pub semantic: IndexTaskProgress,
     pub clip: IndexTaskProgress,
     pub recap: crate::ai::recap::RecapIndexProgress,
+    pub ann: crate::clip_ann::AnnBuildProgress,
 }
 
 /// Read manual screenshot indexing and automatic recap indexing together.
@@ -2089,6 +2090,7 @@ pub async fn get_background_index_progress(
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
     recap_run: tauri::State<'_, crate::ai::recap::RecapSearchRuntime>,
+    ann_run: tauri::State<'_, Arc<crate::clip_ann::ClipAnnState>>,
 ) -> Result<BackgroundIndexProgress, String> {
     let recap_revision = recap_run.progress().run.revision;
     let read_storage = storage.inner().clone();
@@ -2102,6 +2104,12 @@ pub async fn get_background_index_progress(
     let recap = recap_run.sync_scheduler_progress(&app, recap_task, recap_revision);
     Ok(BackgroundIndexProgress {
         recap,
+        ann: ann_run.build_progress(
+            tasks
+                .iter()
+                .find(|row| row.task_kind == crate::background_scheduler::TASK_ANN_BUILD),
+            read_wait_reason,
+        ),
         semantic: IndexTaskProgress::resolve(
             index_run.progress(),
             tasks
