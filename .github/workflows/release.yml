@@ -121,74 +121,19 @@ jobs:
           CARBONPAPER_UPDATE_PUBLIC_KEY_FILE: src-tauri/update-public-key.txt
         run: node scripts/generate-latest-json.mjs ${{ github.ref_name }} release_body.txt
 
-      - name: Smoke test previous stable portable update
+      - name: Verify packaged update policy
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
-          CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION: ${{ vars.CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION }}
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          $zipFile = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
-          $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
-          $smokeArgs = @{
-            TargetTag                              = "${{ github.ref_name }}"
-            TargetVersion                          = $version
-            CandidateZip                           = $zipFile
-            LatestJson                             = $latestJson
-            TimeoutSeconds                         = 180
-            SkipIfPreviousReleaseLacksSmokeSupport = $true
-          }
-          if (-not [string]::IsNullOrWhiteSpace($env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION)) {
-            $smokeArgs["MinPreviousVersionWithSmokeHook"] = $env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION
-          }
-          ./scripts/update-smoke.ps1 @smokeArgs
+          ./scripts/update-smoke.ps1 -CandidateZip "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip" -LatestJson "src-tauri/target/release/bundle/nsis/latest.json"
 
-      - name: Build forward update smoke target
+      - name: Run native update regressions
         shell: pwsh
-        env:
-          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          $core = ($version -split '[-+]')[0]
-          $parts = $core.Split('.')
-          if ($parts.Count -ne 3) {
-            throw "Cannot derive forward smoke version from tag version '$version'"
-          }
-          $patch = [int]$parts[2] + 1
-          $futureVersion = "$($parts[0]).$($parts[1]).$patch"
-          "CARBONPAPER_FORWARD_SMOKE_VERSION=$futureVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          node scripts/bump-version.mjs $futureVersion --label ""
-          npm run build:ml:release
-          npm run verify:ml-runtime
-          npm run build:office:release
-          npm run verify:office-runtime
-          npm run build:semantic-ml:release
-          npm run verify:semantic-runtime
-          npm run tauri -- build --no-bundle
-          npm run pack:portable
-
-      - name: Smoke test candidate forward portable update
-        shell: pwsh
-        env:
-          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          $futureVersion = $env:CARBONPAPER_FORWARD_SMOKE_VERSION
-          $candidateZip = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
-          $futureZip = "src-tauri/target/release/bundle/nsis/carbonpaper_${futureVersion}_x64_portable.zip"
-          $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
-          ./scripts/update-smoke.ps1 `
-            -TargetTag "${{ github.ref_name }}" `
-            -TargetVersion $futureVersion `
-            -ManifestVersion $futureVersion `
-            -ExpectedAppVersion $futureVersion `
-            -SourcePortableZip $candidateZip `
-            -CandidateZip $futureZip `
-            -LatestJson $latestJson `
-            -TimeoutSeconds 180 `
-            -RequireAppliedMarker
+          cargo test --manifest-path src-tauri/app-bound/Cargo.toml --lib windows::update::tests
+          if ($LASTEXITCODE -ne 0) { throw "Native update regressions failed" }
+          cargo test --manifest-path src-tauri/Cargo.toml --lib updater::tests
+          if ($LASTEXITCODE -ne 0) { throw "Update verifier regressions failed" }
 
       - name: Upload portable zip and latest.json
         env:

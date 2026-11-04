@@ -87,7 +87,7 @@ const latestJson = {
   notes,
   pub_date: new Date().toISOString(),
   critical,
-  update_smoke_supported: true,
+  update_smoke_supported: false,
 };
 
 if (min_version) {

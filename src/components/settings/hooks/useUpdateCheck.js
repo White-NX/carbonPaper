@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { checkForUpdate, downloadAndInstallUpdate } from '../../../lib/update_api';
+import { checkForUpdate, downloadAndInstallUpdate, openUpdateDownloadPage } from '../../../lib/update_api';
+import { formatError } from '../../../lib/errors';
 
 export function useUpdateCheck() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -22,7 +23,7 @@ export function useUpdateCheck() {
         setUpToDate(true);
       }
     } catch (err) {
-      setUpdateError(err?.message || String(err));
+      setUpdateError(formatError(err));
     } finally {
       setCheckingUpdate(false);
     }
@@ -37,7 +38,7 @@ export function useUpdateCheck() {
         setDownloadProgress(progress);
       });
     } catch (err) {
-      setUpdateError(err?.message || String(err));
+      setUpdateError(formatError(err));
     } finally {
       setDownloading(false);
     }
@@ -52,5 +53,6 @@ export function useUpdateCheck() {
     downloadProgress,
     handleCheckUpdate,
     handleDownloadUpdate,
+    handleOpenDownloads: openUpdateDownloadPage,
   };
 }

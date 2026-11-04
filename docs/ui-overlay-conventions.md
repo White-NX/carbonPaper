@@ -233,12 +233,13 @@ does not start elevation.
 | `app_bound_install` (enable or repair) | Verifies the packaged setup executable, then uses `runas` in `app_bound.rs`. Windows cancellation maps to `APP_BOUND_CANCELLED`; the caller remains available for an explicit retry. |
 | `app_bound_uninstall` | Verifies the installed setup helper, then uses the same UAC/cancellation contract. |
 | `updater_install` for a protected installation | Installs through `app_bound::install_runtime` before stopping capture. Cancelling UAC keeps the current application and monitor running. |
-| `updater_install` for an ordinary installation | A detached update script runs after application exit. It requests elevation only if the destination fails a write-access probe. Cancellation/failure is logged to `%LOCALAPPDATA%/CarbonPaper/update_error.log`; there is no in-app cancellation response after exit. |
+| `updater_install` for an ordinary installation | An unelevated native helper prepares the signed files before capture stops, then waits for the requesting process to exit before replacement. Preparation failure leaves the application running; insufficient directory permissions offer the official installer in the existing update view. |
 
 These service and updater paths remain Rust-owned. Python installation and
 executable selection are not part of the current product. Interactive checks
-must distinguish protected installation updates from the ordinary update script;
-their cancellation lifetimes differ.
+must distinguish protected installation updates from ordinary native updates:
+the protected installer owns UAC, while ordinary preparation failures return to
+the existing update view.
 
 ## Enforcement
 

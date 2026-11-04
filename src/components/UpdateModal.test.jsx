@@ -1,0 +1,20 @@
+import React from 'react';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { expect, it, vi } from 'vitest';
+import { UpdateModal } from './UpdateModal';
+import { INSTALLER_REQUIRED } from '../lib/update_api';
+
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: key => key }) }));
+
+it('offers the installer when automatic updates cannot write this installation', () => {
+  const onDownload = vi.fn();
+  const onOpenDownloads = vi.fn();
+  render(<UpdateModal isVisible updateInfo={{ version: '1.2.3' }}
+    downloadError={INSTALLER_REQUIRED} onDownload={onDownload}
+    onOpenDownloads={onOpenDownloads} onLater={vi.fn()} onClose={vi.fn()} />);
+  expect(screen.getByText('updateModal.installerRequired')).toBeInTheDocument();
+  expect(screen.queryByText(INSTALLER_REQUIRED)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'updateModal.openDownloads' }));
+  expect(onOpenDownloads).toHaveBeenCalledOnce();
+  expect(onDownload).not.toHaveBeenCalled();
+});

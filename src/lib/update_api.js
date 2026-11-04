@@ -1,6 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
 import { listen } from '@tauri-apps/api/event';
+import { openUrl } from '@tauri-apps/plugin-opener';
+
+export const INSTALLER_REQUIRED = 'UPDATER_INSTALLER_REQUIRED';
+
+export function openUpdateDownloadPage() {
+  return openUrl('https://github.com/White-NX/carbonPaper/releases/latest');
+}
 
 /**
  * Check for available updates from GitHub Releases.
