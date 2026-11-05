@@ -10,6 +10,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $serviceTest = 'windows::install::tests::existing_service_repair_reapplies_restart_policy'
+$administratorTests = @(
+    @{ test = $serviceTest; prefix = 'service' },
+    @{ test = 'windows::update::tests::elevated_update_rejects_corruption_and_preserves_protected_acls'; prefix = 'updater' },
+    @{ test = 'windows::update::process::tests::elevated_coordinator_keeps_parent_and_runs_with_restricted_permissions'; prefix = 'coordinator' }
+)
 $TestBinary = (Resolve-Path -LiteralPath $TestBinary).Path
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 [System.IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
@@ -35,9 +40,9 @@ function Get-TestHash([string]$File) {
 
 if (-not $isAdministrator) {
     if ($Elevated -or $env:CI) {
-        throw 'The isolated service regression requires an administrator Windows test process.'
+        throw 'The isolated service, updater and coordinator regressions require an administrator Windows test process.'
     }
-    Write-Host '[app-bound] Windows will request administrator access for one temporary service test.'
+    Write-Host '[app-bound] Windows will request administrator access for temporary service, signed file-update and restricted-launch tests.'
     $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
     $temporary = Join-Path $temporaryBase ('carbonpaper-native-check-' + [guid]::NewGuid().ToString('N'))
     [System.IO.Directory]::CreateDirectory($temporary) | Out-Null
@@ -55,22 +60,27 @@ if (-not $isAdministrator) {
         $powershell = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
         $child = Start-Process -FilePath $powershell -Verb RunAs -WindowStyle Hidden -Wait -PassThru `
             -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
-        foreach ($name in @('service-stdout.txt', 'service-stderr.txt', 'service-result.json')) {
-            $source = Join-Path $temporary $name
-            if (Test-Path -LiteralPath $source) {
-                Copy-Item -LiteralPath $source -Destination (Join-Path $OutputDirectory $name)
+        foreach ($test in $administratorTests) {
+            foreach ($suffix in @('stdout.txt', 'stderr.txt', 'result.json')) {
+                $name = $test.prefix + '-' + $suffix
+                $source = Join-Path $temporary $name
+                if (Test-Path -LiteralPath $source) {
+                    Copy-Item -LiteralPath $source -Destination (Join-Path $OutputDirectory $name)
+                }
             }
-        }
-        foreach ($name in @('service-stdout.txt', 'service-stderr.txt')) {
-            $log = Join-Path $OutputDirectory $name
-            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
+            foreach ($suffix in @('stdout.txt', 'stderr.txt')) {
+                $log = Join-Path $OutputDirectory ($test.prefix + '-' + $suffix)
+                if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
+            }
         }
         if ($child.ExitCode -ne 0) {
             throw ('The administrator test helper exited with code ' + $child.ExitCode + '.')
         }
-        $result = Get-Content -LiteralPath (Join-Path $OutputDirectory 'service-result.json') -Raw | ConvertFrom-Json
-        if ($result.exit_code -ne 0 -or $result.tests_passed -ne 1 -or $result.test -ne $serviceTest) {
-            throw 'The isolated administrator service regression failed.'
+        foreach ($test in $administratorTests) {
+            $result = Get-Content -LiteralPath (Join-Path $OutputDirectory ($test.prefix + '-result.json')) -Raw | ConvertFrom-Json
+            if ($result.exit_code -ne 0 -or $result.tests_passed -ne 1 -or $result.test -ne $test.test) {
+                throw ('The isolated administrator ' + $test.prefix + ' regression failed.')
+            }
         }
     } finally {
         # Delete only the unique temporary directory created by this invocation.
@@ -86,32 +96,36 @@ if (-not $isAdministrator) {
     exit 0
 }
 
-$result = @{ test = $serviceTest; exit_code = 1; tests_passed = 0 }
-try {
-    if ($ExpectedHash -and (Get-TestHash $TestBinary) -ne $ExpectedHash) {
-        throw 'The test executable changed after preparation.'
-    }
-    $stdout = Join-Path $OutputDirectory 'service-stdout.txt'
-    $stderr = Join-Path $OutputDirectory 'service-stderr.txt'
-    $process = Start-Process -FilePath $TestBinary -WindowStyle Hidden -Wait -PassThru `
-        -ArgumentList @($serviceTest, '--ignored', '--exact', '--nocapture') `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $result.exit_code = $process.ExitCode
-    $output = Get-Content -LiteralPath $stdout -Raw
-    if ($output -match '(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored;') {
-        $result.tests_passed = 1
-    }
-    if ($result.exit_code -eq 0 -and $result.tests_passed -ne 1) {
+$exitCode = 0
+foreach ($test in $administratorTests) {
+    $result = @{ test = $test.test; exit_code = 1; tests_passed = 0 }
+    try {
+        if ($ExpectedHash -and (Get-TestHash $TestBinary) -ne $ExpectedHash) {
+            throw 'The test executable changed after preparation.'
+        }
+        $stdout = Join-Path $OutputDirectory ($test.prefix + '-stdout.txt')
+        $stderr = Join-Path $OutputDirectory ($test.prefix + '-stderr.txt')
+        $process = Start-Process -FilePath $TestBinary -WindowStyle Hidden -Wait -PassThru `
+            -ArgumentList @($test.test, '--ignored', '--exact', '--nocapture') `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $result.exit_code = $process.ExitCode
+        $output = Get-Content -LiteralPath $stdout -Raw
+        if ($output -match '(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored;') {
+            $result.tests_passed = 1
+        }
+        if ($result.exit_code -eq 0 -and $result.tests_passed -ne 1) {
+            $result.exit_code = 1
+            throw 'The selected administrator regression did not run; zero tests is not a passing check.'
+        }
+        Get-Content -LiteralPath $stdout
+        Get-Content -LiteralPath $stderr
+    } catch {
+        $result.error = $_.Exception.Message
         $result.exit_code = 1
-        throw 'The selected service regression did not run; zero tests is not a passing check.'
+        Write-Host ('[app-bound] ' + $result.error)
+    } finally {
+        $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory ($test.prefix + '-result.json')) -Encoding UTF8
     }
-    Get-Content -LiteralPath $stdout
-    Get-Content -LiteralPath $stderr
-} catch {
-    $result.error = $_.Exception.Message
-    $result.exit_code = 1
-    Write-Host ('[app-bound] ' + $result.error)
-} finally {
-    $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'service-result.json') -Encoding UTF8
+    if ($result.exit_code -ne 0) { $exitCode = 1 }
 }
-exit $result.exit_code
+exit $exitCode

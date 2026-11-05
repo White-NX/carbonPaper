@@ -6,6 +6,21 @@
 use std::env;
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--verify-update-manifest")
+    {
+        if args.len() != 3 {
+            std::process::exit(2);
+        }
+        if let Err(error) =
+            carbonpaper_lib::verify_update_manifest_file(std::path::Path::new(&args[2]))
+        {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match carbonpaper_lib::delegate_protected_runtime(&args) {
         Ok(true) => return,
         Ok(false) => {}

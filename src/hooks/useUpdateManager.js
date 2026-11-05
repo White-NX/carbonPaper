@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { checkForUpdate, downloadAndInstallUpdate } from '../lib/update_api';
+import { checkForUpdate, downloadAndInstallUpdate, openUpdateDownloadPage } from '../lib/update_api';
+import { formatError } from '../lib/errors';
 import { useDebugOverlay } from '../components/overlay/coordinator';
 
 export function useUpdateManager() {
@@ -45,7 +46,7 @@ export function useUpdateManager() {
         setUpdateDownloadProgress(progress);
       });
     } catch (err) {
-      setUpdateDownloadError(err.message || String(err));
+      setUpdateDownloadError(formatError(err));
       setUpdateDownloading(false);
     }
   };
@@ -65,6 +66,7 @@ export function useUpdateManager() {
     updateDownloadError,
     setUpdateModalVisible,
     handleDownloadUpdate,
+    handleOpenDownloads: openUpdateDownloadPage,
     handleLater,
   };
 }

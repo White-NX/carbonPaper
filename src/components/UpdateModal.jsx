@@ -5,6 +5,7 @@ import { Download, RefreshCw, AlertCircle, ArrowUpCircle } from 'lucide-react';
 import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
+import { ELEVATION_CANCELLED, INSTALLER_REQUIRED, RESTART_REQUIRED } from '../lib/update_api';
 
 export function UpdateModal({
   isVisible,
@@ -13,6 +14,7 @@ export function UpdateModal({
   downloadProgress,
   downloadError,
   onDownload,
+  onOpenDownloads,
   onLater,
   onClose
 }) {
@@ -22,6 +24,9 @@ export function UpdateModal({
   if (!visible) return null;
 
   const { version, body, critical } = updateInfo;
+  const requiresInstaller = downloadError === INSTALLER_REQUIRED;
+  const elevationCancelled = downloadError === ELEVATION_CANCELLED;
+  const requiresRestart = downloadError === RESTART_REQUIRED;
   const phase = downloadProgress?.phase || 'downloading';
   const hasValidTotal = downloadProgress && downloadProgress.contentLength > 0;
   const progressPercent = hasValidTotal
@@ -43,8 +48,8 @@ export function UpdateModal({
     footer = (
       <>
         <Button size="md" onClick={onClose}>{t('updateModal.later')}</Button>
-        <Button size="md" variant="primary" icon={RefreshCw} disabled={downloading} onClick={onDownload}>
-          {t('updateModal.retry')}
+        <Button size="md" variant="primary" icon={requiresInstaller ? Download : RefreshCw} disabled={downloading} onClick={requiresInstaller ? onOpenDownloads : onDownload}>
+          {t(requiresInstaller ? 'updateModal.openDownloads' : 'updateModal.retry')}
         </Button>
       </>
     );
@@ -80,7 +85,7 @@ export function UpdateModal({
       </div>
 
       {downloadError && (
-        <Banner tone="error" className="shrink-0">{t('updateModal.downloadFailed', { error: downloadError })}</Banner>
+        <Banner tone={elevationCancelled || requiresRestart ? 'info' : 'error'} className="shrink-0">{requiresInstaller ? t('updateModal.installerRequired') : requiresRestart ? t('updateModal.restartRequired') : elevationCancelled ? t('updateModal.elevationCancelled') : t('updateModal.downloadFailed', { error: downloadError })}</Banner>
       )}
 
       {downloading && (
@@ -110,6 +115,7 @@ UpdateModal.propTypes = {
   }),
   downloadError: PropTypes.string,
   onDownload: PropTypes.func.isRequired,
+  onOpenDownloads: PropTypes.func,
   onLater: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
 };

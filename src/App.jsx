@@ -189,6 +189,7 @@ function App() {
     updateDownloadError,
     setUpdateModalVisible,
     handleDownloadUpdate,
+    handleOpenDownloads,
     handleLater,
   } = useUpdateManager();
 
@@ -304,6 +305,7 @@ function App() {
           downloadProgress={updateDownloadProgress}
           downloadError={updateDownloadError}
           onDownload={handleDownloadUpdate}
+          onOpenDownloads={handleOpenDownloads}
           onLater={handleLater}
           onClose={() => setUpdateModalVisible(false)}
         />

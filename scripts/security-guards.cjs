@@ -435,6 +435,17 @@ function checkProtectedRecapBoundary() {
     throw new Error('Recap generation must retain the process background authorization gate');
   }
 }
+function checkUpdaterTrustBoundary() {
+  for (const file of ['src-tauri/src/updater.rs', 'src-tauri/src/lib.rs']) {
+    if (/CARBONPAPER_UPDATE_(?:SMOKE|MANIFEST_URL)|is_update_smoke_test_enabled|maybe_run_update_smoke_test/.test(read(file))) {
+      throw new Error('Production updater must not expose environment-driven smoke installation or key overrides');
+    }
+  }
+  if (/update\.ps1|powershell\.exe/.test(read('src-tauri/src/updater.rs'))) {
+    throw new Error('Updater handoff must use a verified native executable');
+  }
+}
+checkUpdaterTrustBoundary();
 checkProtectedRecapBoundary();
 checkCommandPolicies();
 checkCommandGuardImplementations();

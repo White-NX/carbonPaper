@@ -383,14 +383,19 @@ pub(crate) fn schedule_restart(app: &AppHandle) -> Result<(), String> {
             .ok_or("Restart helper is missing")?,
     )
     .map_err(|e| e.to_string())?;
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new(&helper)
-        .arg("--launch-after")
-        .arg(std::process::id().to_string())
-        .current_dir(runtime)
-        .creation_flags(0x08000000)
-        .spawn()
+    let context = carbonpaper_app_bound::windows::update::CoordinatorContext::new()
         .map_err(|e| e.to_string())?;
+    let mut child = context
+        .spawn_restart(
+            &helper,
+            &[
+                "--launch-after".into(),
+                std::process::id().to_string().into(),
+            ],
+            &runtime,
+        )
+        .map_err(|e| e.to_string())?;
+    child.detach();
     crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
     app.exit(0);
     Ok(())

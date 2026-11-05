@@ -1266,6 +1266,10 @@
     "extracting": "正在解压更新...",
     "applying": "正在应用更新...",
     "downloadFailed": "下载失败: {{error}}",
+    "installerRequired": "请通过安装包更新此份 CarbonPaper。前往发布页下载并安装最新版。",
+    "elevationCancelled": "更新已取消，CarbonPaper 继续运行。你可以稍后重试。",
+    "restartRequired": "请从系统托盘退出 CarbonPaper，以普通权限重新打开后再尝试更新。",
+    "openDownloads": "前往发布页",
     "criticalNotice": "该更新包含重要的安全修复或功能改进，为了您的数据安全和最佳体验，需要尽快更新。"
   },
   "topbar": {
