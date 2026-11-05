@@ -7,7 +7,8 @@
 //! `AppHandle` (reverse IPC, MCP dispatch, background loops).
 //!
 //! Allowed while active: status queries, Windows Hello authentication, and app
-//! exit. Maintenance tasks have no user cancellation path.
+//! exit. Backup preparation also accepts authenticated cancellation; its final
+//! durable commit completes under the maintenance guard.
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};

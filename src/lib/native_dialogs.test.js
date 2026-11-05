@@ -7,15 +7,15 @@ beforeEach(() => { open.mockReset(); save.mockReset(); });
 
 describe('native file selection', () => {
   it('keeps export defaults and the backup archive filter', async () => {
-    save.mockResolvedValue('D:/Backup.zip');
-    await expect(selectBackupExportPath()).resolves.toBe('D:/Backup.zip');
-    expect(save).toHaveBeenCalledWith({ defaultPath: 'CarbonPaper_Backup.zip', filters: [{ name: 'CarbonPaper Backup', extensions: ['zip'] }] });
+    save.mockResolvedValue('D:/Backup.cpbackup');
+    await expect(selectBackupExportPath()).resolves.toBe('D:/Backup.cpbackup');
+    expect(save).toHaveBeenCalledWith({ defaultPath: 'CarbonPaper_Backup.cpbackup', filters: [{ name: 'CarbonPaper Backup', extensions: ['cpbackup'] }] });
   });
 
   it('selects exactly one backup file or one storage directory', async () => {
     open.mockResolvedValueOnce(['D:/Backup.zip']).mockResolvedValueOnce('D:/Storage');
     await expect(selectBackupImportPath()).resolves.toBe('D:/Backup.zip');
-    expect(open).toHaveBeenNthCalledWith(1, { directory: false, multiple: false, filters: [{ name: 'CarbonPaper Backup', extensions: ['zip'] }] });
+    expect(open).toHaveBeenNthCalledWith(1, { directory: false, multiple: false, filters: [{ name: 'CarbonPaper Backup', extensions: ['cpbackup', 'zip'] }] });
     await expect(selectStorageDirectory()).resolves.toBe('D:/Storage');
     expect(open).toHaveBeenNthCalledWith(2, { directory: true, multiple: false });
   });

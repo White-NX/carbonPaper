@@ -1079,6 +1079,7 @@ pub fn run() {
             commands::migration::storage_run_hmac_migration,
             commands::migration::storage_export_backup,
             commands::migration::storage_import_backup,
+            commands::migration::storage_backup_cancel,
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::ai::ai_get_settings,

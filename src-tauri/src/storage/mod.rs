@@ -7,6 +7,9 @@
 
 mod ann_build;
 mod background_scheduler;
+pub(crate) mod backup;
+mod backup_format;
+mod backup_keys;
 mod blind_index;
 mod blind_search;
 mod classification;
@@ -90,6 +93,7 @@ impl From<String> for BackgroundReadError {
 /// It provides methods for initializing storage, saving/loading screenshots and OCR results,
 /// and migrating the data directory.
 pub struct StorageState {
+    pub(crate) backup: backup::Control,
     pub(crate) processing_stage: Arc<crate::processing_stage::ProcessingStaging>,
     protected: Arc<protected::ProtectedStorage>,
     /// Database connection
@@ -231,6 +235,7 @@ impl StorageState {
         ));
 
         Self {
+            backup: backup::Control::default(),
             processing_stage,
             protected,
             db: Mutex::new(None),

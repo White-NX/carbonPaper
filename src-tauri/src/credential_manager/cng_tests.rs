@@ -140,6 +140,29 @@ pub(crate) fn storage_credentials(directory: &std::path::Path) -> Arc<Credential
     state
 }
 
+/// Reopen a fixture using only its local CNG key and persisted credential file.
+/// Unnamed test keys cannot be opened by name, so transfer their handle while
+/// discarding all old master/public/session caches.
+pub(crate) fn reopen_storage_credentials(
+    previous: &CredentialManagerState,
+    directory: &std::path::Path,
+) -> Arc<CredentialManagerState> {
+    let key = previous.cached_private_key.lock().unwrap().take().unwrap();
+    let public = public_blob(&key);
+    let wrapped =
+        decode_master_key_file(&std::fs::read(directory.join(MASTER_KEY_FILE_NAME)).unwrap())
+            .unwrap();
+    let master = key.unwrap_row_key(&wrapped).unwrap();
+    let state = Arc::new(CredentialManagerState::new(directory.into()));
+    state.set_session_timeout(-1);
+    state.background_enabled_for_tests(false);
+    state.fixture_public_key(&public);
+    *state.cached_private_key.lock().unwrap() = Some(key);
+    state.cache_master_key_for_tests(master);
+    state.update_auth_time();
+    state
+}
+
 #[test]
 fn public_export_can_open_before_enforcing_silence_on_public_operations() {
     let key = ephemeral_key();

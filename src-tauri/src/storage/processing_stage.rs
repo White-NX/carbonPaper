@@ -77,6 +77,7 @@ impl StorageState {
             .map_err(|e| e.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn reset_processing_dataset(&self) -> Result<(), String> {
         self.processing_stage.retire_dataset()?;
         let guard = self.get_connection_named("reset_processing_dataset")?;

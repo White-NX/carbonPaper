@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +36,7 @@ pub(crate) const DATABASE_RUNTIME_FILE_NAMES: [&str; 4] = [
     DATABASE_JOURNAL_FILE_NAME,
 ];
 
-const BACKUP_FORMAT_VERSION: u32 = 2;
+pub(crate) const BACKUP_FORMAT_VERSION: u32 = 2;
 const RESTORE_ENTRY_NAMES: [&str; 8] = [
     DATABASE_FILE_NAME,
     DATABASE_WAL_FILE_NAME,
@@ -196,13 +196,23 @@ impl DatabaseSnapshot {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ExtractedBackup {
     directory: TemporaryDirectory,
     pub(crate) manifest: BackupManifest,
     pub(crate) legacy: bool,
     pub(crate) metadata: Vec<u8>,
     pub(crate) encrypted_master_key: Vec<u8>,
+    pub(crate) portable_keys: Option<zeroize::Zeroizing<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for ExtractedBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractedBackup")
+            .field("directory", &self.directory)
+            .field("manifest", &self.manifest)
+            .field("legacy", &self.legacy)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExtractedBackup {
@@ -419,11 +429,13 @@ pub(crate) fn create_database_snapshot(
 /// Archives written by older releases that do contain it are still accepted
 /// by `validate_backup_entry_name` and restored by the transaction, after
 /// which the same discard removes it.
+#[cfg(test)]
 const BACKUP_PAYLOAD_ROOTS: [&str; 1] = ["screenshots"];
 
 /// Copy the user-facing payload directories into a staging tree.  Database
 /// files are intentionally excluded because they must come from
 /// `copy_database_group`; thumbnail and derived-index caches are rebuildable.
+#[cfg(test)]
 pub(crate) fn copy_payload_tree(
     source_directory: &Path,
     target_directory: &Path,
@@ -522,6 +534,7 @@ where
     Ok(copied)
 }
 
+#[cfg(test)]
 pub(crate) fn write_manifest(path: &Path, manifest: &BackupManifest) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|error| format!("Failed to serialize backup manifest: {error}"))?;
@@ -533,7 +546,7 @@ pub(crate) fn write_manifest(path: &Path, manifest: &BackupManifest) -> Result<(
     })
 }
 
-fn normalize_archive_name(raw_name: &str, is_directory: bool) -> Result<String, String> {
+pub(super) fn normalize_archive_name(raw_name: &str, is_directory: bool) -> Result<String, String> {
     if raw_name.is_empty() || raw_name.contains('\0') || raw_name.contains('\\') {
         return Err(format!("Unsafe backup entry path: {raw_name:?}"));
     }
@@ -686,10 +699,11 @@ fn validate_database_file_set(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn extract_backup_archive<F>(
     archive_path: &Path,
     temporary_parent: &Path,
-    mut progress: F,
+    progress: F,
 ) -> Result<ExtractedBackup, String>
 where
     F: FnMut(usize, usize, &str),
@@ -700,14 +714,28 @@ where
             archive_path.display()
         )
     })?;
+    extract_backup_reader(archive_file, temporary_parent, false, progress)
+}
+
+pub(super) fn extract_backup_reader<R, F>(
+    reader: R,
+    temporary_parent: &Path,
+    portable: bool,
+    mut progress: F,
+) -> Result<ExtractedBackup, String>
+where
+    R: Read + Seek,
+    F: FnMut(usize, usize, &str),
+{
     let mut archive =
-        zip::ZipArchive::new(archive_file).map_err(|error| format!("Invalid ZIP: {error}"))?;
+        zip::ZipArchive::new(reader).map_err(|error| format!("Invalid ZIP: {error}"))?;
     archive
         .validate_header_consistency()
         .map_err(|error| format!("Inconsistent backup ZIP headers: {error}"))?;
     let directory = TemporaryDirectory::create(temporary_parent, "carbonpaper-restore-staging")?;
     let total = archive.len();
     let mut names = HashSet::new();
+    let mut portable_keys = None;
 
     for index in 0..total {
         let mut entry = archive
@@ -725,12 +753,36 @@ where
         }
         let is_directory = entry.is_dir() || raw_name.ends_with('/');
         let name = normalize_archive_name(&raw_name, is_directory)?;
-        validate_archive_payload_path(&name)?;
+        let is_key_bundle = portable && name == super::backup_keys::FILE_NAME && !is_directory;
+        if !is_key_bundle {
+            validate_archive_payload_path(&name)?;
+        }
+        if portable
+            && matches!(
+                name.as_str(),
+                BACKUP_METADATA_FILE_NAME | BACKUP_MASTER_KEY_FILE_NAME
+            )
+        {
+            return Err("Legacy key files are not valid in a portable backup".into());
+        }
         let duplicate_key = name.to_ascii_lowercase();
         if !names.insert(duplicate_key) {
             return Err(format!("Duplicate backup entry: {name}"));
         }
 
+        if is_key_bundle {
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            entry
+                .take(super::backup_keys::MAX_BUNDLE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("Failed to read portable key bundle: {error}"))?;
+            if bytes.len() > super::backup_keys::MAX_BUNDLE_BYTES {
+                return Err("Backup key inventory is too large".into());
+            }
+            portable_keys = Some(bytes);
+            progress(index + 1, total, &name);
+            continue;
+        }
         let output = directory.path().join(Path::new(&name));
         if is_directory {
             std::fs::create_dir_all(&output).map_err(|error| {
@@ -770,8 +822,17 @@ where
         progress(index + 1, total, &name);
     }
 
-    let metadata = read_required_file(directory.path(), BACKUP_METADATA_FILE_NAME)?;
-    let encrypted_master_key = read_required_file(directory.path(), BACKUP_MASTER_KEY_FILE_NAME)?;
+    let (metadata, encrypted_master_key) = if portable {
+        if portable_keys.is_none() {
+            return Err("Portable backup key bundle is missing".into());
+        }
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            read_required_file(directory.path(), BACKUP_METADATA_FILE_NAME)?,
+            read_required_file(directory.path(), BACKUP_MASTER_KEY_FILE_NAME)?,
+        )
+    };
     let actual = actual_database_file_map(directory.path())?;
     let manifest_path = directory.path().join(BACKUP_MANIFEST_FILE_NAME);
     let (manifest, legacy) = if manifest_path.exists() {
@@ -781,6 +842,9 @@ where
             .map_err(|error| format!("Invalid backup manifest: {error}"))?;
         (manifest, false)
     } else {
+        if portable {
+            return Err("Portable backup manifest is missing".into());
+        }
         if actual.contains_key(DATABASE_WAL_FILE_NAME)
             || actual.contains_key(DATABASE_SHM_FILE_NAME)
         {
@@ -807,6 +871,7 @@ where
         legacy,
         metadata,
         encrypted_master_key,
+        portable_keys,
     })
 }
 
@@ -1116,7 +1181,12 @@ fn create_durable_marker(directory: &Path, name: &str) -> Result<(), String> {
             ))
         };
     }
-    write_durable_new_file(&path, b"1\n")
+    // Publish only after the marker bytes are synced. A failed sync must not
+    // leave a complete-looking commit marker that would disable rollback.
+    let pending = TemporaryDirectory::create(directory, "carbonpaper-marker")?;
+    let staged = pending.path().join(name);
+    write_durable_new_file(&staged, b"1\n")?;
+    rename_durable(&staged, &path)
 }
 
 fn durable_marker_exists(directory: &Path, name: &str) -> Result<bool, String> {
