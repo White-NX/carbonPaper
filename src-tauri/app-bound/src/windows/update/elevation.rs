@@ -295,7 +295,7 @@ fn verify_destination(destination: &Path) -> Result<DirectoryLocks> {
     {
         return Err(BrokerError::AccessDenied);
     }
-    identity::assert_protected(destination)?;
+    identity::assert_ordinary_installation(destination)?;
     Ok(parents)
 }
 

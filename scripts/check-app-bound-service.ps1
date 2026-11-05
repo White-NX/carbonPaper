@@ -12,7 +12,8 @@ $ProgressPreference = 'SilentlyContinue'
 $serviceTest = 'windows::install::tests::existing_service_repair_reapplies_restart_policy'
 $administratorTests = @(
     @{ test = $serviceTest; prefix = 'service' },
-    @{ test = 'windows::update::tests::elevated_update_rejects_corruption_and_preserves_protected_acls'; prefix = 'updater' }
+    @{ test = 'windows::update::tests::elevated_update_rejects_corruption_and_preserves_protected_acls'; prefix = 'updater' },
+    @{ test = 'windows::update::process::tests::elevated_coordinator_keeps_parent_and_runs_with_restricted_permissions'; prefix = 'coordinator' }
 )
 $TestBinary = (Resolve-Path -LiteralPath $TestBinary).Path
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
@@ -39,9 +40,9 @@ function Get-TestHash([string]$File) {
 
 if (-not $isAdministrator) {
     if ($Elevated -or $env:CI) {
-        throw 'The isolated service and updater regressions require an administrator Windows test process.'
+        throw 'The isolated service, updater and coordinator regressions require an administrator Windows test process.'
     }
-    Write-Host '[app-bound] Windows will request administrator access for temporary service and signed file-update tests.'
+    Write-Host '[app-bound] Windows will request administrator access for temporary service, signed file-update and restricted-launch tests.'
     $temporaryBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
     $temporary = Join-Path $temporaryBase ('carbonpaper-native-check-' + [guid]::NewGuid().ToString('N'))
     [System.IO.Directory]::CreateDirectory($temporary) | Out-Null

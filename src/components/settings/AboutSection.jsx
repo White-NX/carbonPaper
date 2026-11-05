@@ -6,12 +6,13 @@ import { APP_VERSION } from '../../lib/version';
 import appIcon from '../../../src-tauri/icons/128x128.png';
 import { SettingsButton } from './SettingsControls';
 import { SettingsDivider, SettingsErrorBanner, SettingsGroup, SettingsRow, SettingsStatus } from './SettingsPrimitives';
-import { ELEVATION_CANCELLED, INSTALLER_REQUIRED } from '../../lib/update_api';
+import { ELEVATION_CANCELLED, INSTALLER_REQUIRED, RESTART_REQUIRED } from '../../lib/update_api';
 
 export default function AboutSection({ checking, upToDate, onCheckUpdate, updateInfo, updateError, downloading, downloadProgress, onDownloadUpdate, onOpenDownloads }) {
   const { t } = useTranslation();
   const phase = downloadProgress?.phase || 'downloading';
   const requiresInstaller = updateError === INSTALLER_REQUIRED;
+  const requiresRestart = updateError === RESTART_REQUIRED;
   const progress = downloadProgress?.contentLength > 0 ? Math.min(1, downloadProgress.downloaded / downloadProgress.contentLength) : undefined;
   return <div className="space-y-6">
     <div className="flex items-center gap-4 py-2">
@@ -21,11 +22,11 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate, update
     <SettingsGroup className="space-y-3">
       <SettingsRow label={t('settings.about.updates')} description={updateInfo ? t('settings.about.available', { version: updateInfo.version }) : upToDate ? t('settings.about.latest') : APP_VERSION}
         control={<SettingsButton icon={RefreshCw} onClick={onCheckUpdate} disabled={checking || downloading}>{t(checking ? 'settings.about.checking' : 'settings.about.check')}</SettingsButton>} />
-      {updateError && <SettingsErrorBanner>{requiresInstaller ? t('updateModal.installerRequired') : updateError === ELEVATION_CANCELLED ? t('updateModal.elevationCancelled') : updateError}</SettingsErrorBanner>}
+      {updateError && <SettingsErrorBanner>{requiresInstaller ? t('updateModal.installerRequired') : requiresRestart ? t('updateModal.restartRequired') : updateError === ELEVATION_CANCELLED ? t('updateModal.elevationCancelled') : updateError}</SettingsErrorBanner>}
       {downloading ? <div className="space-y-2">
         <SettingsStatus>{t(phase === 'applying' ? 'updateModal.applying' : phase === 'extracting' ? 'updateModal.extracting' : 'updateModal.downloading')}</SettingsStatus>
         <progress className="h-1.5 w-full accent-ide-accent" max={1} value={phase === 'downloading' ? progress : undefined} aria-label={t('settings.about.download')} />
-      </div> : updateInfo && <SettingsButton variant="primary" onClick={requiresInstaller ? onOpenDownloads : onDownloadUpdate}>{t(requiresInstaller ? 'updateModal.openDownloads' : 'settings.about.download')}</SettingsButton>}
+      </div> : updateInfo && <SettingsButton variant="primary" onClick={requiresInstaller ? onOpenDownloads : onDownloadUpdate}>{t(requiresInstaller ? 'updateModal.openDownloads' : requiresRestart ? 'updateModal.retry' : 'settings.about.download')}</SettingsButton>}
     </SettingsGroup>
     <SettingsGroup>
       <div className="space-y-2 text-xs leading-relaxed text-ide-muted"><p>{t('settings.about.license')}</p><p>{t('settings.about.author')}</p></div>

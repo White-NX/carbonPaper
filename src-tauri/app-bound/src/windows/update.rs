@@ -31,6 +31,8 @@ pub const ELEVATING: &str = "ELEVATING";
 
 mod elevation;
 pub use elevation::{check_local_path, run_elevated};
+mod process;
+pub use process::CoordinatorContext;
 
 /// Pin every directory component, including mutable ancestors, against deletion.
 /// Open reparse points themselves, then inspect the handle so validation cannot
@@ -293,7 +295,7 @@ impl Transaction {
         release: &Release,
         current: &Release,
     ) -> Result<Self> {
-        identity::assert_protected(destination)?;
+        identity::assert_ordinary_installation(destination)?;
         let mut files = current
             .manifest
             .files
@@ -383,7 +385,7 @@ impl Transaction {
             }
             self.locks.pin(directory)?;
             if self.protected_files.is_some() && directory.starts_with(&self.destination) {
-                identity::assert_protected(directory)?;
+                identity::assert_ordinary_installation(directory)?;
             }
         }
         Ok(())
@@ -652,8 +654,8 @@ pub fn run(args: &[String]) -> Result<()> {
         return elevation::coordinate(&source, destination, &current, &release, pid, parent.0);
     }
     let mut transaction = Transaction::prepare(&source, destination, &release)?;
-    // The app learns that all bytes are verified and prepared through an
-    // anonymous pipe owned by its exact child, before stopping capture or exiting.
+    // The app learns that all bytes are verified and prepared through a
+    // private inherited pipe to its exact child, before stopping capture or exiting.
     writeln!(std::io::stdout(), "{READY}").map_err(|_| BrokerError::Unavailable)?;
     std::io::stdout()
         .flush()

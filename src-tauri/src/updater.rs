@@ -369,13 +369,27 @@ async fn stop_monitor(app: &AppHandle) {
 struct OrdinaryInstallation {
     _paths: update::DirectoryLocks,
     elevate: bool,
+    coordinator: update::CoordinatorContext,
 }
 
 fn ordinary_installation_access() -> Result<OrdinaryInstallation, String> {
-    if update::is_elevated() {
-        return Err("UPDATER_INSTALLER_REQUIRED".into());
-    }
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let coordinator = update::CoordinatorContext::new().map_err(|e| e.to_string())?;
+    // An elevated app may be able to write Program Files while its restricted
+    // coordinator cannot. Probe using the coordinator's actual permissions.
+    let (paths, elevate) = coordinator
+        .with_permissions(|| ordinary_installation_access_for(&current))
+        .map_err(|e| e.to_string())??;
+    Ok(OrdinaryInstallation {
+        _paths: paths,
+        elevate,
+        coordinator,
+    })
+}
+
+fn ordinary_installation_access_for(
+    current: &Path,
+) -> Result<(update::DirectoryLocks, bool), String> {
     if current
         .file_name()
         .and_then(|name| name.to_str())
@@ -395,7 +409,7 @@ fn ordinary_installation_access() -> Result<OrdinaryInstallation, String> {
     let (release, _) = carbonpaper_app_bound::manifest::read_manifest(directory)
         .map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
     let mut executable =
-        update::locked_file(&current).map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
+        update::locked_file(current).map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
     identity::verify_file(
         &mut executable,
         release
@@ -427,33 +441,30 @@ fn ordinary_installation_access() -> Result<OrdinaryInstallation, String> {
                 .map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
             // Elevation is only useful for an existing administrator-owned
             // installation; mutable/custom ownership needs installer repair.
-            identity::assert_protected(directory)
+            identity::assert_ordinary_installation(directory)
                 .map_err(|_| "UPDATER_INSTALLER_REQUIRED".to_string())?;
             true
         }
         Err(error) => return Err(error.to_string()),
     };
-    Ok(OrdinaryInstallation {
-        _paths: locks,
-        elevate,
-    })
+    Ok((locks, elevate))
 }
 
 async fn updater_apply_impl(
     app: AppHandle,
     package: &ExtractedUpdate,
     version: &str,
-    protected: bool,
-    elevate: bool,
+    installation: Option<&OrdinaryInstallation>,
 ) -> Result<(), String> {
     let _runtime_control = crate::maintenance::runtime_control_guard()?;
-    if protected {
+    let Some(installation) = installation else {
         // The protected installer independently verifies the release manifest
         // and actual installed bytes. Cancellation leaves capture running.
         crate::app_bound::install_runtime(package.directory.clone(), false).await?;
         stop_monitor(&app).await;
         return crate::app_bound::schedule_restart(&app);
-    }
+    };
+    let elevate = installation.elevate;
     let _execution_paths =
         update::DirectoryLocks::for_execution(&package.directory).map_err(|e| e.to_string())?;
     if elevate {
@@ -462,34 +473,31 @@ async fn updater_apply_impl(
     let helper = package.directory.join(update::HELPER_NAME);
     let mut executable = update::locked_file(&helper).map_err(|e| e.to_string())?;
     verify_downloaded_file(&mut executable, &package.helper_hash)?;
-    use std::os::windows::process::CommandExt;
-    let mut command = std::process::Command::new(&helper);
-    command
-        .args(["--apply-unprotected-update", "--source"])
-        .arg(&package.directory)
-        .arg("--caller-pid")
-        .arg(std::process::id().to_string())
-        .arg("--version")
-        .arg(version)
-        .current_dir(&package.directory)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(0x08000000);
+    let mut arguments = vec![
+        "--apply-unprotected-update".into(),
+        "--source".into(),
+        package.directory.as_os_str().to_owned(),
+        "--caller-pid".into(),
+        std::process::id().to_string().into(),
+        "--version".into(),
+        version.into(),
+    ];
     if elevate {
-        command.arg("--elevate");
+        arguments.push("--elevate".into());
     }
-    let mut child = tokio::process::Command::from(command)
-        // A pending UAC prompt must retain the coordinator's executable locks,
-        // even if the application closes or this command's future is dropped.
-        .kill_on_drop(!elevate)
-        .spawn()
+    let (mut child, pipe) = installation
+        .coordinator
+        .spawn_coordinator(
+            &helper,
+            &arguments,
+            &package.directory,
+            // A pending UAC prompt must retain the coordinator's executable locks,
+            // even if the application closes or this command's future is dropped.
+            !elevate,
+        )
         .map_err(|e| format!("Failed to start update installer: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Update installer pipe is unavailable")?;
-    let mut reader = tokio::io::BufReader::new(stdout);
+    pipe.connect().await.map_err(|e| e.to_string())?;
+    let mut reader = tokio::io::BufReader::new(pipe);
     let mut response = String::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(120),
@@ -511,20 +519,17 @@ async fn updater_apply_impl(
     if response.trim_end() != update::READY {
         return Err("Update preparation failed".into());
     }
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or("Update installer pipe is unavailable")?;
-    stdin
+    reader
+        .get_mut()
         .write_all(b"COMMIT\n")
         .await
         .map_err(|e| e.to_string())?;
-    stdin.flush().await.map_err(|e| e.to_string())?;
+    reader.get_mut().flush().await.map_err(|e| e.to_string())?;
     // The child has its own locks and authenticated parent process handle. It
     // cannot apply the prepared update until this exact process has exited.
-    // Detach only after the explicit commit decision. The parent is about to
-    // exit, so the OS will release this process handle without killing the child.
-    std::mem::forget(child);
+    // Detach only after the explicit commit decision; closing the process
+    // handle on exit does not terminate the committed coordinator.
+    child.detach();
     stop_monitor(&app).await;
     crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
     app.exit(0);
@@ -563,9 +568,6 @@ pub async fn updater_install(
     } else {
         Some(ordinary_installation_access()?)
     };
-    let elevate = _application_paths
-        .as_ref()
-        .is_some_and(|installation| installation.elevate);
     let _ = app.emit(
         "updater-phase",
         serde_json::json!({ "phase": "downloading" }),
@@ -577,13 +579,30 @@ pub async fn updater_install(
     );
     let package = updater_extract_impl(&mut download)?;
     let _ = app.emit("updater-phase", serde_json::json!({ "phase": "applying" }));
-    updater_apply_impl(app, &package, &manifest.version, protected, elevate).await
+    updater_apply_impl(
+        app,
+        &package,
+        &manifest.version,
+        _application_paths.as_ref(),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn ordinary_updates_validate_package_metadata_before_testing_write_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("carbonpaper.exe");
+        assert!(matches!(
+            ordinary_installation_access_for(&current),
+            Err(error) if error == "UPDATER_INSTALLER_REQUIRED"
+        ));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn signed_manifest_verification_rejects_tampering() {

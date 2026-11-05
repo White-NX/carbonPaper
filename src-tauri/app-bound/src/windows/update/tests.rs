@@ -25,6 +25,49 @@ fn write_signed_release(directory: &Path, manifest: &ReleaseManifest) -> Release
     read_release(directory, &key).unwrap()
 }
 
+fn apply_standard_installer_acl(directory: &Path) {
+    use windows::Win32::Security::{self, Authorization::*, PSECURITY_DESCRIPTOR, PSID};
+    let sddl = identity::wide(
+        "D:P(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)".as_ref(),
+    );
+    let directory = identity::wide(directory.as_os_str());
+    // SAFETY: this only changes the isolated fixture's DACL. The descriptor
+    // owns its ACL until SetNamedSecurityInfo copies it and LocalFree runs.
+    unsafe {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .unwrap();
+        let result = (|| {
+            let mut present = windows::Win32::Foundation::BOOL::default();
+            let mut defaulted = windows::Win32::Foundation::BOOL::default();
+            let mut acl = std::ptr::null_mut();
+            Security::GetSecurityDescriptorDacl(
+                descriptor,
+                &mut present,
+                &mut acl,
+                &mut defaulted,
+            )?;
+            SetNamedSecurityInfoW(
+                windows::core::PCWSTR(directory.as_ptr()),
+                SE_FILE_OBJECT,
+                Security::DACL_SECURITY_INFORMATION | Security::PROTECTED_DACL_SECURITY_INFORMATION,
+                PSID::default(),
+                PSID::default(),
+                Some(acl),
+                None,
+            )
+            .ok()
+        })();
+        windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(descriptor.0));
+        result.unwrap();
+    }
+}
+
 fn fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("package");
@@ -262,6 +305,11 @@ fn elevated_update_rejects_corruption_and_preserves_protected_acls() {
     );
     fixture.release = write_signed_release(&fixture.source, &fixture.release.manifest);
     identity::protect_path(&fixture.destination, true).unwrap();
+    // NSIS and legacy PowerShell updates leave the standard directory ACL in
+    // place, including its inherit-only CREATOR OWNER entry.
+    apply_standard_installer_acl(&fixture.destination);
+    identity::assert_ordinary_installation(&fixture.destination).unwrap();
+    assert!(identity::assert_protected(&fixture.destination).is_err());
     for name in current_manifest
         .files
         .keys()
@@ -323,5 +371,32 @@ fn elevated_update_rejects_corruption_and_preserves_protected_acls() {
     transaction.commit().unwrap();
     transaction.finish();
     drop(transaction);
-    read_release(&fixture.destination, &fixture.key).unwrap();
+    let installed = read_release(&fixture.destination, &fixture.key).unwrap();
+
+    // A successful upgrade must retain the metadata and directory access
+    // needed for the next release, even though the original ACL is unchanged.
+    let mut next_manifest = installed.manifest.clone();
+    next_manifest.version = "1.2.4".into();
+    for (name, hash) in &mut next_manifest.files {
+        let bytes = format!("next release {name}");
+        fs::write(fixture.source.join(name), bytes.as_bytes()).unwrap();
+        *hash = hex::encode(Sha256::digest(bytes.as_bytes()));
+    }
+    let next = write_signed_release(&fixture.source, &next_manifest);
+    let mut transaction =
+        Transaction::prepare_protected(&fixture.source, &fixture.destination, &next, &installed)
+            .unwrap();
+    transaction.commit().unwrap();
+    drop(transaction.execution_locks().unwrap());
+    transaction.finish();
+    drop(transaction);
+    assert_eq!(
+        read_release(&fixture.destination, &fixture.key)
+            .unwrap()
+            .manifest
+            .version,
+        "1.2.4"
+    );
+    identity::assert_ordinary_installation(&fixture.destination).unwrap();
+    assert!(identity::assert_protected(&fixture.destination).is_err());
 }

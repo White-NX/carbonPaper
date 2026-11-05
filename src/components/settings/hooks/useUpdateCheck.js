@@ -32,6 +32,7 @@ export function useUpdateCheck() {
   const handleDownloadUpdate = async () => {
     if (!updateInfo) return;
     setDownloading(true);
+    setUpdateError('');
     setDownloadProgress({ phase: 'downloading', downloaded: 0, contentLength: 0 });
     try {
       await downloadAndInstallUpdate((progress) => {
