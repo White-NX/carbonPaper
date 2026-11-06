@@ -378,6 +378,28 @@ fn handle_message(
     let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match msg_type {
+        "media_state" => {
+            if let Err(error) = ctx.client.ensure_channel(pipe_name, auth_token) {
+                return serde_json::json!({"status": "error", "error": error});
+            }
+            if !ctx.registered.load(Ordering::SeqCst) {
+                if let Some(browser) = &ctx.browser {
+                    let request = build_register_request(auth_token, &ctx.cmd_pipe_name, browser);
+                    let _ = send_to_pipe(&ctx.client, pipe_name, &request);
+                }
+            }
+            send_to_pipe(
+                &ctx.client,
+                pipe_name,
+                &serde_json::json!({
+                    "command": "report_media_state", "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+                    "auth_token": auth_token, "nmh_pid": std::process::id(),
+                    "focused": msg.get("focused"), "playing": msg.get("playing"),
+                "private": msg.get("private"), "known": msg.get("known"),
+                    "page_title": msg.get("page_title"), "observed_at_ms": msg.get("observed_at_ms"),
+                }),
+            )
+        }
         "save_screenshot" => {
             // Complete message with all data
             let image_data = match msg.get("image_data").and_then(|v| v.as_str()) {

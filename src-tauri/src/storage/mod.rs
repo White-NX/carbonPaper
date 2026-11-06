@@ -39,7 +39,9 @@ mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
 mod types;
+mod usage;
 pub(crate) mod wire_time;
+pub use usage::{UsageCursor, UsageTimelinePage};
 
 pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
 pub use background_scheduler::BackgroundTaskState;
@@ -170,6 +172,7 @@ pub struct StorageState {
     /// would otherwise land on an unrelated screenshot that happens to share
     /// the id. See `document_ref.rs::save_screenshot_document_ref_for_generation`.
     db_generation: AtomicU64,
+    usage_revision: AtomicU64,
 }
 
 struct NamedConnectionGuard<'a> {
@@ -261,6 +264,7 @@ impl StorageState {
             semantic_cache_reset_generation: AtomicU64::new(0),
             search_order_cache: Mutex::new(None),
             db_generation: AtomicU64::new(0),
+            usage_revision: AtomicU64::new(0),
         }
     }
 

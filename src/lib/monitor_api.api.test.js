@@ -23,6 +23,7 @@ import {
   updateMonitorFilters,
   getTimeline,
   getTimelineDetails,
+  getUsageTimeline,
   fetchThumbnailBatch,
 } from './monitor_api';
 
@@ -96,6 +97,36 @@ describe('monitor_api command wrappers', () => {
     controller.abort();
     await expect(getTimeline(100, 200, 500, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('pages observed usage without sampling and preserves explicit millisecond bounds', async () => {
+    const cursor = { start_ms: 1500, id: 500 };
+    invoke.mockResolvedValueOnce({ tracking_started_ms: 1000, intervals: [{ id: 1 }], next_cursor: cursor })
+      .mockResolvedValueOnce({ tracking_started_ms: 1000, intervals: [{ id: 2 }], next_cursor: null });
+    await expect(getUsageTimeline(1000.5, 2000.5)).resolves.toEqual({
+      tracking_started_ms: 1000, intervals: [{ id: 1 }, { id: 2 }],
+    });
+    expect(invoke.mock.calls[0]).toEqual(['storage_get_usage_timeline', {
+      startTime: 1000, endTime: 2001, cursor: null, requestId: expect.any(String),
+    }]);
+    expect(invoke.mock.calls[1][1].cursor).toEqual(cursor);
+    expectWithAuth(1);
+    expectWithAuth(2);
+  });
+
+  it('reuses cached usage labels only within the same archive and authentication epoch', async () => {
+    const cache = { cache_epoch: 'first', intervals: [{ id: 1, process_name: 'player.exe',
+      process_path: 'C:/player.exe', window_title: 'Film', end_ms: 1000 }] };
+    invoke.mockResolvedValueOnce({ cache_epoch: 'first', tracking_started_ms: 0,
+      intervals: [{ id: 1, end_ms: 2000, process_name: null, process_path: null, window_title: null }], next_cursor: null });
+    const result = await getUsageTimeline(0, 3000, { cache });
+    expect(result.intervals[0]).toMatchObject({ process_name: 'player.exe', window_title: 'Film', end_ms: 2000 });
+    expect(invoke.mock.calls[0][1]).toMatchObject({ cacheEpoch: 'first', knownIds: [1] });
+    invoke.mockResolvedValueOnce({ cache_epoch: 'second', tracking_started_ms: 0,
+      intervals: [{ id: 1, process_name: 'editor.exe', window_title: 'Notes' }], next_cursor: null });
+    const restored = await getUsageTimeline(0, 3000, { cache });
+    expect(restored.intervals[0].process_name).toBe('editor.exe');
+    expect(restored.intervals[0].process_path).toBeUndefined();
   });
 
   it('requests lightweight timeline headers only when the caller opts in', async () => {

@@ -770,6 +770,7 @@ async fn end_exited_session(app: &AppHandle, capture_state: &CaptureState, sessi
 /// Releases what a capture session leaves behind once its loop is gone: the
 /// WGC session, the in-flight OCR task, and Office observation.
 async fn drain_capture_session(app: &AppHandle, capture_state: &CaptureState, reason: &str) {
+    crate::usage::interrupt(app, reason);
     // Explicitly release WGC/D3D capture resources: a loop that was
     // force-aborted or panicked never reaches its own teardown.
     capture_state.clear_wgc_session(reason);
@@ -846,6 +847,7 @@ fn set_capture_paused(app: &AppHandle, paused: bool) -> Result<String, String> {
     app.state::<Arc<CaptureState>>()
         .paused
         .store(paused, Ordering::SeqCst);
+    crate::usage::interrupt(app, if paused { "paused" } else { "resumed" });
     crate::refresh_tray_menu(app);
     Ok(serde_json::json!({ "status": if paused { "paused" } else { "resumed" } }).to_string())
 }

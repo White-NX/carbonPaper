@@ -2130,13 +2130,16 @@ impl StorageState {
         start_ts: f64,
         end_ts: f64,
     ) -> Result<i32, String> {
+        if !start_ts.is_finite() || !end_ts.is_finite() || start_ts < 0.0 || start_ts > end_ts {
+            return Err("Invalid deletion time range".into());
+        }
         // Convert timestamps (milliseconds) to SQLite datetime
         let start_dt = DateTime::<Utc>::from_timestamp((start_ts / 1000.0) as i64, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
+            .ok_or("Invalid deletion time range")?;
         let end_dt = DateTime::<Utc>::from_timestamp((end_ts / 1000.0) as i64, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
+            .ok_or("Invalid deletion time range")?;
 
         let ids: Vec<i64> = {
             let guard = self.get_connection_named("delete_screenshots_by_time_range")?;
@@ -2159,6 +2162,21 @@ impl StorageState {
         };
 
         let result = self.soft_delete_screenshots(&ids)?;
+        {
+            let mut guard = self.get_connection_named("delete_usage_by_time_range")?;
+            let transaction = guard
+                .as_mut()
+                .unwrap()
+                .transaction()
+                .map_err(|e| e.to_string())?;
+            self.delete_usage_range(
+                &transaction,
+                start_ts as i64,
+                (end_ts as i64).saturating_add(1),
+                None,
+            )?;
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
         Ok(result.screenshots_marked.clamp(0, i32::MAX as i64) as i32)
     }
 
@@ -2180,6 +2198,9 @@ impl StorageState {
         let process_tokens = self
             .protected
             .process_tokens(&[normalized_process.to_string()])?;
+        let usage_process_tokens =
+            serde_json::to_string(&process_tokens).map_err(|e| e.to_string())?;
+        let mut usage_bounds = (0, i64::MAX);
         let mut filter_plain =
             String::from("process_name IN (SELECT value FROM json_each(?1)) AND is_deleted = 0");
         let mut filter_alias = String::from(
@@ -2193,6 +2214,7 @@ impl StorageState {
             let zone =
                 crate::calendar::time_zone(Some(time_zone.ok_or("CALENDAR_TIME_ZONE_REQUIRED")?))?;
             let (start_ms, end_ms) = crate::calendar::month_bounds(month_key, zone)?;
+            usage_bounds = (start_ms, end_ms);
             filter_plain.push_str(" AND created_at >= ?2 AND created_at < ?3");
             filter_alias.push_str(" AND s.created_at >= ?2 AND s.created_at < ?3");
             param_values.push(Box::new(crate::calendar::sqlite_utc(start_ms)?));
@@ -2247,6 +2269,13 @@ impl StorageState {
             .execute(&mark_screenshots_sql, params_ref.as_slice())
             .map_err(|e| format!("Failed to mark screenshots deleted: {}", e))?
             as i64;
+
+        self.delete_usage_range(
+            &tx,
+            usage_bounds.0,
+            usage_bounds.1,
+            Some(&usage_process_tokens),
+        )?;
 
         tx.commit()
             .map_err(|e| format!("Failed to commit soft-delete transaction: {}", e))?;

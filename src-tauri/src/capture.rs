@@ -364,10 +364,10 @@ impl CaptureState {
 
 /// Information about the currently focused window (handle, title, rect, PID).
 pub struct ActiveWindowInfo {
-    hwnd_raw: isize,
-    title: String,
+    pub(crate) hwnd_raw: isize,
+    pub(crate) title: String,
     rect: RECT,
-    pid: u32,
+    pub(crate) pid: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -672,7 +672,7 @@ fn is_window_protected(hwnd_raw: isize) -> bool {
     }
 }
 
-fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
+pub(crate) fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
     // Empty title
     if info.title.is_empty() {
         return true;

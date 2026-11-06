@@ -203,10 +203,10 @@ impl StorageState {
 
 /// The callback also runs inside sqlite3_step, before the first grouped/sorted
 /// row is returned. Removing it on every exit prevents poisoning later reads.
-struct SqlCancellation<'a>(&'a Connection);
+pub(super) struct SqlCancellation<'a>(&'a Connection);
 
 impl<'a> SqlCancellation<'a> {
-    fn install(
+    pub(super) fn install(
         conn: &'a Connection,
         stop: impl FnMut() -> bool + Send + 'static,
     ) -> Result<Self, String> {

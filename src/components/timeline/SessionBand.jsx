@@ -218,9 +218,9 @@ export default function SessionBand({
           const next = blocks[index + 1] || null;
           // Join adjacent blocks of the same app seamlessly
           const joinLeft = Boolean(block.appName) && previous?.appName === block.appName
-            && previous.end === block.start;
+            && previous.end === block.start && previous.continuityId === block.continuityId;
           const joinRight = Boolean(block.appName) && next?.appName === block.appName
-            && block.end === next.start;
+            && block.end === next.start && block.continuityId === next.continuityId;
 
           const isMixed = block.kind === 'mixed';
           const isActive = activeId !== null && activeId === block.id;

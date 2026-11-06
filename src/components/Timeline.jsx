@@ -2,12 +2,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next';
 import { ChevronUp, Focus, Play } from 'lucide-react';
 import { Button } from './ui/Button';
-import { getTimeline, getTimelineDetails, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
+import { getTimeline, getTimelineDetails, getTimelineDensity, getUsageTimeline, fetchThumbnailBatch } from '../lib/monitor_api';
 import {
   aggregateAppDistribution,
-  buildSessions,
+  buildTimelineSessions,
   collapseSessions,
-  estimateSampleInterval,
   mergeSortedEvents,
   pruneEvents,
 } from '../lib/timeline_sessions';
@@ -39,7 +38,6 @@ const OVERVIEW_HEIGHT = 20;
 const SESSION_HEIGHT = 30;
 const DETAIL_HEIGHT = 58;
 const AXIS_HEIGHT = 18;
-const TIMELINE_HEIGHT = OVERVIEW_HEIGHT + SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT;
 
 /** Tier threshold boundaries for detail track. */
 const FRAME_TIER_MAX_SPAN = 30 * MINUTE;
@@ -160,6 +158,8 @@ const Timeline = ({
 
   const [width, setWidth] = useState(0);
   const [events, setEvents] = useState([]);
+  const [usageTimeline, setUsageTimeline] = useState(undefined);
+  const usageTimelineRef = useRef(null);
   const [rangePending, setRangePending] = useState(false);
   const [densityBuckets, setDensityBuckets] = useState([]);
   const [overviewBuckets, setOverviewBuckets] = useState([]);
@@ -227,6 +227,10 @@ const Timeline = ({
     : visibleSpan <= SESSION_TIER_MAX_SPAN
       ? 'session'
       : 'day';
+  // Exact usage bands are loaded for the frame/session tiers. Wide views show
+  // screenshot distribution until the user zooms into a supported usage range.
+  const sessionHeight = tier === 'day' ? 0 : SESSION_HEIGHT;
+  const timelineHeight = OVERVIEW_HEIGHT + sessionHeight + DETAIL_HEIGHT + AXIS_HEIGHT;
   frameTierRef.current = tier === 'frame';
 
   const imageQueue = useMemo(() => createTimelineBatchQueue(fetchThumbnailBatch, {
@@ -446,9 +450,23 @@ const Timeline = ({
     } },
   ), []);
 
+  // Usage metadata loads separately so decrypting intervals never delays frame thumbnails.
+  const usageRequests = useMemo(() => createTimelineRequestQueue(
+    ({ start, end }, signal) => getUsageTimeline(start, end, { signal, cache: usageTimelineRef.current }),
+    { onResult: (result) => {
+      usageTimelineRef.current = result;
+      setUsageTimeline(result);
+    }, onError: (error) => {
+      console.error('[Timeline] Usage fetch error:', error);
+    } },
+  ), []);
+
   const fetchEventsRange = useCallback((start, end, sampleMs, refresh) => {
     eventRequests.request({ start, end, sampleMs }, { refresh });
-  }, [eventRequests]);
+    if (end - start <= 3 * SESSION_TIER_MAX_SPAN) {
+      usageRequests.request({ start, end, sampleMs }, { refresh });
+    } else usageRequests.cancel();
+  }, [eventRequests, usageRequests]);
 
   const fetchDensityRange = useCallback(async (start, end, bucketMs) => {
     const epoch = ++densityEpochRef.current;
@@ -596,6 +614,8 @@ const Timeline = ({
   useEffect(() => {
     if (refreshKey === undefined || !width) return;
     setEvents([]);
+    setUsageTimeline(undefined);
+    usageTimelineRef.current = null;
     detailsCacheRef.current.clear();
     imageQueue.reset();
     detailsQueue.reset();
@@ -605,6 +625,7 @@ const Timeline = ({
     loadedSampleMsRef.current = null;
     requestEvents.cancel();
     eventRequests.cancel();
+    usageRequests.cancel();
     setImageEpoch((prev) => prev + 1);
     if (sqlPaused) return;
     ensureEvents(centerTime, visibleSpan, true);
@@ -635,16 +656,18 @@ const Timeline = ({
   useEffect(() => () => {
     requestEvents.cancel();
     eventRequests.cancel();
+    usageRequests.cancel();
     // Effect replay must request this range again after cancelling its read.
     requestedEventsRef.current = null;
     requestDensity.cancel();
     requestOverview.cancel();
-  }, [requestEvents, requestDensity, requestOverview, eventRequests]);
+  }, [requestEvents, requestDensity, requestOverview, eventRequests, usageRequests]);
 
   useEffect(() => {
     if (sqlPaused) {
       requestEvents.cancel();
       eventRequests.cancel();
+      usageRequests.cancel();
       requestedEventsRef.current = null;
       requestDensity.cancel();
       requestedDensityRef.current = null;
@@ -653,7 +676,7 @@ const Timeline = ({
       requestedOverviewRef.current = null;
       overviewEpochRef.current += 1;
     }
-  }, [sqlPaused, requestEvents, requestDensity, requestOverview, eventRequests]);
+  }, [sqlPaused, requestEvents, requestDensity, requestOverview, eventRequests, usageRequests]);
 
   // ── Thumbnail Loading ──────────────────────────────────────
 
@@ -664,10 +687,9 @@ const Timeline = ({
 
   // ── Derived Data ───────────────────────────────────────────
 
-  const sampleInterval = useMemo(() => estimateSampleInterval(events), [events]);
   const activities = useMemo(
-    () => buildSessions(events, { tailMs: sampleInterval }),
-    [events, sampleInterval],
+    () => buildTimelineSessions(events, usageTimeline),
+    [events, usageTimeline],
   );
   /**
    * Fold threshold for the session band, snapped so it holds still while the user
@@ -700,7 +722,8 @@ const Timeline = ({
     const event = events.find((item) => item.id === highlightedEventId);
     if (!event) return null;
     const block = sessionBlocks.find(
-      (item) => event.timestamp >= item.start && event.timestamp < item.end,
+      (item) => (event.timestamp >= item.start && event.timestamp < item.end)
+        || item.segments.some((segment) => segment.firstEvent?.id === highlightedEventId),
     );
     return block ? block.id : null;
   }, [events, sessionBlocks, highlightedEventId]);
@@ -901,8 +924,9 @@ const Timeline = ({
   const handleSelectSession = useMemo(
     () => guardedSelect((session) => {
       if (session.firstEvent) onSelectEvent?.(session.firstEvent);
+      else seekTo(session.start);
     }),
-    [guardedSelect, onSelectEvent],
+    [guardedSelect, onSelectEvent, seekTo],
   );
 
   const handleZoomToSession = useCallback((session) => {
@@ -980,7 +1004,7 @@ const Timeline = ({
       aria-label={t('timeline.label')}
       hidden={!active}
       className={`relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border ${active ? '' : 'hidden'}`}
-      style={{ height: TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
+      style={{ height: timelineHeight, backgroundColor: 'var(--ide-timeline-bg)' }}
       data-keep-selection="true"
     >
       <OverviewBand
@@ -1001,7 +1025,7 @@ const Timeline = ({
 
       <div
         className={`relative ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-        style={{ height: SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT }}
+        style={{ height: sessionHeight + DETAIL_HEIGHT + AXIS_HEIGHT }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={endDrag}
@@ -1009,7 +1033,7 @@ const Timeline = ({
         onWheel={handleWheel}
         onClick={handleBackgroundClick}
       >
-        <SessionBand
+        {sessionHeight > 0 && <SessionBand
           blocks={sessionBlocks}
           timeToX={timeToX}
           width={width}
@@ -1020,7 +1044,7 @@ const Timeline = ({
           activeId={activeSessionId}
           onSelect={handleSelectSession}
           onZoomTo={handleZoomToSession}
-        />
+        />}
 
         <DetailTrack
           tier={tier}
@@ -1040,7 +1064,7 @@ const Timeline = ({
           onVisibleFramesChange={handleVisibleFramesChange}
         />
 
-        <div className="pointer-events-none absolute inset-x-0" style={{ top: SESSION_HEIGHT, height: DETAIL_HEIGHT }}>
+        <div className="pointer-events-none absolute inset-x-0" style={{ top: sessionHeight, height: DETAIL_HEIGHT }}>
           <SearchMarkerLayer
             markers={searchState?.markers || []}
             hoveredIds={searchState?.hoveredIds || []}

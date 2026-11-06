@@ -3,12 +3,14 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Timeline from './Timeline';
 import WorkspaceTimelines from './WorkspaceTimelines';
-import { fetchThumbnailBatch, getTimeline, getTimelineDetails, getTimelineDensity } from '../lib/monitor_api';
+import { fetchThumbnailBatch, getTimeline, getTimelineDetails, getTimelineDensity, getUsageTimeline } from '../lib/monitor_api';
+import SessionBand from './timeline/SessionBand';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n: { language: 'en' } }) }));
 vi.mock('../lib/monitor_api', () => ({
   getTimeline: vi.fn(), getTimelineDetails: vi.fn(async () => []),
   getTimelineDensity: vi.fn(async () => []), fetchThumbnailBatch: vi.fn(async () => ({})),
+  getUsageTimeline: vi.fn(async () => ({ tracking_started_ms: null, intervals: [] })),
 }));
 vi.mock('../hooks/useTimelineCamera', async () => {
   const { useEffect, useMemo, useRef } = await import('react');
@@ -31,7 +33,7 @@ vi.mock('../hooks/useTimelineCamera', async () => {
 vi.mock('./timeline/OverviewBand', () => ({
   default: ({ viewStart, viewEnd }) => <div data-testid="overview" data-start={viewStart} data-end={viewEnd} />,
 }));
-vi.mock('./timeline/SessionBand', () => ({ default: () => null }));
+vi.mock('./timeline/SessionBand', () => ({ default: vi.fn(() => <div data-testid="sessions" />) }));
 vi.mock('./timeline/SearchMarkerLayer', () => ({
   default: ({ markers = [], onSelectMarker }) => <div data-testid="markers">{markers.map((marker) => (
     <button key={marker.id} onClick={() => onSelectMarker?.(marker)}>{marker.id}</button>
@@ -60,6 +62,8 @@ beforeEach(() => {
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   reads = [];
   getTimelineDetails.mockReset().mockResolvedValue([]);
+  getUsageTimeline.mockReset().mockResolvedValue({ tracking_started_ms: null, intervals: [] });
+  SessionBand.mockClear();
   fetchThumbnailBatch.mockReset().mockResolvedValue({});
   getTimeline.mockImplementation((_start, _end, _limit, { signal }) => new Promise((resolve) => {
     reads.push({ signal, resolve });
@@ -73,6 +77,49 @@ afterEach(() => {
 
 const record = (title) => [{ id: 1, timestamp: 1767225600, process_name: 'app', window_title: title }];
 const advance = () => act(async () => { await vi.advanceTimersByTimeAsync(350); });
+
+it('loads frames while usage decrypts and then renders the observed film interval', async () => {
+  let finishUsage;
+  getUsageTimeline.mockImplementationOnce(() => new Promise((resolve) => { finishUsage = resolve; }));
+  fetchThumbnailBatch.mockImplementation(async (ids) => Object.fromEntries(ids.map((id) => [id, 'data:image/jpeg;base64,image'])));
+  const end = Date.now();
+  const start = end - 2 * 3_600_000;
+  const view = render(<Timeline />);
+  await advance();
+  await act(async () => { reads[0].resolve([{ id: 1, timestamp: (end - 60_000) / 1000,
+    process_name: 'player.exe', window_title: 'Film' }]); });
+  expect(screen.getByTestId('events').querySelector('img')).not.toBeNull();
+  await act(async () => { finishUsage({ tracking_started_ms: start, intervals: [{ id: 1,
+    run_id: 'film', start_ms: start, end_ms: end, process_name: 'player.exe', window_title: 'Film' }] }); });
+  const props = SessionBand.mock.calls.at(-1)[0];
+  expect(props.blocks).toHaveLength(1);
+  expect(props.blocks[0]).toMatchObject({ start, end, appName: 'player.exe' });
+  view.unmount();
+});
+
+it('shows usage bands only at supported zoom tiers and moves search markers with the detail track', async () => {
+  getTimeline.mockResolvedValue([]);
+  const view = render(<Timeline />);
+  await advance();
+  expect(screen.getByTestId('sessions')).toBeInTheDocument();
+  expect(screen.getByRole('region')).toHaveStyle({ height: '126px' });
+  expect(screen.getByTestId('markers').parentElement).toHaveStyle({ top: '30px' });
+  const usageReads = getUsageTimeline.mock.calls.length;
+
+  fireEvent.keyDown(window, { key: '2' });
+  await advance();
+  expect(screen.queryByTestId('sessions')).not.toBeInTheDocument();
+  expect(screen.getByRole('region')).toHaveStyle({ height: '96px' });
+  expect(screen.getByTestId('markers').parentElement).toHaveStyle({ top: '0px' });
+  expect(getUsageTimeline).toHaveBeenCalledTimes(usageReads);
+
+  fireEvent.keyDown(window, { key: '0' });
+  await advance();
+  expect(screen.getByTestId('sessions')).toBeInTheDocument();
+  expect(screen.getByRole('region')).toHaveStyle({ height: '126px' });
+  expect(getUsageTimeline.mock.calls.length).toBeGreaterThan(usageReads);
+  view.unmount();
+});
 
 it('discards a reset read and loads the same viewport again after cancellation settles', async () => {
   const view = render(<StrictMode><Timeline /></StrictMode>);
@@ -341,7 +388,7 @@ it('preserves the home viewport and search collapse preference across page chang
   expect(screen.getByRole('region', { name: 'timeline.label' })).toBe(home);
   expect(within(home).getByTestId('overview').dataset.start).toBe(before.start);
   expect(within(home).getByTestId('overview').dataset.end).toBe(before.end);
-  expect(home).toHaveStyle({ height: '126px' });
+  expect(home).toHaveStyle({ height: '96px' });
   view.rerender(<WorkspaceTimelines activeTab="advanced-search" searchState={searchState} />);
   expect(screen.getByRole('button', { name: 'timeline.expand' })).toHaveAttribute('aria-expanded', 'false');
   expect(within(screen.getByRole('region', { name: 'timeline.label' })).getByRole('slider')).toBeInTheDocument();

@@ -81,6 +81,7 @@ mod storage;
 mod storage_startup;
 mod task_error;
 mod updater;
+mod usage;
 pub use updater::verify_update_manifest_file;
 
 use analysis::AnalysisState;
@@ -897,6 +898,7 @@ pub fn run() {
         .manage(lightweight_state.clone())
         .manage(Arc::new(PowerState::new()))
         .manage(Arc::new(IdleState::new()))
+        .manage(Arc::new(usage::UsageState::default()))
         .manage(Arc::new(
             smart_cluster_scoring::SmartClusterWorkerState::default(),
         ))
@@ -984,6 +986,7 @@ pub fn run() {
                 // Start power monitor (power saving mode)
                 power::start_power_monitor(app.handle().clone());
                 idle::start_idle_monitor(app.handle().clone());
+                usage::start_monitor(app.handle().clone());
 
                 match native_messaging::sync_installed_extension() {
                     Ok(true) => tracing::info!("Browser extension synced to latest version"),
@@ -1041,6 +1044,7 @@ pub fn run() {
             // 安全告警调试触发（设置 → 高级 → 调试）
             // 存储相关命令
             commands::storage::storage_get_timeline,
+            commands::storage::storage_get_usage_timeline,
             commands::storage::storage_get_timeline_details,
             commands::storage::storage_cancel_timeline,
             commands::storage::storage_get_timeline_density,
@@ -1224,6 +1228,7 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                usage::stop_monitor(app_handle);
                 if let Some(scheduler) =
                     app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
                 {

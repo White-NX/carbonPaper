@@ -83,8 +83,8 @@ impl IdleState {
     }
 }
 
-/// Returns seconds since last keyboard/mouse input.
-fn get_idle_seconds() -> u64 {
+/// Returns milliseconds since last keyboard/mouse input, or None when unavailable.
+pub(crate) fn input_idle_ms() -> Option<u64> {
     // SAFETY: `info` has the required `cbSize`, points to writable initialized memory,
     // and Windows writes it synchronously without retaining the pointer.
     unsafe {
@@ -97,13 +97,17 @@ fn get_idle_seconds() -> u64 {
             // GetTickCount wraps every ~49.7 days; subtraction in u32 wraps too,
             // so we naturally get a valid delta within that window.
             let elapsed_ms = now.wrapping_sub(info.dwTime);
-            (elapsed_ms / 1000) as u64
+            Some(elapsed_ms as u64)
         } else {
-            // Conservative: assume no idle when we can't measure, so background
-            // ML stays gated off rather than running blindly.
-            0
+            None
         }
     }
+}
+
+fn get_idle_seconds() -> u64 {
+    // Background admission fails closed when input cannot be measured. Usage
+    // keeps the Option so an unavailable probe cannot manufacture activity.
+    input_idle_ms().unwrap_or(0) / 1000
 }
 
 /// Determine whether the foreground window is a non-browser fullscreen app.

@@ -186,6 +186,16 @@ impl StorageState {
         //    regardless of how much space they occupy.
         let mut retention_freed_bytes = 0u64;
         if let Some(cutoff_dt) = parse_retention_cutoff(&policy) {
+            if let Some(cutoff) = super::wire_time::sqlite_utc_to_seconds(&cutoff_dt) {
+                let mut guard = self.get_connection_named("prune_expired_usage")?;
+                let transaction = guard
+                    .as_mut()
+                    .unwrap()
+                    .transaction()
+                    .map_err(|e| e.to_string())?;
+                self.delete_usage_range(&transaction, 0, cutoff.saturating_mul(1000), None)?;
+                transaction.commit().map_err(|e| e.to_string())?;
+            }
             let (candidate_ids, freed_bytes) = self.select_screenshots_created_before(
                 &cutoff_dt,
                 MAX_POLICY_DELETE_CANDIDATES_PER_RUN,

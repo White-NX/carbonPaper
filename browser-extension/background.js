@@ -22,6 +22,43 @@ let settingsLoaded = false;
 let isConnected = false;
 let reconnectTimer = null;
 let lastCaptureHash = null;
+let mediaReportEpoch = 0;
+
+async function reportMediaState() {
+  if (!isEnabled || !isConnected || !nmPort) return;
+  const epoch = ++mediaReportEpoch;
+  try {
+    const window = await chrome.windows.getLastFocused();
+    if (!window?.id) return;
+    const [tab] = await chrome.tabs.query({ active: true, windowId: window.id });
+    if (!tab?.id) return;
+    let state = { playing: false, hasVideo: false, pageTitle: tab.title || '' };
+    if (window.focused && !tab.incognito) {
+      try { state = await chrome.tabs.sendMessage(tab.id, { type: 'getMediaState' }); }
+      catch { /* Restricted pages and tabs without a content script report no playback. */ }
+    }
+    const [current] = await chrome.tabs.query({ active: true, windowId: window.id });
+    if (epoch !== mediaReportEpoch || current?.id !== tab.id
+      || !isEnabled || !isConnected || !nmPort) return;
+    nmPort.postMessage({
+      type: 'media_state', observed_at_ms: Date.now(),
+      focused: Boolean(window.focused),
+      private: Boolean(tab.incognito),
+      known: Boolean(tab.incognito || !window.focused || state?.hasVideo),
+      playing: Boolean(window.focused && !tab.incognito && state?.playing),
+      page_title: tab.incognito ? '' : (state?.pageTitle || tab.title || '').slice(0, 512),
+    });
+  } catch { /* The next periodic report retries a browser/window transition. */ }
+}
+
+// The native-messaging port keeps this MV3 worker alive. Navigation and focus
+// also refresh promptly so stale playback cannot follow the user into another tab.
+setInterval(() => { void reportMediaState(); }, 5_000);
+chrome.tabs.onActivated.addListener(() => { void reportMediaState(); });
+chrome.tabs.onUpdated.addListener((_tabId, changes) => {
+  if (changes.status || changes.title) void reportMediaState();
+});
+chrome.windows.onFocusChanged.addListener(() => { void reportMediaState(); });
 
 function ensureNativeConnection(reason = 'unknown') {
   if (!settingsLoaded || !isEnabled || isConnected) return;

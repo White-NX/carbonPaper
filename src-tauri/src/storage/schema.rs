@@ -249,6 +249,34 @@ impl StorageState {
                 is_deleted INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Foreground usage has its own clock and survives screenshot deduplication.
+            CREATE TABLE IF NOT EXISTS usage_tracking (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                started_ms INTEGER NOT NULL,
+                policy_version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS usage_intervals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL CHECK(end_ms >= start_ms),
+                process_name TEXT NOT NULL,
+                identity_enc BLOB NOT NULL,
+                identity_key_enc BLOB NOT NULL,
+                input_active INTEGER NOT NULL,
+                media_active INTEGER NOT NULL,
+                end_reason TEXT NOT NULL,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(run_id, sequence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_intervals_time
+                ON usage_intervals(is_deleted, start_ms, id);
+            CREATE INDEX IF NOT EXISTS idx_usage_intervals_end
+                ON usage_intervals(is_deleted, end_ms, start_ms, id);
+            CREATE INDEX IF NOT EXISTS idx_usage_intervals_process
+                ON usage_intervals(process_name, is_deleted, start_ms);
+
             -- OCR results
             CREATE TABLE IF NOT EXISTS ocr_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

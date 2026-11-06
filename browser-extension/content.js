@@ -253,9 +253,32 @@
     return new URL('/favicon.ico', window.location.origin).href;
   }
 
+  const observedVideos = new WeakMap();
+
+  function getMediaState() {
+    const now = performance.now();
+    let playing = false;
+    const videos = document.querySelectorAll('video');
+    for (const video of videos) {
+      const previous = observedVideos.get(video);
+      const position = video.currentTime;
+      observedVideos.set(video, { position, observedAt: now });
+      const style = getComputedStyle(video);
+      if (document.visibilityState === 'visible' && isElementVisible(video)
+        && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+        && !video.paused && !video.ended && video.readyState >= 3
+        && previous && now - previous.observedAt <= 15_000 && position > previous.position) {
+        playing = true;
+      }
+    }
+    return { playing, hasVideo: videos.length > 0, pageTitle: document.title };
+  }
+
   // Listen for messages from the background script
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'getPageData') {
+    if (message.type === 'getMediaState') {
+      sendResponse(getMediaState());
+    } else if (message.type === 'getPageData') {
       sendResponse({
         url: window.location.href,
         title: document.title,

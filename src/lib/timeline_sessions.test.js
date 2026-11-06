@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   aggregateAppDistribution,
   buildSessions,
+  buildTimelineSessions,
   collapseSessions,
   estimateSampleInterval,
   MAX_INFERRED_SESSION_GAP_MS,
@@ -89,6 +90,82 @@ describe('buildSessions', () => {
 
     expect(sessions[0].end).toBe(1000 + MAX_INFERRED_SESSION_GAP_MS);
     expect(sessions[1].end).toBe(3_600_000 + MAX_INFERRED_SESSION_GAP_MS);
+  });
+});
+
+describe('observed usage sessions', () => {
+  const interval = (id, start, end, run = 'run') => ({
+    id, start_ms: start, end_ms: end, run_id: run,
+    process_name: 'player.exe', window_title: 'Film',
+  });
+
+  it('does not infer usage while its tracking boundary is unavailable', () => {
+    expect(buildTimelineSessions([event(1, 0, 'player'), event(2, 2000, 'player')], undefined)).toEqual([]);
+  });
+
+  it('uses a two-hour playback interval even when there is only one screenshot', () => {
+    const sessions = buildTimelineSessions([event(1, 1000, 'player.exe', 'Film')], {
+      tracking_started_ms: 1000, intervals: [interval(1, 1000, 7_201_000)],
+    });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({ start: 1000, end: 7_201_000, count: 1 });
+  });
+
+  it('keeps a two-hour film continuous when input expires and browser titles omit the suffix', () => {
+    const start = 1000;
+    const end = start + 2 * 3_600_000;
+    const sessions = buildTimelineSessions([event(1, start, 'Chrome.EXE', 'Film')], {
+      tracking_started_ms: start,
+      intervals: [
+        { ...interval(1, start, start + 5 * 60_000), process_name: 'chrome.exe',
+          window_title: 'Film - Google Chrome', input_active: true, media_active: true },
+        { ...interval(2, start + 5 * 60_000, end), process_name: 'chrome.exe',
+          window_title: 'Film - Google Chrome', input_active: false, media_active: true },
+      ],
+    });
+    const blocks = collapseSessions(sessions);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({ start, end, appName: 'chrome.exe', windowTitle: 'Film', count: 1 });
+  });
+
+  it('keeps actual native title changes and gaps between playback intervals', () => {
+    const sessions = buildTimelineSessions([event(1, 1000, 'chrome.exe', 'Film')], {
+      tracking_started_ms: 1000,
+      intervals: [
+        { ...interval(1, 1000, 10_000), process_name: 'chrome.exe', window_title: 'Film - Google Chrome' },
+        { ...interval(2, 10_000, 20_000), process_name: 'chrome.exe', window_title: 'Film - Credits - Google Chrome' },
+        { ...interval(3, 30_000, 40_000), process_name: 'chrome.exe', window_title: 'Film - Credits - Google Chrome' },
+      ],
+    });
+    expect(sessions).toHaveLength(3);
+    expect(sessions[1].windowTitle).toBe('Film - Credits - Google Chrome');
+    expect(sessions[2].start).toBe(30_000);
+  });
+
+  it('clips legacy estimates at cutover and never fills new idle or unrecorded periods', () => {
+    const sessions = buildTimelineSessions([
+      event(1, 1000, 'player.exe'), event(2, 2000, 'player.exe'),
+      event(3, 100_000, 'player.exe'), event(4, 200_000, 'player.exe'),
+    ], { tracking_started_ms: 2500, intervals: [] });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].end).toBe(2500);
+  });
+
+  it('keeps observed return boundaries through folding even when timestamps touch', () => {
+    const sessions = buildTimelineSessions([], {
+      tracking_started_ms: 0,
+      intervals: [interval(1, 0, 1000, 'before'), interval(2, 1000, 2000, 'after')],
+    });
+    const blocks = collapseSessions(sessions, { minBlockMs: 10_000 });
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0].firstEvent).toBeNull();
+  });
+
+  it('retains title changes inside continuously observed usage without a screenshot gap cap', () => {
+    const sessions = buildTimelineSessions([
+      event(1, 1000, 'player.exe', 'Film'), event(2, 3_600_000, 'player.exe', 'Credits'),
+    ], { tracking_started_ms: 1000, intervals: [interval(1, 1000, 7_200_000)] });
+    expect(sessions.map(({ start, end }) => [start, end])).toEqual([[1000, 3_600_000], [3_600_000, 7_200_000]]);
   });
 });
 

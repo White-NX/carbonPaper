@@ -82,6 +82,84 @@ export function buildSessions(
   return sessions;
 }
 
+/** Use observed intervals after tracking starts; retain bounded estimates for legacy history. */
+export function buildTimelineSessions(events, usage) {
+  // Until the tracking boundary is known, only screenshot points are factual.
+  if (usage === undefined) return [];
+  const cutover = usage?.tracking_started_ms;
+  const legacyEvents = Number.isFinite(cutover)
+    ? (events || []).filter((event) => event.timestamp < cutover) : events;
+  const legacy = buildSessions(legacyEvents, { tailMs: estimateSampleInterval(legacyEvents) });
+  if (!Number.isFinite(cutover)) return legacy;
+  for (const session of legacy) session.end = Math.min(session.end, cutover);
+
+  const normalizeApp = (name) => String(name || '').toLowerCase().replace(/\.exe$/, '');
+  const frames = events || [];
+  const icons = new Map();
+  for (const frame of frames) {
+    if (frame.processIcon) icons.set(normalizeApp(frame.appName), frame.processIcon);
+  }
+  const observed = [];
+  for (const interval of usage.intervals || []) {
+    if (!Number.isFinite(interval.start_ms) || !Number.isFinite(interval.end_ms)
+      || interval.end_ms <= interval.start_ms) continue;
+    const app = normalizeApp(interval.process_name);
+    // Screenshot wire times have one-second precision; keep the opening frame
+    // without letting its rounded timestamp extend an observed usage interval.
+    const shots = frames.slice(lowerBound(frames, interval.start_ms - 1000), lowerBound(frames, interval.end_ms))
+      .filter((event) => normalizeApp(event.appName) === app);
+    const parts = shots.length ? buildSessions(
+      shots.map((event) => ({ ...event, appName: interval.process_name,
+        timestamp: Math.max(interval.start_ms, event.timestamp) })),
+      { maxGapMs: Number.MAX_SAFE_INTEGER },
+    ) : [{
+      key: getActivityKey(interval.process_name, interval.window_title),
+      appName: interval.process_name,
+      windowTitle: interval.window_title,
+      processIcon: icons.get(app),
+      category: null, count: 0, firstEvent: null,
+      start: interval.start_ms, end: interval.end_ms,
+    }];
+    parts[0].start = interval.start_ms;
+    parts[parts.length - 1].end = interval.end_ms;
+    for (const part of parts) {
+      part.continuityId = interval.run_id;
+      part.usageId = interval.id;
+      part.nativeWindowTitle = interval.window_title;
+      part.processPath = interval.process_path;
+      const last = observed[observed.length - 1];
+      const titleMatchesNative = (title) => {
+        const page = String(title || '').trim().toLowerCase();
+        const native = String(interval.window_title || '').trim().toLowerCase();
+        return page && (native === page || native.startsWith(`${page} - `)
+          || native.startsWith(`${page} — `));
+      };
+      // A change in input/media basis does not interrupt the activity. Browser
+      // screenshot titles omit the native browser suffix; only reconcile a
+      // screenshot-free part when the native title itself stayed unchanged.
+      const sameTitle = last && (last.key === part.key
+        || (last.nativeWindowTitle === part.nativeWindowTitle
+          && ((!last.firstEvent && titleMatchesNative(part.windowTitle))
+            || (!part.firstEvent && titleMatchesNative(last.windowTitle)))));
+      if (last && last.end === part.start && last.continuityId === part.continuityId
+        && normalizeApp(last.appName) === app
+        && String(last.processPath || '').toLowerCase() === String(part.processPath || '').toLowerCase()
+        && sameTitle) {
+        last.end = part.end;
+        last.count += part.count;
+        if (!last.processIcon) last.processIcon = part.processIcon;
+        if (!last.firstEvent && part.firstEvent) {
+          last.firstEvent = part.firstEvent;
+          last.windowTitle = part.windowTitle;
+          last.key = part.key;
+          last.category = part.category;
+        }
+      } else observed.push(part);
+    }
+  }
+  return [...legacy, ...observed].sort((left, right) => left.start - right.start);
+}
+
 /**
  * Identify a display block by where it starts rather than by what it holds.
  *
@@ -131,6 +209,7 @@ function toActivityBlock(activity) {
     end: activity.end,
     count: activity.count,
     firstEvent: activity.firstEvent,
+    continuityId: activity.continuityId,
     segments: [activity],
     windowCount: 1,
     switches: 0,
@@ -173,6 +252,7 @@ function foldRun(items, dominantRatio) {
     end: items[items.length - 1].end,
     count,
     firstEvent: items[0].firstEvent,
+    continuityId: items[0].continuityId,
     category: items[0].category,
     segments: items,
     switches: items.length - 1,
@@ -212,7 +292,8 @@ function foldRun(items, dominantRatio) {
 
 /** Check if adjacent blocks of the same app should merge. */
 function canAbsorb(left, right) {
-  if (left.end !== right.start || !left.appName || left.appName !== right.appName) return false;
+  if (left.end !== right.start || left.continuityId !== right.continuityId
+    || !left.appName || left.appName !== right.appName) return false;
   return left.kind === 'app' || right.kind === 'app';
 }
 
@@ -233,10 +314,11 @@ export function collapseSessions(
   for (const activity of activities) {
     const isShort = activity.end - activity.start < minBlockMs;
     const last = runs[runs.length - 1];
-    if (isShort && last?.short && last.items[last.items.length - 1].end === activity.start) {
+    const previous = last?.items[last.items.length - 1];
+    if (isShort && last?.short && previous.end === activity.start
+      && previous.continuityId === activity.continuityId) {
       last.items.push(activity);
-    }
-    else runs.push({ short: isShort, items: [activity] });
+    } else runs.push({ short: isShort, items: [activity] });
   }
 
   const blocks = runs.map((run) => (

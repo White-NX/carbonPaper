@@ -245,6 +245,7 @@ async fn process_nmh_request(
                 last_seen_ms: now_ms,
                 nmh_peer: peer.clone(),
                 browser_created_at: browser.created_at,
+                media: None,
             };
             upsert_session(
                 &mut NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner()),
@@ -257,6 +258,56 @@ async fn process_nmh_request(
             let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             remove_peer_sessions(&mut sessions, peer, Some(cmd_pipe_name));
             StorageResponse::success(serde_json::json!({"unregistered": true}))
+        }
+        "report_media_state" => {
+            let (Some(private), Some(known)) = (req["private"].as_bool(), req["known"].as_bool())
+            else {
+                return StorageResponse::error("Invalid media observation coverage");
+            };
+            let Some(focused) = req["focused"].as_bool() else {
+                return StorageResponse::error("Invalid media focus state");
+            };
+            let Some(playing) = req["playing"].as_bool() else {
+                return StorageResponse::error("Invalid media playback state");
+            };
+            let Some(page_title) = req["page_title"]
+                .as_str()
+                .filter(|title| title.len() <= 2048)
+            else {
+                return StorageResponse::error("Invalid media page title");
+            };
+            let Some(observed_at_ms) = req["observed_at_ms"].as_i64() else {
+                return StorageResponse::error("Invalid media observation time");
+            };
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if now_ms.abs_diff(observed_at_ms) > 15_000 {
+                return StorageResponse::error("Stale media observation");
+            }
+            let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            // Session ownership was established through the authenticated pipe
+            // and OS-verified browser ancestry; extension-supplied PIDs are ignored.
+            let Some(session) = sessions
+                .iter_mut()
+                .find(|session| session.nmh_peer == *peer)
+            else {
+                return StorageResponse::error("No registered NMH session");
+            };
+            if focused {
+                session.last_seen_ms = now_ms;
+            }
+            session.media = Some(BrowserMediaObservation {
+                private,
+                known,
+                focused,
+                playing,
+                page_title: page_title.into(),
+                // SAFETY: GetTickCount64 has no pointers and supplies a monotonic TTL clock.
+                observed_tick_ms: unsafe {
+                    windows::Win32::System::SystemInformation::GetTickCount64()
+                        .saturating_sub(now_ms.saturating_sub(observed_at_ms).max(0) as u64)
+                },
+            });
+            StorageResponse::success(serde_json::json!({"recorded": true}))
         }
         "save_extension_screenshot" => {
             // Only the OS-verified owner can refresh this session.
@@ -558,6 +609,67 @@ pub struct NmhSession {
     nmh_peer: ProcessIdentity,
     #[serde(skip)]
     browser_created_at: u64,
+    #[serde(skip)]
+    media: Option<BrowserMediaObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserMediaObservation {
+    private: bool,
+    known: bool,
+    focused: bool,
+    playing: bool,
+    page_title: String,
+    observed_tick_ms: u64,
+}
+
+pub(crate) enum ForegroundMediaHint {
+    Private,
+    Playback(bool),
+}
+
+pub(crate) fn foreground_media_hint(
+    window: &crate::usage::UsageIdentity,
+) -> Option<ForegroundMediaHint> {
+    if !extension_enhancement_enabled() {
+        return None;
+    }
+    // SAFETY: GetTickCount64 takes no arguments and retains no resources.
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    let sessions = NMH_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    sessions
+        .iter()
+        .filter(|session| {
+            session.browser_pid == window.pid
+                || (session
+                    .browser_exe_path
+                    .eq_ignore_ascii_case(&window.process_path)
+                    && is_pid_descendant_of(window.pid, session.browser_pid))
+        })
+        .filter_map(|session| session.media.as_ref())
+        .filter(|media| {
+            now.saturating_sub(media.observed_tick_ms) <= 15_000
+                && ((media.private && media.focused)
+                    || crate::usage::foreground_title_matches(
+                        &window.window_title,
+                        &media.page_title,
+                    ))
+        })
+        .max_by_key(|media| media.observed_tick_ms)
+        .and_then(|media| {
+            if media.private && media.focused {
+                Some(ForegroundMediaHint::Private)
+            } else if media.known {
+                Some(ForegroundMediaHint::Playback(
+                    media.focused && media.playing,
+                ))
+            } else {
+                None
+            }
+        })
 }
 
 static NMH_SESSIONS: once_cell::sync::Lazy<std::sync::Mutex<Vec<NmhSession>>> =
@@ -565,7 +677,14 @@ static NMH_SESSIONS: once_cell::sync::Lazy<std::sync::Mutex<Vec<NmhSession>>> =
 
 /// Insert or replace a session, keyed by nmh_pid (an NMH re-registering —
 /// e.g. after an app restart rotated the token — replaces its old entry).
-fn upsert_session(sessions: &mut Vec<NmhSession>, session: NmhSession) {
+fn upsert_session(sessions: &mut Vec<NmhSession>, mut session: NmhSession) {
+    if let Some(previous) = sessions.iter().find(|previous| {
+        previous.nmh_peer == session.nmh_peer
+            && previous.browser_pid == session.browser_pid
+            && previous.browser_created_at == session.browser_created_at
+    }) {
+        session.media = previous.media.clone();
+    }
     sessions.retain(|s| s.nmh_pid != session.nmh_pid);
     sessions.push(session);
 }
@@ -804,6 +923,7 @@ mod tests {
                 image: PathBuf::new(),
             },
             browser_created_at: 1,
+            media: None,
         }
     }
 

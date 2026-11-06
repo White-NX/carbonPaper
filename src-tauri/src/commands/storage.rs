@@ -270,6 +270,46 @@ pub async fn storage_get_timeline(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Reads observed foreground usage in UTC Unix milliseconds, without screenshot sampling.
+/// Authentication: required. Frontend: `lib/monitor_api.js`.
+#[tauri::command]
+pub async fn storage_get_usage_timeline(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    start_time: i64,
+    end_time: i64,
+    cursor: Option<storage::UsageCursor>,
+    cache_epoch: Option<String>,
+    known_ids: Option<Vec<i64>>,
+    request_id: Option<String>,
+) -> Result<storage::UsageTimelinePage, String> {
+    check_auth_required(&credential_state)?;
+    let known_ids = known_ids.unwrap_or_default();
+    if known_ids.len() > 5000 || cache_epoch.as_ref().is_some_and(|epoch| epoch.len() > 64) {
+        return Err("Invalid usage timeline cache".into());
+    }
+    let request_id = request_id.unwrap_or_else(|| format!("usage-{}", rand::random::<u64>()));
+    if request_id.len() > 128 {
+        return Err("Invalid timeline request id".into());
+    }
+    let ticket = TIMELINE_REQUESTS.begin(window.label(), &request_id)?;
+    let cancelled = ticket.cancelled.clone();
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        state.get_usage_timeline(
+            start_time,
+            end_time,
+            cursor,
+            cache_epoch.as_deref(),
+            &known_ids,
+            &cancelled,
+        )
+    })
+    .await
+    .map_err(|error| format!("Task join error: {error:?}"))?
+}
+
 /// Loads authenticated timeline labels and icons only for the requested screenshot IDs.
 #[tauri::command]
 pub async fn storage_get_timeline_details(

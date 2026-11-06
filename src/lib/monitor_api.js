@@ -249,6 +249,44 @@ export const getTimelineDetails = async (ids, { signal } = {}) => {
     return invokeTimelineRead('storage_get_timeline_details', { ids }, signal);
 };
 
+/** Observed usage uses exact UTC millisecond bounds and paging, never screenshot samples. */
+export const getUsageTimeline = async (startTime, endTime, { signal, cache } = {}) => {
+    let cursor = null;
+    let trackingStarted = null;
+    let cacheEpoch;
+    const cached = new Map((cache?.intervals || []).map((interval) => [interval.id, interval]));
+    const intervals = [];
+    do {
+        const params = { startTime: Math.floor(startTime), endTime: Math.ceil(endTime), cursor };
+        if (cache?.cache_epoch) {
+            params.cacheEpoch = cache.cache_epoch;
+            params.knownIds = [...cached.keys()].slice(0, 5000);
+        }
+        const page = await invokeTimelineRead('storage_get_usage_timeline', params, signal);
+        if (!page || Array.isArray(page)) throw new Error('Invalid usage timeline response');
+        if (cacheEpoch !== undefined && page.cache_epoch !== cacheEpoch) {
+            throw new Error('Usage timeline changed during paging');
+        }
+        cacheEpoch = page.cache_epoch;
+        trackingStarted = page.tracking_started_ms;
+        for (const interval of page.intervals || []) {
+            const previous = page.cache_epoch === cache?.cache_epoch ? cached.get(interval.id) : null;
+            intervals.push({ ...interval,
+                process_name: interval.process_name ?? previous?.process_name,
+                process_path: interval.process_path ?? previous?.process_path,
+                window_title: interval.window_title ?? previous?.window_title,
+            });
+        }
+        const next = page.next_cursor;
+        if (next && cursor && (next.start_ms < cursor.start_ms
+          || (next.start_ms === cursor.start_ms && next.id <= cursor.id))) {
+            throw new Error('Usage timeline cursor did not advance');
+        }
+        cursor = next || null;
+    } while (cursor);
+    return { tracking_started_ms: trackingStarted, intervals, ...(cacheEpoch ? { cache_epoch: cacheEpoch } : {}) };
+};
+
 /**
  * Get timeline snapshot density bucket counts.
  * @param {number} bucketOffsetMs Offset in ms to align bucket boundaries with local timezone.
