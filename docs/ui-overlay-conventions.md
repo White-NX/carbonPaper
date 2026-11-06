@@ -21,6 +21,7 @@ or a fatal surface.
 
 | Surface | Owner and primitive | Dismissal or completion |
 |---|---|---|
+| Brand startup screen | `index.html`, `public/startup.js`, and `src/startup.css`, before React loads | Foreground main windows are created hidden and revealed once the local startup art can paint. The screen has native minimize/hide controls and releases the React root when its first startup overlay or authenticated workspace is committed. `StartupScreenHandoff` runs before dialog focus effects; its short fade does not wait for background work. Settings and snapshot-preview windows skip it, and background launches still create no main WebView. |
 | Recap corrections, sources and diagnostics; OCR repair | Main window, `Dialog` | Close/Escape/backdrop, with close disabled during an active operation. |
 | Smart Cluster and recap deletion; settings deletion and token decisions | Calling window, `ConfirmDialog` | Explicit confirm/cancel; pending work disables cancellation. |
 | Backup import/export, storage-location choice, Agent Access privacy | Settings window, `Dialog` | Close/Escape/backdrop while idle; backup processing disables close. Typed confirmations stay within the existing form. |

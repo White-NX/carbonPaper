@@ -15,6 +15,7 @@ import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StorageInitializationOverlay from './components/StorageInitializationOverlay';
+import StartupScreenHandoff from './components/StartupScreenHandoff';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange, warmupThumbnails } from './lib/monitor_api';
@@ -221,6 +222,7 @@ function App() {
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
       onClickCapture={handleGlobalClick}
     >
+      <StartupScreenHandoff ready={overlays.active !== null || (initialization.ready && isAuthenticated)} />
       <TopBar
         darkMode={darkMode}
         setDarkMode={setDarkMode}

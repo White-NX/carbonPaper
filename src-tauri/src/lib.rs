@@ -38,6 +38,7 @@ mod index_progress;
 mod legacy_python_cleanup;
 mod legacy_vector_discard;
 mod logging;
+mod main_window;
 mod maintenance;
 mod maintenance_support;
 pub mod mcp_contract;
@@ -508,10 +509,8 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
         credential_state.set_foreground_state(true);
     }
 
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+    if app.get_webview_window("main").is_some() {
+        let _ = main_window::request_show(app);
         if show_ocr_model_repair {
             let _ = app.emit("show-ocr-model-repair", ());
         }
@@ -726,14 +725,18 @@ pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::err
 
     tracing::info!("Creating main window");
 
-    let window =
-        WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-            .title("carbonpaper")
-            .inner_size(1300.0, 750.0)
-            .decorations(false)
-            .transparent(true)
-            .visible(true)
-            .build()?;
+    let generation = app
+        .state::<main_window::MainWindowPresentationState>()
+        .begin_creation();
+    let url = format!("index.html?startup={generation}");
+
+    let window = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+        .title("carbonpaper")
+        .inner_size(1300.0, 750.0)
+        .decorations(false)
+        .transparent(true)
+        .visible(false)
+        .build()?;
 
     // 应用 Acrylic 效果
     let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
@@ -805,7 +808,7 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
 }
 
 pub(crate) fn hide_main_window_to_tray(window: &tauri::Window) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())?;
+    main_window::hide(window)?;
     let app = window.app_handle();
     settings_window::refresh_ui_foreground(app);
     let _ = app.emit("app-hidden", ());
@@ -895,6 +898,7 @@ pub fn run() {
         .manage(storage_state)
         .manage(Arc::new(storage_startup::StorageStartupState::new()))
         .manage(Arc::new(commands::migration::HmacMigrationRuntime::default()))
+        .manage(main_window::MainWindowPresentationState::new(!start_hidden))
         .manage(lightweight_state.clone())
         .manage(Arc::new(PowerState::new()))
         .manage(Arc::new(IdleState::new()))
@@ -905,6 +909,12 @@ pub fn run() {
         .manage(Arc::new(rerank::RerankQueryState::default()))
         .on_window_event(|window, event| {
             settings_window::on_window_event(window, event);
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .app_handle()
+                    .state::<main_window::MainWindowPresentationState>()
+                    .destroyed();
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     if error_window::HAS_CRITICAL_ERROR.load(Ordering::Relaxed) {
@@ -919,6 +929,7 @@ pub fn run() {
                 }
             }
         })
+        .on_page_load(main_window::on_page_load)
         .setup({
             let data_dir = data_dir.clone();
             let start_hidden = start_hidden;
@@ -1181,6 +1192,7 @@ pub fn run() {
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
             commands::utility::hide_to_tray,
+            main_window::main_window_ready,
             // 轻量模式命令
             commands::utility::switch_to_lightweight_mode,
             commands::utility::switch_to_standard_mode,
@@ -1251,6 +1263,13 @@ mod tests {
         let mut foreground = config.app.windows.clone();
         apply_startup_window_policy(&mut foreground, false);
         assert!(foreground.iter().any(|window| window.label == "main"));
+        assert!(
+            !foreground
+                .iter()
+                .find(|window| window.label == "main")
+                .unwrap()
+                .visible
+        );
 
         let mut background = config.app.windows;
         apply_startup_window_policy(&mut background, true);

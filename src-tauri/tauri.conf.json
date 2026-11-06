@@ -11,12 +11,14 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "carbonpaper",
         "width": 1300,
         "height": 750,
         "decorations": false,
+        "visible": false,
         "transparent": true
       }
     ],

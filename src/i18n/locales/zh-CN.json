@@ -1,4 +1,8 @@
 {
+  "startupScreen": {
+    "tagline": "找回屏幕上的片刻。",
+    "minimize": "最小化"
+  },
   "storageStartup": {
     "title": "正在准备历史记录",
     "tip": "准备完成后即可继续使用。历史记录较多时可能需要几分钟。",

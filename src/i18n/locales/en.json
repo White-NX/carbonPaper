@@ -1,4 +1,8 @@
 {
+  "startupScreen": {
+    "tagline": "Find moments from your screen.",
+    "minimize": "Minimize"
+  },
   "storageStartup": {
     "title": "Preparing your history",
     "tip": "You can continue when preparation finishes. A large history may take a few minutes.",
