@@ -227,6 +227,7 @@ impl Cancellation {
 
 pub fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(concat!("CarbonPaper/", env!("CARGO_PKG_VERSION")))
         .build()
