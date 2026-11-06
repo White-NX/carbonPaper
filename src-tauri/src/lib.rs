@@ -354,41 +354,9 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             // SQLite triggers remove Rust-owned semantic and CLIP derived rows
             // in the same transaction as the screenshot lifecycle update, so
             // physical cleanup needs no further acknowledgement.
-            let data_dir = storage
-                .data_dir
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-
             for item in &screenshot_candidates {
-                let path = std::path::Path::new(&item.image_path);
-                let abs_path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    data_dir.join(path)
-                };
-
-                if let Err(e) = std::fs::remove_file(&abs_path) {
-                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                    if !not_found {
-                        tracing::debug!(
-                            "[DELETE_QUEUE] Failed to remove image file {}: {}",
-                            abs_path.display(),
-                            e
-                        );
-                    }
-                }
-
-                let thumb_path = StorageState::thumbnail_path_for(&abs_path);
-                if let Err(e) = std::fs::remove_file(&thumb_path) {
-                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                    if !not_found {
-                        tracing::debug!(
-                            "[DELETE_QUEUE] Failed to remove thumbnail {}: {}",
-                            thumb_path.display(),
-                            e
-                        );
-                    }
+                if let Err(error) = storage.remove_screenshot_files(&item.image_path) {
+                    tracing::debug!("[DELETE_QUEUE] Screenshot file cleanup failed: {error}");
                 }
             }
 

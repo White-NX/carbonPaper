@@ -247,6 +247,94 @@ fn empty_backup_restores_without_an_archived_payload_directory() {
 }
 
 #[test]
+fn missing_deleted_and_aborted_images_restore_with_relative_paths() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("missing-images.cpbackup");
+    let source_directory = root.path().join("source");
+    let source = storage(&source_directory);
+    let deleted_relative = "screenshots/deleted.png.enc";
+    let aborted_relative = "screenshots/aborted.png.enc";
+    let deleted_image = source_directory.join(deleted_relative);
+    let deleted_thumbnail = StorageState::thumbnail_path_for(&deleted_image);
+    let aborted_image = source_directory.join(aborted_relative);
+    {
+        let guard = source.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(7,?1,'deleted-image','committed')",
+            [deleted_image.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(8,?1,'aborted-image','aborted')",
+            [aborted_image.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        source
+            .soft_delete_screenshots(&[7])
+            .unwrap()
+            .queued_screenshots,
+        1
+    );
+    assert!(!deleted_image.exists());
+    assert!(!aborted_image.exists());
+    export(&source, &archive);
+    drop(source);
+
+    // The same absolute location may exist on the importing machine. Cleanup
+    // must leave those files intact even though the archive omitted the image.
+    std::fs::write(&deleted_image, b"source image").unwrap();
+    std::fs::create_dir_all(deleted_thumbnail.parent().unwrap()).unwrap();
+    std::fs::write(&deleted_thumbnail, b"source thumbnail").unwrap();
+    let destination_directory = root.path().join("destination");
+    let destination = storage(&destination_directory);
+    let _operation = destination.backup.begin();
+    let prepared = prepare(&destination, &archive, root.path());
+    {
+        let _maintenance = destination.database_maintenance("test missing images import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    {
+        let guard = destination.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        let aborted: (String, i32, String) = conn
+            .query_row(
+                "SELECT image_path,is_deleted,status FROM screenshots WHERE id=8",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(aborted, (aborted_relative.into(), 0, "aborted".into()));
+    }
+    let candidates = destination.fetch_screenshot_delete_candidates(10).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].id, 7);
+    assert_eq!(candidates[0].image_path, deleted_relative);
+    assert_eq!(
+        destination.resolve_image_path(&candidates[0].image_path),
+        destination_directory.join(deleted_relative)
+    );
+    destination
+        .remove_screenshot_files(&candidates[0].image_path)
+        .unwrap();
+    assert_eq!(std::fs::read(&deleted_image).unwrap(), b"source image");
+    assert_eq!(
+        std::fs::read(&deleted_thumbnail).unwrap(),
+        b"source thumbnail"
+    );
+    assert_eq!(
+        destination.finalize_screenshot_delete_batch(&[7]).unwrap(),
+        1
+    );
+    assert!(destination
+        .fetch_screenshot_delete_candidates(10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
     let root = TempDir::new().unwrap();
     let archive = root.path().join("portable.cpbackup");

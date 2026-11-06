@@ -81,6 +81,40 @@ struct ImageFileReadTimings {
     decrypt: Duration,
 }
 
+fn remove_screenshot_file(root: &Path, file: &Path) -> Result<(), String> {
+    let parent = file
+        .parent()
+        .ok_or("Screenshot cleanup path has no parent")?;
+    let parent = match std::fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Failed to resolve screenshot cleanup path: {error}"
+            ))
+        }
+    };
+    if !parent.starts_with(root) {
+        return Err(format!(
+            "Refusing to remove a file outside the screenshot directory: {}",
+            file.display()
+        ));
+    }
+    let name = file
+        .file_name()
+        .ok_or("Screenshot cleanup path has no file name")?;
+    // Resolve directory junctions before deletion, but keep the final component
+    // so a file symlink is unlinked rather than deleting its target.
+    match std::fs::remove_file(parent.join(name)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to remove screenshot file {}: {error}",
+            file.display()
+        )),
+    }
+}
+
 fn image_locations_by_ids(
     conn: &Connection,
     ids: &[i64],
@@ -276,6 +310,33 @@ impl StorageState {
             stem
         };
         thumbs_dir.join(format!("{}.thumb.jpg.enc", base_stem))
+    }
+
+    /// Remove deferred screenshot files only from the current screenshot directory.
+    pub(crate) fn remove_screenshot_files(&self, image_path: &str) -> Result<(), String> {
+        if image_path.starts_with("memory://") {
+            return Ok(());
+        }
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let root = match std::fs::canonicalize(data_dir.join("screenshots")) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("Failed to resolve screenshot directory: {error}")),
+        };
+        let path = Path::new(image_path);
+        let image = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            data_dir.join(path)
+        };
+        let thumbnail = Self::thumbnail_path_for(&image);
+        let image_result = remove_screenshot_file(&root, &image);
+        let thumbnail_result = remove_screenshot_file(&root, &thumbnail);
+        image_result.and(thumbnail_result)
     }
 
     /// Read a thumbnail for an image, generating and caching it on first request.

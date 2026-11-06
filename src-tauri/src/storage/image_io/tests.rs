@@ -12,6 +12,63 @@ fn fixture() -> (tempfile::TempDir, StorageState, Connection) {
     (directory, storage, conn)
 }
 
+#[test]
+fn screenshot_cleanup_handles_current_paths_and_missing_images() {
+    let (directory, storage, _conn) = fixture();
+    for (relative, absolute, image_exists) in [
+        ("screenshots/current.png.enc", false, true),
+        ("screenshots/legacy.png.enc", true, true),
+        ("screenshots/missing.png.enc", false, false),
+    ] {
+        let image = directory.path().join(relative);
+        let thumbnail = StorageState::thumbnail_path_for(&image);
+        std::fs::create_dir_all(thumbnail.parent().unwrap()).unwrap();
+        if image_exists {
+            std::fs::write(&image, b"image").unwrap();
+        }
+        std::fs::write(&thumbnail, b"thumbnail").unwrap();
+        let path = if absolute {
+            image.to_string_lossy().into_owned()
+        } else {
+            relative.into()
+        };
+        storage.remove_screenshot_files(&path).unwrap();
+        assert!(!image.exists());
+        assert!(!thumbnail.exists());
+    }
+}
+
+#[test]
+fn screenshot_cleanup_preserves_files_outside_the_current_screenshot_directory() {
+    let (directory, storage, _conn) = fixture();
+    std::fs::create_dir_all(directory.path().join("screenshots")).unwrap();
+    for relative in [
+        "other/screenshots/image.png.enc",
+        "screenshots-old/image.png.enc",
+    ] {
+        let image = directory.path().join(relative);
+        let thumbnail = StorageState::thumbnail_path_for(&image);
+        std::fs::create_dir_all(thumbnail.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"outside image").unwrap();
+        std::fs::write(&thumbnail, b"outside thumbnail").unwrap();
+        for path in [
+            image.to_string_lossy().into_owned(),
+            relative.into(),
+            format!("screenshots/../{relative}"),
+        ] {
+            assert!(storage.remove_screenshot_files(&path).is_err());
+            assert_eq!(std::fs::read(&image).unwrap(), b"outside image");
+            assert_eq!(std::fs::read(&thumbnail).unwrap(), b"outside thumbnail");
+        }
+        // A missing original must not let an external thumbnail bypass the guard.
+        std::fs::remove_file(&image).unwrap();
+        assert!(storage
+            .remove_screenshot_files(image.to_str().unwrap())
+            .is_err());
+        assert_eq!(std::fs::read(&thumbnail).unwrap(), b"outside thumbnail");
+    }
+}
+
 fn insert_history(conn: &Connection, count: i64) {
     conn.execute(
         "WITH RECURSIVE ids(id) AS (

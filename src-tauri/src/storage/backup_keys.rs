@@ -625,6 +625,15 @@ fn normalize_images(
             if deleted == 0 && status.as_deref() != Some("aborted") {
                 return Err("A screenshot file is missing from the backup".into());
             }
+            if restore {
+                // Tombstones still feed deferred cleanup after import. Rebase
+                // their paths even when there is no file left to re-encrypt.
+                conn.execute(
+                    "UPDATE screenshots SET image_path=?1 WHERE rowid=?2",
+                    params![relative, rowid],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             continue;
         }
         let data = Zeroizing::new(std::fs::read(&file).map_err(|e| e.to_string())?);
