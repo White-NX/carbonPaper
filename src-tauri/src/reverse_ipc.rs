@@ -340,11 +340,8 @@ async fn process_nmh_request(
                     ));
                 }
             }
-            let decoded_rgb_image = match image::load_from_memory_with_format(
-                &encoded_image,
-                image::ImageFormat::Png,
-            ) {
-                Ok(image) => Arc::new(image.to_rgb8()),
+            let decoded_rgb_image = match decode_extension_png(&encoded_image) {
+                Ok(image) => Arc::new(image),
                 Err(error) => {
                     return StorageResponse::error(&format!(
                         "Cannot decode extension PNG: {error}"
@@ -475,6 +472,33 @@ async fn process_nmh_request(
 }
 
 const EXTENSION_OCR_MAX_SIDE: u32 = 1600;
+const EXTENSION_PNG_MAX_SIDE: u32 = 8192;
+const EXTENSION_PNG_MAX_PIXELS: u64 = 16 * 1024 * 1024;
+const EXTENSION_PNG_MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn decode_extension_png(encoded_image: &[u8]) -> image::ImageResult<image::RgbImage> {
+    use image::ImageDecoder;
+
+    // IPC framing only bounds compressed bytes. Limit PNG parsing, decoded
+    // pixels, and the subsequent RGB conversion before allocating image buffers.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(EXTENSION_PNG_MAX_SIDE);
+    limits.max_image_height = Some(EXTENSION_PNG_MAX_SIDE);
+    limits.max_alloc = Some(EXTENSION_PNG_MAX_DECODE_BYTES);
+    let mut decoder = image::codecs::png::PngDecoder::with_limits(
+        std::io::Cursor::new(encoded_image),
+        limits.clone(),
+    )?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > EXTENSION_PNG_MAX_PIXELS {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
+        ));
+    }
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    Ok(image::DynamicImage::from_decoder(decoder)?.to_rgb8())
+}
 
 fn extension_capture_allowed(app: &tauri::AppHandle, capture: &CaptureState) -> bool {
     use tauri::Manager;
