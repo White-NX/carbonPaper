@@ -3,6 +3,9 @@ export function getActivityKey(appName, windowTitle) {
   return `${appName || ''}::${windowTitle || ''}`;
 }
 
+/** Screenshots alone cannot establish continuity across a long observation gap. */
+export const MAX_INFERRED_SESSION_GAP_MS = 5 * 60_000;
+
 /** Unique deduplication key for an event. */
 export function getEventKey(event) {
   if (!event) return null;
@@ -39,19 +42,27 @@ function upperBound(events, target) {
  * Merge consecutive events for the same activity into raw session segments.
  *
  * @param {Array} events Events sorted by timestamp ascending
- * @param {{tailMs?: number}} options
+ * @param {{tailMs?: number, maxGapMs?: number}} options
  */
-export function buildSessions(events, { tailMs = 0 } = {}) {
+export function buildSessions(
+  events,
+  { tailMs = 0, maxGapMs = MAX_INFERRED_SESSION_GAP_MS } = {},
+) {
   if (!events || events.length === 0) return [];
+
+  const gapLimit = Number.isFinite(maxGapMs) ? Math.max(0, maxGapMs) : MAX_INFERRED_SESSION_GAP_MS;
+  const tail = Number.isFinite(tailMs) ? Math.min(gapLimit, Math.max(0, tailMs)) : 0;
 
   const sessions = [];
   for (const event of events) {
     const key = getActivityKey(event.appName, event.windowTitle);
     const last = sessions[sessions.length - 1];
-    if (last && last.key === key) {
+    const continuous = last && event.timestamp - last.end <= gapLimit;
+    if (continuous && last.key === key) {
       last.end = event.timestamp;
       last.count += 1;
     } else {
+      if (last) last.end = continuous ? event.timestamp : last.end + tail;
       sessions.push({
         key,
         appName: event.appName,
@@ -66,11 +77,7 @@ export function buildSessions(events, { tailMs = 0 } = {}) {
     }
   }
 
-  for (let i = 0; i < sessions.length - 1; i += 1) {
-    sessions[i].end = sessions[i + 1].start;
-  }
-  const tail = sessions[sessions.length - 1];
-  tail.end = tail.end + Math.max(0, tailMs);
+  sessions[sessions.length - 1].end += tail;
 
   return sessions;
 }
@@ -205,7 +212,7 @@ function foldRun(items, dominantRatio) {
 
 /** Check if adjacent blocks of the same app should merge. */
 function canAbsorb(left, right) {
-  if (!left.appName || left.appName !== right.appName) return false;
+  if (left.end !== right.start || !left.appName || left.appName !== right.appName) return false;
   return left.kind === 'app' || right.kind === 'app';
 }
 
@@ -226,7 +233,9 @@ export function collapseSessions(
   for (const activity of activities) {
     const isShort = activity.end - activity.start < minBlockMs;
     const last = runs[runs.length - 1];
-    if (isShort && last?.short) last.items.push(activity);
+    if (isShort && last?.short && last.items[last.items.length - 1].end === activity.start) {
+      last.items.push(activity);
+    }
     else runs.push({ short: isShort, items: [activity] });
   }
 
@@ -270,7 +279,7 @@ export function collapseSessions(
   return merged;
 }
 
-/** Estimate median interval between adjacent screenshots. */
+/** Estimate a bounded tail from the median interval between adjacent screenshots. */
 export function estimateSampleInterval(events) {
   if (!events || events.length < 2) return 0;
   const gaps = [];
@@ -280,7 +289,7 @@ export function estimateSampleInterval(events) {
   }
   if (gaps.length === 0) return 0;
   gaps.sort((a, b) => a - b);
-  return gaps[gaps.length >> 1];
+  return Math.min(gaps[gaps.length >> 1], MAX_INFERRED_SESSION_GAP_MS);
 }
 
 /** Prune events outside specified start/end window. */

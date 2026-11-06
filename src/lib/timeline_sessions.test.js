@@ -4,6 +4,7 @@ import {
   buildSessions,
   collapseSessions,
   estimateSampleInterval,
+  MAX_INFERRED_SESSION_GAP_MS,
   getActivityKey,
   mergeSortedEvents,
   pruneEvents,
@@ -69,6 +70,25 @@ describe('buildSessions', () => {
     ]);
 
     expect(sessions).toHaveLength(2);
+  });
+
+  it('preserves a 25-hour absence even when the same app and title return', () => {
+    const events = [event(1, 0, 'Code', 'notes'), event(2, 25 * 3_600_000, 'Code', 'notes')];
+    const sessions = buildSessions(events, { tailMs: estimateSampleInterval(events) });
+
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0].end).toBe(MAX_INFERRED_SESSION_GAP_MS);
+    expect(sessions[1].start).toBe(events[1].timestamp);
+    expect(sessions[1].end - sessions[1].start).toBe(MAX_INFERRED_SESSION_GAP_MS);
+  });
+
+  it('does not fill a long gap before another app or extend an unbounded tail', () => {
+    const sessions = buildSessions([
+      event(1, 0, 'Code'), event(2, 1000, 'Code'), event(3, 3_600_000, 'msedge'),
+    ], { tailMs: 3_600_000 });
+
+    expect(sessions[0].end).toBe(1000 + MAX_INFERRED_SESSION_GAP_MS);
+    expect(sessions[1].end).toBe(3_600_000 + MAX_INFERRED_SESSION_GAP_MS);
   });
 });
 
@@ -206,6 +226,19 @@ describe('collapseSessions', () => {
     expect(blocks.every((block) => block.kind === 'activity')).toBe(true);
   });
 
+  it('preserves observation gaps when folding and absorbing blocks of the same app', () => {
+    const input = activities([['Code', 'a', 100], ['Code', 'b', 100], ['Code', 'c', 5000]]);
+    input[2].start += 3_600_000;
+    input[2].end += 3_600_000;
+
+    for (const minBlockMs of [1000, 10_000]) {
+      const blocks = collapseSessions(input, { minBlockMs });
+      expect(blocks).toHaveLength(2);
+      expect(blocks[0].end).toBe(200);
+      expect(blocks[1].start).toBe(3_600_200);
+    }
+  });
+
   it('leaves an isolated short activity visible', () => {
     const blocks = collapseSessions(
       activities([['Code', 'a.js', 5000], ['msedge', 'docs', 100], ['Code', 'b.js', 5000]]),
@@ -331,6 +364,11 @@ describe('estimateSampleInterval', () => {
   it('returns zero when there is nothing to measure', () => {
     expect(estimateSampleInterval([])).toBe(0);
     expect(estimateSampleInterval([event(1, 0, 'a')])).toBe(0);
+  });
+
+  it('bounds the tail estimate when all observations are far apart', () => {
+    expect(estimateSampleInterval([event(1, 0, 'a'), event(2, 25 * 3_600_000, 'a')]))
+      .toBe(MAX_INFERRED_SESSION_GAP_MS);
   });
 });
 
