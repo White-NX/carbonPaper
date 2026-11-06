@@ -69,7 +69,7 @@ describe('storage migration cancellation', () => {
     await act(async () => { migration.reject(new Error('Migration cancelled by user')); await operation; });
     expect(result.current.isMigrating).toBe(false);
     expect(result.current.migrationError).toBe('');
-    expect(runMonitorAction).toHaveBeenCalledWith('maintenance-start');
+    expect(runMonitorAction).not.toHaveBeenCalled();
   });
 
   it('keeps the migration active after cancellation failure and permits retry', async () => {
@@ -102,7 +102,7 @@ describe('storage migration cancellation', () => {
     expect(invoke.mock.calls.some(([command]) => command === 'storage_migration_cancel')).toBe(false);
     expect(result.current.isMigrating).toBe(false);
     expect(result.current.migrationError).toBe('');
-    expect(runMonitorAction).toHaveBeenCalledWith('maintenance-start');
+    expect(runMonitorAction).not.toHaveBeenCalled();
   });
 
   it('does not retry migration admission after the user cancels during authentication', async () => {

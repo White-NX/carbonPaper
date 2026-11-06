@@ -5,191 +5,118 @@ import { useMonitorLifecycle } from './useMonitorLifecycle';
 
 const events = vi.hoisted(() => new Map());
 vi.mock('./useTauriEventListener', () => ({ useTauriEventListener: (name, handler) => events.set(name, handler) }));
-let stopped;
+let nativeStatus;
+const options = {
+  powerSavingSuppressed: false,
+  formatErrorDetails: String,
+  reportBackendError: vi.fn(),
+  resetBackendErrorDedupe: vi.fn(),
+  t: (key) => key,
+};
 beforeEach(() => {
-  stopped = false;
-  localStorage.clear();
   events.clear();
-  invoke.mockReset().mockImplementation(async (command) => {
-    if (command === 'get_monitor_autostart') return true;
-    if (command === 'get_monitor_status') return JSON.stringify({ stopped });
-    if (command === 'stop_monitor') { stopped = true; events.get('monitor-stopped')?.({ payload: {} }); }
-    if (command === 'start_monitor') stopped = false;
-    return null;
+  nativeStatus = { stopped: true, paused: false, starting: false, power_saving_active: false, error: null, revision: 0 };
+  options.reportBackendError.mockClear();
+  options.resetBackendErrorDedupe.mockClear();
+  invoke.mockReset().mockImplementation(async (command, { action } = {}) => {
+    if (command === 'get_monitor_status') return JSON.stringify(nativeStatus);
+    if (command === 'settings_monitor_action') {
+      nativeStatus = {
+        ...nativeStatus, revision: nativeStatus.revision + 1, error: null,
+        stopped: action === 'stop', paused: action === 'pause',
+      };
+      return null;
+    }
+    throw new Error('Unexpected command: ' + command);
   });
 });
 afterEach(() => vi.useRealTimers());
-const options = { modelsCheckDone: true, modelsNeedDownload: false,
-  powerSavingSuppressed: false, formatErrorDetails: String, reportBackendError: vi.fn(), resetBackendErrorDedupe: vi.fn(), t: (key) => key };
 
-describe('monitor actions from settings', () => {
-  it('does not auto-start after a settings stop, including the native stopped event', async () => {
-    const { result } = renderHook(() => useMonitorLifecycle(options));
-    await waitFor(() => expect(result.current.backendStatus).toBe('online'));
-    await act(() => result.current.handleSettingsMonitorAction('stop'));
-    expect(result.current.backendStatus).toBe('offline');
-    expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(0);
-    await act(() => result.current.handleSettingsMonitorAction('start'));
-    expect(result.current.backendStatus).toBe('online');
-    expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(1);
-  });
-  it('rejects arbitrary bridge actions without invoking a runtime command', async () => {
-    const { result } = renderHook(() => useMonitorLifecycle(options));
-    await waitFor(() => expect(result.current.backendStatus).toBe('online'));
-    await expect(result.current.handleSettingsMonitorAction('exit_app')).rejects.toThrow('INVALID_MONITOR_ACTION');
-    expect(invoke).not.toHaveBeenCalledWith('exit_app');
-  });
-});
-
-describe('capture loop that ends on its own', () => {
-  it('is restarted, but not indefinitely', async () => {
-    const { result } = renderHook(() => useMonitorLifecycle(options));
-    await waitFor(() => expect(result.current.backendStatus).toBe('online'));
-    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
-    const loopEnds = () => {
-      stopped = true;
-      events.get('monitor-stopped')({ payload: { intentional: false } });
-    };
-
-    act(loopEnds);
-    await waitFor(() => expect(starts()).toBe(1));
-    act(loopEnds);
-    await waitFor(() => expect(starts()).toBe(2));
-
-    act(loopEnds);
-    await act(async () => {});
-    expect(starts()).toBe(2);
-    expect(result.current.backendStatus).toBe('offline');
-  });
-});
-
-describe('first-run wizard', () => {
-  it('does not start recording until the wizard releases capture', async () => {
-    stopped = true;
-    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
-    const { result, rerender } = renderHook((props) => useMonitorLifecycle({ ...options, ...props }), {
-      initialProps: { captureHeld: true },
-    });
-    await waitFor(() => expect(result.current.backendStatus).toBe('offline'));
-    await act(async () => {});
-    expect(starts()).toBe(0);
-
-    rerender({ captureHeld: false });
-    await waitFor(() => expect(starts()).toBe(1));
-  });
-});
-
-describe('power-saving admission', () => {
-  it('waits for the startup power probe and stays stopped on battery', async () => {
-    stopped = true;
-    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
-    const { result, rerender } = renderHook((props) => useMonitorLifecycle({ ...options, ...props }), {
-      initialProps: { powerStatusReady: false, powerSavingSuppressed: false },
-    });
-    await waitFor(() => expect(result.current.backendStatus).toBe('offline'));
-    expect(starts()).toBe(0);
-    rerender({ powerStatusReady: true, powerSavingSuppressed: true });
-    await act(async () => {});
-    expect(starts()).toBe(0);
-    rerender({ powerStatusReady: true, powerSavingSuppressed: false });
-    await waitFor(() => expect(starts()).toBe(1));
-  });
-
-  it('treats a native power rejection as temporary and resumes when AC returns', async () => {
-    const reportBackendError = vi.fn();
-    const { result, rerender } = renderHook((props) => useMonitorLifecycle({ ...options, reportBackendError, ...props }), {
+describe('application-owned capture lifecycle', () => {
+  it('observes a stopped runtime through mounting, power changes and WebView recreation without starting it', async () => {
+    vi.useFakeTimers();
+    nativeStatus.auto_start_suppressed = true;
+    const hook = renderHook((props) => useMonitorLifecycle({ ...options, ...props }), {
       initialProps: { powerSavingSuppressed: false },
     });
-    await waitFor(() => expect(result.current.backendStatus).toBe('online'));
-    const originalInvoke = invoke.getMockImplementation();
-    invoke.mockImplementation(async (command, ...args) => {
-      if (command === 'start_monitor') throw 'POWER_SAVING_ACTIVE';
-      return originalInvoke(command, ...args);
-    });
-    await act(() => result.current.handleStartBackend());
-    expect(reportBackendError).not.toHaveBeenCalled();
-    expect(result.current.backendError).toBe('');
-    expect(result.current.monitorPowerSavingSuppressed).toBe(true);
-    expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(1);
-    rerender({ powerSavingSuppressed: true });
-    invoke.mockImplementation(originalInvoke);
-    rerender({ powerSavingSuppressed: false });
-    await waitFor(() => expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(2));
-    expect(result.current.monitorPowerSavingSuppressed).toBe(false);
+    await act(async () => {});
+    expect(hook.result.current.backendStatus).toBe('offline');
+    hook.rerender({ powerSavingSuppressed: true });
+    hook.rerender({ powerSavingSuppressed: false });
+    await act(() => vi.advanceTimersByTimeAsync(30000));
+    hook.unmount();
+    const reopened = renderHook(() => useMonitorLifecycle(options));
+    await act(async () => {});
+    expect(reopened.result.current.backendStatus).toBe('offline');
+    expect(invoke.mock.calls.every(([command]) => command === 'get_monitor_status')).toBe(true);
   });
 
-  it('clears native admission blocking through polling when power events are missing', async () => {
-    vi.useFakeTimers();
-    let nativePowerSaving = false;
-    const originalInvoke = invoke.getMockImplementation();
-    invoke.mockImplementation(async (command, ...args) => {
-      if (command === 'get_monitor_status') return JSON.stringify({ stopped, power_saving_active: nativePowerSaving });
-      if (command === 'start_monitor' && nativePowerSaving) throw 'POWER_SAVING_ACTIVE';
-      return originalInvoke(command, ...args);
-    });
+  it('displays native startup, recovery and a retained retry limit', async () => {
     const { result } = renderHook(() => useMonitorLifecycle(options));
-    await act(async () => {});
+    await waitFor(() => expect(result.current.backendStatus).toBe('offline'));
+    act(() => events.get('monitor-status-changed')({ payload: { ...nativeStatus, starting: true, revision: 1 } }));
+    expect(result.current.backendStatus).toBe('waiting');
+    act(() => events.get('monitor-status-changed')({ payload: { ...nativeStatus, stopped: false, revision: 2 } }));
     expect(result.current.backendStatus).toBe('online');
-
-    stopped = true;
-    nativePowerSaving = true;
-    await act(() => result.current.handleStartBackend());
-    expect(result.current.monitorPowerSavingSuppressed).toBe(true);
-    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
-    await act(() => vi.advanceTimersByTimeAsync(3000));
-    expect(starts()).toBe(1);
-
-    nativePowerSaving = false;
-    await act(() => vi.advanceTimersByTimeAsync(3000));
-    expect(result.current.monitorPowerSavingSuppressed).toBe(false);
-    expect(starts()).toBe(2);
+    act(() => events.get('monitor-status-changed')({
+      payload: { ...nativeStatus, error: 'CAPTURE_RESTART_LIMIT', auto_start_suppressed: true, revision: 3 },
+    }));
+    expect(result.current.backendStatus).toBe('offline');
+    expect(result.current.backendError).toBe('settings.general.monitor.errors.restartLimit');
+    expect(invoke.mock.calls.every(([command]) => command === 'get_monitor_status')).toBe(true);
   });
 
-  it('recovers a stale battery event and retains automatic restart after backend recovery', async () => {
-    vi.useFakeTimers();
-    stopped = true;
-    let nativePowerSaving = true;
-    const originalInvoke = invoke.getMockImplementation();
-    invoke.mockImplementation(async (command, ...args) => {
-      if (command === 'get_monitor_status') return JSON.stringify({ stopped, power_saving_active: nativePowerSaving });
-      return originalInvoke(command, ...args);
-    });
-    const { result } = renderHook(() => useMonitorLifecycle({ ...options, powerSavingSuppressed: true }));
-    await act(async () => {});
-    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
-    expect(starts()).toBe(0);
-
-    // The backend independently resumed; the WebView missed the AC event.
-    nativePowerSaving = false;
-    stopped = false;
-    await act(() => vi.advanceTimersByTimeAsync(3000));
-    expect(result.current.backendStatus).toBe('online');
-    expect(result.current.monitorPowerSavingSuppressed).toBe(false);
-    act(() => {
-      stopped = true;
-      events.get('monitor-stopped')({ payload: { intentional: false } });
-    });
-    await act(async () => {});
-    expect(starts()).toBe(1);
-  });
-
-  it('does not clear a newer native power rejection with an older status response', async () => {
-    vi.useFakeTimers();
-    const originalInvoke = invoke.getMockImplementation();
-    let resolveStatus;
-    let holdStatus = false;
-    invoke.mockImplementation(async (command, ...args) => {
-      if (command === 'get_monitor_status' && holdStatus) return new Promise((resolve) => { resolveStatus = resolve; });
-      if (command === 'start_monitor') throw 'POWER_SAVING_ACTIVE';
-      return originalInvoke(command, ...args);
-    });
+  it('forwards explicit start, pause and resume through the native action boundary', async () => {
     const { result } = renderHook(() => useMonitorLifecycle(options));
-    await act(async () => {});
-    holdStatus = true;
-    await act(() => vi.advanceTimersByTimeAsync(3000));
+    await waitFor(() => expect(result.current.backendStatus).toBe('offline'));
     await act(() => result.current.handleStartBackend());
-    await act(async () => resolveStatus(JSON.stringify({ stopped: true, power_saving_active: false })));
-    expect(result.current.monitorPowerSavingSuppressed).toBe(true);
-    expect(invoke.mock.calls.filter(([command]) => command === 'start_monitor')).toHaveLength(1);
+    expect(result.current.backendStatus).toBe('online');
+    await act(() => result.current.handlePauseMonitor());
+    expect(result.current.monitorPaused).toBe(true);
+    await act(() => result.current.handleResumeMonitor());
+    expect(result.current.monitorPaused).toBe(false);
+    expect(invoke.mock.calls.filter(([command]) => command === 'settings_monitor_action').map(([, args]) => args.action))
+      .toEqual(['start', 'pause', 'resume']);
+  });
+
+  it('ignores an older status response after a newer native event', async () => {
+    vi.useFakeTimers();
+    const hook = renderHook(() => useMonitorLifecycle(options));
+    await act(async () => {});
+    let finishRead;
+    invoke.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    act(() => events.get('monitor-status-changed')({ payload: { ...nativeStatus, stopped: false, revision: 2 } }));
+    await act(async () => finishRead(JSON.stringify(nativeStatus)));
+    expect(hook.result.current.backendStatus).toBe('online');
+  });
+
+  it('waits for native power recovery without a failure notification or a frontend restart', async () => {
+    vi.useFakeTimers();
+    const hook = renderHook(() => useMonitorLifecycle(options));
+    await act(async () => {});
+    invoke.mockRejectedValueOnce('POWER_SAVING_ACTIVE');
+    await act(() => hook.result.current.handleStartBackend());
+    expect(hook.result.current.monitorPowerSavingSuppressed).toBe(true);
+    expect(options.reportBackendError).not.toHaveBeenCalled();
+    nativeStatus = { ...nativeStatus, stopped: false, power_saving_active: false, revision: 1 };
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(hook.result.current.monitorPowerSavingSuppressed).toBe(false);
+    expect(hook.result.current.backendStatus).toBe('online');
+    expect(invoke.mock.calls.filter(([command]) => command === 'settings_monitor_action')).toHaveLength(1);
+  });
+
+  it('does not clear a newer power rejection with an older status response', async () => {
+    vi.useFakeTimers();
+    const hook = renderHook(() => useMonitorLifecycle(options));
+    await act(async () => {});
+    let finishRead;
+    invoke.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    invoke.mockRejectedValueOnce('POWER_SAVING_ACTIVE');
+    await act(() => hook.result.current.handleStartBackend());
+    await act(async () => finishRead(JSON.stringify(nativeStatus)));
+    expect(hook.result.current.monitorPowerSavingSuppressed).toBe(true);
+    expect(invoke.mock.calls.filter(([command]) => command === 'settings_monitor_action')).toHaveLength(1);
   });
 });

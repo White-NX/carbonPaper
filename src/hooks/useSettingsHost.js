@@ -15,7 +15,7 @@ const OVERLAY_PREVIEWS = {
   'app-bound-repair': ['appBound', 'repair'],
 };
 
-export function useSettingsHost({ onMonitorAction, onRecordsChanged, onClosed, onError }) {
+export function useSettingsHost({ onRecordsChanged, onClosed, onError }) {
   const [showSettings, setShowSettings] = useState(false);
   const openSettings = useCallback(async (tab, section) => {
     try {
@@ -23,21 +23,6 @@ export function useSettingsHost({ onMonitorAction, onRecordsChanged, onClosed, o
       setShowSettings(true);
     } catch (error) { onError?.(error); }
   }, [onError]);
-  useTauriEventListener('settings-monitor-request', async ({ payload }) => {
-    if (!Number.isSafeInteger(payload?.id)) return;
-    let claimed = false;
-    let error = null;
-    try {
-      // Events are notifications, not authority. The native main-only claim
-      // returns the stored action exactly once, including after duplicate events.
-      const action = await invoke('take_settings_monitor_action', { id: payload.id });
-      if (!action) return;
-      claimed = true;
-      await onMonitorAction(action);
-    }
-    catch (cause) { error = cause?.message || String(cause); }
-    if (claimed) await invoke('complete_settings_monitor_action', { id: payload.id, error }).catch((cause) => onError?.(cause));
-  });
   useTauriEventListener('settings-window-changed', ({ payload }) => {
     setShowSettings(Boolean(payload));
     if (!payload) onClosed?.();

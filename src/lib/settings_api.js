@@ -27,12 +27,6 @@ export async function saveAdvancedConfig(patch, authOptions = { autoPrompt: true
 }
 
 export async function runMonitorAction(action) {
-  if (isSettingsWindow()) return invoke('settings_monitor_action', { action });
-  const commands = { start: 'start_monitor', stop: 'stop_monitor', pause: 'pause_monitor', resume: 'resume_monitor', 'maintenance-stop': 'stop_monitor', 'maintenance-start': 'start_monitor' };
-  if (action === 'restart') {
-    await invoke('stop_monitor');
-    return invoke('start_monitor');
-  }
-  if (!commands[action]) throw new Error('INVALID_MONITOR_ACTION');
-  return invoke(commands[action]);
+  if (!['start', 'stop', 'pause', 'resume', 'restart'].includes(action)) throw new Error('INVALID_MONITOR_ACTION');
+  return invoke('settings_monitor_action', { action });
 }
