@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
@@ -11,6 +11,7 @@ import {
 import { smartClusterStopDrain } from '../lib/semantic_api';
 import { useHmacMigrationStatus } from './useHmacMigrationStatus';
 import { isIndexTaskPending, useBackgroundIndexProgress } from './useBackgroundIndexProgress';
+import { createLatestTaskQueue } from '../lib/latest_task_queue';
 
 function useDebounce(value, delay) {
   const [debouncedValue, setDebouncedValue] = useState(value);
@@ -64,16 +65,13 @@ function indexTaskLabel(run, percent, kind, t) {
 export function useSearchBoxController({
   onSelectResult,
   onSubmit,
-  controlledMode,
-  onModeChange,
+  disabled = false,
   monitorPaused,
   handlePauseMonitor,
   handleResumeMonitor,
   t,
 }) {
   const [query, setQuery] = useState('');
-  const [localMode, setLocalMode] = useState('ocr');
-  const [showModeMenu, setShowModeMenu] = useState(false);
   const [results, setResults] = useState([]);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -90,18 +88,19 @@ export function useSearchBoxController({
   const debouncedQuery = useDebounce(query, 500);
   const wrapperRef = useRef(null);
   const inputRef = useRef(null);
-  const userInteractionRef = useRef(false);
+  const submittedQueryRef = useRef(null);
+  const searchQueue = useMemo(() => createLatestTaskQueue(), []);
   const wasPausedRef = useRef(null);
   const handleResumeMonitorRef = useRef(handleResumeMonitor);
-  const mode = controlledMode ?? localMode;
-  const pictureQuery = mode === 'nl' ? query.trim() : null;
-  const setMode = onModeChange ?? setLocalMode;
   const isMigrating = useHmacMigrationStatus();
+
+  useEffect(() => {
+    if (query.trim() !== submittedQueryRef.current) submittedQueryRef.current = null;
+  }, [query]);
 
   useEffect(() => {
     function handleClickOutside(event) {
       if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
-        setShowModeMenu(false);
         setShowResults(false);
       }
     }
@@ -112,31 +111,29 @@ export function useSearchBoxController({
   }, []);
 
   useEffect(() => {
-    if (debouncedQuery.trim().length === 0 || pictureQuery === '') {
+    searchQueue.cancel();
+    if (disabled || !query.trim() || query.trim() !== debouncedQuery.trim()) {
       setResults([]);
       setError(null);
       setLoading(false);
       setShowResults(false);
       return;
     }
-    // Clearing a picture query cancels immediately; edits wait for the debounce.
-    if (pictureQuery !== null && pictureQuery !== debouncedQuery.trim()) return;
-
     let active = true;
     const doSearch = async () => {
       setLoading(true);
       setError(null);
       try {
-        const res = await searchScreenshots(debouncedQuery, mode);
+        const res = await searchQueue.run(debouncedQuery.trim(),
+          (signal) => searchScreenshots(debouncedQuery, 'ocr', { signal }));
         if (!active) return;
         setResults(res);
         const isFocused = document.activeElement === inputRef.current;
-        if (isFocused || userInteractionRef.current) {
+        if (isFocused && submittedQueryRef.current !== debouncedQuery.trim()) {
           setShowResults(true);
         }
-        userInteractionRef.current = false;
       } catch (e) {
-        if (!active) return;
+        if (!active || e?.name === 'AbortError') return;
         console.error('Search failed:', e);
         setError(e.message || String(e));
         setResults([]);
@@ -149,18 +146,19 @@ export function useSearchBoxController({
     doSearch();
     return () => {
       active = false;
+      searchQueue.cancel();
     };
-  }, [debouncedQuery, mode, pictureQuery]);
+  }, [debouncedQuery, query, disabled, searchQueue]);
 
   useEffect(() => {
-    if (!results.length || mode === 'nl') {
+    if (!results.length || disabled) {
       setThumbCache({});
       return undefined;
     }
     let active = true;
     const ids = results
       .map((item) => {
-        const sid = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
+        const sid = item.screenshot_id;
         return typeof sid === 'number' && sid > 0 ? sid : null;
       })
       .filter(Boolean);
@@ -175,7 +173,7 @@ export function useSearchBoxController({
     return () => {
       active = false;
     };
-  }, [results, mode]);
+  }, [results, disabled]);
 
   useEffect(() => {
     const handleProgress = (event) => {
@@ -398,22 +396,8 @@ export function useSearchBoxController({
     };
   }, []);
 
-  const switchMode = (nextMode) => {
-    userInteractionRef.current = true;
-    setMode(nextMode);
-  };
-
-  const toggleMode = () => {
-    switchMode(mode === 'ocr' ? 'nl' : 'ocr');
-  };
-
-  const selectMode = (nextMode) => {
-    switchMode(nextMode);
-    setShowModeMenu(false);
-  };
-
   const handleSelect = (item) => {
-    const id = mode === 'ocr' ? item.screenshot_id : item.metadata?.screenshot_id;
+    const id = item.screenshot_id;
     onSelectResult({
       id,
       ...item,
@@ -424,8 +408,14 @@ export function useSearchBoxController({
 
   const handleViewMore = (event) => {
     event?.preventDefault?.();
+    submittedQueryRef.current = query.trim();
     setShowResults(false);
-    onSubmit?.({ query, mode });
+    onSubmit?.({ query });
+  };
+
+  const handleInputFocus = () => {
+    submittedQueryRef.current = null;
+    setShowResults(true);
   };
 
   const handleSubmit = (event) => {
@@ -448,9 +438,6 @@ export function useSearchBoxController({
   return {
     query,
     setQuery,
-    mode,
-    showModeMenu,
-    setShowModeMenu,
     results,
     error,
     loading,
@@ -459,6 +446,7 @@ export function useSearchBoxController({
     debouncedQuery,
     wrapperRef,
     inputRef,
+    handleInputFocus,
     thumbCache,
     isMigrating,
     deleteQueueStatus,
@@ -480,8 +468,6 @@ export function useSearchBoxController({
     progressActive,
     taskSummaryPlaceholder,
     isDownloadingModels,
-    toggleMode,
-    selectMode,
     handleSelect,
     handleSubmit,
     handleViewMore,

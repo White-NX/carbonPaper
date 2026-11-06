@@ -44,13 +44,13 @@ describe('capture status in the title bar', () => {
   it('accepts a quick-search query and disables capture and search while locked', () => {
     const submit = vi.fn(), pause = vi.fn();
     const { rerender } = render(<TopBar isAuthenticated backendStatus="online" onSearchSubmit={submit} handlePauseMonitor={pause} />);
-    const input = screen.getByRole('textbox', { name: '搜索截图里出现过的文字' });
+    const input = screen.getByRole('textbox', { name: zhCN.search.placeholder.unified });
     fireEvent.change(input, { target: { value: 'design' } });
     fireEvent.keyDown(input, { key: 'Enter' });
-    expect(submit).toHaveBeenCalledWith({ query: 'design', mode: 'ocr' });
+    expect(submit).toHaveBeenCalledWith({ query: 'design' });
     rerender(<TopBar isAuthenticated={false} backendStatus="online" onSearchSubmit={submit} handlePauseMonitor={pause} />);
     expect(input).toBeDisabled();
-    expect(screen.getByRole('button', { name: '切换到画面搜索' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: zhCN.topbar.settings })).toBeDisabled();
     expect(screen.getByRole('button', { name: '正在记录' })).toBeDisabled();
 
     rerender(<TopBar isAuthenticated interfaceLocked backendStatus="online" onSearchSubmit={submit} handlePauseMonitor={pause} />);

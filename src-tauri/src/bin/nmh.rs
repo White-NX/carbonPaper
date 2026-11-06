@@ -2,14 +2,14 @@
 //!
 //! Standalone binary launched by the browser via Chrome Native Messaging protocol.
 //! Receives viewport screenshots + metadata from the browser extension,
-//! relays them to CarbonPaper via the deterministic Named Pipe.
+//! relays them through an authenticated, per-NMH single-instance Named Pipe.
 //!
 //! Also listens on a command pipe so CarbonPaper can push capture requests
 //! to the extension (forwarded via stdout NM protocol).
 //!
 //! Protocol:
 //!   - stdin/stdout: Chrome NM protocol (4-byte LE length prefix + JSON)
-//!   - Named Pipe (data): v2 frame (4-byte LE length prefix + JSON)
+//!   - Named Pipe (data): v3 frame (4-byte LE length prefix + JSON + reply ACK)
 //!   - Named Pipe (cmd):  CarbonPaper connects here to request captures
 
 use std::io::{self, Read, Write};
@@ -17,11 +17,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
+#[path = "../nmh_pipe.rs"]
+mod nmh_pipe;
 #[path = "../nmh_protocol.rs"]
+#[allow(dead_code)]
 mod nmh_protocol;
+#[path = "../reverse_ipc_protocol.rs"]
+#[allow(dead_code)]
+mod reverse_ipc_protocol;
 #[cfg(windows)]
 #[path = "../windows_platform.rs"]
+#[allow(dead_code)]
 mod windows_platform;
+use nmh_pipe::NmhClient;
+#[cfg(test)]
+use nmh_pipe::{read_frame as read_pipe_frame, write_frame as write_pipe_frame};
+#[cfg(test)]
+use nmh_protocol::select_browser_ancestor;
 use nmh_protocol::IPC_PROTOCOL_VERSION;
 
 /// The browser main process that (indirectly) spawned this NMH.
@@ -37,6 +50,7 @@ struct NmhContext {
     browser: Option<BrowserInfo>,
     cmd_pipe_name: String,
     registered: Arc<AtomicBool>,
+    client: Arc<NmhClient>,
 }
 
 fn main() {
@@ -80,6 +94,16 @@ fn main() {
     let auth_token_path = data_dir.join("nmh_auth_token");
 
     let registered = Arc::new(AtomicBool::new(false));
+    let client = match NmhClient::new(registered.clone()) {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            send_nm_response(
+                &stdout_mutex,
+                &serde_json::json!({"status": "error", "error": error}),
+            );
+            return;
+        }
+    };
 
     if let Some(b) = &browser {
         // Command pipe + registration only make sense when we know which
@@ -92,6 +116,7 @@ fn main() {
             auth_token_path.clone(),
             registered.clone(),
             stdout_mutex.clone(),
+            client.clone(),
         );
     } else {
         send_nm_response(
@@ -107,6 +132,7 @@ fn main() {
         browser,
         cmd_pipe_name: cmd_pipe_name.clone(),
         registered,
+        client,
     };
 
     // Auth token is read fresh from disk on every message.  This is
@@ -151,6 +177,7 @@ fn main() {
     if ctx.registered.load(Ordering::SeqCst) {
         if let Some(token) = read_auth_token(&auth_token_path) {
             let _ = send_to_pipe(
+                &ctx.client,
                 &pipe_name,
                 &build_unregister_request(&token, &cmd_pipe_name),
             );
@@ -218,6 +245,7 @@ fn start_registration_thread(
     auth_token_path: PathBuf,
     registered: Arc<AtomicBool>,
     stdout_mutex: Arc<Mutex<io::Stdout>>,
+    client: Arc<NmhClient>,
 ) {
     std::thread::spawn(move || {
         let mut last_error: Option<String> = None;
@@ -227,7 +255,7 @@ fn start_registration_thread(
             let result = match read_auth_token(&auth_token_path) {
                 Some(token) => {
                     let req = build_register_request(&token, &cmd_pipe_name, &browser);
-                    let resp = send_to_pipe(&data_pipe_name, &req);
+                    let resp = send_to_pipe(&client, &data_pipe_name, &req);
                     if resp.get("status").and_then(|s| s.as_str()) == Some("success") {
                         Ok(())
                     } else {
@@ -243,7 +271,6 @@ fn start_registration_thread(
 
             match result {
                 Ok(()) => {
-                    registered.store(true, Ordering::SeqCst);
                     if !was_registered {
                         last_error = None;
                         send_nm_response(
@@ -366,16 +393,19 @@ fn handle_message(
                 }
             };
 
+            if let Err(error) = ctx.client.ensure_channel(pipe_name, auth_token) {
+                return serde_json::json!({
+                    "status": "error", "error": format!("Cannot connect to CarbonPaper: {error}"),
+                });
+            }
+
             // If the session isn't registered yet (app just started, or it
             // restarted and wiped the table), register before saving so the
             // capture route comes back together with the data path.
             if !ctx.registered.load(Ordering::SeqCst) {
                 if let Some(browser) = &ctx.browser {
                     let req = build_register_request(auth_token, &ctx.cmd_pipe_name, browser);
-                    let resp = send_to_pipe(pipe_name, &req);
-                    if resp.get("status").and_then(|s| s.as_str()) == Some("success") {
-                        ctx.registered.store(true, Ordering::SeqCst);
-                    }
+                    let _ = send_to_pipe(&ctx.client, pipe_name, &req);
                 }
             }
 
@@ -409,7 +439,7 @@ fn handle_message(
                 "nmh_pid": std::process::id(),
             });
 
-            let response = send_to_pipe(pipe_name, &pipe_request);
+            let response = send_to_pipe(&ctx.client, pipe_name, &pipe_request);
 
             // App restart rotates the token — mark unregistered so the next
             // save (or the heartbeat) re-registers with the fresh token.
@@ -431,61 +461,16 @@ fn handle_message(
     }
 }
 
-fn write_pipe_frame(writer: &mut impl Write, body: &[u8]) -> io::Result<()> {
-    writer.write_all(&nmh_protocol::frame_prefix(body.len())?)?;
-    writer.write_all(body)
-}
-
-fn read_pipe_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut prefix = [0u8; 4];
-    reader.read_exact(&mut prefix)?;
-    let mut body = vec![0u8; nmh_protocol::frame_length(prefix)?];
-    reader.read_exact(&mut body)?;
-    Ok(body)
-}
-
-fn send_to_pipe(pipe_name: &str, request: &serde_json::Value) -> serde_json::Value {
-    use std::fs::OpenOptions;
-
-    let data = match serde_json::to_vec(request) {
-        Ok(d) => d,
-        Err(e) => {
-            return serde_json::json!({"status": "error", "error": format!("Serialization failed: {}", e)})
-        }
-    };
-
-    // Open the named pipe as a file (Windows named pipes can be opened as files)
-    let mut pipe = match OpenOptions::new().read(true).write(true).open(pipe_name) {
-        Ok(p) => p,
-        Err(e) => {
-            return serde_json::json!({
-                "status": "error",
-                "error": format!("Cannot connect to CarbonPaper (pipe {}): {}", pipe_name, e)
-            })
-        }
-    };
-
-    // Write v2 framed request.
-    if let Err(e) = write_pipe_frame(&mut pipe, &data) {
-        return serde_json::json!({"status": "error", "error": format!("Pipe write failed: {}", e)});
-    }
-
-    if let Err(e) = pipe.flush() {
-        return serde_json::json!({"status": "error", "error": format!("Pipe flush failed: {}", e)});
-    }
-
-    let response_buf = match read_pipe_frame(&mut pipe) {
-        Ok(buf) => buf,
-        Err(e) => {
-            return serde_json::json!({"status": "error", "error": format!("Pipe read failed: {}", e)})
-        }
-    };
-
-    match serde_json::from_slice(&response_buf) {
-        Ok(v) => v,
-        Err(e) => {
-            serde_json::json!({"status": "error", "error": format!("Invalid response JSON: {}", e)})
-        }
+fn send_to_pipe(
+    client: &NmhClient,
+    pipe_name: &str,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    match client.send(pipe_name, request) {
+        Ok(response) => response,
+        Err(error) => serde_json::json!({
+            "status": "error", "error": format!("Cannot connect to CarbonPaper: {error}"),
+        }),
     }
 }
 
@@ -493,85 +478,15 @@ fn compute_nmh_pipe_name() -> Result<String, String> {
     Ok(nmh_protocol::pipe_name(&get_current_user_sid()?))
 }
 
-/// Windows Chromium browsers launch native messaging hosts through
-/// `cmd.exe /c` so stdin/stdout can be redirected to the browser pipes.
-fn is_native_messaging_launcher_wrapper(exe_name: &str) -> bool {
-    exe_name.eq_ignore_ascii_case("cmd.exe") || exe_name.eq_ignore_ascii_case("cmd")
-}
-
-/// Select the browser main process from an ancestor chain ordered nearest to
-/// farthest from the NMH process.
-fn select_browser_ancestor(ancestors: &[(u32, String)]) -> Option<(u32, String)> {
-    let first_browser_index = ancestors
-        .iter()
-        .position(|(_, name)| !name.is_empty() && !is_native_messaging_launcher_wrapper(name))?;
-    let (first_pid, browser_name) = ancestors.get(first_browser_index)?.clone();
-
-    // Chromium subprocesses normally share the browser executable name. Use
-    // the topmost consecutive process with that name as the browser main PID.
-    let mut main_pid = first_pid;
-    for (ancestor_pid, ancestor_name) in ancestors.iter().skip(first_browser_index + 1) {
-        if ancestor_name.eq_ignore_ascii_case(&browser_name) {
-            main_pid = *ancestor_pid;
-        } else {
-            break;
-        }
-    }
-
-    Some((main_pid, browser_name))
-}
-
-/// Detect the browser main process that spawned this NMH by walking up the
-/// process tree. Returns the browser's PID, exe name, and full exe path.
-///
-/// After skipping the Native Messaging `cmd.exe` launcher, take the topmost
-/// consecutive ancestor with the same executable name. This remains browser
-/// name agnostic and therefore supports Chromium forks without a name list.
+/// Use the same bounded, browser-agnostic ancestor selection as the server.
 fn detect_browser() -> Option<BrowserInfo> {
-    #[cfg(windows)]
-    {
-        let process_map = windows_platform::process_tree()?;
-        {
-            let current_pid = std::process::id();
-            // Collect the ancestor chain (excluding this NMH process itself)
-            let mut ancestors: Vec<(u32, String)> = Vec::new();
-            let mut pid = current_pid;
-            for _ in 0..16 {
-                let (parent_pid, _) = match process_map.get(&pid) {
-                    Some(entry) => entry,
-                    None => break,
-                };
-                if *parent_pid == 0 || *parent_pid == pid {
-                    break;
-                }
-                match process_map.get(parent_pid) {
-                    Some((_, parent_name)) => {
-                        ancestors.push((*parent_pid, parent_name.clone()));
-                        pid = *parent_pid;
-                    }
-                    None => break,
-                }
-            }
-
-            let (main_pid, browser_name) = select_browser_ancestor(&ancestors)?;
-
-            let exe_path = query_process_image_path(main_pid).unwrap_or_default();
-            Some(BrowserInfo {
-                pid: main_pid,
-                exe_name: browser_name,
-                exe_path,
-            })
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        None
-    }
+    let browser = windows_platform::browser_ancestor(std::process::id())?;
+    Some(BrowserInfo {
+        pid: browser.pid,
+        exe_name: browser.image.file_name()?.to_string_lossy().into_owned(),
+        exe_path: browser.image.to_string_lossy().into_owned(),
+    })
 }
-
-#[cfg(windows)]
-use windows_platform::process_image_path as query_process_image_path;
 
 /// Start the command pipe thread that listens for capture requests from the main app.
 /// When a `request_capture` command arrives, it forwards a `capture_request` message
@@ -588,142 +503,111 @@ fn start_command_pipe_thread(stdout_mutex: Arc<Mutex<io::Stdout>>, cmd_pipe_name
 #[cfg(windows)]
 const CMD_PIPE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Run a blocking command-pipe I/O operation, cancelling the pending I/O via
-/// `CancelIoEx` if it does not complete within `timeout`.
-///
-/// The caller must keep the pipe handle open until this function returns (the
-/// watchdog thread is joined before returning, so the handle stays valid for
-/// the cancel call). Cancelling when no I/O is pending is a harmless no-op.
-#[cfg(windows)]
-fn with_pipe_io_timeout<T>(
-    pipe: windows::Win32::Foundation::HANDLE,
-    timeout: std::time::Duration,
-    op: impl FnOnce() -> T,
-) -> T {
-    let pipe_addr = pipe.0 as usize;
-    // The scoped watchdog joins on both normal return and unwind, before the
-    // caller can release the pipe's RAII handle.
-    std::thread::scope(|scope| {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        scope.spawn(move || {
-            if done_rx.recv_timeout(timeout).is_err() {
-                // SAFETY: the caller's pipe outlives this scope; no OVERLAPPED
-                // pointer asks Windows to cancel all pending I/O on the handle.
-                unsafe {
-                    let _ = windows::Win32::System::IO::CancelIoEx(
-                        windows::Win32::Foundation::HANDLE(pipe_addr as *mut _),
-                        None,
-                    );
-                }
-            }
-        });
-        let result = op();
-        let _ = done_tx.send(());
-        result
-    })
+fn forward_capture_command(request: &serde_json::Value, stdout: &mut impl Write) -> io::Result<()> {
+    if request["command"] != "request_capture"
+        || request["ipc_protocol_version"] != IPC_PROTOCOL_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid NMH capture command",
+        ));
+    }
+    let data = serde_json::to_vec(&serde_json::json!({"type": "capture_request"}))
+        .map_err(io::Error::other)?;
+    nmh_pipe::write_frame(stdout, &data)?;
+    stdout.flush()
 }
 
-/// Run the synchronous command pipe server loop using Win32 API.
+/// Keep one command-pipe handle alive for the NMH lifetime.
 #[cfg(windows)]
 fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>>) {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED};
-    use windows::Win32::Storage::FileSystem::{
-        FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
+    use windows::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe};
+    let verifier = match nmh_pipe::PeerVerifier::new(nmh_pipe::PeerRole::Desktop) {
+        Ok(verifier) => verifier,
+        Err(error) => {
+            send_nm_response(
+                stdout_mutex,
+                &serde_json::json!({
+                    "type": "nmh_registration_failed", "error": error,
+                }),
+            );
+            return;
+        }
     };
-    use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
-    };
-
-    let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut create_failure_reported = false;
-    loop {
-        // SAFETY: the pipe name is NUL-terminated and live. Default security
-        // attributes retain the host's existing access policy.
-        let raw = unsafe {
-            CreateNamedPipeW(
-                PCWSTR(wide_name.as_ptr()),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,
-                4096,
-                4096,
-                0,
-                None,
-            )
-        };
-        if raw.is_invalid() {
-            if !create_failure_reported {
-                create_failure_reported = true;
-                // SAFETY: read the error from the immediately preceding Win32 call.
-                let error = unsafe { GetLastError() }.0;
-                send_nm_response(
-                    stdout_mutex,
-                    &serde_json::json!({
-                        "type": "nmh_registration_failed",
-                        "error": format!("Failed to create command pipe (Win32 error {error}); capture requests unavailable")
-                    }),
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            continue;
-        }
-        let pipe = windows_platform::OwnedHandle(raw);
-        create_failure_reported = false;
-        // SAFETY: the owned handle is live; no OVERLAPPED selects blocking I/O.
-        if let Err(error) = unsafe { ConnectNamedPipe(pipe.0, None) } {
-            if error.code() != ERROR_PIPE_CONNECTED.to_hresult() {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
-        }
-
-        let mut buffer = [0u8; 4096];
-        let mut bytes_read = 0u32;
-        // SAFETY: the connected pipe and writable output buffers outlive the I/O.
-        let read = with_pipe_io_timeout(pipe.0, CMD_PIPE_IO_TIMEOUT, || unsafe {
-            ReadFile(pipe.0, Some(&mut buffer), Some(&mut bytes_read), None)
-        });
-        if read.is_ok() && bytes_read > 0 {
-            if let Ok(request) =
-                serde_json::from_slice::<serde_json::Value>(&buffer[..bytes_read as usize])
-            {
-                if request.get("command").and_then(|value| value.as_str())
-                    == Some("request_capture")
-                {
-                    let data = serde_json::to_vec(&serde_json::json!({"type": "capture_request"}))
-                        .unwrap_or_default();
-                    let forwarded = {
-                        let mut stdout = stdout_mutex
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        stdout
-                            .write_all(&(data.len() as u32).to_le_bytes())
-                            .and_then(|_| stdout.write_all(&data))
-                            .and_then(|_| stdout.flush())
-                    };
-                    let response = match forwarded {
-                        Ok(()) => serde_json::json!({"status": "ok", "forwarded": true}),
-                        Err(error) => serde_json::json!({
-                            "status": "error",
-                            "error": format!("Failed to forward capture request to extension: {error}")
+    let mut pipe = loop {
+        match nmh_pipe::create_server_file(pipe_name, false) {
+            Ok(pipe) => break pipe,
+            Err(error) => {
+                if !create_failure_reported {
+                    create_failure_reported = true;
+                    send_nm_response(
+                        stdout_mutex,
+                        &serde_json::json!({
+                            "type": "nmh_registration_failed",
+                            "error": format!("Cannot create NMH command pipe: {error}"),
                         }),
-                    };
-                    let bytes = serde_json::to_vec(&response).unwrap_or_default();
-                    let mut written = 0u32;
-                    // SAFETY: pipe and bytes remain live until the scoped I/O
-                    // watchdog joins; flushing is bounded by the same timeout.
-                    with_pipe_io_timeout(pipe.0, CMD_PIPE_IO_TIMEOUT, || unsafe {
-                        let _ = WriteFile(pipe.0, Some(&bytes), Some(&mut written), None);
-                        let _ = FlushFileBuffers(pipe.0);
-                    });
+                    );
                 }
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
-        // SAFETY: disconnect before the owned handle drops; the watchdog has joined.
-        unsafe {
-            let _ = DisconnectNamedPipe(pipe.0);
+    };
+    let handle = HANDLE(pipe.as_raw_handle());
+    let mut desktop = None;
+    loop {
+        // SAFETY: pipe owns this synchronous handle throughout the server loop.
+        if let Err(error) = unsafe { ConnectNamedPipe(handle, None) } {
+            if error.code() != ERROR_PIPE_CONNECTED.to_hresult() {
+                break;
+            }
+        }
+        let peer = verifier
+            .inspect(handle, nmh_pipe::PipeSide::Server)
+            .and_then(|peer| {
+                if desktop.as_ref() != Some(&peer) {
+                    verifier.verify_identity(&peer)?;
+                }
+                Ok(peer)
+            });
+        if let Ok(peer) = peer {
+            desktop = Some(peer);
+            let _ = nmh_pipe::with_io_timeout(handle, CMD_PIPE_IO_TIMEOUT, || {
+                let bytes = nmh_pipe::read_frame(&mut pipe)?;
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                let forwarded = {
+                    let mut stdout = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    forward_capture_command(&request, &mut *stdout)
+                };
+                let response = match forwarded {
+                    Ok(()) => serde_json::json!({"status": "ok", "forwarded": true}),
+                    Err(error) => serde_json::json!({
+                        "status": "error",
+                        "error": format!("Failed to forward capture request to extension: {error}"),
+                    }),
+                };
+                nmh_pipe::write_frame(
+                    &mut pipe,
+                    &serde_json::to_vec(&response).map_err(io::Error::other)?,
+                )?;
+                let mut ack = [0u8];
+                pipe.read_exact(&mut ack)?;
+                if ack[0] != nmh_protocol::RESPONSE_ACK {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid command acknowledgement",
+                    ));
+                }
+                Ok(())
+            });
+        }
+        // SAFETY: disconnect only after the bounded exchange has consumed the ACK
+        // (or failed); the original single-instance handle is retained for reuse.
+        if unsafe { DisconnectNamedPipe(handle) }.is_err() {
+            break;
         }
     }
 }
@@ -859,5 +743,30 @@ mod tests {
         let body = vec![0u8; IPC_MAX_MESSAGE_BYTES + 1];
         let error = write_pipe_frame(&mut Vec::new(), &body).unwrap_err();
         assert!(error.kind() == std::io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn capture_command_preserves_the_browser_native_message_contract() {
+        let mut output = Vec::new();
+        forward_capture_command(
+            &serde_json::json!({
+                "command": "request_capture", "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+            }),
+            &mut output,
+        )
+        .unwrap();
+        let payload = read_pipe_frame(&mut output.as_slice()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({"type": "capture_request"})
+        );
+
+        for request in [
+            serde_json::json!({"command": "request_capture"}),
+            serde_json::json!({"command": "other", "ipc_protocol_version": IPC_PROTOCOL_VERSION}),
+        ] {
+            let mut rejected = Vec::new();
+            assert!(forward_capture_command(&request, &mut rejected).is_err());
+            assert!(rejected.is_empty());
+        }
     }
 }

@@ -32,7 +32,7 @@ function ServiceStatusBadge({ backendStatus, powerSavingSuppressed, monitorPause
 export default function TopBar({
   darkMode, setDarkMode, setShowSettings, showNotifications, setShowNotifications,
   isMaximized, onMinimize, onToggleMaximize, onHideToTray,
-  searchInputRef, onSearchSelect, onSearchSubmit, searchMode, onSearchModeChange, previewCount = 0, onRestorePreviews,
+  searchInputRef, onSearchSelect, onSearchSubmit, previewCount = 0, onRestorePreviews,
   backendStatus, powerSavingSuppressed = false, monitorPaused,
   handleStartBackend, handlePauseMonitor, handleResumeMonitor, isAuthenticated, interfaceLocked = false,
 }) {
@@ -51,8 +51,6 @@ export default function TopBar({
         ref={searchInputRef}
         onSelectResult={onSearchSelect}
         onSubmit={onSearchSubmit}
-        mode={searchMode}
-        onModeChange={onSearchModeChange}
         monitorPaused={monitorPaused}
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}

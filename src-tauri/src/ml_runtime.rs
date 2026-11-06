@@ -334,6 +334,7 @@ impl MlRuntimeState {
                 request_id: response_id,
                 kind,
                 message,
+                ..
             }) if response_id == request_id => {
                 let error = format!("Rust OCR {kind}: {message}");
                 self.record_failure(&error, elapsed_ms);

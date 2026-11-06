@@ -359,6 +359,14 @@ pub fn broadcast_auth_state(app: &tauri::AppHandle) {
     if *previous != Some(valid) {
         *previous = Some(valid);
         drop(previous);
+        if !valid {
+            if let Some(storage) = app.try_state::<Arc<crate::storage::StorageState>>() {
+                storage.clear_protected_read_cache();
+            }
+            if let Some(ann) = app.try_state::<crate::clip_ann::ClipAnnState>() {
+                ann.disarm();
+            }
+        }
         let _ = app.emit("auth-session-changed", valid);
     }
 }

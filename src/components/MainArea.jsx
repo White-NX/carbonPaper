@@ -14,7 +14,7 @@ import { workspaceLabelKey } from '../lib/workspace_navigation';
 
 export default function MainArea({
   activeTab, setActiveTab, selectedImageSrc, isLoadingDetails, selectedEvent, selectedDetails, lastError,
-  onAdvancedSelect, advancedSearchParams, searchMode, onSearchModeChange, onDeleteRecord, onDeleteNearbyRecords,
+  onAdvancedSelect, advancedSearchParams, onDeleteRecord, onDeleteNearbyRecords,
   onCopyText, isAuthenticated, onTimelineSearchChange, onOpenSnapshotPreview, searchFocusRequest, previewRequest,
   onRetrySnapshot, returnTo, onReturn,
   recordsRevision = 0,
@@ -71,7 +71,7 @@ export default function MainArea({
       <div className={`${activeTab === 'advanced-search' ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col overflow-hidden`}>
         <AdvancedSearch active={activeTab === 'advanced-search'} searchParams={advancedSearchParams}
           onSelectResult={openInlinePreview} onOpenSnapshotPreview={onOpenSnapshotPreview}
-          searchMode={searchMode} onSearchModeChange={onSearchModeChange} onTimelineSearchChange={onTimelineSearchChange}
+          onTimelineSearchChange={onTimelineSearchChange}
           isAuthenticated={isAuthenticated} focusRequest={searchFocusRequest} recordsRevision={recordsRevision} onOpenRecapDay={(date) => handleOpenRecap({ date })} />
       </div>
       <div className={`${activeTab === 'smart-cluster' ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-1 flex-col overflow-hidden`}>

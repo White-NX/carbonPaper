@@ -285,14 +285,23 @@ pub async fn app_bound_set_policy(
     let storage = storage.inner().clone();
     let recap_app = app.clone();
     tokio::task::spawn_blocking(move || {
+        let was_enabled = storage.processing_stage.status().enabled;
         storage.processing_stage.set_policy(enabled, limits)?;
+        storage.clear_protected_read_cache();
         if enabled {
+            if !was_enabled {
+                storage.rotate_protected_write_keys()?;
+            }
+            storage.publish_protected_keys()?;
             crate::ai::recap::protected::sync_after_unlock(&recap_app)?;
         }
         storage.processing_stage.reconcile(&storage)
     })
     .await
     .map_err(|e| e.to_string())??;
+    if let Some(ann) = app.try_state::<crate::clip_ann::ClipAnnState>() {
+        ann.disarm();
+    }
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {
@@ -374,14 +383,19 @@ pub(crate) fn schedule_restart(app: &AppHandle) -> Result<(), String> {
             .ok_or("Restart helper is missing")?,
     )
     .map_err(|e| e.to_string())?;
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new(&helper)
-        .arg("--launch-after")
-        .arg(std::process::id().to_string())
-        .current_dir(runtime)
-        .creation_flags(0x08000000)
-        .spawn()
+    let context = carbonpaper_app_bound::windows::update::CoordinatorContext::new()
         .map_err(|e| e.to_string())?;
+    let mut child = context
+        .spawn_restart(
+            &helper,
+            &[
+                "--launch-after".into(),
+                std::process::id().to_string().into(),
+            ],
+            &runtime,
+        )
+        .map_err(|e| e.to_string())?;
+    child.detach();
     crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
     app.exit(0);
     Ok(())

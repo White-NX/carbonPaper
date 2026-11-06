@@ -288,11 +288,11 @@ impl StorageState {
         Ok(status)
     }
 
-    /// Attempt to start the lazy indexer (and check migration status).
+    /// Start the lazy OCR indexer once for this storage instance.
     /// Called after user authentication succeeds.
-    pub fn try_bitmap_index_migration(self: &std::sync::Arc<Self>) {
+    pub fn start_lazy_indexer(self: &std::sync::Arc<Self>) {
         if self
-            .bitmap_index_migrated
+            .lazy_indexer_started
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
@@ -315,7 +315,7 @@ impl StorageState {
                 break;
             }
 
-            if !*self.initialized.lock().unwrap_or_else(|e| e.into_inner()) {
+            if !self.is_initialized() {
                 std::thread::sleep(std::time::Duration::from_millis(2000));
                 continue;
             }

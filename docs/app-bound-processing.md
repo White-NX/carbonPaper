@@ -6,6 +6,11 @@ MiniLM, CLIP, Smart Cluster and recap inputs. Existing screenshots and OCR rows 
 encryption and authorization rules; keyword HMAC indexing resumes through the
 existing unlock path without waiting for an idle window.
 
+Derived topics, summaries, evidence, process labels, embeddings and ANN files
+use separate metadata, vector and ANN content keys. Historical-key grants are
+distinct from pending capture-input leases and preserve the archive's existing
+screenshot/OCR authorization rules.
+
 Source snapshot: application version `0.8.5`, branch
 `feat/rust-task-vectors-classification`, baseline `693d45a` plus the native
 classification changes committed with this revision. Historical acceptance notes below do not
@@ -93,8 +98,8 @@ have a separate protected `config` object populated on unlock/settings changes.
 This explicit configuration grant lasts until replacement, disablement, dataset
 retirement or removal. Input/context grants retain the configured retention and
 share the staging capacity limit. The service does not receive model requests,
-archive keys or plaintext screenshot content. The existing remote-endpoint
-consent and request budgets remain required.
+the archive master key, screenshot/OCR row keys or plaintext screenshot content.
+The existing remote-endpoint consent and request budgets remain required.
 
 Older services negotiate without the Recap bit, and immutable older capture
 bindings cannot gain it. Those inputs, expired inputs and periods with missing

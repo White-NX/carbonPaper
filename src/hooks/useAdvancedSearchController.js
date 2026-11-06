@@ -1,18 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  batchGetCategories,
   fetchThumbnailBatch,
   getCategoriesFromDb,
   listProcesses,
   listRecentScreenshots,
-  searchScreenshots,
 } from '../lib/monitor_api';
 import { searchSnapshotsAndRecaps } from '../lib/search_api';
 import { groupSearchResults, sampleRecentCaptures } from '../lib/search_grouping';
 import { clearRecentSearches, loadRecentSearches, pushRecentSearch } from '../lib/recent_searches';
+import { createLatestTaskQueue } from '../lib/latest_task_queue';
 
 const PAGE_SIZE = 40;
-const NL_PAGE_SIZE = 100;
 /** 着陆区展示的最近截图数量。 */
 const LANDING_CAPTURE_COUNT = 12;
 /**
@@ -37,12 +35,18 @@ export function useAdvancedSearchController({
   authenticated = true,
   recordsRevision = 0,
   searchParams,
-  searchMode,
-  onSearchModeChange,
   t,
 }) {
-  const [query, setQuery] = useState(searchParams?.query || '');
-  const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
+  const incomingQuery = searchParams?.query || '';
+  const sourceRefreshKey = searchParams?.refreshKey ?? 0;
+  const reloadToken = `${sourceRefreshKey}:${recordsRevision}`;
+  const [queryState, setQueryState] = useState(() => ({ query: incomingQuery, sourceQuery: incomingQuery, refreshKey: sourceRefreshKey }));
+  // Apply a top-bar submission before either search channel can start with an old local edit.
+  const query = queryState.sourceQuery === incomingQuery && queryState.refreshKey === sourceRefreshKey
+    ? queryState.query : incomingQuery;
+  const setQuery = useCallback((value) => {
+    setQueryState({ query: value, sourceQuery: incomingQuery, refreshKey: sourceRefreshKey });
+  }, [incomingQuery, sourceRefreshKey]);
   const [searchTarget, setSearchTarget] = useState('mixed');
   const [recapSemantic, setRecapSemantic] = useState(true);
   const [results, setResults] = useState([]);
@@ -68,11 +72,12 @@ export function useAdvancedSearchController({
   const [semanticUpdating, setSemanticUpdating] = useState(false);
   const [semanticStatus, setSemanticStatus] = useState('empty');
   const [totals, setTotals] = useState(null);
-  const useRecapSemantic = mode === 'ocr' && searchTarget !== 'snapshots' && recapSemantic;
-  const unified = mode === 'ocr' && Boolean(query.trim() || searchTarget === 'recaps' || selectedProcesses.length || (searchTarget !== 'recaps' && selectedCategories.length) || startDate || endDate);
+  const useRecapSemantic = searchTarget !== 'snapshots' && recapSemantic;
+  const unified = Boolean(query.trim() || searchTarget === 'recaps' || selectedProcesses.length || (searchTarget !== 'recaps' && selectedCategories.length) || startDate || endDate);
+  const keywordQueue = useMemo(() => createLatestTaskQueue(), []);
+  const semanticQueue = useMemo(() => createLatestTaskQueue(), []);
   const observerRef = useRef(null);
   const sentinelRef = useRef(null);
-  const lastParamsRef = useRef({ query: '', mode: 'ocr', refreshKey: searchParams?.refreshKey });
   const searchIdRef = useRef(0);
   const completedRequestRef = useRef(null);
   /**
@@ -87,28 +92,39 @@ export function useAdvancedSearchController({
   useEffect(() => {
     searchIdRef.current += 1;
     completedRequestRef.current = null;
+    keywordQueue.cancel();
+    semanticQueue.cancel();
     setSemanticUpdating(false);
     setLoading(false);
     setLoadingMore(false);
     setResults([]);
+    setThumbnailCache({});
     setHasMore(false);
     setTotals(null);
-  }, [query, authenticated, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate]);
+  }, [query, authenticated, reloadToken, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, keywordQueue, semanticQueue]);
   useEffect(() => {
     if (active) return;
-    // Leaving a workspace cancels pending work, while completed results and their scroll container stay mounted.
+    // Keep completed text results mounted while cancelling unfinished work.
     searchIdRef.current += 1;
-    setLoading(false); setLoadingMore(false); setSemanticUpdating(false);
-  }, [active]);
+    keywordQueue.cancel();
+    semanticQueue.cancel();
+    setSemanticUpdating(false);
+    setLoading(false);
+    setLoadingMore(false);
+  }, [active, keywordQueue, semanticQueue]);
   useEffect(() => {
     if (authenticated) return;
-    completedRequestRef.current = null;
-    optionsTokenRef.current = null; landingTokenRef.current = null;
-    setThumbnailCache({}); setLandingCaptures([]); setProcessOptions([]); setCategoryOptions([]);
+    optionsTokenRef.current = null;
+    landingTokenRef.current = null;
+    setLandingCaptures([]);
+    setProcessOptions([]);
+    setCategoryOptions([]);
   }, [authenticated]);
-  useEffect(() => () => { searchIdRef.current += 1; }, []);
-  /** 重取的判据：只有用户显式刷新时它才变化。 */
-  const reloadToken = `${searchParams?.refreshKey ?? 0}:${recordsRevision}`;
+  useEffect(() => () => {
+    searchIdRef.current += 1;
+    keywordQueue.cancel();
+    semanticQueue.cancel();
+  }, [keywordQueue, semanticQueue]);
   const rotatingMessages = useMemo(() => t('advancedSearch.rotating', { returnObjects: true }) || [], [t]);
   const [rotatingMessage, setRotatingMessage] = useState(() => {
     return rotatingMessages.length > 0 ? rotatingMessages[Math.floor(Math.random() * rotatingMessages.length)] : '';
@@ -129,7 +145,7 @@ export function useAdvancedSearchController({
   }, [rotatingMessages]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || !authenticated) return;
     if (optionsTokenRef.current === reloadToken) return;
     let mounted = true;
     (async () => {
@@ -143,43 +159,7 @@ export function useAdvancedSearchController({
     return () => {
       mounted = false;
     };
-  }, [active, reloadToken]);
-
-  const handleModeChange = useCallback((nextMode) => {
-    if (nextMode === mode) return;
-    searchIdRef.current += 1;
-    setResults([]);
-    setThumbnailCache({});
-    setHasMore(false);
-    setLoading(false);
-    setLoadingMore(false);
-    setError(null);
-    offsetRef.current = 0;
-    rankingRevisionRef.current = null;
-    if (searchMode === undefined) {
-      setMode(nextMode);
-    }
-    onSearchModeChange?.(nextMode);
-  }, [onSearchModeChange, mode, searchMode]);
-
-  useEffect(() => {
-    if (searchMode === undefined || searchMode === mode) return;
-    setMode(searchMode);
-  }, [searchMode, mode]);
-
-  useEffect(() => {
-    if (!searchParams) return;
-    const { query: nextQuery = '', mode: nextMode = 'ocr', refreshKey } = searchParams;
-    const prev = lastParamsRef.current;
-    const refreshed = prev.refreshKey !== refreshKey;
-    if (refreshed || prev.query !== nextQuery) {
-      setQuery(nextQuery);
-    }
-    if (refreshed || prev.mode !== nextMode) {
-      handleModeChange(nextMode);
-    }
-    lastParamsRef.current = { query: nextQuery, mode: nextMode, refreshKey };
-  }, [searchParams, handleModeChange]);
+  }, [active, authenticated, reloadToken]);
 
   const queryTokens = useMemo(() => {
     return debouncedQuery.trim()
@@ -190,8 +170,8 @@ export function useAdvancedSearchController({
 
   /** 除关键词以外是否还有生效的筛选条件。 */
   const hasFilters = useMemo(
-    () => selectedProcesses.length > 0 || (mode === 'ocr' && searchTarget !== 'recaps' && selectedCategories.length > 0) || Boolean(startDate) || Boolean(endDate),
-    [mode, searchTarget, selectedProcesses, selectedCategories, startDate, endDate]
+    () => selectedProcesses.length > 0 || (searchTarget !== 'recaps' && selectedCategories.length > 0) || Boolean(startDate) || Boolean(endDate),
+    [searchTarget, selectedProcesses, selectedCategories, startDate, endDate]
   );
 
   const computeTimestamp = useCallback((value) => {
@@ -201,30 +181,16 @@ export function useAdvancedSearchController({
     return Math.floor(parsed / 1000);
   }, []);
 
-  const enrichNlCategories = async (fetched, currentSearchId) => {
-    if (mode !== 'nl' || fetched.length === 0) return;
-    const hashes = fetched
-      .map((item) => (item.image_path || '').replace('memory://', ''))
-      .filter(Boolean);
-    if (hashes.length === 0) return;
-    const categoryMap = await batchGetCategories(hashes);
-    if (searchIdRef.current === currentSearchId) {
-      for (const item of fetched) {
-        const hash = (item.image_path || '').replace('memory://', '');
-        if (hash && categoryMap[hash] !== undefined) {
-          item.category = categoryMap[hash];
-        }
-      }
-    }
-  };
-
   const resetAndFetch = useCallback(async (force = false) => {
     if (!active || !authenticated) return;
     if (query.trim() !== debouncedQuery.trim()) return;
     const normalizedQuery = debouncedQuery.trim();
-    const requestKey = JSON.stringify([normalizedQuery, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, reloadToken]);
+    const options = { limit: PAGE_SIZE, processNames: selectedProcesses,
+      categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget,
+      includeSemantic: false, startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate) };
+    const requestKey = JSON.stringify([normalizedQuery, options, useRecapSemantic, reloadToken]);
     if (!force && completedRequestRef.current === requestKey) return;
-    if (!normalizedQuery && !hasFilters && !(mode === 'ocr' && searchTarget === 'recaps')) {
+    if (!normalizedQuery && !hasFilters && searchTarget !== 'recaps') {
       searchIdRef.current += 1;
       setResults([]);
       setThumbnailCache({});
@@ -234,10 +200,12 @@ export function useAdvancedSearchController({
       setError(null);
       setElapsedMs(null);
       offsetRef.current = 0;
+      completedRequestRef.current = requestKey;
       return;
     }
 
     const currentSearchId = ++searchIdRef.current;
+    completedRequestRef.current = null;
     const startedAt = performance.now();
     setLoading(true);
     setSemanticUpdating(false);
@@ -245,71 +213,47 @@ export function useAdvancedSearchController({
     setError(null);
     setThumbnailCache({});
     offsetRef.current = 0;
-    const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     rankingRevisionRef.current = null;
     try {
-      let fetched;
-      if (mode === 'ocr' && (normalizedQuery || hasFilters || searchTarget === 'recaps')) {
-        const options = { limit: PAGE_SIZE, processNames: selectedProcesses,
-          categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget,
-          includeSemantic: false, startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate) };
-        const apply = (response, semantic) => {
-          const items = response.items.map((item) => item.kind === 'snapshot'
-            ? { ...item.snapshot, kind: 'snapshot' } : { kind: 'recap', recap: item.recap });
-          setResults(items); setResultSetKey(currentSearchId);
-          setHasMore(response.next_offset != null);
-          offsetRef.current = response.next_offset ?? items.length;
-          stageRef.current = semantic;
-          rankingRevisionRef.current = response.ranking_revision ?? null;
-          setSemanticStatus(response.semantic_status);
-          setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count, complete: response.complete });
-          setElapsedMs(performance.now() - startedAt); setLoading(false);
-          if (items.length) setRecentQueries(pushRecentSearch(normalizedQuery, mode));
-        };
-        const keywords = await searchSnapshotsAndRecaps(normalizedQuery, options);
-        if (searchIdRef.current !== currentSearchId) return;
-        apply(keywords, false);
-        if (!normalizedQuery || !useRecapSemantic || keywords.semantic_status === 'disabled') { completedRequestRef.current = requestKey; return; }
-        setSemanticUpdating(true);
-        try {
-          const combined = await searchSnapshotsAndRecaps(normalizedQuery, { ...options, includeSemantic: true });
-          if (searchIdRef.current === currentSearchId) apply(combined, true);
-        } catch (error) {
-          if (searchIdRef.current === currentSearchId) {
-            setSemanticStatus('unavailable');
-          }
-        } finally {
-          if (searchIdRef.current === currentSearchId) { setSemanticUpdating(false); completedRequestRef.current = requestKey; }
-        }
+      const apply = (response, semantic) => {
+        const items = response.items.map((item) => item.kind === 'snapshot'
+          ? { ...item.snapshot, kind: 'snapshot' } : { kind: 'recap', recap: item.recap });
+        setResults(items); setResultSetKey(currentSearchId);
+        setHasMore(response.next_offset != null);
+        offsetRef.current = response.next_offset ?? items.length;
+        stageRef.current = semantic;
+        rankingRevisionRef.current = response.ranking_revision ?? null;
+        setSemanticStatus(response.semantic_status);
+        setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count, complete: response.complete });
+        setElapsedMs(performance.now() - startedAt); setLoading(false);
+        if (items.length) setRecentQueries(pushRecentSearch(normalizedQuery, 'ocr'));
+      };
+      const keywords = await keywordQueue.run(requestKey,
+        (signal) => searchSnapshotsAndRecaps(normalizedQuery, { ...options, signal }));
+      if (searchIdRef.current !== currentSearchId) return;
+      apply(keywords, false);
+      if (!normalizedQuery || !useRecapSemantic || keywords.semantic_status === 'disabled') {
+        completedRequestRef.current = requestKey;
         return;
       }
-      fetched = await searchScreenshots(normalizedQuery, mode, {
-        limit: pageSize,
-        offset: 0,
-        processNames: selectedProcesses,
-        categories: mode === 'ocr' ? selectedCategories : [],
-        startTime: computeTimestamp(startDate),
-        endTime: computeTimestamp(endDate),
-        fuzzy: mode !== 'nl',
-        ...(mode === 'nl' ? { includeOcr: false } : {}),
-      });
-      if (searchIdRef.current !== currentSearchId) return;
-
-      await enrichNlCategories(fetched, currentSearchId);
-
-      if (searchIdRef.current !== currentSearchId) return;
-      setResults(fetched);
-      completedRequestRef.current = requestKey;
-      setResultSetKey(currentSearchId);
-      setHasMore(fetched.length === pageSize);
-      setElapsedMs(performance.now() - startedAt);
-      offsetRef.current = fetched.length;
-
-      // 只记下真正搜到东西的查询，免得输入过程中的半截词污染历史。
-      if (normalizedQuery && fetched.length > 0) {
-        setRecentQueries(pushRecentSearch(normalizedQuery, mode));
+      setSemanticUpdating(true);
+      try {
+        const combined = await semanticQueue.run(requestKey,
+          (signal) => searchSnapshotsAndRecaps(normalizedQuery, { ...options, includeSemantic: true, signal }));
+        if (searchIdRef.current === currentSearchId) apply(combined, true);
+      } catch (error) {
+        if (searchIdRef.current === currentSearchId) {
+          setSemanticStatus('unavailable');
+        }
+      } finally {
+        if (searchIdRef.current === currentSearchId) {
+          setSemanticUpdating(false);
+          completedRequestRef.current = requestKey;
+        }
       }
+      return;
     } catch (e) {
+      if (e?.name === 'AbortError') return;
       console.error('Advanced search resetAndFetch failed:', e);
       if (searchIdRef.current === currentSearchId) {
         setError(e?.message || String(e));
@@ -322,7 +266,7 @@ export function useAdvancedSearchController({
         setLoading(false);
       }
     }
-  }, [active, authenticated, reloadToken, query, debouncedQuery, mode, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters]);
+  }, [active, authenticated, query, debouncedQuery, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters, reloadToken, keywordQueue, semanticQueue]);
 
   useEffect(() => {
     // Query/filter changes and explicit refresh share one trigger. A separate
@@ -340,9 +284,9 @@ export function useAdvancedSearchController({
    *
    * 取回后按来源折叠再挑选，理由见 sampleRecentCaptures。
    */
-  const isLanding = !debouncedQuery.trim() && !hasFilters && !(mode === 'ocr' && searchTarget === 'recaps');
+  const isLanding = !debouncedQuery.trim() && !hasFilters && searchTarget !== 'recaps';
   useEffect(() => {
-    if (!active || !isLanding) return undefined;
+    if (!active || !authenticated || !isLanding) return undefined;
     if (landingTokenRef.current === reloadToken) return undefined;
     let mounted = true;
     (async () => {
@@ -352,12 +296,10 @@ export function useAdvancedSearchController({
       setLandingCaptures(sampleRecentCaptures(fetched, LANDING_CAPTURE_COUNT));
     })();
     return () => { mounted = false; };
-  }, [active, isLanding, reloadToken]);
+  }, [active, authenticated, isLanding, reloadToken]);
 
   useEffect(() => {
-    // Picture results load originals at the card; landing captures keep thumbnails.
     if (!active || !authenticated) return undefined;
-    if (mode === 'nl' && !isLanding) return undefined;
     const source = results.length > 0 ? results : landingCaptures;
     if (source.length === 0) return;
     let activeBatch = true;
@@ -373,70 +315,53 @@ export function useAdvancedSearchController({
       }
     })();
     return () => { activeBatch = false; };
-  }, [active, authenticated, results, landingCaptures, mode, isLanding]);
+  }, [results, landingCaptures, active, authenticated]);
 
   const loadMore = useCallback(async () => {
     if (!active || !authenticated || !hasMore || loadingMore || loading || semanticUpdating) return;
     const currentSearchId = searchIdRef.current;
     setLoadingMore(true);
     setError(null);
-    const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     try {
-      if (mode === 'ocr' && (debouncedQuery.trim() || hasFilters || searchTarget === 'recaps')) {
-        const response = await searchSnapshotsAndRecaps(debouncedQuery.trim(), {
-          limit: PAGE_SIZE, offset: offsetRef.current,
-          includeSemantic: stageRef.current, target: searchTarget, processNames: selectedProcesses,
-          rankingRevision: rankingRevisionRef.current,
-          categories: searchTarget === 'recaps' ? [] : selectedCategories,
-          startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate),
-        });
-        if (searchIdRef.current !== currentSearchId) return;
-        const items = response.items.map((item) => item.kind === 'snapshot'
-          ? { ...item.snapshot, kind: 'snapshot' } : { kind: 'recap', recap: item.recap });
-        const restarted = response.offset === 0;
-        setResults((previous) => {
-          const prefix = restarted ? [] : previous;
-          const key = (item) => item.kind === 'recap'
-            ? `recap:${item.recap.date}:${item.recap.activity_id}`
-            : `snapshot:${item.screenshot_id}`;
-          const seen = new Set(prefix.map(key));
-          return [...prefix, ...items.filter((item) => {
-            const id = key(item);
-            if (seen.has(id)) return false;
-            seen.add(id);
-            return true;
-          })];
-        });
-        rankingRevisionRef.current = response.ranking_revision ?? null;
-        if (restarted) {
-          setResultSetKey(++searchIdRef.current);
-          setLoadingMore(false);
-        }
-        setSemanticStatus(response.semantic_status);
-        setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count, complete: response.complete });
-        offsetRef.current = response.next_offset ?? (response.offset ?? offsetRef.current) + items.length;
-        setHasMore(response.next_offset != null);
-        return;
-      }
-      const fetched = await searchScreenshots(debouncedQuery.trim(), mode, {
-        limit: pageSize,
-        offset: offsetRef.current,
-        processNames: selectedProcesses,
-        categories: mode === 'ocr' ? selectedCategories : [],
-        startTime: computeTimestamp(startDate),
-        endTime: computeTimestamp(endDate),
-        fuzzy: mode !== 'nl',
-        ...(mode === 'nl' ? { includeOcr: false } : {}),
+      const options = {
+        limit: PAGE_SIZE, offset: offsetRef.current,
+        includeSemantic: stageRef.current, target: searchTarget, processNames: selectedProcesses,
+        rankingRevision: rankingRevisionRef.current,
+        categories: searchTarget === 'recaps' ? [] : selectedCategories,
+        startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate),
+      };
+      const requestKey = JSON.stringify([debouncedQuery.trim(), options, reloadToken]);
+      const response = await (stageRef.current ? semanticQueue : keywordQueue).run(requestKey,
+        (signal) => searchSnapshotsAndRecaps(debouncedQuery.trim(), { ...options, signal }));
+      if (searchIdRef.current !== currentSearchId) return;
+      const items = response.items.map((item) => item.kind === 'snapshot'
+        ? { ...item.snapshot, kind: 'snapshot' } : { kind: 'recap', recap: item.recap });
+      const restarted = response.offset === 0;
+      setResults((previous) => {
+        const prefix = restarted ? [] : previous;
+        const key = (item) => item.kind === 'recap'
+          ? `recap:${item.recap.date}:${item.recap.activity_id}`
+          : `snapshot:${item.screenshot_id}`;
+        const seen = new Set(prefix.map(key));
+        return [...prefix, ...items.filter((item) => {
+          const id = key(item);
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })];
       });
-      if (searchIdRef.current !== currentSearchId) return;
-
-      await enrichNlCategories(fetched, currentSearchId);
-
-      if (searchIdRef.current !== currentSearchId) return;
-      setResults((prev) => [...prev, ...fetched]);
-      setHasMore(fetched.length === pageSize);
-      offsetRef.current += fetched.length;
+      rankingRevisionRef.current = response.ranking_revision ?? null;
+      if (restarted) {
+        setResultSetKey(++searchIdRef.current);
+        setLoadingMore(false);
+      }
+      setSemanticStatus(response.semantic_status);
+      setTotals({ total: response.total, snapshots: response.snapshot_count, recaps: response.recap_count, complete: response.complete });
+      offsetRef.current = response.next_offset ?? (response.offset ?? offsetRef.current) + items.length;
+      setHasMore(response.next_offset != null);
+      return;
     } catch (e) {
+      if (e?.name === 'AbortError') return;
       console.error('Advanced search loadMore failed:', e);
       if (searchIdRef.current === currentSearchId) {
         setError(e?.message || String(e));
@@ -447,7 +372,7 @@ export function useAdvancedSearchController({
         setLoadingMore(false);
       }
     }
-  }, [active, authenticated, debouncedQuery, mode, searchTarget, hasFilters, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating]);
+  }, [active, authenticated, debouncedQuery, searchTarget, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating, reloadToken, keywordQueue, semanticQueue]);
 
   useEffect(() => {
     if (!active) return;
@@ -495,10 +420,7 @@ export function useAdvancedSearchController({
   const applyRecentQuery = useCallback((entry) => {
     if (!entry?.query) return;
     setQuery(entry.query);
-    if (entry.mode && entry.mode !== mode) {
-      handleModeChange(entry.mode);
-    }
-  }, [mode, handleModeChange]);
+  }, [setQuery]);
 
   /** 从着陆区直接按来源筛选。 */
   const applyProcessFilter = useCallback((processName) => {
@@ -509,28 +431,32 @@ export function useAdvancedSearchController({
     setRecentQueries(clearRecentSearches());
   }, []);
 
+  const rememberVisualQuery = useCallback((value) => {
+    setRecentQueries(pushRecentSearch(value, 'ocr'));
+  }, []);
+
   /** 相邻时间里同一窗口的重复命中折叠成一组。 */
   const groupedResults = useMemo(() => results.reduce((groups, item) => {
     if (item.kind === 'recap') return [...groups, { primary: item, duplicates: [] }];
     const previous = groups.at(-1);
     if (previous && previous.primary.kind !== 'recap') {
-      const pair = groupSearchResults([previous.primary, ...previous.duplicates, item], mode);
+      const pair = groupSearchResults([previous.primary, ...previous.duplicates, item], 'ocr');
       if (pair.length === 1) return [...groups.slice(0, -1), pair[0]];
     }
     return [...groups, { primary: item, duplicates: [] }];
-  }, []), [results, mode]);
+  }, []), [results]);
 
   const searchSourceDetail = useMemo(() => {
-    // 预览面板的来源标签用完整说法，「文字搜索 · 关键词」比「文字 · 关键词」清楚。
-    const modeLabel = mode === 'nl' ? t('advancedSearch.modes.nl_full') : t('advancedSearch.modes.ocr_full');
+    // 来源标签带上查询，便于从预览返回综合搜索。
+    const modeLabel = t('advancedSearch.modes.unified');
     const trimmed = query.trim();
     return trimmed ? `${modeLabel} · ${trimmed}` : modeLabel;
-  }, [mode, query, t]);
+  }, [query, t]);
 
   return {
     query,
     setQuery,
-    mode,
+    debouncedQuery,
     searchTarget,
     setSearchTarget,
     recapSemantic,
@@ -566,14 +492,17 @@ export function useAdvancedSearchController({
     applyRecentQuery,
     applyProcessFilter,
     clearRecentQueries,
+    rememberVisualQuery,
     landingCaptures,
     sentinelRef,
     queryTokens,
     rotatingMessage,
-    handleModeChange,
     handleSubmit,
     clearFilters,
     searchSourceDetail,
     resultSetKey,
+    visualStartTime: computeTimestamp(startDate),
+    visualEndTime: computeTimestamp(endDate),
+    refreshKey: reloadToken,
   };
 }

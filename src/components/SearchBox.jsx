@@ -1,27 +1,23 @@
 import React, { useState, useEffect, useImperativeHandle } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
+import { Image as ImageIcon, Search, Loader2, X, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 import { ProgressBar } from './overlay/ProgressBlock';
-import { OriginalSearchImage } from './search/OriginalSearchImage';
 
-export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }, ref) {
+export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, onSubmit, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }, ref) {
     const { t } = useTranslation();
     const {
         query,
         setQuery,
-        mode,
-        showModeMenu,
-        setShowModeMenu,
         results,
         error,
         loading,
         showResults,
-        setShowResults,
         debouncedQuery,
         wrapperRef,
         inputRef,
+        handleInputFocus,
         thumbCache,
         isMigrating,
         deleteQueueStatus,
@@ -41,8 +37,6 @@ export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, o
         progressActive,
         taskSummaryPlaceholder,
         isDownloadingModels,
-        toggleMode,
-        selectMode,
         handleSelect,
         handleSubmit,
         handleViewMore,
@@ -50,8 +44,7 @@ export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, o
     } = useSearchBoxController({
         onSelectResult,
         onSubmit,
-        controlledMode,
-        onModeChange,
+        disabled,
         monitorPaused,
         handlePauseMonitor,
         handleResumeMonitor,
@@ -74,45 +67,24 @@ export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, o
                     <ProgressBar variant="background" label={taskSummaryPlaceholder}
                         percent={progressFillPercent} active={progressActive} />
                 )}
-                <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
-                <button
-                    className="p-2 text-ide-muted hover:text-ide-text transition-colors"
-                    onClick={toggleMode}
-                    disabled={disabled}
-                    title={mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR')}
-                >
-                    {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
-                </button>
-                <button
-                    className="p-2 pl-0 text-ide-muted hover:text-ide-text transition-colors"
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        setShowModeMenu(!showModeMenu);
-                    }}
-                    title={t('search.selectMode')}
-                    disabled={disabled}
-                >
-                    <ChevronDown size={14} />
-                </button>
-            </div>
+                <Search size={15} className="relative z-10 ml-3 shrink-0 text-ide-muted" aria-hidden="true" />
 
             <input
                 ref={inputRef}
                 type="text"
                 disabled={disabled}
-                aria-label={mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl')}
+                aria-label={t('search.placeholder.unified')}
                 aria-keyshortcuts="Control+K"
                 className="relative z-10 bg-transparent border-none outline-none text-ide-text text-sm w-full h-8 px-3 placeholder-ide-muted"
-                placeholder={showProgressBar ? taskSummaryPlaceholder : (mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl'))}
+                placeholder={showProgressBar ? taskSummaryPlaceholder : t('search.placeholder.unified')}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                onFocus={() => setShowResults(true)}
+                onFocus={handleInputFocus}
                 onKeyDown={handleSubmit}
             />
             {canCancelClusterTask && (
                 <button
                     onClick={handleCancelCluster}
-                    disabled={disabled}
                     className="relative z-10 p-1 mr-2 text-rose-500 hover:text-rose-600 transition-colors shrink-0"
                     title={t('search.task.stopTooltip')}
                 >
@@ -123,39 +95,12 @@ export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, o
                 <Loader2 size={16} className="relative z-10 animate-spin text-ide-muted mr-2" />
             ) : (
                 query && (
-                    <button disabled={disabled} onClick={() => setQuery('')} className="relative z-10 p-1 mr-2 text-ide-muted hover:text-ide-text">
+                    <button onClick={() => setQuery('')} className="relative z-10 p-1 mr-2 text-ide-muted hover:text-ide-text">
                         <X size={14} />
                     </button>
                 )
             )}
             </div>
-
-            {!disabled && showModeMenu && (
-                <div className="absolute top-full left-0 mt-2 w-72 bg-ide-panel border border-ide-border rounded-md shadow-xl z-[60] p-1 flex flex-col gap-1">
-                    <button
-                        className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'ocr' ? 'bg-ide-active border border-ide-border' : ''}`}
-                        onClick={() => selectMode('ocr')}
-                    >
-                        <div className="mt-1 text-ide-accent"><Type size={18} /></div>
-                        <div>
-                            <div className="text-sm font-bold text-ide-text">{t('search.mode.ocr.title')}</div>
-                            <div className="text-xs text-ide-muted leading-relaxed">{t('search.mode.ocr.description')}</div>
-                        </div>
-                    </button>
-                    <button
-                        className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''}`}
-                        onClick={() => selectMode('nl')}
-                    >
-                        <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>
-                        <div>
-                            <div className="text-sm font-bold text-ide-text">{t('search.mode.nl.title')}</div>
-                            <div className="text-xs text-ide-muted leading-relaxed">
-                                {t('search.mode.nl.description')}
-                            </div>
-                        </div>
-                    </button>
-                </div>
-            )}
 
             {!disabled && showResults && (
                 <div className="absolute top-full mt-2 w-[450px] bg-ide-panel border border-ide-border rounded-lg shadow-2xl overflow-hidden max-h-[600px] flex flex-col">
@@ -254,10 +199,9 @@ export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, o
                                 <SearchResultItem
                                     key={item.id || index}
                                     item={item}
-                                    mode={mode}
                                     query={debouncedQuery}
                                     onClick={() => handleSelect(item)}
-                                    preloadedSrc={thumbCache[mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id] || null}
+                                    preloadedSrc={thumbCache[item.screenshot_id] || null}
                                 />
                             ))
                             ) : loading ? (
@@ -285,25 +229,24 @@ export const SearchBox = React.forwardRef(function SearchBox({ onSelectResult, o
     );
 });
 
-function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
+function SearchResultItem({ item, query, onClick, preloadedSrc }) {
     const { t } = useTranslation();
     const [imgSrc, setImgSrc] = useState(preloadedSrc);
     const [loadFailed, setLoadFailed] = useState(false);
 
     useEffect(() => {
-        if (mode === 'nl') return;
         if (preloadedSrc) {
             setImgSrc(preloadedSrc);
             setLoadFailed(false);
         }
-    }, [preloadedSrc, mode]);
+    }, [preloadedSrc]);
 
     // Fallback: individually fetch if batch didn't provide a thumbnail
     useEffect(() => {
-        if (mode === 'nl' || imgSrc || loadFailed) return;
+        if (imgSrc || loadFailed) return;
         let active = true;
         const timer = setTimeout(async () => {
-            const screenshotId = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
+            const screenshotId = item.screenshot_id;
             const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
             const path = item.image_path || item.metadata?.image_path || item.path;
             if (!id && !path) { if (active) setLoadFailed(true); return; }
@@ -318,16 +261,12 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
             }
         }, 100);
         return () => { active = false; clearTimeout(timer); };
-    }, [imgSrc, loadFailed, item, mode]);
+    }, [imgSrc, loadFailed, item]);
 
     // Highlighting logic for OCR
     const renderOCRText = () => {
-        const text = mode === 'nl' ? item.ocr_text : item.text;
+        const text = item.text;
         if (!text) return <span className="text-ide-muted italic">{t('search.noTextContent')}</span>;
-
-        if (mode === 'nl') {
-            return <span className="text-ide-muted font-light">{text.length > 150 ? text.substring(0, 150) + '...' : text}</span>;
-        }
 
         // Simple highlight for OCR keywords
         if (!query) return <span className="text-ide-muted font-light">{text}</span>;
@@ -350,8 +289,8 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
         );
     };
 
-    const processName = mode === 'nl' ? item.metadata?.process_name : item.process_name;
-    const windowTitle = mode === 'nl' ? item.metadata?.window_title : item.window_title;
+    const processName = item.process_name;
+    const windowTitle = item.window_title;
 
     return (
         <div
@@ -359,9 +298,7 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
             onClick={(e) => { e.stopPropagation(); onClick(); }}
         >
             <div className="w-28 h-20 flex-shrink-0 bg-ide-bg rounded-md overflow-hidden border border-ide-border shadow-sm relative group-hover:border-ide-accent transition-colors">
-                {mode === 'nl' ? (
-                    <OriginalSearchImage item={item} placeholder={<ImageIcon size={16} className="text-ide-muted opacity-50" />} />
-                ) : imgSrc ? (
+                {imgSrc ? (
                     <img src={imgSrc} alt="" className="w-full h-full object-cover" />
                 ) : loadFailed ? (
                     <div className="w-full h-full flex items-center justify-center">
@@ -385,11 +322,6 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
                 <div className="text-xs leading-relaxed line-clamp-2 break-all">
                     {renderOCRText()}
                 </div>
-                {mode === 'nl' && (
-                    <div className="text-[10px] text-ide-muted mt-auto pt-1">
-                        {t('search.matchScore')}: {(item.similarity || 0).toFixed(2)}
-                    </div>
-                )}
             </div>
         </div>
     );

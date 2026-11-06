@@ -1,17 +1,23 @@
 //! Stable flat-vector format shared by the Tauri process and `carbonpaper-ml`.
 //!
-//! Version 4 separates variable-length subject keys from the fixed-stride f32
-//! matrix. Readers can therefore mmap the file and reach candidate vectors
-//! directly instead of walking the whole corpus during the first query.
+//! Version 5 keeps a fixed stride of authenticated encrypted vector records.
+//! The graph is decrypted once into owned memory; float records are decrypted
+//! only when requested and retained in a bounded, zeroizing candidate cache.
 
+use carbonpaper_app_bound::payload::{CipherKey, OVERHEAD};
+use hmac::{Hmac, Mac};
 use memmap2::{Mmap, MmapOptions};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
-pub const MAGIC: &[u8; 8] = b"CPDVEC04";
-pub const FORMAT_VERSION: u32 = 4;
-pub const HEADER_BYTES: u64 = 512;
+pub const MAGIC: &[u8; 8] = b"CPDVEC05";
+pub const FORMAT_VERSION: u32 = 5;
+pub const HEADER_BYTES: u64 = 1024;
 pub const VECTOR_ALIGNMENT: u64 = 4096;
 pub const ANN_IMPLEMENTATION_VERSION: &str = "usearch-2.26.0";
 pub const ANN_ALGORITHM: &str = "hnsw";
@@ -23,6 +29,7 @@ pub const MAX_ROWS: u64 = 2_000_000;
 pub const MAX_DIMENSIONS: u32 = 65_536;
 pub const MAX_TEXT_BYTES: usize = 4096;
 pub const ANN_PROBE_MIN_COSINE: f32 = 0.95;
+pub const VECTOR_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Validate the observable result of a persisted usearch query.
 ///
@@ -108,6 +115,9 @@ const FIELD_INDEX_KIND: usize = 104;
 const FIELD_MODEL_ID: usize = 168;
 const FIELD_MODEL_REVISION: usize = 296;
 const FIELD_ANN_IMPLEMENTATION: usize = 424;
+const FIELD_ENCRYPTION_KEY: usize = 488;
+const FIELD_SNAPSHOT_ID: usize = 504;
+const FIELD_AUTHENTICATION: usize = 520;
 const INDEX_KIND_BYTES: usize = 64;
 const MODEL_ID_BYTES: usize = 128;
 const MODEL_REVISION_BYTES: usize = 128;
@@ -131,6 +141,9 @@ pub struct Header {
     pub model_id: String,
     pub model_revision: String,
     pub ann_implementation: String,
+    pub encryption_key_id: String,
+    pub snapshot_id: String,
+    authentication: [u8; 32],
 }
 
 impl Header {
@@ -144,7 +157,16 @@ impl Header {
         model_revision: &str,
         expansion_search: u32,
         key_bytes: u64,
+        key: &CipherKey,
+        snapshot_id: &str,
     ) -> Result<Self, String> {
+        if key.purpose != "ann"
+            || hex::decode(snapshot_id)
+                .ok()
+                .is_none_or(|value| value.len() != 16)
+        {
+            return Err("Invalid ANN encryption scope".into());
+        }
         validate_text("index kind", index_kind, INDEX_KIND_BYTES)?;
         validate_text("model id", model_id, MODEL_ID_BYTES)?;
         validate_text("model revision", model_revision, MODEL_REVISION_BYTES)?;
@@ -172,11 +194,12 @@ impl Header {
         let vectors_offset = align_up(keys_end, VECTOR_ALIGNMENT)?;
         let vector_stride = u64::from(dimensions)
             .checked_mul(4)
+            .and_then(|value| value.checked_add(OVERHEAD as u64))
             .ok_or("ANN vector stride overflow")?;
         let vectors_bytes = row_count
             .checked_mul(vector_stride)
             .ok_or("ANN vector section overflow")?;
-        Ok(Self {
+        let mut header = Self {
             generation,
             covered_epoch,
             row_count,
@@ -193,7 +216,12 @@ impl Header {
             model_id: model_id.to_string(),
             model_revision: model_revision.to_string(),
             ann_implementation: ANN_IMPLEMENTATION_VERSION.to_string(),
-        })
+            encryption_key_id: key.id.clone(),
+            snapshot_id: snapshot_id.into(),
+            authentication: [0; 32],
+        };
+        header.authentication = header.mac(key)?.finalize().into_bytes().into();
+        Ok(header)
     }
 
     pub fn file_len(&self) -> Result<u64, String> {
@@ -242,7 +270,57 @@ impl Header {
             ANN_IMPLEMENTATION_BYTES,
             &self.ann_implementation,
         )?;
+        let id = hex::decode(&self.encryption_key_id)
+            .map_err(|_| "Invalid ANN encryption key identity")?;
+        let snapshot =
+            hex::decode(&self.snapshot_id).map_err(|_| "Invalid ANN snapshot identity")?;
+        if id.len() != 16 || snapshot.len() != 16 {
+            return Err("Invalid ANN encryption identity".into());
+        }
+        bytes[FIELD_ENCRYPTION_KEY..FIELD_ENCRYPTION_KEY + 16].copy_from_slice(&id);
+        bytes[FIELD_SNAPSHOT_ID..FIELD_SNAPSHOT_ID + 16].copy_from_slice(&snapshot);
+        bytes[FIELD_AUTHENTICATION..FIELD_AUTHENTICATION + 32]
+            .copy_from_slice(&self.authentication);
         Ok(bytes)
+    }
+
+    fn mac(&self, key: &CipherKey) -> Result<Hmac<Sha256>, String> {
+        if key.id != self.encryption_key_id || key.purpose != "ann" {
+            return Err("ANN encryption key mismatch".into());
+        }
+        let mut derivation =
+            <Hmac<Sha256> as Mac>::new_from_slice(key.bytes()).map_err(|_| "Invalid ANN key")?;
+        derivation.update(b"CarbonPaper-ANN-Header-Key-v1");
+        let derived = Zeroizing::new(<[u8; 32]>::from(derivation.finalize().into_bytes()));
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&*derived)
+            .map_err(|_| "Invalid ANN header key")?;
+        let mut bytes = self.encode()?;
+        bytes[FIELD_AUTHENTICATION..FIELD_AUTHENTICATION + 32].fill(0);
+        mac.update(key.dataset.as_bytes());
+        mac.update(&bytes);
+        Ok(mac)
+    }
+
+    pub fn verify_key(&self, key: &CipherKey) -> Result<(), String> {
+        self.mac(key)?
+            .verify_slice(&self.authentication)
+            .map_err(|_| "ANN header authentication failed".into())
+    }
+
+    pub fn scope(&self) -> Result<String, String> {
+        Ok(format!(
+            "ann:{}:{}",
+            self.snapshot_id,
+            hex::encode(Sha256::digest(self.encode()?))
+        ))
+    }
+
+    pub fn graph_identity(&self, rows: u64) -> Result<String, String> {
+        Ok(format!("{}:graph:{rows}", self.scope()?))
+    }
+
+    pub fn vector_stride(&self) -> u64 {
+        u64::from(self.dimensions) * 4 + OVERHEAD as u64
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -277,7 +355,15 @@ impl Header {
                 FIELD_ANN_IMPLEMENTATION,
                 ANN_IMPLEMENTATION_BYTES,
             )?,
+            encryption_key_id: hex::encode(&bytes[FIELD_ENCRYPTION_KEY..FIELD_ENCRYPTION_KEY + 16]),
+            snapshot_id: hex::encode(&bytes[FIELD_SNAPSHOT_ID..FIELD_SNAPSHOT_ID + 16]),
+            authentication: bytes[FIELD_AUTHENTICATION..FIELD_AUTHENTICATION + 32]
+                .try_into()
+                .unwrap(),
         };
+        if header.encode()?.as_slice() != &bytes[..HEADER_BYTES as usize] {
+            return Err("ANN sidecar header has invalid reserved bytes".into());
+        }
         header.validate_layout(bytes.len() as u64)?;
         Ok(header)
     }
@@ -300,12 +386,16 @@ impl Header {
         if self.key_offsets_offset != HEADER_BYTES
             || self.keys_offset != self.key_offsets_offset.saturating_add(offset_bytes)
             || self.vectors_offset % VECTOR_ALIGNMENT != 0
+            || self
+                .keys_offset
+                .checked_add(self.keys_bytes)
+                .is_none_or(|end| end > self.vectors_offset)
         {
             return Err("ANN sidecar section layout is invalid".to_string());
         }
         let expected_vectors = self
             .row_count
-            .checked_mul(u64::from(self.dimensions).saturating_mul(4))
+            .checked_mul(self.vector_stride())
             .ok_or("ANN sidecar vector section overflow")?;
         if self.vectors_bytes != expected_vectors || self.file_len()? != file_len {
             return Err("ANN sidecar file length mismatch".to_string());
@@ -315,26 +405,100 @@ impl Header {
 }
 
 pub struct MappedFlatIndex {
-    _file: File,
-    map: Mmap,
+    _file: Option<File>,
+    backing: FlatBacking,
     pub header: Header,
+    encryption: Arc<CipherKey>,
+    scope: String,
+    cache: Mutex<VectorCache>,
+}
+
+enum FlatBacking {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+impl std::ops::Deref for FlatBacking {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VectorGuard(Arc<Zeroizing<Vec<f32>>>);
+impl std::ops::Deref for VectorGuard {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        &self.0
+    }
+}
+impl AsRef<[f32]> for VectorGuard {
+    fn as_ref(&self) -> &[f32] {
+        self
+    }
+}
+
+struct CachedVector {
+    subject: String,
+    vector: VectorGuard,
+    bytes: usize,
+}
+#[derive(Default)]
+struct VectorCache {
+    entries: HashMap<usize, CachedVector>,
+    order: VecDeque<usize>,
+    bytes: usize,
 }
 
 impl MappedFlatIndex {
-    pub fn open(path: &Path) -> Result<Self, String> {
+    /// Read only the nonsecret key identity. The complete header is verified
+    /// with that key before any vector or graph bytes are accepted.
+    pub fn encryption_key_id(path: &Path) -> Result<String, String> {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let mut bytes = [0u8; HEADER_BYTES as usize];
+        file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        if &bytes[..8] != MAGIC {
+            return Err("Encrypted ANN sidecar format is required".into());
+        }
+        Ok(hex::encode(
+            &bytes[FIELD_ENCRYPTION_KEY..FIELD_ENCRYPTION_KEY + 16],
+        ))
+    }
+
+    pub fn open(path: &Path, encryption: Arc<CipherKey>) -> Result<Self, String> {
         let file = File::open(path)
             .map_err(|error| format!("Failed to open ANN sidecar {}: {error}", path.display()))?;
         let map = unsafe { MmapOptions::new().map(&file) }
             .map_err(|error| format!("Failed to mmap ANN sidecar {}: {error}", path.display()))?;
-        let header = Header::decode(&map)?;
-        let last = read_u64_at(&map, header.key_offsets_offset + header.row_count * 8)?;
+        Self::from_backing(Some(file), FlatBacking::Mapped(map), encryption)
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>, encryption: Arc<CipherKey>) -> Result<Self, String> {
+        Self::from_backing(None, FlatBacking::Owned(bytes), encryption)
+    }
+
+    fn from_backing(
+        file: Option<File>,
+        backing: FlatBacking,
+        encryption: Arc<CipherKey>,
+    ) -> Result<Self, String> {
+        let header = Header::decode(&backing)?;
+        header.verify_key(&encryption)?;
+        let scope = header.scope()?;
+        let last = read_u64_at(&backing, header.key_offsets_offset + header.row_count * 8)?;
         if last != header.keys_bytes {
             return Err("ANN sidecar key-offset terminator mismatch".to_string());
         }
         Ok(Self {
             _file: file,
-            map,
+            backing,
             header,
+            encryption,
+            scope,
+            cache: Mutex::new(VectorCache::default()),
         })
     }
 
@@ -343,32 +507,80 @@ impl MappedFlatIndex {
             return Err(format!("ANN ordinal {ordinal} is out of range"));
         }
         let base = self.header.key_offsets_offset;
-        let start = read_u64_at(&self.map, base + ordinal as u64 * 8)?;
-        let end = read_u64_at(&self.map, base + (ordinal as u64 + 1) * 8)?;
-        if start > end || end > self.header.keys_bytes {
+        let start = read_u64_at(&self.backing, base + ordinal as u64 * 8)?;
+        let end = read_u64_at(&self.backing, base + (ordinal as u64 + 1) * 8)?;
+        if start > end || end > self.header.keys_bytes || end - start > MAX_TEXT_BYTES as u64 {
             return Err("ANN sidecar key offsets are invalid".to_string());
         }
         let absolute_start = self.header.keys_offset.saturating_add(start);
         let absolute_end = self.header.keys_offset.saturating_add(end);
-        let bytes = slice_at(&self.map, absolute_start, absolute_end - absolute_start)?;
+        let bytes = slice_at(&self.backing, absolute_start, absolute_end - absolute_start)?;
         std::str::from_utf8(bytes).map_err(|_| "ANN sidecar key is not UTF-8".to_string())
     }
 
-    pub fn vector(&self, ordinal: usize) -> Result<&[f32], String> {
+    pub fn vector_uncached(&self, ordinal: usize) -> Result<VectorGuard, String> {
         if ordinal >= self.header.row_count as usize {
             return Err(format!("ANN ordinal {ordinal} is out of range"));
         }
-        let stride = u64::from(self.header.dimensions) * 4;
+        let stride = self.header.vector_stride();
         let offset = self.header.vectors_offset + ordinal as u64 * stride;
-        let bytes = slice_at(&self.map, offset, stride)?;
-        let (prefix, floats, suffix) = unsafe { bytes.align_to::<f32>() };
-        if !prefix.is_empty()
-            || !suffix.is_empty()
-            || floats.len() != self.header.dimensions as usize
+        let bytes = slice_at(&self.backing, offset, stride)?;
+        let identity = format!("{}:vector:{ordinal}:{}", self.scope, self.key(ordinal)?);
+        let plaintext = self.encryption.open(&identity, bytes)?;
+        let vector = Zeroizing::new(
+            plaintext
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+        );
+        if vector.len() != self.header.dimensions as usize
+            || vector.iter().any(|value| !value.is_finite())
         {
-            return Err("ANN sidecar vector alignment is invalid".to_string());
+            return Err("ANN vector payload is invalid".into());
         }
-        Ok(floats)
+        Ok(VectorGuard(Arc::new(vector)))
+    }
+
+    pub fn vector(&self, ordinal: usize) -> Result<VectorGuard, String> {
+        let subject = self.key(ordinal)?;
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.entries.get(&ordinal) {
+            if cached.subject != subject {
+                return Err("ANN subject identity changed".into());
+            }
+            return Ok(cached.vector.clone());
+        }
+        let vector = self.vector_uncached(ordinal)?;
+        // Charge conservatively for HashMap/queue slots, the Arc and allocator
+        // bookkeeping. This bounds cache-owned entries; an in-flight guard may
+        // retain an evicted allocation until that query finishes.
+        let bytes = vector.len() * 4 + subject.len() + 256;
+        if bytes <= VECTOR_CACHE_MAX_BYTES {
+            while cache.bytes + bytes > VECTOR_CACHE_MAX_BYTES {
+                let evicted = cache
+                    .order
+                    .pop_front()
+                    .ok_or("ANN cache accounting mismatch")?;
+                if let Some(entry) = cache.entries.remove(&evicted) {
+                    cache.bytes -= entry.bytes;
+                }
+            }
+            cache.bytes += bytes;
+            cache.order.push_back(ordinal);
+            cache.entries.insert(
+                ordinal,
+                CachedVector {
+                    subject: subject.into(),
+                    vector: vector.clone(),
+                    bytes,
+                },
+            );
+        }
+        Ok(vector)
+    }
+
+    pub fn clear_vector_cache(&self) {
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = VectorCache::default();
     }
 
     pub fn rows(&self) -> usize {
@@ -382,47 +594,15 @@ fn write_flat_file(
     header: &Header,
     keys: &[String],
     vectors: &[Vec<f32>],
+    encryption: Arc<CipherKey>,
 ) -> Result<(), String> {
     if keys.len() != vectors.len() || keys.len() != header.row_count as usize {
         return Err("ANN flat writer row count mismatch".to_string());
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("Failed to create ANN sidecar {}: {error}", path.display()))?;
-    file.write_all(&header.encode()?)
-        .map_err(|error| format!("Failed to write ANN header: {error}"))?;
-    let mut key_offset = 0u64;
-    for key in keys {
-        file.write_all(&key_offset.to_le_bytes())
-            .map_err(|error| format!("Failed to write ANN key offsets: {error}"))?;
-        key_offset = key_offset
-            .checked_add(key.as_bytes().len() as u64)
-            .ok_or("ANN key bytes overflow")?;
-    }
-    file.write_all(&key_offset.to_le_bytes())
-        .map_err(|error| format!("Failed to write ANN key terminator: {error}"))?;
-    if key_offset != header.keys_bytes {
-        return Err("ANN flat writer key byte count mismatch".to_string());
-    }
-    for key in keys {
-        file.write_all(key.as_bytes())
-            .map_err(|error| format!("Failed to write ANN keys: {error}"))?;
-    }
-    file.seek(SeekFrom::Start(header.vectors_offset))
-        .map_err(|error| format!("Failed to align ANN vector section: {error}"))?;
-    for vector in vectors {
-        if vector.len() != header.dimensions as usize {
-            return Err("ANN flat writer vector dimension mismatch".to_string());
-        }
-        for value in vector {
-            file.write_all(&value.to_le_bytes())
-                .map_err(|error| format!("Failed to write ANN vector: {error}"))?;
-        }
-    }
-    file.sync_all()
-        .map_err(|error| format!("Failed to sync ANN sidecar: {error}"))
+    let mut writer = FlatFileWriter::create(path, header.clone(), encryption)?;
+    writer.push_keys(&keys.iter().map(String::as_str).collect::<Vec<_>>())?;
+    writer.push_vectors(&vectors.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+    writer.finish()
 }
 
 pub struct FlatFileWriter {
@@ -432,10 +612,21 @@ pub struct FlatFileWriter {
     keys_written: u64,
     vectors_written: u64,
     vector_bytes: Vec<u8>,
+    encryption: Arc<CipherKey>,
+    scope: String,
+    pending_keys: VecDeque<String>,
 }
 
 impl FlatFileWriter {
-    pub fn resume(path: &Path, header: Header, rows: u64, key_bytes: u64) -> Result<Self, String> {
+    pub fn resume(
+        path: &Path,
+        header: Header,
+        rows: u64,
+        key_bytes: u64,
+        encryption: Arc<CipherKey>,
+    ) -> Result<Self, String> {
+        header.verify_key(&encryption)?;
+        let scope = header.scope()?;
         use std::io::Read;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -464,6 +655,9 @@ impl FlatFileWriter {
             keys_written: rows,
             vectors_written: rows,
             vector_bytes: Vec::new(),
+            encryption,
+            scope,
+            pending_keys: VecDeque::new(),
         })
     }
 
@@ -472,7 +666,9 @@ impl FlatFileWriter {
             .sync_all()
             .map_err(|e| format!("Failed to sync ANN input checkpoint: {e}"))
     }
-    pub fn create(path: &Path, header: Header) -> Result<Self, String> {
+    pub fn create(path: &Path, header: Header, encryption: Arc<CipherKey>) -> Result<Self, String> {
+        header.verify_key(&encryption)?;
+        let scope = header.scope()?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -489,6 +685,9 @@ impl FlatFileWriter {
             keys_written: 0,
             vectors_written: 0,
             vector_bytes: Vec::new(),
+            encryption,
+            scope,
+            pending_keys: VecDeque::new(),
         })
     }
 
@@ -516,6 +715,9 @@ impl FlatFileWriter {
         payload.reserve(payload_bytes);
         let mut next_offset = self.next_key_offset;
         for key in keys {
+            if key.len() > MAX_TEXT_BYTES {
+                return Err("ANN subject key exceeds the format limit".into());
+            }
             offsets.extend_from_slice(&next_offset.to_le_bytes());
             next_offset = next_offset
                 .checked_add(key.as_bytes().len() as u64)
@@ -536,6 +738,8 @@ impl FlatFileWriter {
             .map_err(|error| format!("Failed to write ANN keys: {error}"))?;
         self.next_key_offset = next_offset;
         self.keys_written = self.keys_written.saturating_add(batch_len);
+        self.pending_keys
+            .extend(keys.iter().map(|key| key.to_string()));
         Ok(())
     }
 
@@ -558,18 +762,27 @@ impl FlatFileWriter {
         let bytes_per_vector = dimensions
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or("ANN flat writer vector byte length overflow")?;
-        let total_bytes = bytes_per_vector
+        if self.pending_keys.len() < vectors.len() {
+            return Err("ANN vector has no pending subject key".into());
+        }
+        let total_bytes = (bytes_per_vector + OVERHEAD)
             .checked_mul(vectors.len())
             .ok_or("ANN flat writer vector batch byte length overflow")?;
         self.vector_bytes.clear();
         self.vector_bytes.reserve(total_bytes);
-        for vector in vectors {
+        for (index, vector) in vectors.iter().enumerate() {
             if vector.len() != bytes_per_vector {
                 return Err("ANN flat writer vector dimension mismatch".to_string());
             }
-            self.vector_bytes.extend_from_slice(vector);
+            let ordinal = self.vectors_written + index as u64;
+            let identity = format!(
+                "{}:vector:{ordinal}:{}",
+                self.scope, self.pending_keys[index]
+            );
+            self.vector_bytes
+                .extend(self.encryption.seal(&identity, vector)?);
         }
-        let stride = u64::from(self.header.dimensions) * 4;
+        let stride = self.header.vector_stride();
         self.file
             .seek(SeekFrom::Start(
                 self.header.vectors_offset + self.vectors_written * stride,
@@ -577,6 +790,7 @@ impl FlatFileWriter {
             .and_then(|_| self.file.write_all(&self.vector_bytes))
             .map_err(|error| format!("Failed to write ANN vectors: {error}"))?;
         self.vectors_written = self.vectors_written.saturating_add(batch_len);
+        self.pending_keys.drain(..vectors.len());
         Ok(())
     }
 
@@ -692,6 +906,22 @@ fn slice_at(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_key() -> Arc<CipherKey> {
+    Arc::new(
+        CipherKey::new(
+            "11".repeat(16),
+            "synthetic-ann-fixture".into(),
+            "ann".into(),
+            &[0x6b; 32],
+        )
+        .unwrap(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) const TEST_SNAPSHOT_ID: &str = "22222222222222222222222222222222";
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -699,21 +929,34 @@ mod tests {
     fn a_partial_flat_page_is_replayed_from_its_durable_cursor() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("partial.cpdvec");
-        let header = Header::for_snapshot(1, 2, 2, 2, "clip_image", "model", "rev", 96, 2).unwrap();
-        let mut writer = FlatFileWriter::create(&path, header.clone()).unwrap();
+        let header = Header::for_snapshot(
+            1,
+            2,
+            2,
+            2,
+            "clip_image",
+            "model",
+            "rev",
+            96,
+            2,
+            &test_key(),
+            TEST_SNAPSHOT_ID,
+        )
+        .unwrap();
+        let mut writer = FlatFileWriter::create(&path, header.clone(), test_key()).unwrap();
         writer.push_key("a").unwrap();
         writer.push_vector(&[1.0, 0.0]).unwrap();
         writer.sync_checkpoint().unwrap();
         writer.push_key("b").unwrap(); // crash before this page's vector / cursor
         drop(writer);
-        let mut writer = FlatFileWriter::resume(&path, header, 1, 1).unwrap();
+        let mut writer = FlatFileWriter::resume(&path, header, 1, 1, test_key()).unwrap();
         writer.push_key("b").unwrap();
         writer.push_vector(&[0.0, 1.0]).unwrap();
         writer.finish().unwrap();
-        let flat = MappedFlatIndex::open(&path).unwrap();
+        let flat = MappedFlatIndex::open(&path, test_key()).unwrap();
         assert_eq!(flat.key(0).unwrap(), "a");
         assert_eq!(flat.key(1).unwrap(), "b");
-        assert_eq!(flat.vector(1).unwrap(), &[0.0, 1.0]);
+        assert_eq!(&*flat.vector(1).unwrap(), &[0.0, 1.0]);
     }
 
     #[test]
@@ -725,12 +968,24 @@ mod tests {
         let keys = vec!["图像-a".to_string(), "hash-b".to_string()];
         let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let key_bytes = keys.iter().map(|key| key.as_bytes().len() as u64).sum();
-        let header =
-            Header::for_snapshot(7, 11, 2, 2, "clip_image", "clip", "rev", 256, key_bytes).unwrap();
-        write_flat_file(&path, &header, &keys, &vectors).unwrap();
-        let mapped = MappedFlatIndex::open(&path).unwrap();
+        let header = Header::for_snapshot(
+            7,
+            11,
+            2,
+            2,
+            "clip_image",
+            "clip",
+            "rev",
+            256,
+            key_bytes,
+            &test_key(),
+            TEST_SNAPSHOT_ID,
+        )
+        .unwrap();
+        write_flat_file(&path, &header, &keys, &vectors, test_key()).unwrap();
+        let mapped = MappedFlatIndex::open(&path, test_key()).unwrap();
         assert_eq!(mapped.key(0).unwrap(), "图像-a");
-        assert_eq!(mapped.vector(1).unwrap(), &[0.0, 1.0]);
+        assert_eq!(&*mapped.vector(1).unwrap(), &[0.0, 1.0]);
         assert_eq!(mapped.header.covered_epoch, 11);
     }
 
@@ -738,22 +993,34 @@ mod tests {
     fn batched_writer_preserves_key_and_vector_order_across_pages() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("batched.cpdvec");
-        let header =
-            Header::for_snapshot(8, 12, 3, 2, "clip_image", "clip", "rev", 256, 3).unwrap();
-        let mut writer = FlatFileWriter::create(&path, header).unwrap();
+        let header = Header::for_snapshot(
+            8,
+            12,
+            3,
+            2,
+            "clip_image",
+            "clip",
+            "rev",
+            256,
+            3,
+            &test_key(),
+            TEST_SNAPSHOT_ID,
+        )
+        .unwrap();
+        let mut writer = FlatFileWriter::create(&path, header, test_key()).unwrap();
         writer.push_keys(&["a", "b"]).unwrap();
         writer.push_vectors(&[&[1.0, 0.0], &[0.0, 1.0]]).unwrap();
         writer.push_keys(&["c"]).unwrap();
         writer.push_vectors(&[&[0.5, 0.5]]).unwrap();
         writer.finish().unwrap();
 
-        let mapped = MappedFlatIndex::open(&path).unwrap();
+        let mapped = MappedFlatIndex::open(&path, test_key()).unwrap();
         assert_eq!(mapped.key(0).unwrap(), "a");
         assert_eq!(mapped.key(1).unwrap(), "b");
         assert_eq!(mapped.key(2).unwrap(), "c");
-        assert_eq!(mapped.vector(0).unwrap(), &[1.0, 0.0]);
-        assert_eq!(mapped.vector(1).unwrap(), &[0.0, 1.0]);
-        assert_eq!(mapped.vector(2).unwrap(), &[0.5, 0.5]);
+        assert_eq!(&*mapped.vector(0).unwrap(), &[1.0, 0.0]);
+        assert_eq!(&*mapped.vector(1).unwrap(), &[0.0, 1.0]);
+        assert_eq!(&*mapped.vector(2).unwrap(), &[0.5, 0.5]);
     }
 
     #[test]
@@ -761,7 +1028,129 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("bad.cpdvec");
         std::fs::write(&path, MAGIC).unwrap();
-        assert!(MappedFlatIndex::open(&path).is_err());
+        assert!(MappedFlatIndex::open(&path, test_key()).is_err());
+    }
+
+    #[test]
+    fn encrypted_records_reject_wrong_keys_headers_swaps_and_subject_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sealed.cpdvec");
+        let header = Header::for_snapshot(
+            17,
+            9,
+            2,
+            3,
+            "clip_image",
+            "model",
+            "rev",
+            96,
+            2,
+            &test_key(),
+            TEST_SNAPSHOT_ID,
+        )
+        .unwrap();
+        let vectors = vec![vec![0.1234567, 0.7654321, 0.2345678], vec![0.3, 0.4, 0.5]];
+        write_flat_file(
+            &path,
+            &header,
+            &["a".into(), "b".into()],
+            &vectors,
+            test_key(),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let plaintext = vectors[0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert!(!original
+            .windows(plaintext.len())
+            .any(|bytes| bytes == plaintext));
+        let wrong = Arc::new(
+            CipherKey::new(
+                test_key().id.clone(),
+                test_key().dataset.clone(),
+                "ann".into(),
+                &[0x6c; 32],
+            )
+            .unwrap(),
+        );
+        assert!(MappedFlatIndex::open(&path, wrong).is_err());
+        let wrong_dataset = Arc::new(
+            CipherKey::new(
+                test_key().id.clone(),
+                "other-dataset".into(),
+                "ann".into(),
+                test_key().bytes(),
+            )
+            .unwrap(),
+        );
+        assert!(MappedFlatIndex::open(&path, wrong_dataset).is_err());
+        let mut altered = original.clone();
+        altered[FIELD_GENERATION] ^= 1;
+        assert!(MappedFlatIndex::from_bytes(altered, test_key()).is_err());
+        let start = header.vectors_offset as usize;
+        let stride = header.vector_stride() as usize;
+        let mut altered = original.clone();
+        altered[start + 36] ^= 1;
+        assert!(MappedFlatIndex::from_bytes(altered, test_key())
+            .unwrap()
+            .vector(0)
+            .is_err());
+        let mut swapped = original.clone();
+        swapped.copy_within(start + stride..start + stride * 2, start);
+        assert!(MappedFlatIndex::from_bytes(swapped, test_key())
+            .unwrap()
+            .vector(0)
+            .is_err());
+        let mut renamed = original;
+        renamed[header.keys_offset as usize] = b'z';
+        assert!(MappedFlatIndex::from_bytes(renamed, test_key())
+            .unwrap()
+            .vector(0)
+            .is_err());
+    }
+
+    #[test]
+    fn decrypted_candidate_cache_is_bounded_and_pinned_vectors_survive_eviction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded.cpdvec");
+        let rows = 8300;
+        let header = Header::for_snapshot(
+            18,
+            10,
+            rows,
+            512,
+            "clip_image",
+            "model",
+            "rev",
+            96,
+            rows * 8,
+            &test_key(),
+            TEST_SNAPSHOT_ID,
+        )
+        .unwrap();
+        let mut writer = FlatFileWriter::create(&path, header, test_key()).unwrap();
+        let vector = vec![0.0625f32; 512];
+        for ordinal in 0..rows {
+            writer.push_key(&format!("{ordinal:08}")).unwrap();
+            writer.push_vector(&vector).unwrap();
+        }
+        writer.finish().unwrap();
+        let flat = MappedFlatIndex::open(&path, test_key()).unwrap();
+        let pinned = flat.vector(0).unwrap();
+        assert!(Arc::ptr_eq(&pinned.0, &flat.vector(0).unwrap().0));
+        for ordinal in 1..rows as usize {
+            flat.vector(ordinal).unwrap();
+        }
+        let cache = flat.cache.lock().unwrap();
+        assert!(cache.bytes <= VECTOR_CACHE_MAX_BYTES);
+        assert!(cache.entries.len() < rows as usize);
+        assert!(!cache.entries.contains_key(&0));
+        drop(cache);
+        flat.clear_vector_cache();
+        assert_eq!(pinned.as_ref(), vector.as_slice());
+        assert_eq!(flat.cache.lock().unwrap().bytes, 0);
     }
 
     #[test]

@@ -117,7 +117,7 @@ export default function SettingsContent({
         cleanup={<QuickDeleteSection onDelete={c.handleQuickDelete} isDeleting={c.isDeleting} deleteMessage={c.deleteMessage} deleteMessageType={c.deleteMessageType} />} />;
       case 'advanced': return <AdvancedSection preferences={runtime.preferences} ocr={runtime.ocr} indexes={runtime.indexes} scheduler={runtime.scheduler} />;
       case 'about': return <AboutSection checking={c.checkingUpdate} upToDate={c.upToDate} onCheckUpdate={c.handleCheckUpdate}
-        updateInfo={c.updateInfo} updateError={c.updateError} downloading={c.downloading} downloadProgress={c.downloadProgress} onDownloadUpdate={c.handleDownloadUpdate} />;
+        updateInfo={c.updateInfo} updateError={c.updateError} downloading={c.downloading} downloadProgress={c.downloadProgress} onDownloadUpdate={c.handleDownloadUpdate} onOpenDownloads={c.handleOpenDownloads} />;
       default: return null;
     }
   };

@@ -94,6 +94,8 @@ fn ann_checkpoint(storage: &StorageState, generation: u64) -> crate::storage::An
         runtime_generation: Some(storage.db_generation()),
         generation,
         dataset_id: storage.processing_dataset_id().unwrap(),
+        encryption_key_id: storage.protected_ann_write_key().unwrap().id.clone(),
+        snapshot_id: hex::encode(rand::random::<[u8; 16]>()),
         model_fingerprint: "revision-1".into(),
         covered_epoch: current_epoch(storage),
         scan_upper: String::new(),

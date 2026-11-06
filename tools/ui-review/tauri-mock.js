@@ -79,6 +79,9 @@ export async function invoke(command, args = {}) {
     case 'get_onboarding_state': return { mode: 'none', current_version: 1, completed_version: 1 };
     case 'check_model_files': return {};
     case 'get_critical_errors': return [];
+    case 'storage_get_initialization_status': case 'storage_retry_initialization': return {
+      ready: true, running: false, phase: 'complete', processed: 0, total: 0, revision: 1, error: null,
+    };
     case 'storage_check_hmac_migration_status': return { needs_migration: false, is_running: false };
     case 'get_blind_index_repair_status': return { needs_repair: false };
     case 'get_clip_backfill_offer': return { should_offer: false };

@@ -23,33 +23,22 @@ pub async fn credential_initialize(
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
-        match credential_manager::load_public_key_from_file(&credential_state) {
-            Ok(_) => {}
-            Err(_) => {
-                let pk = credential_manager::export_or_get_public_key(&credential_state)
-                    .map_err(|e| format!("Failed to initialize credentials: {}", e))?;
-
-                credential_manager::save_public_key_to_file(&credential_state, &pk)
-                    .map_err(|e| format!("Failed to save public key: {}", e))?;
-            }
-        };
-
-        credential_manager::ensure_master_key_created(&credential_state)
-            .map_err(|e| format!("Failed to create master key: {}", e))?;
-
-        storage_state.initialize()?;
-        // First-run initialization can happen after the Tauri setup callback
-        // failed to load/export the public key. Start Office observation at the
-        // same post-storage boundary used by the normal startup path.
-        if let Some(office_runtime) =
-            app.try_state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
-        {
-            office_runtime.start(app.clone(), storage_state.inner().clone());
-        }
-        if let Some(scheduler) =
-            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-        {
-            scheduler.start(app.clone());
+        let already_initialized = storage_state.is_initialized();
+        // Join the application-owned blocking job. Unlock and setup must never
+        // validate, migrate or start the storage services concurrently.
+        crate::storage_startup::ensure_initialized(app).await?;
+        if already_initialized {
+            // Joining an already-ready job must not skip the explicit unlock
+            // flow's existing authority/master-file validation.
+            let credentials = credential_state.inner().clone();
+            tokio::task::spawn_blocking(move || {
+                credential_manager::initialize_public_key(&credentials)
+                    .map_err(|error| format!("Failed to validate credentials: {error}"))?;
+                credential_manager::ensure_master_key_created(&credentials)
+                    .map_err(|error| format!("Failed to create master key: {error}"))
+            })
+            .await
+            .map_err(|error| format!("Credential validation task failed: {error}"))??;
         }
 
         Ok("Credentials initialized successfully".to_string())
@@ -101,13 +90,17 @@ pub async fn credential_verify_user(
                 .map_err(|e| format!("Verification task failed: {}", e))??;
 
                 // Run completion work once, even if the original window closes.
+                let key_storage = storage.clone();
+                tokio::task::spawn_blocking(move || key_storage.publish_protected_keys())
+                    .await
+                    .map_err(|e| e.to_string())??;
                 crate::settings_window::broadcast_auth_state(&app);
                 if let Some(scheduler) =
                     app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
                 {
                     scheduler.wake();
                 }
-                storage.try_bitmap_index_migration();
+                storage.start_lazy_indexer();
                 let recap_app = app.clone();
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     crate::ai::recap::protected::sync_after_unlock(&recap_app)
@@ -230,6 +223,15 @@ pub async fn credential_set_background_processing_enabled(
 ) -> Result<(), String> {
     crate::commands::check_auth_required(&state)?;
     state.set_background_processing_enabled(enabled)?;
+    if let Some(storage) = app.try_state::<Arc<StorageState>>() {
+        storage.clear_protected_read_cache();
+        if enabled {
+            storage.publish_protected_keys()?;
+        }
+    }
+    if let Some(ann) = app.try_state::<crate::clip_ann::ClipAnnState>() {
+        ann.disarm();
+    }
     if !enabled {
         let storage = app
             .state::<Arc<crate::storage::StorageState>>()

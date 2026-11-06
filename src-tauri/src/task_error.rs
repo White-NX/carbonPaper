@@ -65,7 +65,11 @@ impl TaskError {
 
 impl From<String> for TaskError {
     fn from(message: String) -> Self {
-        Self::Failed(message)
+        if message.contains("AUTH_REQUIRED") {
+            Self::AuthenticationRequired
+        } else {
+            Self::Failed(message)
+        }
     }
 }
 

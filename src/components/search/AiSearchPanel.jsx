@@ -7,6 +7,7 @@ import { aiErrorDetail, aiErrorKey } from '../../lib/ai_api';
 import { citedIds, parseAnswer } from '../../lib/ai_answer';
 import { openSettingsWindow } from '../../lib/settings_api';
 import { useFollowOutput } from '../../hooks/useFollowOutput';
+import { AiSearchLanding } from './AiSearchLanding';
 
 const MAX_SOURCES = 12;
 
@@ -358,8 +359,8 @@ export function AiSearchPanel({ controller: c, tabs, onSelectResult, header: Hea
         ref={inputRef}
         data-workspace-search-input
         rows={1}
-        aria-label={t(hasConversation ? 'aiSearch.followUp' : 'aiSearch.placeholder')}
-        placeholder={t(hasConversation ? 'aiSearch.followUp' : 'aiSearch.placeholder')}
+        aria-label={t(hasConversation ? 'aiSearch.followUp' : 'aiSearch.landing.placeholder')}
+        placeholder={t(hasConversation ? 'aiSearch.followUp' : 'aiSearch.landing.placeholder')}
         value={input}
         onChange={(event) => setInput(event.target.value)}
         onKeyDown={(event) => {
@@ -371,7 +372,7 @@ export function AiSearchPanel({ controller: c, tabs, onSelectResult, header: Hea
         className="custom-scrollbar block max-h-[108px] min-h-9 min-w-0 flex-1 resize-none overflow-y-auto overscroll-contain bg-transparent py-1.5 text-sm leading-6 text-ide-text outline-none placeholder:text-ide-muted [field-sizing:content]"
       />
       <button type={running ? 'button' : 'submit'} onClick={running ? c.cancel : undefined}
-        disabled={!running && !input.trim()}
+        disabled={!running && (!canCompose || !input.trim())}
         title={running ? t('aiSearch.stop') : `${t('aiSearch.send')} · ${t('aiSearch.composerHint')}`}
         aria-label={t(running ? 'aiSearch.stop' : 'aiSearch.send')}
         className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-ide-accent text-white transition hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 disabled:opacity-40">
@@ -381,6 +382,13 @@ export function AiSearchPanel({ controller: c, tabs, onSelectResult, header: Hea
   );
 
   const renderBody = () => {
+    if (c.status === 'idle') {
+      return <div className="w-full self-start">
+        <div className="mx-auto w-full max-w-[668px] px-6 pt-8">{composer}</div>
+        <AiSearchLanding loading={!c.settings} needsSetup={noProvider} selectedQuestion={input}
+          onChooseQuestion={(question) => { setInput(question); inputRef.current?.focus({ preventScroll: true }); }} />
+      </div>;
+    }
     if (!c.settings) {
       return <div className="flex justify-center py-16 text-ide-muted"><Loader2 className="h-4 w-4 animate-spin" /></div>;
     }
@@ -403,24 +411,6 @@ export function AiSearchPanel({ controller: c, tabs, onSelectResult, header: Hea
             <Button variant="ghost" onClick={c.declineConsent}>{t('common.cancel')}</Button>
             <Button variant="primary" onClick={c.acceptConsent}>{t('aiSearch.consent.accept')}</Button>
           </div>
-        </div>
-      );
-    }
-    if (c.status === 'idle') {
-      return (
-        <div className="mx-auto flex w-full max-w-2xl flex-col gap-5 px-6 py-12">
-          <Bot className="mx-auto h-8 w-8 text-ide-accent" />
-          <h2 className="text-center text-xl font-medium text-ide-text">{t('aiSearch.landing.title')}</h2>
-          {composer}
-          <div className="space-y-1.5">
-            {t('aiSearch.landing.examples', { returnObjects: true }).map((example) => (
-              <button key={example} type="button" onClick={() => { setInput(''); c.start(example); }}
-                className="block w-full rounded-lg border border-ide-border px-3 py-2 text-left text-sm text-ide-text transition-colors hover:bg-ide-hover">
-                {example}
-              </button>
-            ))}
-          </div>
-          <p className="text-center text-xs text-ide-muted">{t('aiSearch.landing.using', { name: c.provider.name })}</p>
         </div>
       );
     }

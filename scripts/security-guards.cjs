@@ -91,6 +91,8 @@ const COMMAND_TIERS = {
   'commands::storage::storage_get_categories_from_db': 'session_required',
   'commands::storage::storage_batch_get_categories': 'session_required',
   'commands::migration::storage_get_startup_vacuum_status': 'public',
+  'storage_startup::storage_get_initialization_status': 'public',
+  'storage_startup::storage_retry_initialization': 'background_policy',
   'commands::migration::storage_is_startup_vacuum_in_progress': 'public',
   'commands::migration::storage_run_startup_vacuum_if_needed': 'background_policy',
   'commands::migration::storage_run_manual_vacuum': 'session_required',
@@ -275,6 +277,7 @@ function checkCommandGuardImplementations() {
   }
 
   const mainWindowCommands = [
+    'storage_startup::storage_retry_initialization',
     'settings_window::take_settings_monitor_action',
     'settings_window::open_settings_window',
     'settings_window::complete_settings_monitor_action',
@@ -434,6 +437,17 @@ function checkProtectedRecapBoundary() {
     throw new Error('Recap generation must retain the process background authorization gate');
   }
 }
+function checkUpdaterTrustBoundary() {
+  for (const file of ['src-tauri/src/updater.rs', 'src-tauri/src/lib.rs']) {
+    if (/CARBONPAPER_UPDATE_(?:SMOKE|MANIFEST_URL)|is_update_smoke_test_enabled|maybe_run_update_smoke_test/.test(read(file))) {
+      throw new Error('Production updater must not expose environment-driven smoke installation or key overrides');
+    }
+  }
+  if (/update\.ps1|powershell\.exe/.test(read('src-tauri/src/updater.rs'))) {
+    throw new Error('Updater handoff must use a verified native executable');
+  }
+}
+checkUpdaterTrustBoundary();
 checkProtectedRecapBoundary();
 checkCommandPolicies();
 checkCommandGuardImplementations();

@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 #[path = "../../src/clip_preprocess.rs"]
 mod clip_preprocess;
+#[path = "../../src/clip_text_model.rs"]
+mod clip_text_model;
 #[allow(dead_code)]
 #[path = "../../src/ml_protocol.rs"]
 mod ml_protocol;
@@ -15,6 +17,8 @@ mod semantic_metrics;
 #[allow(dead_code)]
 #[path = "../../src/semantic_models.rs"]
 mod semantic_models;
+#[path = "../../src/semantic_session_cache.rs"]
+mod semantic_session_cache;
 
 use ml_protocol::{
     read_request, write_response, MlError, MlErrorKind, MlProvider, MlRequest, MlResponse,
@@ -118,7 +122,7 @@ fn run() -> Result<(), String> {
         let cpu_started = semantic_metrics::cpu_ms();
         engine.begin_request(control.clone());
         if let Err(error) = control.check() {
-            write_semantic_error(&mut writer, request_id, error)?;
+            write_semantic_error(&mut writer, request_id, error, &engine)?;
             registry.finish(request_id);
             continue;
         }
@@ -142,6 +146,7 @@ fn run() -> Result<(), String> {
                         model_id: loaded.map(|model| model.descriptor.model_id.to_string()),
                         model_revision: loaded.map(|model| model.descriptor.revision.to_string()),
                         model_fingerprint: loaded.map(|model| model.model_fingerprint.clone()),
+                        resident_sessions: engine.resident_sessions(),
                     },
                 )?;
             }
@@ -165,11 +170,15 @@ fn run() -> Result<(), String> {
                         input_ids: tokens.input_ids,
                         attention_mask: tokens.attention_mask,
                         token_type_ids: tokens.token_type_ids,
+                        resident_sessions: engine.resident_sessions(),
                     },
                 )?,
-                Err(error) => {
-                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
-                }
+                Err(error) => write_semantic_error(
+                    &mut writer,
+                    request_id,
+                    engine.request_error(error),
+                    &engine,
+                )?,
             },
             MlRequest::EmbedText {
                 request_id,
@@ -179,7 +188,7 @@ fn run() -> Result<(), String> {
             } => match engine.embed_text(model, &texts) {
                 Ok(result) => {
                     if let Err(error) = control.check() {
-                        write_semantic_error(&mut writer, request_id, error)?;
+                        write_semantic_error(&mut writer, request_id, error, &engine)?;
                         registry.finish(request_id);
                         continue;
                     }
@@ -192,12 +201,16 @@ fn run() -> Result<(), String> {
                             dimensions: result.value.first().map(Vec::len).unwrap_or(0),
                             vectors: result.value,
                             timings: response_timings,
+                            resident_sessions: engine.resident_sessions(),
                         },
                     )?
                 }
-                Err(error) => {
-                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
-                }
+                Err(error) => write_semantic_error(
+                    &mut writer,
+                    request_id,
+                    engine.request_error(error),
+                    &engine,
+                )?,
             },
             MlRequest::EmbedImage {
                 request_id,
@@ -207,7 +220,7 @@ fn run() -> Result<(), String> {
             } => match engine.embed_image(model, &images, &body) {
                 Ok(result) => {
                     if let Err(error) = control.check() {
-                        write_semantic_error(&mut writer, request_id, error)?;
+                        write_semantic_error(&mut writer, request_id, error, &engine)?;
                         registry.finish(request_id);
                         continue;
                     }
@@ -220,12 +233,16 @@ fn run() -> Result<(), String> {
                             dimensions: result.value.first().map(Vec::len).unwrap_or(0),
                             vectors: result.value,
                             timings: response_timings,
+                            resident_sessions: engine.resident_sessions(),
                         },
                     )?
                 }
-                Err(error) => {
-                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
-                }
+                Err(error) => write_semantic_error(
+                    &mut writer,
+                    request_id,
+                    engine.request_error(error),
+                    &engine,
+                )?,
             },
             MlRequest::Rerank {
                 request_id,
@@ -236,7 +253,7 @@ fn run() -> Result<(), String> {
             } => match engine.rerank(model, &query, &documents) {
                 Ok(result) => {
                     if let Err(error) = control.check() {
-                        write_semantic_error(&mut writer, request_id, error)?;
+                        write_semantic_error(&mut writer, request_id, error, &engine)?;
                         registry.finish(request_id);
                         continue;
                     }
@@ -248,12 +265,16 @@ fn run() -> Result<(), String> {
                             model,
                             scores: result.value,
                             timings: response_timings,
+                            resident_sessions: engine.resident_sessions(),
                         },
                     )?
                 }
-                Err(error) => {
-                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
-                }
+                Err(error) => write_semantic_error(
+                    &mut writer,
+                    request_id,
+                    engine.request_error(error),
+                    &engine,
+                )?,
             },
             MlRequest::Ocr { .. } => write_semantic_error(
                 &mut writer,
@@ -262,6 +283,7 @@ fn run() -> Result<(), String> {
                     MlErrorKind::InvalidRequest,
                     "OCR request was sent to the semantic worker",
                 ),
+                &engine,
             )?,
         }
         registry.finish(request_id);
@@ -290,6 +312,7 @@ fn write_semantic_error<W: Write>(
     writer: &mut W,
     request_id: u64,
     error: MlError,
+    engine: &semantic_engine::SemanticEngine,
 ) -> Result<(), String> {
     let kind = error.kind.as_str().to_string();
     let message = error.message;
@@ -300,6 +323,7 @@ fn write_semantic_error<W: Write>(
             request_id,
             kind,
             message,
+            resident_sessions: engine.resident_sessions(),
         },
     )
     .map_err(Into::into)

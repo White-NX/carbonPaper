@@ -1,4 +1,20 @@
 {
+  "storageStartup": {
+    "title": "Preparing your history",
+    "tip": "You can continue when preparation finishes. A large history may take a few minutes.",
+    "error": "Preparation could not finish. Please try again.",
+    "phases": {
+      "credentials": "Checking data protection",
+      "opening": "Opening your history",
+      "schema": "Preparing your history",
+      "metadata": "Protecting history information",
+      "vectors": "Protecting search data",
+      "processes": "Protecting app information",
+      "cleanup": "Cleaning up old search data",
+      "compacting": "Organizing your history",
+      "finalizing": "Finishing preparation"
+    }
+  },
   "mainPreview": {
     "emptyHint": "Select a screenshot from the timeline above, or search your history."
   },
@@ -1250,6 +1266,10 @@
     "extracting": "Extracting update...",
     "applying": "Applying update...",
     "downloadFailed": "Download failed: {{error}}",
+    "installerRequired": "Use the installer to update this copy of CarbonPaper. Download the latest installer from the release page.",
+    "elevationCancelled": "Update cancelled. CarbonPaper is still running. You can retry when you are ready.",
+    "restartRequired": "To continue updating, exit CarbonPaper from the system tray, then reopen it without administrator privileges and retry the update.",
+    "openDownloads": "Open release page",
     "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
   },
   "topbar": {
@@ -1365,7 +1385,7 @@
     "switchToNL": "Switch to picture search",
     "switchToOCR": "Switch to text search",
     "selectMode": "Select Search Mode",
-    "pressEnterToViewMore": "Press [Enter] to view more results",
+    "pressEnterToViewMore": "Press Enter to open unified search",
     "mode": {
       "ocr": {
         "title": "Text search",
@@ -1378,7 +1398,8 @@
     },
     "placeholder": {
       "ocr": "Search text that appeared on screen",
-      "nl": "Describe the screen you are looking for"
+      "nl": "Describe the screen you are looking for",
+      "unified": "Search text or describe a scene…"
     },
     "loading": "Loading...",
     "noContents": "No Contents",
@@ -1527,7 +1548,7 @@
     "search": {
       "error": "Search failed: {{message}}",
       "placeholder_ocr": "Search snapshots and recaps",
-      "placeholder_snapshots": "Search text in snapshots",
+      "placeholder_snapshots": "Search screenshot text or describe a scene",
       "placeholder_recaps": "Search recaps",
       "placeholder_nl": "Describe the screen you are looking for",
       "go": "Search",
@@ -1537,7 +1558,9 @@
       "no_results_filtered": "No results match the current filters.",
       "no_results_hint": "Widening the time range or dropping a filter often helps.",
       "try_visual": "Search by picture instead",
-      "clear_filters": "Clear filters"
+      "clear_filters": "Clear filters",
+      "placeholder_unified": "Search text, recaps, or describe a scene",
+      "no_text_results_for": "No text or recap matches for “{{query}}”"
     },
     "modes": {
       "ocr": "Text",
@@ -1547,7 +1570,9 @@
       "ocr_hint": "Search snapshot text and recap activities",
       "nl_hint": "Match screen content with a description",
       "ai": "AI",
-      "ai_hint": "Ask a question and let AI search your history for the answer"
+      "ai_hint": "Ask a question and let AI search your history for the answer",
+      "unified": "Unified search",
+      "unified_hint": "Find memories in screenshot text, recaps, and visual content"
     },
     "processes": {
       "all": "All Processes",
@@ -1587,6 +1612,7 @@
       "sort_similarity": "By similarity",
       "sort_relevance": "By relevance",
       "total": "{{count}} results",
+      "summary": "{{results}}, took {{seconds}} seconds",
       "resultTypes": "{{snapshots}} snapshots · {{recaps}} recaps",
       "categoryScope": "Categories filter snapshots",
       "partial": "Showing some matches. Narrow the search for more precise results."
@@ -1633,7 +1659,33 @@
     "resultTypes": {
       "recap": "Recap"
     },
-    "viewSource": "Open source snapshot"
+    "viewSource": "Open source snapshot",
+    "visual": {
+      "title": "Visual search",
+      "open": "View all visual results",
+      "back": "Back to unified search",
+      "hint": "Find screenshots by their visual content",
+      "unavailable": "Visual search is unavailable",
+      "empty": "No matching screenshots",
+      "expand": "Expand",
+      "collapse": "Collapse",
+      "results": "Visual search results",
+      "count": "{{count}} images",
+      "count_one": "{{count}} image",
+      "count_other": "{{count}} images",
+      "count_more": "{{count}}+ images",
+      "count_more_one": "{{count}}+ images",
+      "count_more_other": "{{count}}+ images",
+      "more": "Show {{count}} more",
+      "view_more": "View more",
+      "retry": "Retry",
+      "retry_hint": "Unable to search visual content right now. Please try again.",
+      "empty_hint": "Try a more specific scene description or adjust your filters.",
+      "page_error": "Unable to load more screenshots right now.",
+      "order": "More relevant images appear first",
+      "relevance": "Relevance {{score}}",
+      "relevanceHint": "Higher values indicate a closer visual match to your description."
+    }
   },
   "mask": {
     "model_download": {
@@ -2058,13 +2110,36 @@
       "accept": "Allow and continue"
     },
     "landing": {
-      "title": "What would you like to find?",
-      "using": "Using {{name}}",
-      "examples": [
-        "What was I doing yesterday afternoon?",
-        "Which articles about async Rust did I read recently?",
-        "When did I last see that error message?"
-      ]
+      "title": "Start with a question",
+      "description": "Find answers in your screenshots and daily recaps.",
+      "placeholder": "What would you like to find?",
+      "preparing": "Preparing AI search…",
+      "cards": {
+        "day": {
+          "label": "Daily recap",
+          "title": "What was I doing yesterday?",
+          "description": "Piece together your day",
+          "question": "What was I doing yesterday?"
+        },
+        "reading": {
+          "label": "Things you read",
+          "title": "That article…\nWhere did I read it?",
+          "description": "Find clues in pages and screenshots",
+          "question": "Where did I read that article?"
+        },
+        "discussion": {
+          "label": "Past discussions",
+          "title": "How did we solve\nthat problem last week?",
+          "description": "Pick up the discussion and find the conclusion",
+          "question": "How did we solve that problem last week?"
+        },
+        "project": {
+          "label": "Work progress",
+          "title": "What have I done\nfor this project lately?",
+          "description": "Connect your work and review progress",
+          "question": "What have I done for this project lately?"
+        }
+      }
     },
     "reasoning": "Thinking",
     "followUp": "Ask a follow-up…",

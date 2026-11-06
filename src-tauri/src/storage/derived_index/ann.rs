@@ -24,7 +24,7 @@ pub(super) const ANN_TAIL_UPDATES_SQL: &str = r#"
                   AND j.model_id = e.model_id AND j.model_revision = e.model_revision
                   AND j.embedding_version = e.embedding_version
                   AND j.source_fingerprint = e.source_fingerprint
-                THEN e.vector_f32 END
+                THEN cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key) END
     FROM derived_ann_changes c INDEXED BY idx_derived_ann_changes_epoch
     LEFT JOIN derived_embeddings e
       ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
@@ -75,11 +75,42 @@ impl StorageState {
                 "#,
             )
             .map_err(|error| format!("Failed to prepare derived sidecar cleanup: {error}"))?;
-        let referenced = statement
+        let mut referenced = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| format!("Failed to query referenced derived sidecars: {error}"))?
             .collect::<Result<HashSet<_>, _>>()
             .map_err(|error| format!("Failed to read referenced derived sidecar: {error}"))?;
+        drop(statement);
+        let mut checkpoints = conn
+            .prepare("SELECT state_json FROM ann_build_checkpoints LIMIT 8")
+            .map_err(|e| e.to_string())?;
+        for json in checkpoints
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+        {
+            let json = json.map_err(|e| e.to_string())?;
+            let Ok(state) =
+                serde_json::from_str::<super::super::ann_build::AnnBuildCheckpoint>(&json)
+            else {
+                continue;
+            };
+            if state.phase == "complete" {
+                continue;
+            }
+            referenced.insert(state.flat_name());
+            referenced.insert(state.ann_name());
+            referenced.insert(format!(".{}.partial", state.flat_name()));
+            referenced.insert(format!(".{}.partial", state.ann_name()));
+            for checkpoint in [state.complete, state.previous].into_iter().flatten() {
+                if checkpoint
+                    .name
+                    .starts_with(&format!("clip_image-{}.checkpoint-", state.generation))
+                    && !checkpoint.name.contains(['/', '\\', ':'])
+                {
+                    referenced.insert(checkpoint.name);
+                }
+            }
+        }
 
         let sidecar_dir = data_dir.join("derived-indexes");
         let entries = match fs::read_dir(&sidecar_dir) {
@@ -107,9 +138,11 @@ impl StorageState {
                     file_name.starts_with(&format!("{}-", kind.as_str()))
                         && (file_name.ends_with(".cpdvec") || file_name.ends_with(".cpdann"))
                 });
-            let is_temp = file_name.starts_with('.')
-                && (file_name.ends_with(".cpdvec.tmp") || file_name.ends_with(".cpdann.tmp"));
-            if (!is_finalized || referenced.contains(&file_name)) && !is_temp {
+            let normalized = file_name.trim_start_matches('.');
+            let is_temp = (normalized.starts_with("clip_image-")
+                || normalized.starts_with("semantic_text-"))
+                && (file_name.ends_with(".tmp") || file_name.ends_with(".partial"));
+            if (!is_finalized && !is_temp) || referenced.contains(&file_name) {
                 continue;
             }
             match fs::remove_file(entry.path()) {
@@ -569,7 +602,7 @@ impl StorageState {
                            AND j.model_revision = e.model_revision
                            AND j.embedding_version = e.embedding_version
                            AND j.source_fingerprint = e.source_fingerprint
-                        THEN e.vector_f32 END
+                        THEN cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key) END
                     FROM derived_ann_changes c
                     LEFT JOIN derived_embeddings e
                       ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key

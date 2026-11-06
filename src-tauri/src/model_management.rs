@@ -507,6 +507,7 @@ pub async fn download_model(
     // Bootstrap downloads are idempotent. Existing complete models require no
     // network or authentication and should not break a partially restored setup.
     if model_files_complete(&download_path, spec.files) {
+        prepare_search_model(&model_id, &download_path).await?;
         return Ok(download_path.to_string_lossy().to_string());
     }
 
@@ -544,9 +545,33 @@ pub async fn download_model(
     )
     .await
     {
-        Ok(path) => Ok(path.to_string_lossy().to_string()),
+        Ok(path) => {
+            prepare_search_model(&model_id, &path).await?;
+            Ok(path.to_string_lossy().to_string())
+        }
         Err(e) => Err(format!("download_model error: {}", e)),
     }
+}
+
+/// Prepare the deterministic text branch during model installation. Existing
+/// installations also rebuild a missing or damaged cache on the next load.
+async fn prepare_search_model(model_id: &str, base: &Path) -> Result<(), String> {
+    if model_id != "chinese-clip" {
+        return Ok(());
+    }
+    let base = base.to_path_buf();
+    task::spawn_blocking(move || {
+        let resolved = crate::semantic_models::resolve_semantic_model(
+            crate::ml_protocol::MlSemanticModel::ChineseClip,
+            &base,
+            &base,
+        )
+        .map_err(|error| error.to_string())?;
+        crate::clip_text_model::prepare(&resolved).map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("CLIP text preparation task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -727,7 +752,9 @@ fn file_set_size(base: &Path, files: &[&str]) -> u64 {
 }
 
 fn clip_root_size(root: &Path) -> u64 {
-    file_set_size(root, CLIP_ROOT_MEASURE_FILES) + dir_size_recursive(&root.join("onnx"))
+    file_set_size(root, CLIP_ROOT_MEASURE_FILES)
+        + dir_size_recursive(&root.join("onnx"))
+        + dir_size_recursive(&root.join(crate::clip_text_model::CACHE_DIRECTORY))
 }
 
 fn variant_dir(root: &Path, subdir: Option<&str>) -> PathBuf {

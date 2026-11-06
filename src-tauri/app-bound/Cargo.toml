@@ -32,6 +32,7 @@ required-features = ["development-runtime"]
 
 [dependencies]
 aes-gcm = "0.10"
+aes = { version = "0.8", features = ["zeroize"] }
 base64 = "0.22"
 ed25519-dalek = "2"
 hex = "0.4"
@@ -53,6 +54,10 @@ windows = { version = "0.58", features = [
   "Win32_System_Com", "Win32_System_Memory", "Win32_System_Pipes",
   "Win32_System_Services", "Win32_System_Threading", "Win32_System_IO",
   "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Wdk_Storage_FileSystem",
 ] }
 
 [dev-dependencies]

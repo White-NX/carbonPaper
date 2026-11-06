@@ -7,7 +7,7 @@ import zh from './i18n/locales/zh-CN.json';
 import { searchSnapshotsAndRecaps } from './lib/search_api';
 import { fetchImage, getScreenshotDetails, searchScreenshots } from './lib/monitor_api';
 
-const mocks = vi.hoisted(() => ({ authenticated: true, copy: vi.fn(async () => {}), window: vi.fn(), timelines: vi.fn() }));
+const mocks = vi.hoisted(() => ({ authenticated: true, storageReady: true, copy: vi.fn(async () => {}), window: vi.fn(), timelines: vi.fn() }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({
   t: (key, options = {}) => {
     const value = key.split('.').reduce((object, part) => object?.[part], zh);
@@ -17,6 +17,7 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({
 }) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => vi.fn()) }));
 vi.mock('./hooks/useAuthSession', () => ({ useAuthSession: () => ({ isAuthenticated: mocks.authenticated }) }));
+vi.mock('./hooks/useStorageInitialization', () => ({ useStorageInitialization: () => ({ ready: mocks.storageReady }) }));
 vi.mock('./hooks/useAppTheme', () => ({ useAppTheme: () => ({ darkMode: true }) }));
 vi.mock('./hooks/useAppWindowState', () => ({
   usePowerSavingState: () => ({ windowFocused: true }), useWindowMaximizedState: () => false, useAppWindowActions: () => ({}),
@@ -35,6 +36,7 @@ vi.mock('./components/Mask', () => ({ default: () => null }));
 vi.mock('./components/AuthMask', () => ({ default: () => null }));
 vi.mock('./components/ErrorWindow', () => ({ default: () => null }));
 vi.mock('./components/StartupVacuumDialog', () => ({ default: () => null }));
+vi.mock('./components/StorageInitializationOverlay', () => ({ default: () => null }));
 vi.mock('./components/VectorMigrationOverlay', () => ({ default: () => null }));
 vi.mock('./components/HmacMigrationDialog', () => ({ default: () => null }));
 vi.mock('./components/ClipBackfillDialog', () => ({ default: () => null }));
@@ -51,6 +53,7 @@ vi.mock('./components/OfficeDocumentEntry', () => ({ default: () => null }));
 vi.mock('./lib/recap_api', async (original) => ({ ...await original(), getSnapshotRecapContext: vi.fn(async () => ({ status: 'unmatched', items: [] })) }));
 vi.mock('./lib/monitor_api', () => ({
   warmupThumbnails: vi.fn(async () => {}), fetchImage: vi.fn(async () => 'screenshot.png'), fetchThumbnail: vi.fn(async () => null),
+  fetchSearchImage: vi.fn(async () => 'screenshot.png'),
   fetchThumbnailBatch: vi.fn(async () => ({})), getScreenshotDetails: vi.fn(async () => ({
     record: { id: 42, process_name: 'Editor', window_title: 'Design notes', created_at: '2026-10-28T02:00:00Z' }, ocr_results: [{ text: 'Matched design' }],
   })), listProcesses: vi.fn(async () => []), getCategoriesFromDb: vi.fn(async () => []), listRecentScreenshots: vi.fn(async () => []),
@@ -62,7 +65,7 @@ vi.mock('./lib/monitor_api', () => ({
 vi.mock('./lib/search_api', () => ({ searchSnapshotsAndRecaps: vi.fn() }));
 
 beforeEach(() => {
-  localStorage.clear(); mocks.authenticated = true;
+  localStorage.clear(); mocks.authenticated = true; mocks.storageReady = true;
   invoke.mockImplementation(async (command) => command === 'storage_check_hmac_migration_status'
     ? { needs_migration: false, is_running: false }
     : null);
@@ -75,7 +78,7 @@ beforeEach(() => {
 
 it('returns from timeline navigation to the same search result with source focus restored', async () => {
   render(<App />);
-  const quickSearch = screen.getByRole('textbox', { name: '搜索截图里出现过的文字' });
+  const quickSearch = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
   fireEvent.change(quickSearch, { target: { value: 'design' } });
   fireEvent.keyDown(quickSearch, { key: 'Enter' });
   const field = await screen.findByRole('textbox', { name: '搜索历史记录' });
@@ -106,11 +109,10 @@ it.each([42, undefined])('opens a visual search result in the timeline with an i
     metadata: { screenshot_id: screenshotId, image_path: path, process_name: 'Editor', window_title: 'Visual design', created_at: '2026-10-28T02:00:00Z' },
   }]);
   render(<App />);
-  fireEvent.click(screen.getByRole('button', { name: '切换到画面搜索' }));
-  const input = screen.getByRole('textbox', { name: '描述你想找的画面' });
+  const input = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
   fireEvent.change(input, { target: { value: 'moon' } });
   fireEvent.keyDown(input, { key: 'Enter' });
-  fireEvent.click(await screen.findByRole('button', { name: '预览 Visual design' }));
+  fireEvent.click(await screen.findByRole('button', { name: /^Visual design ·/ }));
   const dialog = await screen.findByRole('dialog', { name: '快照预览' });
   await within(dialog).findByRole('img', { name: 'Screenshot' });
   fireEvent.click(within(dialog).getByRole('button', { name: '在时间线上查看' }));
@@ -129,7 +131,7 @@ it('opens a title-bar quick-search result in the records viewer', async () => {
     text: 'Matched design', created_at: '2026-10-28T02:00:00Z',
   }]);
   render(<App />);
-  const input = screen.getByRole('textbox', { name: '搜索截图里出现过的文字' });
+  const input = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
   act(() => input.focus());
   fireEvent.change(input, { target: { value: 'design' } });
   fireEvent.click(await screen.findByText('Quick design notes'));
@@ -139,22 +141,22 @@ it('opens a title-bar quick-search result in the records viewer', async () => {
   expect(screen.queryByText('Quick design notes')).not.toBeInTheDocument();
 });
 
-it('submits the picture-search query and mode from the title bar to full search', async () => {
+it('submits the title-bar query to unified text and visual search', async () => {
   render(<App />);
-  fireEvent.click(screen.getByRole('button', { name: '切换到画面搜索' }));
-  const input = screen.getByRole('textbox', { name: '描述你想找的画面' });
+  const input = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
   fireEvent.change(input, { target: { value: 'moon' } });
   fireEvent.keyDown(input, { key: 'Enter' });
   const field = await screen.findByRole('textbox', { name: '搜索历史记录' });
   await waitFor(() => expect(field).toHaveValue('moon'));
   await waitFor(() => expect(searchScreenshots).toHaveBeenCalledWith('moon', 'nl', expect.any(Object)));
-  expect(searchSnapshotsAndRecaps).not.toHaveBeenCalled();
+  await waitFor(() => expect(searchSnapshotsAndRecaps).toHaveBeenCalledWith('moon', expect.any(Object)));
+  expect(screen.queryByRole('button', { name: '切换到画面搜索' })).not.toBeInTheDocument();
 });
 
 it('focuses title-bar quick search without leaving the current workspace', () => {
   render(<App />);
   fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
-  expect(screen.getByRole('textbox', { name: '搜索截图里出现过的文字' })).toHaveFocus();
+  expect(screen.getByRole('textbox', { name: zh.search.placeholder.unified })).toHaveFocus();
   expect(screen.getByRole('heading', { name: '记录' })).toBeInTheDocument();
 });
 
@@ -162,7 +164,7 @@ it('reapplies the submitted quick-search query after editing the full-search fie
   const clock = vi.spyOn(Date, 'now').mockReturnValue(1234567890);
   try {
     render(<App />);
-    const input = screen.getByRole('textbox', { name: '搜索截图里出现过的文字' });
+    const input = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
     fireEvent.change(input, { target: { value: 'design' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     const field = await screen.findByRole('textbox', { name: '搜索历史记录' });
@@ -180,7 +182,7 @@ it('keeps the global search shortcut disabled while locked', () => {
   render(<App />);
   fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
   expect(screen.getByRole('heading', { name: '记录' })).toBeInTheDocument();
-  const input = screen.getByRole('textbox', { name: '搜索截图里出现过的文字' });
+  const input = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
   expect(input).toBeDisabled();
   expect(input).not.toHaveFocus();
 });
@@ -193,5 +195,23 @@ it('pauses timeline data and preview caches when the screenshot session is locke
   expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({ sqlPaused: true }));
   mocks.authenticated = true;
   view.rerender(<App />);
+  expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({ sqlPaused: false }));
+});
+
+it('gates history reads and the global search shortcut until storage is ready', () => {
+  mocks.storageReady = false;
+  const view = render(<App />);
+  const input = screen.getByRole('textbox', { name: zh.search.placeholder.unified });
+  fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+  expect(input).toBeDisabled();
+  expect(input).not.toHaveFocus();
+  expect(mocks.timelines).not.toHaveBeenCalled();
+  expect(getScreenshotDetails).not.toHaveBeenCalled();
+  expect(searchSnapshotsAndRecaps).not.toHaveBeenCalled();
+
+  mocks.storageReady = true;
+  view.rerender(<App />);
+  fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+  expect(input).toHaveFocus();
   expect(mocks.timelines).toHaveBeenLastCalledWith(expect.objectContaining({ sqlPaused: false }));
 });

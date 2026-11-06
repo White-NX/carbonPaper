@@ -1,8 +1,10 @@
 //! Internal control protocol for the resumable, isolated ANN builder.
 // The desktop and the standalone worker intentionally use different subsets.
 #![allow(dead_code)]
+use carbonpaper_app_bound::{payload::CipherKey, protocol::TaskKey};
 use serde::{Deserialize, Serialize};
-pub const ANN_WORKER_PROTOCOL: u32 = 1;
+use std::sync::Arc;
+pub const ANN_WORKER_PROTOCOL: u32 = 2;
 pub const IO_CHUNK: usize = 256 * 1024;
 pub const IO_RATE: u64 = 2 * 1024 * 1024;
 pub const CHECKPOINT_ROWS: u64 = 5000;
@@ -57,6 +59,25 @@ impl From<&str> for AnnError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AnnEncryptionKey {
+    pub id: String,
+    pub dataset: String,
+    pub key: TaskKey,
+}
+impl AnnEncryptionKey {
+    pub fn from_key(key: &CipherKey) -> Self {
+        Self {
+            id: key.id.clone(),
+            dataset: key.dataset.clone(),
+            key: TaskKey(key.bytes().to_vec()),
+        }
+    }
+    pub fn into_key(self) -> Result<Arc<CipherKey>, String> {
+        CipherKey::new(self.id, self.dataset, "ann".into(), &self.key.0).map(Arc::new)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AnnRequest {
     Open {
@@ -66,6 +87,7 @@ pub enum AnnRequest {
         checkpoint: Option<String>,
         checksum: Option<String>,
         checkpoint_rows: u64,
+        encryption: AnnEncryptionKey,
     },
     Step {
         request_id: u64,

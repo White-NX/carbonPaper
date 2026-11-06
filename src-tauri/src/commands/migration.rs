@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 
 #[derive(serde::Serialize)]
 pub struct HmacMigrationStatus {
@@ -459,8 +459,8 @@ pub async fn storage_export_backup(
             let file = File::create(&export_path)
                 .map_err(|error| format!("Failed to create export file: {error}"))?;
             let mut zip = zip::ZipWriter::new(file);
-            let options: FileOptions<'_, ()> =
-                FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (index, (path, zip_name)) in files_to_process.iter().enumerate() {
                 zip.start_file(zip_name, options)
                     .map_err(|error| format!("Failed to add {zip_name} to backup: {error}"))?;

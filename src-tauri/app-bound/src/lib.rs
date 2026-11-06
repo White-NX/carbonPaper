@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod development;
 pub mod ledger;
 pub mod manifest;
+pub mod payload;
 pub mod protocol;
 #[cfg(windows)]
 pub mod windows;

@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth, requestAuth, checkAuthSession } from './auth_api';
+import { throwIfSearchAborted } from './latest_task_queue';
 
 // Re-export auth functions for convenience
 export { requestAuth, checkAuthSession };
@@ -409,17 +410,20 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
     
     return withAuth(async () => {
         // Natural-language image search is served directly by Rust.
+        throwIfSearchAborted(options.signal);
         if (mode === 'nl') {
             const response = await invoke('monitor_search_nl', {
                 query,
                 limit,
                 offset,
                 processNames,
+                ...(categories.length ? { categories } : {}),
                 startTime,
                 endTime,
                 fuzzy,
                 ...(includeOcr === false ? { includeOcr: false } : {}),
             });
+            throwIfSearchAborted(options.signal);
             if (response.error) {
                 throw new Error(response.error);
             }
@@ -437,6 +441,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
             startTime: startTime,
             endTime: endTime
         });
+        throwIfSearchAborted(options.signal);
         return results || [];
     });
 };

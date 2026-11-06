@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 mod recap;
+mod storage_keys;
 
 #[derive(Debug, Clone)]
 pub struct Principal {
@@ -74,6 +75,7 @@ impl Ledger {
             return Err(BrokerError::VersionMismatch);
         }
         Self::init_recap(&conn)?;
+        Self::init_storage_keys(&conn)?;
         Ok(Self { conn })
     }
 
@@ -104,6 +106,8 @@ impl Ledger {
         db(tx.execute("DELETE FROM recap_objects WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM recap_revoked_sources WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM tasks WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM storage_keys WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM storage_public_keys WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM owners WHERE sid=?1", [sid]))?;
         db(tx.commit())
     }
@@ -207,6 +211,16 @@ impl Ledger {
         dataset: Option<String>,
         protector: &dyn KeyProtector,
     ) -> Result<Response> {
+        if let Some(response) = Self::dispatch_storage_keys(
+            conn,
+            who,
+            &request,
+            enabled,
+            dataset.as_deref(),
+            protector,
+        )? {
+            return Ok(response);
+        }
         if let Some(response) = Self::dispatch_recap(
             conn,
             who,
@@ -605,6 +619,7 @@ impl Ledger {
             active_bytes: used,
             runtime_id: who.runtime_id.clone(),
             supported_consumers: Consumer::ALL_MASK,
+            supported_storage_keys: true,
         })
     }
 
@@ -619,6 +634,7 @@ impl Ledger {
     }
 
     fn retire_where(conn: &Connection, sid: &str, dataset: Option<&str>) -> Result<()> {
+        Self::retire_storage_keys(conn, sid, dataset)?;
         Self::retire_recap(conn, sid, dataset)?;
         db(conn.execute("UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND (?2 IS NULL OR dataset=?2)", params![sid,dataset]))?;
         db(conn.execute("DELETE FROM leases WHERE task IN (SELECT id FROM tasks WHERE owner=?1 AND (?2 IS NULL OR dataset=?2))", params![sid,dataset]))?;

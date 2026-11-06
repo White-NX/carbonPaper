@@ -1,4 +1,20 @@
 {
+  "storageStartup": {
+    "title": "正在准备历史记录",
+    "tip": "准备完成后即可继续使用。历史记录较多时可能需要几分钟。",
+    "error": "无法完成准备，请重试。",
+    "phases": {
+      "credentials": "检查数据保护",
+      "opening": "打开历史记录",
+      "schema": "准备历史记录",
+      "metadata": "保护历史信息",
+      "vectors": "保护搜索数据",
+      "processes": "保护应用信息",
+      "cleanup": "清理旧的搜索数据",
+      "compacting": "整理历史记录",
+      "finalizing": "完成准备"
+    }
+  },
   "mainPreview": {
     "emptyHint": "选择上方时间轴中的截图，或搜索历史内容"
   },
@@ -1250,6 +1266,10 @@
     "extracting": "正在解压更新...",
     "applying": "正在应用更新...",
     "downloadFailed": "下载失败: {{error}}",
+    "installerRequired": "请通过安装包更新此份 CarbonPaper。前往发布页下载并安装最新版。",
+    "elevationCancelled": "更新已取消，CarbonPaper 继续运行。你可以稍后重试。",
+    "restartRequired": "请从系统托盘退出 CarbonPaper，以普通权限重新打开后再尝试更新。",
+    "openDownloads": "前往发布页",
     "criticalNotice": "该更新包含重要的安全修复或功能改进，为了您的数据安全和最佳体验，需要尽快更新。"
   },
   "topbar": {
@@ -1365,7 +1385,7 @@
     "switchToNL": "切换到画面搜索",
     "switchToOCR": "切换到文字搜索",
     "selectMode": "选择搜索模式",
-    "pressEnterToViewMore": "按下 [Enter] 查看更多结果",
+    "pressEnterToViewMore": "回车查看综合搜索结果",
     "mode": {
       "ocr": {
         "title": "文字搜索",
@@ -1378,7 +1398,8 @@
     },
     "placeholder": {
       "ocr": "搜索截图里出现过的文字",
-      "nl": "描述你想找的画面"
+      "nl": "描述你想找的画面",
+      "unified": "搜索文字或描述画面…"
     },
     "loading": "加载中...",
     "noContents": "无内容",
@@ -1527,7 +1548,7 @@
     "search": {
       "error": "搜索出错：{{message}}",
       "placeholder_ocr": "搜索快照与回顾",
-      "placeholder_snapshots": "搜索快照中的文字",
+      "placeholder_snapshots": "搜索快照文字或描述画面",
       "placeholder_recaps": "搜索回顾",
       "placeholder_nl": "描述你想找的画面，比如「月亮」",
       "go": "搜索",
@@ -1537,7 +1558,9 @@
       "no_results_filtered": "当前筛选条件下没有相关结果。",
       "no_results_hint": "尝试使用其他关键词或清除筛选条件。",
       "try_visual": "改用画面搜索",
-      "clear_filters": "清除筛选条件"
+      "clear_filters": "清除筛选条件",
+      "placeholder_unified": "搜索文字、回顾或描述画面",
+      "no_text_results_for": "没有找到与「{{query}}」相关的文字或回顾"
     },
     "modes": {
       "ocr": "文字",
@@ -1547,7 +1570,9 @@
       "ocr_hint": "查找快照文字和回顾活动",
       "nl_hint": "用一句描述匹配画面内容",
       "ai": "AI",
-      "ai_hint": "用一句话提问，由 AI 在记录里查找并回答"
+      "ai_hint": "用一句话提问，由 AI 在记录里查找并回答",
+      "unified": "综合搜索",
+      "unified_hint": "从快照文字、回顾和画面中查找记忆"
     },
     "processes": {
       "all": "所有进程",
@@ -1586,7 +1611,8 @@
       "sort_time": "按时间倒序",
       "sort_similarity": "按相似度",
       "sort_relevance": "按相关程度",
-      "total": "{{count}} 条结果",
+      "total": "共 {{count}} 个结果",
+      "summary": "{{results}}，用时 {{seconds}} 秒",
       "resultTypes": "快照 {{snapshots}} · 回顾 {{recaps}}",
       "categoryScope": "分类仅筛选快照",
       "partial": "已显示部分匹配，缩小范围可找到更准确的结果"
@@ -1633,7 +1659,33 @@
     "resultTypes": {
       "recap": "回顾"
     },
-    "viewSource": "查看来源快照"
+    "viewSource": "查看来源快照",
+    "visual": {
+      "title": "画面搜索",
+      "open": "查看全部画面",
+      "back": "返回综合搜索",
+      "hint": "按画面内容查找相关快照",
+      "unavailable": "暂时无法查找画面",
+      "empty": "没有找到相关画面",
+      "expand": "展开",
+      "collapse": "收起",
+      "results": "画面搜索结果",
+      "count": "{{count}} 张",
+      "count_one": "{{count}} 张",
+      "count_other": "{{count}} 张",
+      "count_more": "{{count}}+ 张",
+      "count_more_one": "{{count}}+ 张",
+      "count_more_other": "{{count}}+ 张",
+      "more": "再显示 {{count}} 张",
+      "view_more": "查看更多",
+      "retry": "重试",
+      "retry_hint": "暂时无法查找画面，请稍后重试。",
+      "empty_hint": "试试更具体的画面描述，或调整筛选条件。",
+      "page_error": "暂时无法加载更多画面。",
+      "order": "优先展示更相关的画面",
+      "relevance": "相关度 {{score}}",
+      "relevanceHint": "数值越高，画面内容与你的描述越接近。"
+    }
   },
   "mask": {
     "model_download": {
@@ -2058,12 +2110,36 @@
       "accept": "允许并继续"
     },
     "landing": {
-      "title": "描述你想找回的内容",
-      "using": "正在使用 {{name}}",
-      "examples": [
-        "我昨天下午在做什么？",
-        "最近看过的关于写作的文章有哪些？"
-      ]
+      "title": "从一个问题开始",
+      "description": "从你的截图和每日回顾里，找回答案。",
+      "placeholder": "想找什么，直接问…",
+      "preparing": "正在准备 AI 搜索…",
+      "cards": {
+        "day": {
+          "label": "每日回顾",
+          "title": "我昨天在干什么？",
+          "description": "串起一天的记录",
+          "question": "我昨天在干什么？"
+        },
+        "reading": {
+          "label": "看过的内容",
+          "title": "那篇文章，\n我在哪里看过？",
+          "description": "找回网页与截图里的线索",
+          "question": "那篇文章，我在哪里看过？"
+        },
+        "discussion": {
+          "label": "之前的讨论",
+          "title": "上周那个问题，\n我们怎么解决的？",
+          "description": "接着当时的讨论，找回结论",
+          "question": "上周那个问题，我们怎么解决的？"
+        },
+        "project": {
+          "label": "工作进展",
+          "title": "这几天，\n我为项目做了什么？",
+          "description": "串起相关工作，理清进展",
+          "question": "这几天，我为这个项目做了什么？"
+        }
+      }
     },
     "reasoning": "思考过程",
     "followUp": "追问……",

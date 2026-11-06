@@ -209,7 +209,22 @@ fn trusted_sid(sid: &str) -> bool {
 /// Reject mutable ownership, null DACLs, unsupported ACE forms, and any write
 /// grant outside SYSTEM, Administrators and Windows TrustedInstaller.
 pub fn assert_protected(path: &Path) -> Result<()> {
+    assert_path_protected(path, false)
+}
+
+/// Ordinary installer directories can retain Windows' standard CREATOR OWNER
+/// inheritance template. It does not grant access to the directory itself;
+/// its current owner and every other write grant must still be trusted.
+pub fn assert_ordinary_installation(path: &Path) -> Result<()> {
+    assert_path_protected(path, true)
+}
+
+fn assert_path_protected(path: &Path, ordinary_installation: bool) -> Result<()> {
     no_reparse(path)?;
+    let allow_creator_owner_inheritance = ordinary_installation
+        && std::fs::symlink_metadata(path)
+            .map_err(|_| BrokerError::Integrity)?
+            .is_dir();
     let name = wide(path.as_os_str());
     // SAFETY: GetNamedSecurityInfo allocates the descriptor. Owner, ACL and ACE
     // pointers refer into it and are inspected before it is freed below.
@@ -229,44 +244,60 @@ pub fn assert_protected(path: &Path) -> Result<()> {
         )
         .ok()
         .map_err(|_| BrokerError::AccessDenied)?;
-        let result = (|| {
-            if acl.is_null() || !trusted_sid(&sid_string(owner)?) {
-                return Err(BrokerError::AccessDenied);
-            }
-            // Generic/standard write rights and every file/directory mutation.
-            const WRITE_RIGHTS: u32 = 0x1000_0000
-                | 0x4000_0000
-                | 0x0001_0000
-                | 0x0004_0000
-                | 0x0008_0000
-                | 0x2
-                | 0x4
-                | 0x10
-                | 0x40
-                | 0x100;
-            for index in 0..(*acl).AceCount {
-                let mut ace = std::ptr::null_mut();
-                Security::GetAce(acl, index as u32, &mut ace)
-                    .map_err(|_| BrokerError::AccessDenied)?;
-                let header = &*ace.cast::<Security::ACE_HEADER>();
-                if header.AceType == 1 {
-                    continue;
-                } // deny ACE cannot grant writes
-                if header.AceType != 0 {
-                    return Err(BrokerError::AccessDenied);
-                }
-                let allowed = &*ace.cast::<Security::ACCESS_ALLOWED_ACE>();
-                if allowed.Mask & WRITE_RIGHTS != 0 {
-                    let sid = PSID((&allowed.SidStart as *const u32).cast_mut().cast());
-                    if !trusted_sid(&sid_string(sid)?) {
-                        return Err(BrokerError::AccessDenied);
-                    }
-                }
-            }
-            Ok(())
-        })();
+        let result = validate_protected_acl(owner, acl, allow_creator_owner_inheritance);
         LocalFree(HLOCAL(descriptor.0));
         result
+    }
+}
+
+/// # Safety
+/// The owner and ACL must belong to a valid Windows security descriptor that
+/// stays live until this function returns. A null DACL is rejected.
+unsafe fn validate_protected_acl(
+    owner: PSID,
+    acl: *const Security::ACL,
+    allow_creator_owner_inheritance: bool,
+) -> Result<()> {
+    // SAFETY: the caller retains the OS-provided descriptor containing the
+    // owner, ACL and every ACE inspected here; GetAce bounds-checks each entry.
+    unsafe {
+        if acl.is_null() || !trusted_sid(&sid_string(owner)?) {
+            return Err(BrokerError::AccessDenied);
+        }
+        // Generic/standard write rights and every file/directory mutation.
+        const WRITE_RIGHTS: u32 = 0x1000_0000
+            | 0x4000_0000
+            | 0x0001_0000
+            | 0x0004_0000
+            | 0x0008_0000
+            | 0x2
+            | 0x4
+            | 0x10
+            | 0x40
+            | 0x100;
+        for index in 0..(*acl).AceCount {
+            let mut ace = std::ptr::null_mut();
+            Security::GetAce(acl, index as u32, &mut ace).map_err(|_| BrokerError::AccessDenied)?;
+            let header = &*ace.cast::<Security::ACE_HEADER>();
+            if header.AceType == 1 {
+                continue;
+            } // deny ACE cannot grant writes
+            if header.AceType != 0 {
+                return Err(BrokerError::AccessDenied);
+            }
+            let allowed = &*ace.cast::<Security::ACCESS_ALLOWED_ACE>();
+            if allowed.Mask & WRITE_RIGHTS != 0 {
+                let sid = PSID((&allowed.SidStart as *const u32).cast_mut().cast());
+                let sid = sid_string(sid)?;
+                let creator_owner_template = allow_creator_owner_inheritance
+                    && u32::from(header.AceFlags) & Security::INHERIT_ONLY_ACE.0 != 0
+                    && sid == "S-1-3-0";
+                if !trusted_sid(&sid) && !creator_owner_template {
+                    return Err(BrokerError::AccessDenied);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -469,6 +500,68 @@ pub(crate) fn active_runtime_for_sid(sid: &str) -> Result<Option<PathBuf>> {
 #[cfg(all(test, not(feature = "development-runtime")))]
 mod tests {
     use super::*;
+
+    fn validate_sddl(sddl: &str, ordinary_directory: bool) -> Result<()> {
+        let text = wide(sddl.as_ref());
+        // SAFETY: the descriptor is allocated by Windows, and all extracted
+        // pointers remain valid until validation finishes and LocalFree runs.
+        unsafe {
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(text.as_ptr()),
+                1,
+                &mut descriptor,
+                None,
+            )
+            .expect("valid ACL regression fixture");
+            let result = (|| {
+                let mut owner = PSID::default();
+                let mut defaulted = BOOL::default();
+                Security::GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted)
+                    .expect("ACL regression fixture has an owner");
+                let mut present = BOOL::default();
+                let mut acl = std::ptr::null_mut();
+                Security::GetSecurityDescriptorDacl(
+                    descriptor,
+                    &mut present,
+                    &mut acl,
+                    &mut defaulted,
+                )
+                .expect("ACL regression fixture has a DACL");
+                validate_protected_acl(owner, acl, ordinary_directory)
+            })();
+            LocalFree(HLOCAL(descriptor.0));
+            result
+        }
+    }
+
+    #[test]
+    fn ordinary_installation_accepts_standard_creator_owner_inheritance() {
+        let sddl =
+            "O:BAG:BAD:P(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+        assert!(validate_sddl(sddl, true).is_ok());
+        // Protected runtimes and files keep the original strict policy.
+        assert!(matches!(
+            validate_sddl(sddl, false),
+            Err(BrokerError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn ordinary_installation_rejects_mutable_owners_and_other_write_grants() {
+        for sddl in [
+            "O:BAG:BAD:P(A;OICI;FA;;;BA)(A;OICI;GA;;;CO)",
+            "O:BAG:BAD:P(A;OICI;FA;;;BA)(A;OICIIO;GA;;;BU)",
+            "O:BAG:BAD:P(A;OICI;FA;;;BA)(A;;GW;;;BU)",
+            "O:BUG:BAD:P(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)",
+            "O:BAG:BAD:NO_ACCESS_CONTROL",
+        ] {
+            assert!(
+                matches!(validate_sddl(sddl, true), Err(BrokerError::AccessDenied)),
+                "{sddl}"
+            );
+        }
+    }
 
     #[test]
     fn service_state_uses_a_dedicated_program_data_namespace() {

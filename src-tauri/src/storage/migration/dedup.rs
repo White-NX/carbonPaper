@@ -1,5 +1,7 @@
 //! Retire inline browser metadata before publishing the archive connection.
 //!
+//! v0.6.4 still shipped these columns alongside dedup references, so this
+//! schema conversion remains part of the supported direct upgrade path.
 //! Moving ciphertext together with its wrapped row key needs no private key.
 //! Even an unreadable legacy payload is preserved, without retrying it on every
 //! unlock. Existing dedup references remain authoritative. Unconverted values
@@ -65,11 +67,6 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         ))
         .map_err(|error| format!("Failed to retire inline {column}: {error}"))?;
     }
-    tx.execute(
-        "DELETE FROM app_metadata WHERE key = 'dedup_migration_done'",
-        [],
-    )
-    .map_err(|error| error.to_string())?;
     tx.commit()
         .map_err(|error| format!("Failed to commit browser metadata migration: {error}"))
 }
@@ -80,7 +77,7 @@ mod tests {
     use crate::{credential_manager::CredentialManagerState, storage::StorageState};
     use std::sync::Arc;
 
-    fn legacy_archive() -> (tempfile::TempDir, Connection) {
+    fn v0_6_4_archive() -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().unwrap();
         let credentials = Arc::new(CredentialManagerState::new(temp.path().into()));
         let storage = StorageState::new(temp.path().into(), credentials);
@@ -89,7 +86,6 @@ mod tests {
         conn.execute_batch(
             "ALTER TABLE screenshots ADD COLUMN page_icon_enc BLOB;
              ALTER TABLE screenshots ADD COLUMN visible_links_enc BLOB;
-             INSERT INTO app_metadata(key,value) VALUES ('dedup_migration_done','1');
              WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<105)
              INSERT INTO screenshots(id,image_path,image_hash,page_icon_enc,visible_links_enc,content_key_encrypted)
              SELECT id, 'test.enc', CAST(id AS TEXT), X'01', X'02', X'03' FROM ids;"
@@ -99,7 +95,7 @@ mod tests {
 
     #[test]
     fn cutover_preserves_unreadable_metadata_and_existing_references_without_unlock() {
-        let (_temp, conn) = legacy_archive();
+        let (_temp, conn) = v0_6_4_archive();
         conn.execute_batch(
             "INSERT INTO page_icons(id,content_hash,icon_enc,icon_key_encrypted) VALUES (1000,'existing',X'04',X'05');
              UPDATE screenshots SET page_icon_id=1000 WHERE id=1;
@@ -129,7 +125,7 @@ mod tests {
 
     #[test]
     fn failed_cutover_rolls_back_copies_and_column_removal() {
-        let (_temp, conn) = legacy_archive();
+        let (_temp, conn) = v0_6_4_archive();
         conn.execute_batch("CREATE TRIGGER reject_links BEFORE INSERT ON link_sets BEGIN SELECT RAISE(ABORT,'injected write failure'); END;").unwrap();
         assert!(migrate(&conn).is_err());
         let original: i64 = conn.query_row(

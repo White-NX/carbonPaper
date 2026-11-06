@@ -6,8 +6,10 @@ Use these rules for the main window and screenshot previews alongside
 ## Application frame
 
 The title bar owns brand, quick search, recording status, settings, notifications,
-theme and native window controls. Text and picture queries show inline results;
-Enter or the view-more action sends the query and mode to the full-search page.
+theme and native window controls. Quick search shows inline text matches;
+Enter or the view-more action sends the query to the unified full-search page,
+where text, recap and visual results share the query and filters. AI search has
+its own entry on that page.
 Ctrl+K focuses the title-bar input without leaving the current workspace or
 clearing its query. Startup gates and modal dialogs retain keyboard ownership.
 
@@ -40,10 +42,13 @@ accessible label at narrow widths; use semantic `ide-*` tokens for states.
 selects the native window; the alternate action remains available. Topic cards
 and citations obey the same preference.
 
-Keep workspaces mounted during preview and navigation. Completed results survive
-a visit to Records; pending search responses are ignored after leaving. A records
-revision or explicit refresh invalidates retained results. Large originals in
-hidden picture-result cards are released and reloaded on visibility.
+Keep workspaces mounted during preview and navigation. Completed text results
+survive a visit to Records; unfinished search work is cancelled after leaving.
+A records revision or explicit refresh invalidates retained results while keeping
+local query edits. Visual retrieval starts fresh when the workspace is reopened,
+and hidden picture-result cards release their originals. Locking discards private
+results and preview caches; storage preparation gates history access before any
+workspace reads begin.
 
 ## Screenshot viewer
 

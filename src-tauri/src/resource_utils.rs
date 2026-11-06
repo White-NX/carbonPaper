@@ -3,13 +3,6 @@
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-/// Convert a Path to a String suitable for use in `Command`.
-/// Strips the Windows extended-length prefix "\\\\?\\" if present.
-pub fn normalize_path_for_command(path: &std::path::Path) -> String {
-    let s = path.as_os_str().to_string_lossy().to_string();
-    s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string()
-}
-
 /// Construct a path under the app's resource directory by joining `filename` to the resource dir.
 /// Note: this function does NOT check whether the file exists; it just returns the constructed path
 /// if the resource directory can be retrieved.

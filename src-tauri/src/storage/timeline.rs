@@ -299,7 +299,7 @@ fn timeline_rows_sql(bucket: Option<i64>) -> String {
 fn timeline_projection(include_details: bool) -> &'static str {
     if include_details {
         "s.id, s.image_path, s.created_at,
-         CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, s.process_name,
+         CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, cp_process(s.process_name),
          s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
          s.content_key_encrypted, s.page_icon_id,
          pi.icon_enc, pi.icon_key_encrypted, s.category"

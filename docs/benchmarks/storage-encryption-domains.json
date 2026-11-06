@@ -1,0 +1,200 @@
+{
+  "cache_conditions": "decryption cache cold/hot as labeled; OS file cache is not flushed",
+  "fixture": "synthetic normalized vectors; explicit public fixture key",
+  "hot_batch_repetitions": 100,
+  "profile": "release; single thread; thin LTO; default target CPU",
+  "results": [
+    {
+      "candidates": 512,
+      "candidates_encrypted_cache_cold": {
+        "max_ms": 2.4421,
+        "median_ms": 1.8151000000000002,
+        "min_ms": 1.4656,
+        "samples_ms": [
+          2.4421,
+          1.8151000000000002,
+          1.4656,
+          1.6539,
+          1.9488
+        ]
+      },
+      "candidates_encrypted_cache_hot_100_batches": {
+        "max_ms": 4.8034,
+        "median_ms": 4.2998,
+        "min_ms": 4.1452,
+        "samples_ms": [
+          4.1838,
+          4.1452,
+          4.2998,
+          4.8034,
+          4.3306000000000004
+        ]
+      },
+      "candidates_plain_mmap": {
+        "max_ms": 0.2585,
+        "median_ms": 0.0266,
+        "min_ms": 0.0252,
+        "samples_ms": [
+          0.2585,
+          0.0266,
+          0.0252,
+          0.0354,
+          0.0252
+        ]
+      },
+      "dimensions": 384,
+      "encrypted_flat_bytes": 161204352,
+      "envelope_overhead_bytes_per_vector": 52,
+      "float_payload_bytes": 153600000,
+      "full_scan_encrypted_uncached": {
+        "max_ms": 353.6304,
+        "median_ms": 306.5225,
+        "min_ms": 300.02869999999996,
+        "samples_ms": [
+          353.6304,
+          302.5979,
+          306.5225,
+          300.02869999999996,
+          315.1056
+        ]
+      },
+      "full_scan_plain_mmap": {
+        "max_ms": 60.7193,
+        "median_ms": 8.7912,
+        "min_ms": 4.9818,
+        "samples_ms": [
+          60.7193,
+          8.7912,
+          9.885299999999999,
+          6.3796,
+          4.9818
+        ]
+      },
+      "graph_decrypt": {
+        "max_ms": 46.3065,
+        "median_ms": 42.1536,
+        "min_ms": 39.860800000000005,
+        "samples_ms": [
+          39.860800000000005,
+          46.0798,
+          46.3065,
+          41.7112,
+          42.1536
+        ]
+      },
+      "graph_encrypt": {
+        "max_ms": 43.0805,
+        "median_ms": 38.1824,
+        "min_ms": 35.8983,
+        "samples_ms": [
+          38.1824,
+          35.8983,
+          38.369800000000005,
+          43.0805,
+          35.9492
+        ]
+      },
+      "graph_mib": 32,
+      "rows": 100000
+    },
+    {
+      "candidates": 512,
+      "candidates_encrypted_cache_cold": {
+        "max_ms": 2.5835,
+        "median_ms": 2.3874,
+        "min_ms": 1.6443,
+        "samples_ms": [
+          2.3874,
+          2.4296,
+          1.6443,
+          2.5835,
+          1.7447000000000001
+        ]
+      },
+      "candidates_encrypted_cache_hot_100_batches": {
+        "max_ms": 6.9605,
+        "median_ms": 6.7685,
+        "min_ms": 6.0046,
+        "samples_ms": [
+          6.2136,
+          6.9605,
+          6.0046,
+          6.7685,
+          6.8288
+        ]
+      },
+      "candidates_plain_mmap": {
+        "max_ms": 0.34680000000000005,
+        "median_ms": 0.037700000000000004,
+        "min_ms": 0.036000000000000004,
+        "samples_ms": [
+          0.34680000000000005,
+          0.0564,
+          0.037700000000000004,
+          0.0361,
+          0.036000000000000004
+        ]
+      },
+      "dimensions": 512,
+      "encrypted_flat_bytes": 212404352,
+      "envelope_overhead_bytes_per_vector": 52,
+      "float_payload_bytes": 204800000,
+      "full_scan_encrypted_uncached": {
+        "max_ms": 443.32460000000003,
+        "median_ms": 369.3506,
+        "min_ms": 355.52450000000005,
+        "samples_ms": [
+          443.32460000000003,
+          369.3506,
+          355.52450000000005,
+          385.5015,
+          368.3649
+        ]
+      },
+      "full_scan_plain_mmap": {
+        "max_ms": 71.4892,
+        "median_ms": 8.6775,
+        "min_ms": 6.7379,
+        "samples_ms": [
+          71.4892,
+          9.2218,
+          8.6775,
+          6.9943,
+          6.7379
+        ]
+      },
+      "graph_decrypt": {
+        "max_ms": 47.3701,
+        "median_ms": 41.2387,
+        "min_ms": 37.8211,
+        "samples_ms": [
+          47.3701,
+          41.2387,
+          37.8211,
+          45.0623,
+          40.111399999999996
+        ]
+      },
+      "graph_encrypt": {
+        "max_ms": 40.8087,
+        "median_ms": 37.0766,
+        "min_ms": 33.619299999999996,
+        "samples_ms": [
+          37.0766,
+          33.619299999999996,
+          40.8087,
+          40.7066,
+          34.8163
+        ]
+      },
+      "graph_mib": 32,
+      "rows": 100000
+    }
+  ],
+  "samples": 5,
+  "scope": "actual CPDVEC05 and CipherKey; excludes CNG, SQLCipher, USearch, Tauri and app startup/query latency",
+  "measured_at_utc": "2026-11-03T03:44:55.7628207Z",
+  "cpu": "AMD Ryzen 7 8845H w/ Radeon 780M Graphics",
+  "os": "Microsoft Windows NT 10.0.26220.0",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+}

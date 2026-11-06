@@ -10,7 +10,7 @@ use crate::background_resources::{process_usage, set_cpu_rate};
 use crate::background_scheduler::BackgroundSchedulerState;
 use crate::ml_protocol::{
     read_response, write_request, MlImageInput, MlProvider, MlRequest, MlResponse, MlSemanticModel,
-    MlSemanticTimings, ML_PROTOCOL_VERSION,
+    MlSemanticSession, MlSemanticTimings, ML_PROTOCOL_VERSION,
 };
 use crate::ml_protocol::{MlError, MlErrorKind};
 use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources};
@@ -80,6 +80,7 @@ pub struct SemanticRuntimeStatus {
     pub ort_version: Option<String>,
     pub runtime_path: Option<String>,
     pub loaded_model: Option<String>,
+    pub resident_sessions: Vec<MlSemanticSession>,
     pub model_revision: Option<String>,
     pub model_fingerprint: Option<String>,
     pub restart_count: u64,
@@ -323,6 +324,7 @@ struct SemanticRuntimeInner {
     ort_version: Option<String>,
     runtime_path: Option<String>,
     loaded_model: Option<MlSemanticModel>,
+    resident_sessions: Vec<MlSemanticSession>,
     restart_count: u64,
     success_count: u64,
     failure_count: u64,
@@ -366,6 +368,7 @@ impl SemanticRuntimeState {
                 ort_version: None,
                 runtime_path: None,
                 loaded_model: None,
+                resident_sessions: Vec::new(),
                 restart_count: 0,
                 success_count: 0,
                 failure_count: 0,
@@ -539,14 +542,9 @@ impl SemanticRuntimeState {
         }
     }
 
-    /// Release the resident model without stopping the worker process.
-    ///
-    /// M2.5 step 6. The engine holds exactly one model
-    /// (`semantic_engine.rs`, `loaded: Option<LoadedModel>`), and the
-    /// cross-encoder is 570 MB against MiniLM's 118 MB. The Python Smart Cluster
-    /// worker unloaded its reranker once a drain finished; a background pass in
-    /// Rust does the same, so an idle machine is not left holding half a
-    /// gigabyte because a scoring pass happened to run last.
+    /// Release all resident sessions without stopping the worker process.
+    /// Background reranking remains exclusive and unloads after a drain so
+    /// its large cross-encoder does not remain allocated on an idle machine.
     ///
     /// A no-op when no worker is running or nothing is loaded — otherwise this
     /// would start a worker process for the sole purpose of telling it to
@@ -554,7 +552,7 @@ impl SemanticRuntimeState {
     pub async fn unload_model(self: &Arc<Self>, app: AppHandle) -> Result<(), TaskError> {
         {
             let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            if inner.process.is_none() || inner.loaded_model.is_none() {
+            if inner.process.is_none() || inner.resident_sessions.is_empty() {
                 return Ok(());
             }
         }
@@ -581,6 +579,7 @@ impl SemanticRuntimeState {
             MlResponse::Unloaded { .. } => {
                 let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 inner.loaded_model = None;
+                inner.resident_sessions.clear();
                 Ok(())
             }
             other => Err(TaskError::worker(
@@ -628,8 +627,8 @@ impl SemanticRuntimeState {
                 model,
                 inner.directml_supported_models.as_deref(),
             );
-            model.is_some()
-                && inner.loaded_model == model
+            request_session(&request)
+                .is_some_and(|session| inner.resident_sessions.contains(&session))
                 && inner.process.as_ref().is_some_and(|process| {
                     Some(process.provider) == provider && process.is_running()
                 })
@@ -771,7 +770,8 @@ impl SemanticRuntimeState {
         });
         if let (Some(scheduler), Some(key)) = (&scheduler, &cost_key) {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let cold = inner.loaded_model != request_model(&request)
+            let cold = !request_session(&request)
+                .is_some_and(|session| inner.resident_sessions.contains(&session))
                 || inner
                     .process
                     .as_ref()
@@ -804,14 +804,7 @@ impl SemanticRuntimeState {
             watch.lease.as_ref().map(|_| CPU_RATE_PERCENT),
         )?;
         let request_model = request_model(&request);
-        {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if request_model.is_some() && inner.loaded_model != request_model {
-                // The engine drops its previous model before loading another.
-                // A failed switch cannot leave the old model marked resident.
-                inner.loaded_model = None;
-            }
-        }
+        let request_session = request_session(&request);
         if let Some(model) = request_model {
             if !process.supported_models.contains(&model) {
                 return Err(TaskError::worker(
@@ -882,6 +875,15 @@ impl SemanticRuntimeState {
         if let Some(usage) = process.usage() {
             peak_private = peak_private.max(usage.peak_since(usage_before));
         }
+        // Even a cancelled request may have loaded or evicted a session.
+        // Publish the exact worker's response before returning cancellation.
+        if let Ok(response) = &response {
+            if response_request_id(response) == Some(request_id) {
+                self.record_residency(&process, request_session, response);
+            }
+        } else {
+            self.clear_residency(&process);
+        }
         if let Some((_, error)) = cancellation {
             return Err(error);
         }
@@ -919,6 +921,7 @@ impl SemanticRuntimeState {
                 request_id: response_id,
                 kind,
                 message,
+                ..
             }) if response_id == request_id => {
                 let error = TaskError::from(MlError::from_response(&kind, message.clone()));
                 if kind != "cancelled" {
@@ -929,7 +932,7 @@ impl SemanticRuntimeState {
             Ok(response)
                 if response_matches_request(expected, request_id, request_model, &response) =>
             {
-                self.record_success(request_model, elapsed_ms);
+                self.record_success(elapsed_ms);
                 Ok(response)
             }
             Ok(response) => {
@@ -968,6 +971,7 @@ impl SemanticRuntimeState {
         if let Some(error) = exited {
             inner.process = None;
             inner.loaded_model = None;
+            inner.resident_sessions.clear();
             inner.state = "failed".to_string();
             inner.failure_count += 1;
             inner.last_error_kind = Some("worker_stopped".to_string());
@@ -989,6 +993,7 @@ impl SemanticRuntimeState {
             ort_version: inner.ort_version.clone(),
             runtime_path: inner.runtime_path.clone(),
             loaded_model: loaded_descriptor.map(|model| model.model_id.to_string()),
+            resident_sessions: inner.resident_sessions.clone(),
             model_revision: loaded_descriptor.map(|model| model.revision.to_string()),
             model_fingerprint: inner
                 .loaded_model
@@ -1042,6 +1047,7 @@ impl SemanticRuntimeState {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             inner.state = "stopping".to_string();
             inner.loaded_model = None;
+            inner.resident_sessions.clear();
             inner.process.take()
         };
         if let Some(process) = process {
@@ -1114,6 +1120,7 @@ impl SemanticRuntimeState {
                 .unwrap_or_else(|failure| failure.into_inner());
             inner.process = None;
             inner.loaded_model = None;
+            inner.resident_sessions.clear();
             inner.state = "failed".to_string();
             inner.failure_count += 1;
             inner.last_error_kind = Some(kind.to_string());
@@ -1274,6 +1281,7 @@ impl SemanticRuntimeState {
                 inner.ort_version = Some(ort_version);
                 inner.runtime_path = Some(ort_dylib.display().to_string());
                 inner.loaded_model = None;
+                inner.resident_sessions.clear();
                 inner.last_error_kind = None;
                 inner.last_error = None;
                 Ok(process)
@@ -1289,13 +1297,52 @@ impl SemanticRuntimeState {
         }
     }
 
-    fn record_success(&self, model: Option<MlSemanticModel>, elapsed_ms: f64) {
+    fn record_residency(
+        &self,
+        process: &Arc<SemanticMlChild>,
+        requested: Option<MlSemanticSession>,
+        response: &MlResponse,
+    ) {
+        let Some(sessions) = response_residency(response, requested) else {
+            return;
+        };
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if !inner
+            .process
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, process))
+        {
+            return;
+        }
+        inner.loaded_model = match response {
+            MlResponse::EmbeddingComplete { model, .. }
+            | MlResponse::TokenizationComplete { model, .. }
+            | MlResponse::RerankComplete { model, .. } => Some(*model),
+            MlResponse::SemanticStatus { loaded_model, .. } => *loaded_model,
+            MlResponse::Error { .. } => inner
+                .loaded_model
+                .filter(|model| sessions.iter().any(|session| session.model() == *model)),
+            _ => None,
+        };
+        inner.resident_sessions = sessions;
+    }
+
+    fn clear_residency(&self, process: &Arc<SemanticMlChild>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if inner
+            .process
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, process))
+        {
+            inner.loaded_model = None;
+            inner.resident_sessions.clear();
+        }
+    }
+
+    fn record_success(&self, elapsed_ms: f64) {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner.state = "ready".to_string();
         inner.success_count += 1;
-        if model.is_some() {
-            inner.loaded_model = model;
-        }
         inner.last_error_kind = None;
         inner.last_error = None;
         inner.last_elapsed_ms = Some(elapsed_ms);
@@ -1311,6 +1358,7 @@ impl SemanticRuntimeState {
         {
             inner.process = None;
             inner.loaded_model = None;
+            inner.resident_sessions.clear();
             inner.state = "stopped".into();
         }
     }
@@ -1331,11 +1379,12 @@ impl SemanticRuntimeState {
             if let Ok(_guard) = self.request_gate.try_lock() {
                 let process = {
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if inner.process.is_none() || inner.loaded_model.is_none() {
+                    if inner.process.is_none() || inner.resident_sessions.is_empty() {
                         return;
                     }
                     let process = inner.process.take();
                     inner.loaded_model = None;
+                    inner.resident_sessions.clear();
                     inner.state = "stopped".into();
                     process
                 };
@@ -1376,6 +1425,7 @@ impl SemanticRuntimeState {
             inner.restart_count += 1;
             inner.state = "restarting".to_string();
             inner.loaded_model = None;
+            inner.resident_sessions.clear();
             inner.process.take()
         };
         if let Some(process) = process {
@@ -1402,6 +1452,7 @@ impl SemanticRuntimeState {
         inner.restart_count += 1;
         inner.process = None;
         inner.loaded_model = None;
+        inner.resident_sessions.clear();
         inner.state = "degraded".to_string();
         inner.last_error_kind = Some(kind.to_string());
         inner.last_error = Some(truncate_error(message));
@@ -1547,6 +1598,51 @@ fn request_model(request: &MlRequest) -> Option<MlSemanticModel> {
         | MlRequest::InspectTokenization { model, .. }
         | MlRequest::Rerank { model, .. } => Some(*model),
         MlRequest::Unload { .. } => None,
+        _ => None,
+    }
+}
+
+fn request_session(request: &MlRequest) -> Option<MlSemanticSession> {
+    match request {
+        MlRequest::EmbedImage {
+            model: MlSemanticModel::ChineseClip,
+            ..
+        } => Some(MlSemanticSession::ChineseClipImage),
+        MlRequest::EmbedText { model, .. }
+        | MlRequest::InspectTokenization { model, .. }
+        | MlRequest::Rerank { model, .. } => Some(MlSemanticSession::for_text(*model)),
+        _ => None,
+    }
+}
+
+fn response_residency(
+    response: &MlResponse,
+    requested: Option<MlSemanticSession>,
+) -> Option<Vec<MlSemanticSession>> {
+    match response {
+        MlResponse::EmbeddingComplete {
+            resident_sessions, ..
+        }
+        | MlResponse::TokenizationComplete {
+            resident_sessions, ..
+        }
+        | MlResponse::RerankComplete {
+            resident_sessions, ..
+        } => {
+            // Older workers omit the additive field and retain one model.
+            Some(if resident_sessions.is_empty() {
+                requested.into_iter().collect()
+            } else {
+                resident_sessions.clone()
+            })
+        }
+        MlResponse::SemanticStatus {
+            resident_sessions, ..
+        }
+        | MlResponse::Error {
+            resident_sessions, ..
+        } => Some(resident_sessions.clone()),
+        MlResponse::Unloaded { .. } => Some(Vec::new()),
         _ => None,
     }
 }

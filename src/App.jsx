@@ -18,6 +18,7 @@ import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
+import StorageInitializationOverlay from './components/StorageInitializationOverlay';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange, warmupThumbnails } from './lib/monitor_api';
@@ -26,6 +27,7 @@ import { useAppTheme } from './hooks/useAppTheme';
 import { useAppWindowActions, usePowerSavingState, useWindowMaximizedState } from './hooks/useAppWindowState';
 import { useAppNotifications } from './hooks/useAppNotifications';
 import { useAuthSession } from './hooks/useAuthSession';
+import { useStorageInitialization } from './hooks/useStorageInitialization';
 import { DialogVisibilityContext } from './hooks/useDialogFocus';
 import { useCriticalErrors } from './hooks/useCriticalErrors';
 import { useMonitorLifecycle } from './hooks/useMonitorLifecycle';
@@ -44,6 +46,7 @@ import { OverlayCoordinatorProvider, useOverlayCoordinator } from './components/
 function App() {
   const { t } = useTranslation();
   const overlays = useOverlayCoordinator();
+  const initialization = useStorageInitialization();
 
   useEffect(() => initAuthListeners(), []);
 
@@ -62,9 +65,8 @@ function App() {
   const [showOcrModelRepair, setShowOcrModelRepair] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
   const sidebarExpanded = usePreference('workspaceNavigationExpanded', 'true') === 'true';
-  const [searchMode, setSearchMode] = useState('ocr');
   const searchInputRef = useRef(null);
-  const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', refreshKey: Date.now() });
   const [searchFocusRequest, setSearchFocusRequest] = useState(0);
   const [returnTo, setReturnTo] = useState(null);
   const returnFocusRef = useRef(null);
@@ -112,6 +114,7 @@ function App() {
     handleAuthSuccess,
     handleLockSession,
   } = useAuthSession();
+  const workspaceReady = isAuthenticated && initialization.ready;
   const { criticalErrors, criticalErrorLogPath } = useCriticalErrors();
   const {
     modelsCheckDone,
@@ -128,7 +131,7 @@ function App() {
   });
   const requiredSizeMb = downloadSizeMb(missingRequiredModels(missingModels));
   const onboarding = useOnboarding({
-    isAuthenticated,
+    isAuthenticated: workspaceReady,
     requiredModelsReady: modelsCheckDone && !modelsNeedDownload,
     requiredDownload,
     pushNotification,
@@ -149,7 +152,7 @@ function App() {
   } = useMonitorLifecycle({
     modelsCheckDone,
     modelsNeedDownload,
-    captureHeld: onboarding.captureHeld,
+    captureHeld: onboarding.captureHeld || !initialization.ready,
     powerSavingSuppressed,
     powerStatusReady,
     formatErrorDetails,
@@ -159,10 +162,10 @@ function App() {
   });
 
   useEffect(() => {
-    if (backendStatus !== 'online' || !isAuthenticated) return;
+    if (backendStatus !== 'online' || !workspaceReady) return;
     warmupThumbnails()
       .catch((err) => console.warn('[Warmup] Thumbnail warmup failed:', err));
-  }, [backendStatus, isAuthenticated]);
+  }, [backendStatus, workspaceReady]);
 
   const {
     selectedEvent,
@@ -176,17 +179,16 @@ function App() {
     timelineJump,
     setTimelineJump,
     timelineRefreshKey,
-    ocrBoxes,
     clearSelection,
     bumpTimelineRefresh,
-  } = useSelectedSnapshot({ enabled: isAuthenticated });
+  } = useSelectedSnapshot({ enabled: workspaceReady });
   const { showSettings, openSettings } = useSettingsHost({
     onMonitorAction: handleSettingsMonitorAction,
     onRecordsChanged: bumpTimelineRefresh,
     onClosed: refreshRequiredModels,
     onError: (error) => reportBackendError(t('settings.title'), String(error)),
   });
-  useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: isAuthenticated });
+  useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: workspaceReady });
   const {
     updateModalVisible,
     updateInfo,
@@ -195,6 +197,7 @@ function App() {
     updateDownloadError,
     setUpdateModalVisible,
     handleDownloadUpdate,
+    handleOpenDownloads,
     handleLater,
   } = useUpdateManager();
 
@@ -241,36 +244,35 @@ function App() {
     setActiveTab('preview');
   }, [activeTab, setHighlightedEventId, setSelectedEvent, setTimelineJump]);
 
-  const handleSearchSubmit = useCallback(({ query, mode }) => {
-    if (!isAuthenticated || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
+  const handleSearchSubmit = useCallback(({ query }) => {
+    if (!workspaceReady || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
     navigate('advanced-search');
-    setSearchMode(mode);
-    setAdvancedSearchParams((params) => ({ query, mode, refreshKey: params.refreshKey + 1 }));
-  }, [isAuthenticated, navigate, overlays.active]);
+    setAdvancedSearchParams((params) => ({ query, refreshKey: params.refreshKey + 1 }));
+  }, [workspaceReady, navigate, overlays.active]);
 
   const focusQuickSearch = useCallback(() => {
-    if (!isAuthenticated || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
+    if (!workspaceReady || overlays.active !== null || document.querySelector('[aria-modal="true"]')) return;
     searchInputRef.current?.focus();
-  }, [isAuthenticated, overlays.active]);
+  }, [workspaceReady, overlays.active]);
 
   useEffect(() => {
     const keydown = (event) => {
       if (event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return;
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && isAuthenticated && overlays.active === null) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && workspaceReady && overlays.active === null) {
         event.preventDefault(); focusQuickSearch();
-      } else if (event.altKey && event.key === 'ArrowLeft' && activeTab === 'preview' && returnTo && isAuthenticated && overlays.active === null) {
+      } else if (event.altKey && event.key === 'ArrowLeft' && activeTab === 'preview' && returnTo && workspaceReady && overlays.active === null) {
         event.preventDefault(); returnToSource();
       }
     };
     window.addEventListener('keydown', keydown);
     return () => window.removeEventListener('keydown', keydown);
-  }, [activeTab, focusQuickSearch, isAuthenticated, overlays.active, returnTo, returnToSource]);
+  }, [activeTab, focusQuickSearch, workspaceReady, overlays.active, returnTo, returnToSource]);
 
-  const previewWindows = useSnapshotPreviewWindow({ isAuthenticated, onOpenTimeline: selectSearchResult });
+  const previewWindows = useSnapshotPreviewWindow({ isAuthenticated: workspaceReady, onOpenTimeline: selectSearchResult });
 
   return (
     <OverlayCoordinatorProvider value={overlays.value}>
-    <DialogVisibilityContext.Provider value={isAuthenticated}>
+    <DialogVisibilityContext.Provider value={workspaceReady}>
     <div
       data-tauri-drag-region
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
@@ -289,8 +291,6 @@ function App() {
         searchInputRef={searchInputRef}
         onSearchSelect={selectSearchResult}
         onSearchSubmit={handleSearchSubmit}
-        searchMode={searchMode}
-        onSearchModeChange={setSearchMode}
         previewCount={previewWindows.tabs.length}
         onRestorePreviews={previewWindows.restore}
         backendStatus={backendStatus}
@@ -300,10 +300,11 @@ function App() {
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
         isAuthenticated={isAuthenticated}
-        interfaceLocked={overlays.active !== null}
+        interfaceLocked={overlays.active !== null || !initialization.ready}
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
+        <StorageInitializationOverlay initialization={initialization} />
         <Mask
           modelsNeedDownload={modelsNeedDownload}
           sizeMb={requiredSizeMb}
@@ -311,7 +312,7 @@ function App() {
         />
 
         <AuthMask
-          isVisible={!isAuthenticated}
+          isVisible={initialization.ready && !isAuthenticated}
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
@@ -325,15 +326,15 @@ function App() {
           onExit={exitApp}
         />
 
-        <StartupVacuumDialog />
+        {initialization.ready && <StartupVacuumDialog />}
 
         {/* Startup overlays share this content area and the coordinator shows
             one at a time (components/overlay/coordinator.js). The top bar is
             locked while any of them is on screen. */}
-        <VectorMigrationOverlay />
+        {initialization.ready && <VectorMigrationOverlay />}
 
-        {isAuthenticated && <HmacMigrationDialog />}
-        {isAuthenticated && <ClipBackfillDialog />}
+        {workspaceReady && <HmacMigrationDialog />}
+        {workspaceReady && <ClipBackfillDialog />}
 
         <OnboardingOverlay
           onboarding={onboarding}
@@ -353,11 +354,12 @@ function App() {
           downloadProgress={updateDownloadProgress}
           downloadError={updateDownloadError}
           onDownload={handleDownloadUpdate}
+          onOpenDownloads={handleOpenDownloads}
           onLater={handleLater}
           onClose={() => setUpdateModalVisible(false)}
         />
 
-        <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings} />
+        <AppBoundUpgradePrompt visible={workspaceReady && !showSettings} />
 
         <main className="flex-1 min-h-0 flex flex-row overflow-hidden relative bg-ide-bg">
           <ActivityBar
@@ -369,6 +371,7 @@ function App() {
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <WorkspaceHeader activeTab={activeTab} />
+            {initialization.ready && <>
             <WorkspaceTimelines
               activeTab={activeTab}
               onSelectEvent={(evt) => {
@@ -383,7 +386,7 @@ function App() {
               jumpTimestamp={timelineJump}
               highlightedEventId={highlightedEventId}
               refreshKey={timelineRefreshKey}
-              sqlPaused={!windowFocused || !isAuthenticated}
+              sqlPaused={!windowFocused || !workspaceReady}
               searchState={timelineSearch}
               onSelectSearchResult={(item) => setPreviewRequest({ item, token: Date.now() })}
             />
@@ -403,14 +406,10 @@ function App() {
               selectedDetails={selectedDetails}
               lastError={lastError}
               onRetrySnapshot={() => setSelectedEvent((event) => event ? { ...event } : null)}
-              ocrBoxes={ocrBoxes}
               advancedSearchParams={advancedSearchParams}
-              searchMode={searchMode}
-              onSearchModeChange={setSearchMode}
               isAuthenticated={isAuthenticated}
               onTimelineSearchChange={setTimelineSearch}
               onAdvancedSelect={selectSearchResult}
-              onInspectorBoxClick={(box) => handleCopyText(box.label)}
               onDeleteRecord={async (id) => {
                 try {
                   await deleteScreenshot(id);
@@ -436,6 +435,7 @@ function App() {
               }}
               onCopyText={handleCopyText}
             />
+            </>}
           </div>
         </main>
       </div>

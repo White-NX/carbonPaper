@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAiSearch } from './useAiSearch';
-import { getAiSettings, runAiSearch, grantAiRemoteConsent } from '../lib/ai_api';
+import { cancelAiSearch, getAiSettings, runAiSearch, grantAiRemoteConsent } from '../lib/ai_api';
 
 vi.mock('../lib/ai_api', () => ({
   getAiSettings: vi.fn(), runAiSearch: vi.fn(),
@@ -26,6 +26,54 @@ async function setup() {
 }
 
 describe('AI conversation', () => {
+  it('cancels a run when its mode becomes inactive and blocks further requests', async () => {
+    const { result, rerender } = renderHook(useAiSearch, { initialProps: { active: true } });
+    await waitFor(() => expect(result.current.provider?.id).toBe('p'));
+    act(() => { void result.current.start('first'); });
+    const requestId = runAiSearch.mock.calls[0][0].requestId;
+    rerender({ active: false });
+    expect(cancelAiSearch).toHaveBeenCalledWith(requestId);
+    await act(async () => result.current.start('hidden question'));
+    expect(runAiSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears private conversation data on lock and discards late events and answers', async () => {
+    const { result, rerender } = renderHook(useAiSearch, { initialProps: { active: true, isAuthenticated: true } });
+    await waitFor(() => expect(result.current.provider?.id).toBe('p'));
+    act(() => { void result.current.start('private question'); });
+    act(() => {
+      emit({ type: 'step_started', step: 1 });
+      emit({ type: 'text_delta', text: 'Private draft answer' });
+      emit({ type: 'tool_started', call_id: 'a', name: 'search_ocr_text' });
+      emit({ type: 'tool_finished', call_id: 'a', ok: true, snapshots: [{ screenshot_id: 42 }] });
+    });
+    rerender({ active: false, isAuthenticated: false });
+    expect(cancelAiSearch).toHaveBeenCalledWith(runAiSearch.mock.calls[0][0].requestId);
+    expect(result.current.question).toBe('');
+    expect(result.current.answer).toBe('');
+    expect(result.current.steps).toEqual([]);
+    expect(result.current.rounds).toEqual([]);
+    expect(result.current.turns).toEqual([]);
+    act(() => emit({ type: 'text_delta', text: 'late event' }));
+    await act(async () => finish({ answer: 'late answer', snapshots: [{ screenshot_id: 42 }] }));
+    expect(result.current.status).toBe('idle');
+    expect(result.current.answer).toBe('');
+    expect(result.current.outcome).toBeNull();
+    await act(async () => result.current.start('locked question'));
+    expect(runAiSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it('discards a settings read that completes after locking', async () => {
+    let finishSettings;
+    getAiSettings.mockImplementationOnce(() => new Promise((resolve) => { finishSettings = resolve; }));
+    const { result, rerender } = renderHook(useAiSearch, { initialProps: { active: true, isAuthenticated: true } });
+    await waitFor(() => expect(finishSettings).toEqual(expect.any(Function)));
+    rerender({ active: false, isAuthenticated: false });
+    await act(async () => finishSettings(settings));
+    expect(result.current.settings).toBeNull();
+    expect(result.current.provider).toBeNull();
+  });
+
   it('records duration per turn, resets it for follow-ups and freezes completed durations', async () => {
     const { result } = await setup();
     const now = vi.spyOn(performance, 'now').mockReturnValue(1000);

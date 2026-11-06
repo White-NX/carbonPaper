@@ -740,6 +740,15 @@ impl StorageState {
         validate_job_spec(&write.job)?;
         validate_required_text("lease_token", &write.lease_token, MAX_METADATA_BYTES)?;
         let vector_blob = encode_vector(&write.vector)?;
+        let vector_blob = self.protected.seal(
+            "vectors",
+            &format!(
+                "{}:{}",
+                write.job.index_kind.as_str(),
+                write.job.subject_key
+            ),
+            &vector_blob,
+        )?;
         let dimensions = i64::try_from(write.vector.len())
             .map_err(|_| "Derived embedding dimensions exceed SQLite range".to_string())?;
         let mut guard = self.get_connection_named("commit_derived_embedding")?;
@@ -1889,7 +1898,7 @@ fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
     let source = visible_embedding_source();
     format!(
         r#"
-        SELECT e.subject_key, e.dimensions, e.vector_f32, e.model_id,
+        SELECT e.subject_key, e.dimensions, cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key), e.model_id,
                e.model_revision, e.embedding_version, e.source_fingerprint,
                e.updated_at
         {source}
@@ -1918,7 +1927,7 @@ pub(super) fn visible_embedding_page_sql() -> String {
     let source = visible_embedding_source();
     format!(
         r#"
-        SELECT e.subject_key, e.dimensions, e.vector_f32
+        SELECT e.subject_key, e.dimensions, cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key)
         {source}
           AND e.subject_key > ?2
         ORDER BY e.subject_key
