@@ -21,6 +21,7 @@ or a fatal surface.
 
 | Surface | Owner and primitive | Dismissal or completion |
 |---|---|---|
+| Brand startup screen | `index.html`, `public/startup.js`, and `src/startup.css`, before React loads | Foreground main windows are created hidden and revealed once the local startup art can paint. The screen has native minimize/hide controls and releases the React root when its first startup overlay or authenticated workspace is committed. `StartupScreenHandoff` runs before dialog focus effects; its short fade does not wait for background work. Settings and snapshot-preview windows skip it, and background launches still create no main WebView. |
 | Recap corrections, sources and diagnostics; OCR repair | Main window, `Dialog` | Close/Escape/backdrop, with close disabled during an active operation. |
 | Smart Cluster and recap deletion; settings deletion and token decisions | Calling window, `ConfirmDialog` | Explicit confirm/cancel; pending work disables cancellation. |
 | Backup import/export, storage-location choice, Agent Access privacy | Settings window, `Dialog` | Close/Escape/backdrop while idle; backup processing disables close. Typed confirmations stay within the existing form. |
@@ -28,12 +29,12 @@ or a fatal surface.
 | Unsaved settings discard decision | Settings window, `ConfirmDialog` with `allowWhenLocked` | Explicit discard-and-close or keep editing; remains available over the lock. |
 | Windows Hello lock (`auth`) | Each window, `AuthMask` / `OverlayShell`, `gate` | User unlocks explicitly; no dismissal. |
 | Fatal error (`fatal`) | Main window, `ErrorWindow`, `fatal` | Restart/exit and presentation switch only; covers the title bar too. |
-| Rust index maintenance (`maintenance`) and startup database cleanup (`vacuum`) | Main window, `OverlayShell`, `maintenance` | Complete automatically; maintenance offers its own unlock action when required. |
-| Storage initialization (`storageInitialization`) | Main window, `StorageInitializationOverlay` / `OverlayShell`, `maintenance` | Completes before the login flow; failed preparation offers an explicit retry. Recreated hidden-start windows read the current application-owned job before requesting progress; application access stays gated until readiness is confirmed. |
+| Rust index maintenance (`maintenance`) | Main window, `OverlayShell`, `maintenance` | Completes automatically; maintenance offers its own unlock action when required. |
+| Storage initialization (`storageInitialization`) | Main window, `StorageInitializationOverlay` / `OverlayShell`, `maintenance` | Rust starts preparation and any required database compaction before admitting capture, including background launches. The overlay observes this job before the login flow; failed preparation offers an explicit retry. Recreated hidden-start windows read the current application-owned job before requesting progress; application access stays gated until readiness is confirmed. |
 | First-run onboarding and What's New (`onboarding`) | Main window, `OnboardingOverlay` / `OverlayShell`, `prompt` | Wizard navigation follows its step state; What's New can defer while idle. Applying choices blocks dismissal. |
 | Update offer/progress (`update`) | Main window, `UpdateModal` / `OverlayShell`, `prompt` | Explicit later/hide/retry controls; hiding progress leaves the operation running. |
 | Required-model download (`modelDownload`) | Main window, `Mask` / `OverlayShell`, `prompt` | Explicit background/retry actions; shares the download controller with onboarding. |
-| Search-index security upgrade (`hmac`) | Main window, `HmacMigrationDialog` / `OverlayShell`, `prompt` | Close/Escape hides progress while the upgrade continues; admission waits for authentication. |
+| Search-index security upgrade (`hmac`) | Main window, `HmacMigrationDialog` / `OverlayShell`, `prompt` | Rust admits one application-owned upgrade after explicit authentication. The view recovers current progress on mount; Close/Escape hides progress while the upgrade continues. |
 | Optional history indexing (`clipBackfill`) and protected processing offer (`appBound`) | Main window, `OverlayShell`, `prompt` | The former accepts a decision or dismissal; the latter offers explicit enable/repair/later actions. |
 
 `SettingsWindow` owns a separate WebView rather than an outer settings dialog.
@@ -127,7 +128,7 @@ when it leaves. A component never shows itself on its own authority, and
 A new startup overlay needs an id in `OVERLAY_PRIORITY`, placed with a comment
 that says why it ranks where it does.
 
-The current grant order is `fatal`, `storageInitialization`, `maintenance`, `vacuum`, `auth`,
+The current grant order is `fatal`, `storageInitialization`, `maintenance`, `auth`,
 `onboarding`, `update`, `modelDownload`, `hmac`, `clipBackfill`, then `appBound`.
 This controls which startup view renders; CSS layer bands control stacking
 against ordinary dialogs and the explicit settings discard decision.
@@ -202,11 +203,12 @@ Frontend verification goes through `src/lib/auth_api.js`:
 
 `autoPrompt: true` remains a compatibility spelling for an explicit action;
 `promptMode` takes precedence. Do not use it for automatic effects. Index-health
-reads, automatic capture-filter application, automatic search-index security
-upgrades, and resumed smart-cluster downloads (including their settings write)
-defer authentication. Resumed downloads keep their queued intent until the
-authenticated readiness state returns. The security-upgrade component mounts
-only while authenticated; a lost session defers admission until its next mount.
+reads, automatic capture-filter application, and resumed smart-cluster downloads
+(including their settings write) defer authentication. Resumed downloads keep
+their queued intent until authenticated readiness returns. Rust admits the
+search-index upgrade after an explicit unlock, and its authenticated view
+observes the existing job. A lost session before admission defers the job until
+the next explicit unlock.
 
 Each WebView shares a pending frontend request. Cancellation becomes
 `AUTH_CANCELLED`, provider unavailability becomes `AUTH_NOT_AVAILABLE`, and

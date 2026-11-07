@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 
+mod automation;
+pub(crate) use automation::{start as start_automation, wake as wake_automation};
+
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Performance::*;
 
@@ -22,6 +25,7 @@ const LIFECYCLE_DRAINING: u64 = u64::MAX;
 
 pub struct MonitorState {
     control: tokio::sync::Mutex<()>,
+    automation: automation::AutomationState,
     /// A maintenance pause whose restore was rejected by the power gate.
     maintenance_resume_pending: AtomicBool,
     /// Which capture session owns the monitor: `LIFECYCLE_IDLE`,
@@ -49,6 +53,7 @@ impl MonitorState {
     pub fn new() -> Self {
         Self {
             control: tokio::sync::Mutex::new(()),
+            automation: automation::AutomationState::default(),
             maintenance_resume_pending: AtomicBool::new(false),
             lifecycle: AtomicU64::new(LIFECYCLE_IDLE),
             next_session: AtomicU64::new(1),
@@ -154,10 +159,27 @@ const MAX_MONITOR_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
 
 fn monitor_status_value(state: &MonitorState, capture_state: &CaptureState) -> Value {
     let running = state.is_running() && !state.stopping.load(Ordering::SeqCst);
+    let policy = state
+        .automation
+        .policy
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     serde_json::json!({
         "paused": running && capture_state.paused.load(Ordering::SeqCst),
         "stopped": !running,
+        "starting": state.automation.starting.load(Ordering::SeqCst),
+        "auto_start_suppressed": policy.manual_stop || policy.error.is_some(),
+        "error": policy.error,
+        "revision": state.automation.revision.load(Ordering::SeqCst),
     })
+}
+
+pub(crate) fn publish_monitor_status(app: &AppHandle) {
+    let state = app.state::<MonitorState>();
+    state.automation.revision.fetch_add(1, Ordering::SeqCst);
+    let mut status = monitor_status_value(&state, &app.state::<Arc<CaptureState>>());
+    status["power_saving_active"] = serde_json::json!(crate::power::is_saving_power(app));
+    let _ = app.emit("monitor-status-changed", status);
 }
 
 fn validate_monitor_command_payload(payload: &Value) -> Result<(), String> {
@@ -506,7 +528,7 @@ pub async fn monitor_remove_local_anchors_by_process(
     Ok(serde_json::json!({"status":"success","removed_count":removed}))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MonitorAction {
     Start,
     Stop,
@@ -517,11 +539,23 @@ pub(crate) enum MonitorAction {
     TogglePause,
 }
 
-/// Shared by commands, tray actions, power events and startup. The admission
-/// permit spans the whole operation, including model checks and capture drain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlSource {
+    User,
+    Automatic,
+    Maintenance,
+}
+
+/// Explicit commands and tray actions update application-owned intent.
+/// The permit spans model checks and capture drain.
 pub(crate) async fn control(app: &AppHandle, action: MonitorAction) -> Result<String, String> {
     let _admission = crate::maintenance::runtime_control_guard()?;
-    apply_control(app, action).await
+    apply_control(app, action, ControlSource::User).await
+}
+
+async fn control_automatic(app: &AppHandle, action: MonitorAction) -> Result<String, String> {
+    let _admission = crate::maintenance::runtime_control_guard()?;
+    apply_control(app, action, ControlSource::Automatic).await
 }
 
 pub(crate) async fn control_in_maintenance(
@@ -529,12 +563,36 @@ pub(crate) async fn control_in_maintenance(
     action: MonitorAction,
     _owner: &crate::maintenance::MaintenanceGuard,
 ) -> Result<String, String> {
-    apply_control(app, action).await
+    apply_control(app, action, ControlSource::Maintenance).await
 }
 
-async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String, String> {
+async fn apply_control(
+    app: &AppHandle,
+    action: MonitorAction,
+    source: ControlSource,
+) -> Result<String, String> {
     let state = app.state::<MonitorState>();
     let _control = state.control.lock().await;
+    {
+        let mut policy = state
+            .automation
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Recheck under the lock: a queued start must observe a user stop.
+        if source == ControlSource::Automatic
+            && policy.automatic_action(automation::conditions(app, &state)) != Some(action)
+        {
+            return Ok("Capture policy already reconciled".into());
+        }
+        if source == ControlSource::User {
+            let paused = app
+                .state::<Arc<CaptureState>>()
+                .paused
+                .load(Ordering::SeqCst);
+            policy.user_action(action, paused);
+        }
+    }
     // The power loop can select Start before maintenance records its rejected
     // restore. Reconcile under the lock instead of accepting "already running"
     // and clearing a pause that still needs to be restored.
@@ -544,13 +602,24 @@ async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String,
         }
         action => action,
     };
+    let starting = matches!(action, MonitorAction::Start | MonitorAction::Restart);
+    if starting {
+        state.automation.starting.store(true, Ordering::SeqCst);
+        publish_monitor_status(app);
+    }
+    let initially_paused = state
+        .automation
+        .policy
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .manual_pause;
     let result = match action {
-        MonitorAction::Start => start_capture(app).await,
+        MonitorAction::Start => start_capture(app, initially_paused).await,
         MonitorAction::Stop => stop_capture(app).await,
-        MonitorAction::Restart => {
-            stop_capture(app).await?;
-            start_capture(app).await
-        }
+        MonitorAction::Restart => match stop_capture(app).await {
+            Ok(_) => start_capture(app, initially_paused).await,
+            Err(error) => Err(error),
+        },
         MonitorAction::Pause => set_capture_paused(app, true),
         MonitorAction::Resume => set_capture_paused(app, false),
         MonitorAction::ResumeAfterPowerSaving => {
@@ -581,24 +650,36 @@ async fn apply_control(app: &AppHandle, action: MonitorAction) -> Result<String,
             .maintenance_resume_pending
             .store(false, Ordering::SeqCst);
     }
+    state.automation.starting.store(false, Ordering::SeqCst);
+    state
+        .automation
+        .policy
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish_action(&result, source);
+    publish_monitor_status(app);
+    if source != ControlSource::Automatic {
+        wake_automation(app);
+    }
     result
 }
 
-async fn start_capture(app: &AppHandle) -> Result<String, String> {
+async fn start_capture(app: &AppHandle, initially_paused: bool) -> Result<String, String> {
+    if !crate::storage_startup::is_ready(app) {
+        return Err(crate::storage_startup::STORAGE_INITIALIZING.into());
+    }
     crate::power::check_capture_allowed(app)?;
     let state = app.state::<MonitorState>();
     // Check if required model files are complete
-    if let Ok(model_status) = crate::model_management::check_model_files().await {
+    {
+        let model_status = crate::model_management::check_model_files().await?;
         if let Some(obj) = model_status.as_object() {
             let has_incomplete = obj.values().any(|m| {
                 m.get("complete").and_then(|c| c.as_bool()) == Some(false)
                     && m.get("required").and_then(|r| r.as_bool()) != Some(false)
             });
             if has_incomplete {
-                return Err(
-                    "Model files are incomplete. Please download required models first."
-                        .to_string(),
-                );
+                return Err(automation::MODELS_REQUIRED.into());
             }
         }
     }
@@ -610,7 +691,7 @@ async fn start_capture(app: &AppHandle) -> Result<String, String> {
         return Ok("Monitor is already running".into());
     };
     state.stopping.store(false, Ordering::SeqCst);
-    spawn_capture_loop(&app, session);
+    spawn_capture_loop(&app, session, initially_paused);
     crate::refresh_tray_menu(&app);
     Ok("Monitor started".into())
 }
@@ -623,29 +704,45 @@ pub async fn start_monitor(window: tauri::Window, app: AppHandle) -> Result<Stri
 
 #[tauri::command]
 pub fn get_monitor_autostart() -> bool {
-    crate::registry_config::get_bool("autoStartMonitor").unwrap_or(true)
+    crate::registry_config::get_bool("autoStartMonitor")
+        .or_else(|| crate::registry_config::get_bool("lightweight_auto_start_monitor"))
+        .unwrap_or(true)
 }
 
 #[tauri::command]
 pub fn set_monitor_autostart(
+    app: AppHandle,
     window: tauri::Window,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     enabled: bool,
 ) -> Result<(), String> {
     crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
-    crate::registry_config::set_bool("autoStartMonitor", enabled)
+    crate::registry_config::set_bool("autoStartMonitor", enabled)?;
+    if enabled {
+        app.state::<MonitorState>()
+            .automation
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .request_start();
+    }
+    publish_monitor_status(&app);
+    wake_automation(&app);
+    Ok(())
 }
 
 /// Spawn the Rust-side capture loop for `session` using CaptureState
-fn spawn_capture_loop(app: &AppHandle, session: u64) {
+fn spawn_capture_loop(app: &AppHandle, session: u64, initially_paused: bool) {
     let capture_state = app.state::<Arc<CaptureState>>();
     let storage = app.state::<Arc<StorageState>>();
     let _monitor_state = app.state::<MonitorState>();
 
     // Reset capture state for new session
     capture_state.stopped.store(false, Ordering::SeqCst);
-    capture_state.paused.store(false, Ordering::SeqCst);
+    capture_state
+        .paused
+        .store(initially_paused, Ordering::SeqCst);
     capture_state.in_flight_ocr_count.store(0, Ordering::SeqCst);
     capture_state.clear_wgc_session("spawn_capture_loop_reset");
     capture_state
@@ -762,9 +859,17 @@ async fn end_exited_session(app: &AppHandle, capture_state: &CaptureState, sessi
 
     drain_capture_session(app, capture_state, "capture_loop_exited").await;
 
+    state
+        .automation
+        .policy
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .unexpected_stop(std::time::Instant::now());
     state.finish_drain();
     crate::refresh_tray_menu(app);
     let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": false}));
+    publish_monitor_status(app);
+    wake_automation(app);
 }
 
 /// Releases what a capture session leaves behind once its loop is gone: the

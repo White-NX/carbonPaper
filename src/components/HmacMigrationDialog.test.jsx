@@ -1,47 +1,64 @@
-import React, { useEffect, useState } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import React from 'react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import HmacMigrationDialog from './HmacMigrationDialog';
 
+const events = vi.hoisted(() => new Map());
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => vi.fn()) }));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async (name, handler) => { events.set(name, handler); return vi.fn(); }),
+}));
+let status;
+beforeEach(() => {
+  events.clear();
+  status = { needs_migration: true, is_running: true, processed: 512, total: 1000, error: null, revision: 2 };
+  invoke.mockReset().mockImplementation(async (command) => {
+    if (command === 'storage_check_hmac_migration_status') return status;
+    throw new Error('Unexpected command: ' + command);
+  });
+});
+afterEach(() => vi.useRealTimers());
 
-// App only mounts the upgrade while the session is authenticated.
-function Session() {
-  const [authenticated, setAuthenticated] = useState(true);
-  useEffect(() => {
-    const lock = () => setAuthenticated(false);
-    window.addEventListener('cp-auth-required', lock);
-    return () => window.removeEventListener('cp-auth-required', lock);
-  }, []);
-  return authenticated ? <HmacMigrationDialog /> : <button onClick={() => setAuthenticated(true)}>Unlock</button>;
-}
-
-describe('automatic search-index security upgrade', () => {
-  it('waits for unlock after lost authentication and resumes on the next authenticated mount', async () => {
-    let attempts = 0;
-    invoke.mockReset().mockImplementation(async (command) => {
-      if (command === 'storage_check_hmac_migration_status') return { needs_migration: true, is_running: false };
-      if (command === 'storage_run_hmac_migration') {
-        if (++attempts === 1) throw new Error('AUTH_REQUIRED');
-        return true;
-      }
-      throw new Error(`Unexpected command: ${command}`);
-    });
-    render(<Session />);
-    await screen.findByRole('button', { name: 'Unlock' });
-    expect(attempts).toBe(1);
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    expect(invoke.mock.calls.some(([command]) => command.startsWith('credential_'))).toBe(false);
-
-    await userEvent.click(screen.getByRole('button', { name: 'Unlock' }));
-    await waitFor(() => expect(attempts).toBe(2));
+describe('application-owned search-index upgrade', () => {
+  it('recovers a running job on mount and recreation without starting another upgrade', async () => {
+    const view = render(<HmacMigrationDialog />);
+    await screen.findByRole('dialog');
+    await userEvent.click(screen.getByRole('button', { name: 'common.close' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
-      'storage_check_hmac_migration_status', 'storage_run_hmac_migration',
-      'storage_check_hmac_migration_status', 'storage_run_hmac_migration',
-    ]);
+    view.unmount();
+    render(<HmacMigrationDialog />);
+    await screen.findByRole('dialog');
+    expect(invoke.mock.calls.every(([command]) => command === 'storage_check_hmac_migration_status')).toBe(true);
+  });
+
+  it('waits for native admission without requesting authentication or running migration', async () => {
+    status = { ...status, is_running: false };
+    render(<HmacMigrationDialog />);
+    await act(async () => {});
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    act(() => events.get('hmac-migration-progress')({ payload: { ...status, is_running: true, revision: 3 } }));
+    await screen.findByRole('dialog');
+    expect(invoke.mock.calls.every(([command]) => command === 'storage_check_hmac_migration_status')).toBe(true);
+  });
+
+  it('keeps newer progress when an old mount query arrives late', async () => {
+    invoke.mockReset();
+    let finishRead;
+    invoke.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    render(<HmacMigrationDialog />);
+    await act(async () => {});
+    act(() => events.get('hmac-migration-progress')({ payload: status }));
+    await screen.findByRole('dialog');
+    await act(async () => finishRead({ ...status, needs_migration: false, is_running: false, revision: 1 }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('shows a retained native failure without retrying it from the view', async () => {
+    status = { ...status, is_running: false, error: 'disk failure' };
+    render(<HmacMigrationDialog />);
+    await screen.findByText('disk failure');
+    expect(invoke.mock.calls.every(([command]) => command === 'storage_check_hmac_migration_status')).toBe(true);
   });
 });

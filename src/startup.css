@@ -1,0 +1,180 @@
+/* Critical startup styles: loaded independently of React and Tailwind. */
+:root {
+  --startup-bg: #eef2f4;
+  --startup-text: #253441;
+  --startup-muted: #60717e;
+  --startup-paper-top: #c6d0d7;
+  --startup-paper-bottom: #91a3b0;
+  --startup-glow: #dce7f6;
+  --startup-controls: #e0e7ec;
+  --startup-control-hover: #cedae3;
+  --startup-accent: #2563eb;
+}
+
+:root.dark {
+  --startup-bg: #151c20;
+  --startup-text: #e3eaf0;
+  --startup-muted: #a3b1bc;
+  --startup-paper-top: #e5ebef;
+  --startup-paper-bottom: #8fa3b5;
+  --startup-glow: #152839;
+  --startup-controls: #10171b;
+  --startup-control-hover: #29353d;
+  --startup-accent: #79b9ff;
+}
+
+html[data-startup] {
+  background-color: var(--startup-bg);
+}
+
+html[data-startup] body {
+  overflow: hidden;
+}
+
+/* Keep all React surfaces below the static screen until its handoff. */
+html[data-startup] #root {
+  isolation: isolate;
+}
+
+html[data-startup="loading"] #root {
+  pointer-events: none;
+}
+
+#startup-screen {
+  display: none;
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  isolation: isolate;
+  box-sizing: border-box;
+  background: var(--startup-bg);
+  color: var(--startup-text);
+  font-family: 'Source Han Sans SC', 'Microsoft YaHei UI', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  user-select: none;
+  opacity: 1;
+  transition: opacity 160ms ease;
+}
+
+html[data-startup] #startup-screen {
+  display: block;
+}
+
+html[data-startup="handoff"] #startup-screen,
+html[data-startup="leaving"] #startup-screen {
+  pointer-events: none;
+}
+
+html[data-startup="leaving"] #startup-screen {
+  opacity: 0;
+}
+
+#startup-screen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at 5% 95%, var(--startup-glow), transparent 65%);
+  pointer-events: none;
+}
+
+.startup-paper {
+  position: absolute;
+  width: max(780px, 78vw);
+  height: max(780px, 78vw);
+  right: -14vw;
+  bottom: -2vh;
+  transform: rotate(-10deg);
+  background: linear-gradient(150deg, var(--startup-paper-top), var(--startup-paper-bottom));
+  mask: url('./assets/carbonpaper-mark.svg') center / contain no-repeat;
+  -webkit-mask: url('./assets/carbonpaper-mark.svg') center / contain no-repeat;
+  opacity: .83;
+  pointer-events: none;
+}
+
+.startup-header {
+  position: relative;
+  height: 72px;
+  padding: 0 clamp(24px, 3vw, 40px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  box-sizing: border-box;
+}
+
+.startup-title {
+  font-size: 13px;
+  font-weight: 500;
+  pointer-events: none;
+}
+
+.startup-controls {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--startup-controls);
+}
+
+.startup-window-control {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 34px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--startup-text);
+  cursor: default;
+}
+
+.startup-window-control:hover:not(:disabled) {
+  background: var(--startup-control-hover);
+}
+
+.startup-window-control:focus-visible {
+  outline: 2px solid var(--startup-accent);
+  outline-offset: -2px;
+}
+
+.startup-window-control svg {
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}
+
+.startup-brand {
+  position: absolute;
+  left: clamp(32px, 5vw, 64px);
+  top: 34vh;
+  pointer-events: none;
+}
+
+.startup-wordmark {
+  margin: 0;
+  font-size: clamp(32px, 3.4vw, 52px);
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: .015em;
+}
+
+.startup-tagline {
+  min-height: 1.5em;
+  margin: 13px 0 0;
+  color: var(--startup-muted);
+  font-size: clamp(13px, 1.2vw, 16px);
+}
+
+@media (max-width: 900px) {
+  .startup-paper {
+    right: -240px;
+    opacity: .26;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #startup-screen {
+    transition: none;
+  }
+}

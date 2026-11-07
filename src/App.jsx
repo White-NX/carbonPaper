@@ -14,8 +14,8 @@ import { NotificationToast, NotificationPanel } from './components/Notifications
 import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import ClipBackfillDialog from './components/ClipBackfillDialog';
-import StartupVacuumDialog from './components/StartupVacuumDialog';
 import StorageInitializationOverlay from './components/StorageInitializationOverlay';
+import StartupScreenHandoff from './components/StartupScreenHandoff';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange, warmupThumbnails } from './lib/monitor_api';
@@ -81,7 +81,7 @@ function App() {
   }, [openOcrModelRepair]);
 
   const { darkMode, setDarkMode } = useAppTheme();
-  const { powerSavingMode, setPowerSavingMode, powerSavingSuppressed, powerStatusReady, windowFocused } = usePowerSavingState();
+  const { powerSavingMode, setPowerSavingMode, powerSavingSuppressed, windowFocused } = usePowerSavingState();
   const isMaximized = useWindowMaximizedState();
   const { minimize, toggleMaximize, hideToTray, restartApp, exitApp } = useAppWindowActions();
   const {
@@ -129,23 +129,14 @@ function App() {
     t,
   });
   const {
-    autoStartMonitor,
-    setAutoStartMonitor,
-    handleManualStartMonitor,
-    handleManualStopMonitor,
     backendStatus,
     monitorPowerSavingSuppressed,
     monitorPaused,
     handleStartBackend,
     handlePauseMonitor,
     handleResumeMonitor,
-    handleSettingsMonitorAction,
   } = useMonitorLifecycle({
-    modelsCheckDone,
-    modelsNeedDownload,
-    captureHeld: onboarding.captureHeld || !initialization.ready,
     powerSavingSuppressed,
-    powerStatusReady,
     formatErrorDetails,
     reportBackendError,
     resetBackendErrorDedupe,
@@ -175,7 +166,6 @@ function App() {
     bumpTimelineRefresh,
   } = useSelectedSnapshot();
   const { showSettings, openSettings } = useSettingsHost({
-    onMonitorAction: handleSettingsMonitorAction,
     onRecordsChanged: bumpTimelineRefresh,
     onClosed: refreshRequiredModels,
     onError: (error) => reportBackendError(t('settings.title'), String(error)),
@@ -232,6 +222,7 @@ function App() {
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
       onClickCapture={handleGlobalClick}
     >
+      <StartupScreenHandoff ready={overlays.active !== null || (initialization.ready && isAuthenticated)} />
       <TopBar
         darkMode={darkMode}
         setDarkMode={setDarkMode}
@@ -276,8 +267,6 @@ function App() {
           onRestart={restartApp}
           onExit={exitApp}
         />
-
-        {initialization.ready && <StartupVacuumDialog />}
 
         {/* Startup overlays share this content area and the coordinator shows
             one at a time (components/overlay/coordinator.js). The top bar is

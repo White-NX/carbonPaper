@@ -1,296 +1,118 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { withAuth } from '../lib/auth_api';
+import { runMonitorAction } from '../lib/settings_api';
+import { usePolling } from './usePolling';
 import { useTauriEventListener } from './useTauriEventListener';
 
-// An unexpected stop is a capture loop that ended without being asked to. The
-// auto-start effect restarts it, and a failure that recurs on every start would
-// otherwise be restarted indefinitely.
-const MAX_UNEXPECTED_STOPS = 3;
-const UNEXPECTED_STOP_WINDOW_MS = 10 * 60 * 1000;
-
+// Rust owns automatic admission, manual-stop intent and recovery. This hook
+// observes the existing runtime and forwards explicit user actions.
 export function useMonitorLifecycle({
-  modelsCheckDone,
-  modelsNeedDownload,
-  captureHeld = false,
   powerSavingSuppressed,
-  powerStatusReady = true,
   formatErrorDetails,
   reportBackendError,
   resetBackendErrorDedupe,
   t,
 }) {
-  const [autoStartMonitor, setAutoStartMonitorState] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('autoStartMonitor');
-    return saved === null ? true : saved === 'true';
-  });
-  const [autoStartSuppressed, setAutoStartSuppressed] = useState(false);
-  const autoStartSuppressedRef = useRef(false);
-  const maintenanceSuppressedRef = useRef(null);
-  const runtimeActionRef = useRef(false);
   const [backendStatus, setBackendStatus] = useState('unknown');
   const [monitorPaused, setMonitorPaused] = useState(false);
   const [backendError, setBackendError] = useState('');
-  const backendStatusRef = useRef('unknown');
-  const backendStartAtRef = useRef(null);
-  const unexpectedStopsRef = useRef([]);
-  const powerBlockedRef = useRef(Boolean(powerSavingSuppressed));
   const [powerBlocked, setPowerBlocked] = useState(Boolean(powerSavingSuppressed));
-  const powerEventVersionRef = useRef(0);
+  const latestRevision = useRef(-1);
+  const powerEventVersion = useRef(0);
+  const alive = useRef(false);
 
   useEffect(() => {
-    powerEventVersionRef.current += 1;
-    powerBlockedRef.current = Boolean(powerSavingSuppressed);
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+
+  useEffect(() => {
+    powerEventVersion.current += 1;
     setPowerBlocked(Boolean(powerSavingSuppressed));
   }, [powerSavingSuppressed]);
 
-  useEffect(() => {
-    backendStatusRef.current = backendStatus;
-  }, [backendStatus]);
+  const reportError = useCallback((error) => {
+    const message = error === 'CAPTURE_RESTART_LIMIT'
+      ? t('settings.general.monitor.errors.restartLimit')
+      : typeof error === 'string' ? error : error?.message || t('settings.general.monitor.errors.startFailedFallback');
+    setBackendError(message);
+    reportBackendError(t('settings.general.monitor.errors.startFailedTitle'), message, formatErrorDetails(error));
+  }, [formatErrorDetails, reportBackendError, t]);
 
-  useEffect(() => {
-    let cancelled = false;
-    invoke('get_monitor_autostart')
-      .then((enabled) => {
-        if (!cancelled) setAutoStartMonitorState(Boolean(enabled));
-      })
-      .catch(() => {
-        // Keep the legacy local preference as a compatibility fallback.
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem('autoStartMonitor', autoStartMonitor ? 'true' : 'false');
-  }, [autoStartMonitor]);
-
-  const setAutoStartMonitor = useCallback(async (next) => {
-    const previous = autoStartMonitor;
-    setAutoStartMonitorState(next);
-    try {
-      await withAuth(
-        () => invoke('set_monitor_autostart', { enabled: next }),
-        { autoPrompt: true },
-      );
-      if (next) setAutoStartSuppressed(false);
-    } catch (err) {
-      setAutoStartMonitorState(previous);
-      console.warn('Failed to update monitor auto-start policy:', err);
+  const acceptStatus = useCallback((status, powerVersion = powerEventVersion.current) => {
+    if (!alive.current || !status || typeof status.stopped !== 'boolean') return;
+    // An event may arrive before the response to an older status query.
+    if (Number.isFinite(status.revision)) {
+      if (status.revision < latestRevision.current) return;
+      latestRevision.current = status.revision;
     }
-  }, [autoStartMonitor]);
+    setBackendStatus(status.starting ? 'waiting' : status.stopped ? 'offline' : 'online');
+    setMonitorPaused(!status.stopped && Boolean(status.paused));
+    if (powerVersion === powerEventVersion.current && typeof status.power_saving_active === 'boolean') {
+      setPowerBlocked(status.power_saving_active);
+    }
+    if (status.error) reportError(status.error);
+    else {
+      setBackendError('');
+      resetBackendErrorDedupe();
+    }
+  }, [reportError, resetBackendErrorDedupe]);
 
-  const handleManualStartMonitor = useCallback(() => {
-    autoStartSuppressedRef.current = false;
-    setAutoStartSuppressed(false);
-  }, []);
+  const checkBackendStatus = useCallback(async () => {
+    const powerVersion = powerEventVersion.current;
+    try {
+      const response = await invoke('get_monitor_status');
+      const status = typeof response === 'string' ? JSON.parse(response) : response;
+      acceptStatus(status, powerVersion);
+    } catch (error) {
+      if (!alive.current) return;
+      setBackendStatus('offline');
+      const message = error?.message || t('settings.general.monitor.errors.offlineFallback');
+      setBackendError(message);
+      reportBackendError(t('settings.general.monitor.errors.unavailableTitle'), message, formatErrorDetails(error));
+    }
+  }, [acceptStatus, formatErrorDetails, reportBackendError, t]);
 
-  const handleManualStopMonitor = useCallback(() => {
-    autoStartSuppressedRef.current = true;
-    setAutoStartSuppressed(true);
-  }, []);
+  usePolling(checkBackendStatus, { intervalMs: 3000 });
+  useTauriEventListener('monitor-status-changed', ({ payload }) => acceptStatus(payload), [acceptStatus]);
+  useTauriEventListener('monitor-stopped', checkBackendStatus, [checkBackendStatus]);
 
   const handleStartBackend = useCallback(async () => {
-    autoStartSuppressedRef.current = false;
-    setAutoStartSuppressed(false);
-    setBackendError('');
     setBackendStatus('waiting');
-    backendStatusRef.current = 'waiting';
-    backendStartAtRef.current = Date.now();
+    setBackendError('');
     try {
-      await invoke('start_monitor');
-    } catch (err) {
+      await runMonitorAction('start');
+      await checkBackendStatus();
+    } catch (error) {
       setBackendStatus('offline');
-      backendStatusRef.current = 'offline';
-      // Native admission can observe unplugging before the power event reaches
-      // this window. Wait for the policy transition without a failure dialog or
-      // permanently disabling auto-start when AC returns.
-      if ((typeof err === 'string' ? err : err?.message) === 'POWER_SAVING_ACTIVE') {
-        powerEventVersionRef.current += 1;
-        powerBlockedRef.current = true;
+      if ((typeof error === 'string' ? error : error?.message) === 'POWER_SAVING_ACTIVE') {
+        powerEventVersion.current += 1;
         setPowerBlocked(true);
-        backendStartAtRef.current = null;
         return;
       }
-      const message = err?.message || t('settings.general.monitor.errors.startFailedFallback');
-      const details = formatErrorDetails(err);
-      setBackendError(message);
-      setAutoStartSuppressed(true);
-      reportBackendError(t('settings.general.monitor.errors.startFailedTitle'), message, details);
+      reportError(error);
     }
-  }, [formatErrorDetails, reportBackendError, t]);
+  }, [checkBackendStatus, reportError]);
 
   const handlePauseMonitor = useCallback(async () => {
     try {
-      await invoke('pause_monitor');
-      setMonitorPaused(true);
-    } catch (err) {
-      console.warn('Failed to pause monitor:', err);
+      await runMonitorAction('pause');
+      await checkBackendStatus();
+    } catch (error) {
+      console.warn('Failed to pause monitor:', error);
     }
-  }, []);
+  }, [checkBackendStatus]);
 
   const handleResumeMonitor = useCallback(async () => {
     try {
-      await invoke('resume_monitor');
-      setMonitorPaused(false);
-    } catch (err) {
-      console.warn('Failed to resume monitor:', err);
-    }
-  }, []);
-
-  const checkBackendStatus = useCallback(async () => {
-    const t0 = performance.now();
-    const powerVersion = powerEventVersionRef.current;
-    try {
-      const resString = await invoke('get_monitor_status');
-      const elapsed = performance.now() - t0;
-      if (elapsed > 5000) {
-        console.warn(`[DIAG:STATUS] get_monitor_status took ${elapsed.toFixed(0)}ms`);
-      }
-      let res = null;
-      try {
-        res = JSON.parse(resString);
-      } catch {
-        res = null;
-      }
-
-      // Status polling also recovers when a power event is missed. Do not
-      // replace a newer event or native admission failure with an older read.
-      if (powerVersion === powerEventVersionRef.current && typeof res?.power_saving_active === 'boolean') {
-        powerBlockedRef.current = res.power_saving_active;
-        setPowerBlocked(res.power_saving_active);
-      }
-
-      if (res?.stopped) {
-        setBackendStatus('offline');
-        backendStatusRef.current = 'offline';
-        setMonitorPaused(false);
-        setBackendError('');
-        resetBackendErrorDedupe();
-        backendStartAtRef.current = null;
-        return;
-      }
-
-      setBackendStatus('online');
-      backendStatusRef.current = 'online';
-      setMonitorPaused(!!res?.paused);
-      setBackendError('');
-      resetBackendErrorDedupe();
-      backendStartAtRef.current = null;
-    } catch (err) {
-      const elapsed = performance.now() - t0;
-      if (elapsed > 5000) {
-        console.warn(`[DIAG:STATUS] get_monitor_status FAILED after ${elapsed.toFixed(0)}ms:`, err);
-      }
-      if (backendStatusRef.current === 'waiting') {
-        const startAt = backendStartAtRef.current;
-        if (startAt && Date.now() - startAt < 15000) {
-          return;
-        }
-      }
-      setBackendStatus('offline');
-      backendStatusRef.current = 'offline';
-      const message = err?.message || t('settings.general.monitor.errors.offlineFallback');
-      const details = formatErrorDetails(err);
-      setBackendError(message);
-      reportBackendError(t('settings.general.monitor.errors.unavailableTitle'), message, details);
-    }
-  }, [formatErrorDetails, reportBackendError, resetBackendErrorDedupe, t]);
-
-  // One owner for manual and maintenance commands, including requests from the
-  // settings window. Suppress auto-start synchronously before stopping capture.
-  const handleSettingsMonitorAction = useCallback(async (action) => {
-    if (runtimeActionRef.current) throw new Error('MONITOR_ACTION_BUSY');
-    runtimeActionRef.current = true;
-    const previous = autoStartSuppressedRef.current;
-    try {
-      if (action === 'pause' || action === 'resume') {
-        await invoke(action === 'pause' ? 'pause_monitor' : 'resume_monitor');
-      } else {
-        if (!['start', 'stop', 'restart', 'maintenance-stop', 'maintenance-start'].includes(action)) throw new Error('INVALID_MONITOR_ACTION');
-        if (action === 'maintenance-stop' && maintenanceSuppressedRef.current === null) maintenanceSuppressedRef.current = previous;
-        autoStartSuppressedRef.current = true;
-        setAutoStartSuppressed(true);
-        if (['stop', 'restart', 'maintenance-stop'].includes(action)) await invoke('stop_monitor');
-        if (['start', 'restart', 'maintenance-start'].includes(action)) {
-          if (powerBlockedRef.current) throw new Error(t('settings.general.monitor.power_saving_blocked'));
-          setBackendStatus('waiting');
-          backendStatusRef.current = 'waiting';
-          await invoke('start_monitor');
-          await checkBackendStatus();
-          const suppressed = action === 'maintenance-start' ? Boolean(maintenanceSuppressedRef.current) : false;
-          maintenanceSuppressedRef.current = null;
-          autoStartSuppressedRef.current = suppressed;
-          setAutoStartSuppressed(suppressed);
-        }
-      }
+      await runMonitorAction('resume');
       await checkBackendStatus();
-    } finally { runtimeActionRef.current = false; }
-  }, [checkBackendStatus, t]);
-
-  useTauriEventListener('settings-preferences-changed', ({ payload }) => {
-    if (payload?.includes('autostart')) {
-      invoke('get_monitor_autostart').then((enabled) => {
-        setAutoStartMonitorState(Boolean(enabled));
-        if (enabled) handleManualStartMonitor();
-      }).catch(console.warn);
+    } catch (error) {
+      console.warn('Failed to resume monitor:', error);
     }
-  });
-
-  useEffect(() => {
-    checkBackendStatus();
-    const interval = setInterval(checkBackendStatus, 3000);
-    return () => clearInterval(interval);
   }, [checkBackendStatus]);
 
-  useTauriEventListener('monitor-stopped', (event) => {
-    setBackendStatus('offline');
-    backendStatusRef.current = 'offline';
-    setMonitorPaused(false);
-    setBackendError('');
-    resetBackendErrorDedupe();
-    backendStartAtRef.current = null;
-    if (event?.payload?.intentional !== false) return;
-    const now = Date.now();
-    const recent = unexpectedStopsRef.current.filter((at) => now - at < UNEXPECTED_STOP_WINDOW_MS);
-    recent.push(now);
-    unexpectedStopsRef.current = recent;
-    if (recent.length >= MAX_UNEXPECTED_STOPS) {
-      // Leave it stopped until someone starts it again.
-      autoStartSuppressedRef.current = true;
-      setAutoStartSuppressed(true);
-      console.warn(`Capture stopped unexpectedly ${recent.length} times within ${UNEXPECTED_STOP_WINDOW_MS / 60000} minutes; not restarting it automatically`);
-    }
-  }, [resetBackendErrorDedupe]);
-
-  useEffect(() => {
-    if (!autoStartMonitor) return;
-    if (!powerStatusReady || powerBlocked || powerBlockedRef.current) return;
-    if (autoStartSuppressed || autoStartSuppressedRef.current || runtimeActionRef.current) return;
-    if (!modelsCheckDone) return;
-    if (modelsNeedDownload) return;
-    // A new user starts recording by finishing the first-run wizard.
-    if (captureHeld) return;
-    if (backendStatus === 'offline' && backendStatusRef.current !== 'waiting') {
-      handleStartBackend();
-    }
-  }, [
-    autoStartMonitor,
-    autoStartSuppressed,
-    backendStatus,
-    captureHeld,
-    handleStartBackend,
-    modelsCheckDone,
-    modelsNeedDownload,
-    powerBlocked,
-    powerStatusReady,
-  ]);
-
   return {
-    autoStartMonitor,
-    setAutoStartMonitor,
-    handleManualStartMonitor,
-    handleManualStopMonitor,
     backendStatus,
     monitorPowerSavingSuppressed: powerBlocked,
     monitorPaused,
@@ -298,6 +120,5 @@ export function useMonitorLifecycle({
     handleStartBackend,
     handlePauseMonitor,
     handleResumeMonitor,
-    handleSettingsMonitorAction,
   };
 }

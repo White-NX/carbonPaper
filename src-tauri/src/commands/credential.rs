@@ -117,6 +117,7 @@ pub async fn credential_verify_user(
                 {
                     tracing::warn!("Failed to restore MCP after authentication: {}", e);
                 }
+                crate::commands::migration::spawn_auto_hmac_migration(app);
                 Ok(())
             })
             .await?;

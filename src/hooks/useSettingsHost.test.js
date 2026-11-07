@@ -7,20 +7,25 @@ const events = vi.hoisted(() => new Map());
 vi.mock('./useTauriEventListener', () => ({ useTauriEventListener: (name, handler) => events.set(name, handler) }));
 beforeEach(() => { events.clear(); invoke.mockReset().mockResolvedValue(null); });
 
-describe('settings monitor request boundary', () => {
-  it('ignores events without a native pending request', async () => {
-    const onMonitorAction = vi.fn();
-    renderHook(() => useSettingsHost({ onMonitorAction }));
-    await act(() => events.get('settings-monitor-request')({ payload: { id: 99, action: 'stop' } }));
-    expect(onMonitorAction).not.toHaveBeenCalled();
-    expect(invoke).not.toHaveBeenCalledWith('complete_settings_monitor_action', expect.anything());
+describe('settings window notifications', () => {
+  it('opens settings and follows the native close notification', async () => {
+    const onClosed = vi.fn();
+    const { result } = renderHook(() => useSettingsHost({ onClosed }));
+    await act(() => result.current.openSettings('capture'));
+    expect(result.current.showSettings).toBe(true);
+    expect(invoke).toHaveBeenCalledWith('open_settings_window', { tab: 'capture', section: null });
+    act(() => events.get('settings-window-changed')({ payload: false }));
+    expect(result.current.showSettings).toBe(false);
+    expect(onClosed).toHaveBeenCalledOnce();
   });
-  it('executes the claimed action instead of an action supplied in the event', async () => {
-    invoke.mockImplementation(async (command) => command === 'take_settings_monitor_action' ? 'pause' : null);
-    const onMonitorAction = vi.fn(async () => {});
-    renderHook(() => useSettingsHost({ onMonitorAction }));
-    await act(() => events.get('settings-monitor-request')({ payload: { id: 1, action: 'stop' } }));
-    expect(onMonitorAction).toHaveBeenCalledWith('pause');
-    expect(invoke).toHaveBeenCalledWith('complete_settings_monitor_action', { id: 1, error: null });
+
+  it('refreshes records and model state after changes from the settings window', () => {
+    const onRecordsChanged = vi.fn();
+    const onClosed = vi.fn();
+    renderHook(() => useSettingsHost({ onRecordsChanged, onClosed }));
+    act(() => events.get('settings-preferences-changed')({ payload: ['storage', 'records', 'models'] }));
+    expect(onRecordsChanged).toHaveBeenCalledOnce();
+    expect(onClosed).toHaveBeenCalledOnce();
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

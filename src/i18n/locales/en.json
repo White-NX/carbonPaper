@@ -1,4 +1,8 @@
 {
+  "startupScreen": {
+    "tagline": "Find moments from your screen.",
+    "minimize": "Minimize"
+  },
   "storageStartup": {
     "title": "Preparing your history",
     "tip": "You can continue when preparation finishes. A large history may take a few minutes.",
@@ -399,7 +403,8 @@
           "startFailedTitle": "Monitor service failed to start",
           "unavailableTitle": "Monitor service unavailable",
           "startFailedFallback": "Failed to start backend",
-          "offlineFallback": "Backend offline"
+          "offlineFallback": "Backend offline",
+          "restartLimit": "Capture stopped repeatedly, so automatic retries are paused. You can start it again manually."
         }
       }
     },

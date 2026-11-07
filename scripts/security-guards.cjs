@@ -27,13 +27,11 @@ const COMMAND_TIERS = {
   'commands::ai::ai_grant_remote_consent': 'session_required',
   'commands::ai::ai_search': 'session_required',
   'commands::ai::ai_search_cancel': 'runtime_public',
-  'settings_window::take_settings_monitor_action': 'runtime_public',
   'settings_window::settings_debug_preview': 'session_required',
   'settings_window::open_settings_window': 'lifecycle_public',
   'settings_window::close_settings_window': 'lifecycle_public',
   'settings_window::settings_set_busy': 'public',
   'settings_window::settings_monitor_action': 'runtime_public',
-  'settings_window::complete_settings_monitor_action': 'runtime_public',
   'settings_window::settings_preferences_changed': 'public',
   'app_bound::app_bound_status': 'public',
   'app_bound::app_bound_acknowledge_offer': 'public',
@@ -88,11 +86,9 @@ const COMMAND_TIERS = {
   'commands::storage::storage_update_category': 'session_required',
   'commands::storage::storage_get_categories_from_db': 'session_required',
   'commands::storage::storage_batch_get_categories': 'session_required',
-  'commands::migration::storage_get_startup_vacuum_status': 'public',
   'storage_startup::storage_get_initialization_status': 'public',
   'storage_startup::storage_retry_initialization': 'background_policy',
   'commands::migration::storage_is_startup_vacuum_in_progress': 'public',
-  'commands::migration::storage_run_startup_vacuum_if_needed': 'background_policy',
   'commands::migration::storage_run_manual_vacuum': 'session_required',
   'commands::migration::storage_check_hmac_migration_status': 'public',
   'commands::migration::storage_run_hmac_migration': 'session_required',
@@ -165,6 +161,7 @@ const COMMAND_TIERS = {
   'commands::utility::trigger_test_error': 'session_required',
   'commands::utility::exit_app': 'lifecycle_public',
   'commands::utility::hide_to_tray': 'lifecycle_public',
+  'main_window::main_window_ready': 'lifecycle_public',
   'commands::utility::switch_to_lightweight_mode': 'public',
   'commands::utility::switch_to_standard_mode': 'public',
   'commands::utility::get_lightweight_status': 'public',
@@ -276,9 +273,7 @@ function checkCommandGuardImplementations() {
 
   const mainWindowCommands = [
     'storage_startup::storage_retry_initialization',
-    'settings_window::take_settings_monitor_action',
     'settings_window::open_settings_window',
-    'settings_window::complete_settings_monitor_action',
     'ml_runtime::debug_trigger_ocr_model_repair_notification',
     'monitor::start_monitor',
     'monitor::stop_monitor',
@@ -287,6 +282,7 @@ function checkCommandGuardImplementations() {
     'commands::utility::restart_app',
     'commands::utility::exit_app',
     'commands::utility::hide_to_tray',
+    'main_window::main_window_ready',
     'commands::utility::trigger_test_error',
     'onboarding::complete_onboarding',
   ];
@@ -296,6 +292,7 @@ function checkCommandGuardImplementations() {
     throw new Error(`High-impact commands missing main-window guard:\n${missingWindowGuard.join('\n')}`);
   }
   const settingsCommands = [
+  'settings_window::settings_monitor_action',
   "minilm_index::semantic_index_run_now",
   "minilm_index::semantic_index_stop_now",
   "clip_index::clip_index_run_now",
@@ -339,6 +336,14 @@ function checkRuntimeControlInvariants() {
     if (/check_auth_required|is_session_valid|AUTH_REQUIRED/.test(body)) {
       throw new Error(`${command} must remain available while the UI session is locked`);
     }
+  }
+
+  const sharedControl = commandFunctionBody('settings_window::settings_monitor_action');
+  if (!sharedControl.includes('check_settings_ui') || !sharedControl.includes('monitor::control')) {
+    throw new Error('Settings runtime actions must use the finite native control boundary');
+  }
+  if (/check_auth_required|is_session_valid|AUTH_REQUIRED/.test(sharedControl)) {
+    throw new Error('Settings runtime actions must remain available while the UI session is locked');
   }
 
   const interactiveAuthRuntimeCalls = walk(path.join(ROOT, 'src'))

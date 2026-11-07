@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 use tokio::sync::watch;
 
 const PROGRESS_EVENT: &str = "storage-initialization-progress";
+pub(crate) const STORAGE_INITIALIZING: &str = "STORAGE_INITIALIZING";
 
 #[derive(Clone, Serialize)]
 pub struct InitializationStatus {
@@ -22,12 +23,11 @@ pub struct InitializationStatus {
 
 pub(crate) struct StorageStartupState {
     progress: watch::Sender<InitializationStatus>,
-    start_hidden: bool,
     services_started: AtomicBool,
 }
 
 impl StorageStartupState {
-    pub fn new(start_hidden: bool) -> Self {
+    pub fn new() -> Self {
         let (progress, _) = watch::channel(InitializationStatus {
             running: false,
             ready: false,
@@ -37,7 +37,6 @@ impl StorageStartupState {
         });
         Self {
             progress,
-            start_hidden,
             services_started: AtomicBool::new(false),
         }
     }
@@ -95,7 +94,16 @@ pub(crate) fn spawn(app: tauri::AppHandle) {
         }
         state.finish(result);
         let _ = app.emit(PROGRESS_EVENT, state.snapshot());
+        crate::monitor::wake_automation(&app);
+        if state.snapshot().ready {
+            crate::commands::migration::spawn_auto_hmac_migration(app);
+        }
     });
+}
+
+pub(crate) fn is_ready(app: &tauri::AppHandle) -> bool {
+    app.state::<Arc<StorageStartupState>>().snapshot().ready
+        && app.state::<Arc<StorageState>>().is_initialized()
 }
 
 pub(crate) async fn ensure_initialized(app: tauri::AppHandle) -> Result<(), String> {
@@ -134,6 +142,19 @@ fn run(app: &tauri::AppHandle, state: &StorageStartupState) -> Result<(), String
     );
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     storage.initialize_with_progress(|progress| state.update(app, progress))?;
+    // Complete unattended database preparation before publishing readiness or
+    // admitting any producer, even when there is no foreground window.
+    if storage.check_startup_vacuum_needed()? {
+        state.update(
+            app,
+            InitializationProgress::phase(InitializationPhase::Compacting),
+        );
+        storage.run_startup_vacuum_if_needed()?;
+    }
+    state.update(
+        app,
+        InitializationProgress::phase(InitializationPhase::Finalizing),
+    );
     if crate::IS_QUITTING.load(std::sync::atomic::Ordering::Relaxed)
         || crate::IS_UPDATING.load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -142,7 +163,7 @@ fn run(app: &tauri::AppHandle, state: &StorageStartupState) -> Result<(), String
     // A later reopen (for example after failed backup recovery) still reports
     // startup progress, but must not duplicate loops or override a manual stop.
     if !state.services_started.swap(true, Ordering::AcqRel) {
-        start_storage_services(app, &storage, state.start_hidden);
+        start_storage_services(app, &storage);
     }
     tracing::info!(
         "[DB:STARTUP] Background storage startup completed in {:?}",
@@ -153,7 +174,7 @@ fn run(app: &tauri::AppHandle, state: &StorageStartupState) -> Result<(), String
 
 // All database-dependent startup work is admitted after migration and key
 // publication. This runs once even when a window closes or unlock joins startup.
-fn start_storage_services(app: &tauri::AppHandle, storage: &Arc<StorageState>, start_hidden: bool) {
+fn start_storage_services(app: &tauri::AppHandle, storage: &Arc<StorageState>) {
     crate::ai::recap::start_scheduler(app.clone());
     let office = app.state::<Arc<crate::office_runtime::OfficeRuntimeState>>();
     office.start(app.clone(), storage.clone());
@@ -251,19 +272,6 @@ fn start_storage_services(app: &tauri::AppHandle, storage: &Arc<StorageState>, s
             }
         }
     });
-    if start_hidden
-        && crate::registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true)
-        && !crate::onboarding::capture_held()
-    {
-        let capture_app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) =
-                crate::monitor::control(&capture_app, crate::monitor::MonitorAction::Start).await
-            {
-                tracing::error!("Failed to auto-start monitor: {error}");
-            }
-        });
-    }
 }
 
 /// Read-only bootstrap progress; available before authentication and after a
@@ -291,7 +299,7 @@ mod tests {
 
     #[test]
     fn concurrent_startup_claims_are_deduplicated_and_errors_allow_retry() {
-        let state = Arc::new(StorageStartupState::new(false));
+        let state = Arc::new(StorageStartupState::new());
         let workers = (0..8)
             .map(|_| {
                 let state = state.clone();

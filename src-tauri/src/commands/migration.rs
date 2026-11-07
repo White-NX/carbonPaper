@@ -24,16 +24,15 @@ use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
+mod hmac_startup;
+pub(crate) use hmac_startup::spawn_auto_hmac_migration;
+pub use hmac_startup::HmacMigrationRuntime;
+
 #[derive(serde::Serialize)]
 pub struct HmacMigrationStatus {
     pub needs_migration: bool,
-    pub is_running: bool,
-}
-
-#[derive(serde::Serialize)]
-pub struct StartupVacuumStatus {
-    pub needs_vacuum: bool,
-    pub in_progress: bool,
+    #[serde(flatten)]
+    progress: hmac_startup::HmacProgress,
 }
 
 /// Reports whether HMAC records need migration and whether a migration is running.
@@ -44,41 +43,16 @@ pub struct StartupVacuumStatus {
 #[tauri::command]
 pub async fn storage_check_hmac_migration_status(
     state: tauri::State<'_, Arc<StorageState>>,
+    runtime: tauri::State<'_, Arc<HmacMigrationRuntime>>,
 ) -> Result<HmacMigrationStatus, String> {
-    let needs_migration = state.check_hmac_migration_status()?;
-    let is_running = state.is_hmac_migration_in_progress();
+    let state = state.inner().clone();
+    let needs_migration = tokio::task::spawn_blocking(move || state.check_hmac_migration_status())
+        .await
+        .map_err(|error| error.to_string())??;
 
     Ok(HmacMigrationStatus {
         needs_migration,
-        is_running,
-    })
-}
-
-/// Reports whether startup database compaction is needed or already running.
-///
-/// Authentication: not required. Returns `{ "needs_vacuum": boolean,
-/// "in_progress": boolean }`. Frontend: `components/StartupVacuumDialog.jsx`.
-#[tauri::command]
-pub async fn storage_get_startup_vacuum_status(
-    state: tauri::State<'_, Arc<StorageState>>,
-) -> Result<StartupVacuumStatus, String> {
-    let in_progress = state.is_startup_vacuum_in_progress();
-    if in_progress {
-        // Avoid touching the DB mutex while VACUUM holds it.
-        return Ok(StartupVacuumStatus {
-            needs_vacuum: true,
-            in_progress,
-        });
-    }
-
-    let state = state.inner().clone();
-    let needs_vacuum = tokio::task::spawn_blocking(move || state.check_startup_vacuum_needed())
-        .await
-        .map_err(|error| format!("Startup VACUUM status task failed: {error}"))??;
-
-    Ok(StartupVacuumStatus {
-        needs_vacuum,
-        in_progress,
+        progress: runtime.snapshot(),
     })
 }
 
@@ -89,34 +63,6 @@ pub async fn storage_get_startup_vacuum_status(
 #[tauri::command]
 pub fn storage_is_startup_vacuum_in_progress(state: tauri::State<'_, Arc<StorageState>>) -> bool {
     state.is_startup_vacuum_in_progress()
-}
-
-/// Runs the one-time startup VACUUM when required.
-///
-/// Authentication: not required because it runs before the login flow and does not
-/// expose records. Returns `{ "ran", "already_done", "already_running" }` booleans.
-/// Frontend: `components/StartupVacuumDialog.jsx`.
-#[tauri::command]
-pub async fn storage_run_startup_vacuum_if_needed(
-    state: tauri::State<'_, Arc<StorageState>>,
-) -> Result<serde_json::Value, String> {
-    let state = state.inner().clone();
-
-    tokio::task::spawn_blocking(move || match state.run_startup_vacuum_if_needed() {
-        Ok(ran) => Ok(serde_json::json!({
-            "ran": ran,
-            "already_done": !ran,
-            "already_running": false
-        })),
-        Err(e) if e == "ALREADY_RUNNING" => Ok(serde_json::json!({
-            "ran": false,
-            "already_done": false,
-            "already_running": true
-        })),
-        Err(e) => Err(e),
-    })
-    .await
-    .map_err(|e| format!("VACUUM task panicked: {}", e))?
 }
 
 /// Runs an explicitly requested database VACUUM.
@@ -155,36 +101,9 @@ pub async fn storage_run_manual_vacuum(
 pub async fn storage_run_hmac_migration(
     app_handle: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<(), String> {
     super::check_auth_required(&credential_state)?;
-
-    let state = state.inner().clone();
-
-    if state.is_hmac_migration_in_progress() {
-        return Err("ALREADY_RUNNING".to_string());
-    }
-
-    tokio::task::spawn_blocking(move || {
-        let app_handle_clone = app_handle.clone();
-        let result = state.run_hmac_migration(move |phase, processed, total| {
-            let _ = app_handle_clone.emit(
-                "hmac-migration-progress",
-                serde_json::json!({
-                    "phase": phase,
-                    "processed": processed,
-                    "total": total
-                }),
-            );
-        });
-
-        if result.is_ok() {
-            let _ = app_handle.emit("hmac-migration-complete", ());
-        }
-        result
-    })
-    .await
-    .map_err(|e| format!("Migration task panicked: {}", e))?
+    hmac_startup::run_manual(app_handle).await
 }
 
 /// Lists screenshot files that still exist as plaintext paths.
@@ -284,6 +203,8 @@ pub async fn storage_migrate_data_dir(
         }
     }
 
+    crate::monitor::wake_automation(&app_handle);
+    spawn_auto_hmac_migration(app_handle);
     outcome?
 }
 
@@ -501,6 +422,8 @@ pub async fn storage_export_backup(
         }
     }
 
+    crate::monitor::wake_automation(&app_handle);
+    spawn_auto_hmac_migration(app_handle);
     result.and(init_result)
 }
 
@@ -683,5 +606,7 @@ pub async fn storage_import_backup(
         }
     }
 
+    crate::monitor::wake_automation(&app_handle);
+    spawn_auto_hmac_migration(app_handle);
     result.and(init_result)
 }

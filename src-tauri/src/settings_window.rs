@@ -1,39 +1,17 @@
 //! The settings window and its small, authenticated window boundary.
 //!
-//! Monitor actions are executed by the existing main UI lifecycle owner. This
-//! preserves manual-stop suppression without granting auxiliary windows access
-//! to the main-only runtime commands or an arbitrary command proxy.
+//! Monitor actions go directly to the Rust lifecycle owner through a finite
+//! action enum. They do not depend on a live main WebView.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
-use tokio::sync::oneshot;
 
 pub const LABEL: &str = "settings";
-type ActionResult = Result<(), String>;
-
-struct PendingAction {
-    action: MonitorAction,
-    claimed: bool,
-    sender: oneshot::Sender<ActionResult>,
-}
-
-fn claim_action(pending: &mut HashMap<u64, PendingAction>, id: u64) -> Option<MonitorAction> {
-    let request = pending.get_mut(&id)?;
-    if request.claimed {
-        return None;
-    }
-    request.claimed = true;
-    Some(request.action.clone())
-}
-
 #[derive(Default)]
 pub struct SettingsWindowState {
     opening: Mutex<()>,
-    sequence: AtomicU64,
-    pending: Mutex<HashMap<u64, PendingAction>>,
     busy: AtomicBool,
     auth_state: Mutex<Option<bool>>,
 }
@@ -158,7 +136,7 @@ pub async fn open_settings_window(
     Ok(())
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MonitorAction {
     Start,
@@ -166,83 +144,30 @@ pub enum MonitorAction {
     Pause,
     Resume,
     Restart,
-    MaintenanceStop,
-    MaintenanceStart,
+}
+
+impl MonitorAction {
+    fn into_runtime(self) -> crate::monitor::MonitorAction {
+        match self {
+            Self::Start => crate::monitor::MonitorAction::Start,
+            Self::Stop => crate::monitor::MonitorAction::Stop,
+            Self::Pause => crate::monitor::MonitorAction::Pause,
+            Self::Resume => crate::monitor::MonitorAction::Resume,
+            Self::Restart => crate::monitor::MonitorAction::Restart,
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn settings_monitor_action(
     app: tauri::AppHandle,
     window: tauri::Window,
-    state: tauri::State<'_, SettingsWindowState>,
     action: MonitorAction,
 ) -> Result<(), String> {
-    check_settings_window(&window)?;
-    if app.get_webview_window("main").is_none() {
-        return Err("SETTINGS_HOST_UNAVAILABLE".into());
-    }
-    let id = state.sequence.fetch_add(1, Ordering::Relaxed);
-    let (sender, receiver) = oneshot::channel();
-    {
-        let mut pending = state.pending.lock().map_err(|e| e.to_string())?;
-        if !pending.is_empty() {
-            return Err("MONITOR_ACTION_BUSY".into());
-        }
-        pending.insert(
-            id,
-            PendingAction {
-                action,
-                claimed: false,
-                sender,
-            },
-        );
-    }
-    if let Err(error) = app.emit_to(
-        "main",
-        "settings-monitor-request",
-        serde_json::json!({ "id": id }),
-    ) {
-        state
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
-        return Err(error.to_string());
-    }
-    let result = tokio::time::timeout(std::time::Duration::from_secs(120), receiver).await;
-    state
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&id);
-    result
-        .map_err(|_| "MONITOR_ACTION_TIMEOUT".to_string())?
-        .map_err(|_| "SETTINGS_HOST_UNAVAILABLE".to_string())?
-}
-
-#[tauri::command]
-pub fn take_settings_monitor_action(
-    window: tauri::Window,
-    state: tauri::State<'_, SettingsWindowState>,
-    id: u64,
-) -> Result<Option<MonitorAction>, String> {
-    crate::commands::check_main_window(&window)?;
-    let mut pending = state.pending.lock().map_err(|e| e.to_string())?;
-    Ok(claim_action(&mut pending, id))
-}
-
-#[tauri::command]
-pub fn complete_settings_monitor_action(
-    window: tauri::Window,
-    state: tauri::State<'_, SettingsWindowState>,
-    id: u64,
-    error: Option<String>,
-) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
-    if let Some(request) = state.pending.lock().map_err(|e| e.to_string())?.remove(&id) {
-        let _ = request.sender.send(error.map_or(Ok(()), Err));
-    }
-    Ok(())
+    check_settings_ui(&window)?;
+    crate::monitor::control(&app, action.into_runtime())
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -429,25 +354,6 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
 mod tests {
     use super::*;
     #[test]
-    fn events_cannot_invent_or_replay_monitor_requests() {
-        let mut pending = HashMap::new();
-        assert!(claim_action(&mut pending, 4).is_none());
-        let (sender, _receiver) = oneshot::channel();
-        pending.insert(
-            4,
-            PendingAction {
-                action: MonitorAction::Stop,
-                claimed: false,
-                sender,
-            },
-        );
-        assert!(matches!(
-            claim_action(&mut pending, 4),
-            Some(MonitorAction::Stop)
-        ));
-        assert!(claim_action(&mut pending, 4).is_none());
-    }
-    #[test]
     fn auxiliary_windows_cannot_use_the_settings_boundary() {
         assert!(is_settings_ui("main"));
         assert!(is_settings_ui("settings"));
@@ -474,8 +380,15 @@ mod tests {
         assert!(min_width <= width && min_height <= height);
     }
     #[test]
-    fn monitor_bridge_rejects_arbitrary_commands() {
-        assert!(serde_json::from_str::<MonitorAction>("\"stop\"").is_ok());
-        assert!(serde_json::from_str::<MonitorAction>("\"exit_app\"").is_err());
+    fn monitor_actions_reject_arbitrary_commands_and_map_restart_atomically() {
+        assert_eq!(
+            serde_json::from_str::<MonitorAction>("\"restart\"")
+                .unwrap()
+                .into_runtime(),
+            crate::monitor::MonitorAction::Restart
+        );
+        for action in ["exit_app", "storage_migrate_data_dir", "maintenance-start"] {
+            assert!(serde_json::from_str::<MonitorAction>(&format!("\"{action}\"")).is_err());
+        }
     }
 }
