@@ -16,6 +16,7 @@ import { RecapTabs } from './RecapTabs';
 import RecapRecords from './RecapRecords';
 import RecapRunStatus from './RecapRunStatus';
 import RecapApps from './RecapApps';
+import RecapMainlines from './RecapMainlines';
 import RecapKeyDetails from './RecapKeyDetails';
 
 function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
@@ -57,7 +58,7 @@ function Period({ batch, time, onTask, onDetails }) {
   const topics = batch.summary?.topics?.length ? batch.summary.topics : [...new Map(batch.activities.map((activity) => [activity.task_id, activity])).values()].map((activity) => ({ task_id: activity.task_id, title: activity.task_title, text: activity.text }));
   const problem = batch.error || batch.summary_error;
   return <article className="recap-period">
-    <div className="recap-period-time"><span className="recap-time-dot" /><h2 className="text-xs font-medium tabular-nums text-ide-muted">{time(batch.start_ms)}–{time(batch.end_ms)}</h2></div>
+    <div className="recap-period-time"><span className="recap-time-dot" /><h3 className="text-xs font-medium tabular-nums text-ide-muted">{time(batch.start_ms)}–{time(batch.end_ms)}</h3></div>
     <div className="min-w-0 pb-9">
       {batch.summary?.overview && <p className={`${batch.apps?.length ? 'mb-2' : 'mb-5'} whitespace-pre-wrap text-sm leading-7`}>{batch.summary.overview}</p>}
       <RecapApps apps={batch.apps} />
@@ -126,8 +127,8 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
   const showTabs = Boolean(settings?.enabled || hasContent || days.length);
   const running = operation === 'generate' || liveRunning || Boolean(day?.running);
   const issue = error || loadError || day?.error;
-  const consentNeeded = String(issue).includes('AI_REMOTE_CONSENT_REQUIRED') || batches.some((batch) => [batch.error, batch.summary_error].some((value) => value?.includes('AI_REMOTE_CONSENT_REQUIRED')));
-  const latest = Math.max(0, ...batches.map((batch) => batch.updated_at_ms || 0));
+  const consentNeeded = [issue, day?.mainlines_error].some(value => String(value).includes('AI_REMOTE_CONSENT_REQUIRED')) || batches.some((batch) => [batch.error, batch.summary_error].some((value) => value?.includes('AI_REMOTE_CONSENT_REQUIRED')));
+  const latest = Math.max(day?.mainlines_updated_at_ms || 0, ...batches.map((batch) => batch.updated_at_ms || 0));
   const back = useCallback(() => {
     focusTask.current = { task, entry: originEntry.current };
     targetScroll.current = null; setHighlightedActivity(null); setNavigationUnavailable(false); setTask(null);
@@ -301,7 +302,11 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
           </article>)}
         </div> : !settings?.enabled || !hasContent || !day ? <Landing enabled={settings?.enabled} hasClosedPeriod={batches.length > 0} loading={(!settings || !day) && !loadError}
           error={loadError} running={running} onConfigure={configure} onGenerate={() => generate()} onRetry={refresh} />
-          : <div className="recap-timeline">{batches.filter((batch) => batch.activities.length || batch.summary || batch.error || batch.summary_error || (batch.record_count ?? batch.records?.length) > 0).map((batch) => <Period key={batch.start_ms} batch={batch} time={time} onTask={enterTask} onDetails={() => setDiagnostics(true)} />)}</div>}
+          : <>
+            <RecapMainlines mainlines={day.mainlines} error={day.mainlines_error} threads={day.threads} batches={batches} time={time} onTask={enterTask} onSources={setSources} onDetails={() => setDiagnostics(true)} />
+            <h2 className="mb-6 text-sm font-semibold">{t('recap.periodRecaps')}</h2>
+            <div className="recap-timeline">{batches.filter((batch) => batch.activities.length || batch.summary || batch.error || batch.summary_error || (batch.record_count ?? batch.records?.length) > 0).map((batch) => <Period key={batch.start_ms} batch={batch} time={time} onTask={enterTask} onDetails={() => setDiagnostics(true)} />)}</div>
+          </>}
       </div>
     </div>}
     {editing && <CorrectionDialog key={`${editing.kind}:${editing.id || editing.task_id}`} date={date} editing={editing} threads={day?.threads || []} onClose={() => setEditing(null)} onSaved={(correction) => correctionSaved(correction, editing.epoch)} />}

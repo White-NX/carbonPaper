@@ -83,7 +83,7 @@
     "summaryPending": "时段概述待补全，可先查看具体经过。",
     "summaryUnavailable": "时段概述暂时无法更新，具体经过仍可查看。",
     "errorDetails": "查看错误详情",
-    "remoteConsent": "生成回顾和语义筛查会把选取的屏幕文字发送到你配置的模型服务。",
+    "remoteConsent": "回顾、主线整理和语义筛选会将选中的屏幕文字发送给你配置的模型服务。",
     "allowRemote": "允许发送并继续",
     "progress": {
       "title": "生成过程",
@@ -102,7 +102,10 @@
       "attempts": {
         "initial": "整理活动",
         "repair": "补全与修复",
-        "summary": "归纳概述"
+        "summary": "归纳概述",
+        "evidence": "补充活动依据",
+        "mainlines": "整合全天主线",
+        "mainline_evidence": "查证任务关联"
       },
       "stages": {
         "preparing": "准备回顾",
@@ -119,7 +122,14 @@
         "partial": "部分内容待补全",
         "failed": "生成失败",
         "cancelled": "已停止",
-        "paused": "等待全屏应用退出后继续"
+        "paused": "等待全屏应用退出后继续",
+        "integrating": "整合全天主线"
+      },
+      "tools": {
+        "search_day_evidence": "搜索当天记录",
+        "read_day_evidence": "读取记录文字",
+        "get_day_evidence_neighbors": "查看相邻记录",
+        "read_task_activities": "查看任务经过"
       }
     },
     "diagnostics": {
@@ -157,7 +167,9 @@
         "updating": "正在更新结果",
         "interrupted": "请求已中断",
         "noHistory": "暂无生成记录"
-      }
+      },
+      "evidenceCalls": "按需取证",
+      "evidenceResults": "{{records}} 条记录 · {{activities}} 条活动"
     },
     "correction": {
       "action": "纠正方式",
@@ -175,7 +187,7 @@
       "missingProvider": "原模型服务已移除",
       "manageModels": "管理模型服务",
       "title": "每日回顾设置",
-      "description": "概括一天的活动和进展，随时回看具体经过。",
+      "description": "整理每个已结束时段的活动，并串联当天相关的任务。",
       "enabled": "启用每日回顾",
       "provider": "回顾模型",
       "defaultProvider": "使用默认 AI 模型",
@@ -184,9 +196,9 @@
       "request_output_tokens": "单次请求输出上限（含思考，token）",
       "answer_tokens": "回顾正文目标篇幅（token）",
       "dailyTotal": "每日生成总额度：{{total}} token（输入与输出合计）",
-      "budgetHint": "请求输出上限包含模型思考和回顾正文；正文目标篇幅用于控制回顾长度。活动整理与时段归纳分别受每批额度限制，并共用每日额度；实际请求上限还受模型上下文限制。",
-      "batch_input_tokens": "每批输入上限（token）",
-      "batch_output_tokens": "每批输出上限（token）",
+      "budgetHint": "每次请求的输出上限包括思考和回顾正文，正文目标控制回顾长度。活动整理、按需取证、时段摘要和全天主线均受单次整理预算限制，并共用每日额度。模型上下文也会限制每次请求。",
+      "batch_input_tokens": "单次整理输入上限（token）",
+      "batch_output_tokens": "单次整理输出上限（含思考，token）",
       "daily_input_tokens": "每日生成输入上限（token）",
       "daily_output_tokens": "每日生成输出上限（token）",
       "screening_input_tokens": "每日筛查输入上限（token）",
@@ -249,7 +261,12 @@
       "RECAP_INVALID_DETAIL": "部分关键细节缺少有效来源，请重试生成。",
       "RECAP_INVALID_SEARCH": "请输入搜索内容，并检查搜索选项。",
       "RECAP_SEARCH_NOT_READY": "语义搜索仍在准备中，可继续按关键词查找。",
-      "RECAP_SEARCH_MODEL_UNAVAILABLE": "暂时无法按含义查找，请稍后重试。关键词搜索仍可使用。"
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "暂时无法按含义查找，请稍后重试。关键词搜索仍可使用。",
+      "RECAP_INVALID_MAINLINES": "模型返回的任务关联无法使用。请重试或查看分时段回顾。",
+      "RECAP_EVIDENCE_LIMIT": "已达到取证次数或内容上限，将根据已有信息继续整理。",
+      "RECAP_INVALID_TOOL_ARGUMENTS": "模型的取证请求格式有误，将根据已有信息继续整理。",
+      "RECAP_UNKNOWN_TOOL": "模型请求了无法使用的取证工具，将根据已有信息继续整理。",
+      "RECAP_EVIDENCE_UNAVAILABLE": "这条记录暂时无法读取，将根据已有信息继续整理。"
     },
     "keyDetails": "关键细节",
     "detailSources": "{{count}} 条来源",
@@ -257,6 +274,15 @@
       "sources": "{{count}} 条来源",
       "activity": "活动详情",
       "openDay": "查看当天回顾"
+    },
+    "periodRecaps": "分时段回顾",
+    "mainlines": {
+      "title": "全天主线",
+      "count": "{{count}} 条主线",
+      "pending": "全天主线待更新，可继续查看分时段回顾。",
+      "unavailable": "全天主线暂时无法更新，可继续查看分时段回顾。",
+      "sources": "查看关联记录",
+      "taskCount": "{{count}} 个子任务"
     }
   },
   "appBound": {

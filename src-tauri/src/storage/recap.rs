@@ -61,6 +61,19 @@ impl StorageState {
              INSERT OR IGNORE INTO recap_summary_jobs(day,version)
                 SELECT DISTINCT day,1 FROM recap_payloads WHERE kind='corrections';"
         ).map_err(|e| e.to_string())?;
+        // Batch checkpoints also queue relationship updates after interruption,
+        // without advancing the correction version used by protected runs.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS recap_batch_insert AFTER INSERT ON recap_payloads
+                WHEN NEW.kind='batch' BEGIN
+                INSERT INTO recap_summary_jobs(day,version,completed_version) VALUES(NEW.day,0,-1)
+                ON CONFLICT(day) DO UPDATE SET completed_version=-1; END;
+             CREATE TRIGGER IF NOT EXISTS recap_batch_update AFTER UPDATE ON recap_payloads
+                WHEN NEW.kind='batch' BEGIN
+                INSERT INTO recap_summary_jobs(day,version,completed_version) VALUES(NEW.day,0,-1)
+                ON CONFLICT(day) DO UPDATE SET completed_version=-1; END;",
+        )
+        .map_err(|e| e.to_string())?;
         // Real evidence edits invalidate the day: later batches may depend on
         // earlier task identities. Derived metadata and no-op writes must not
         // evict expensive recaps. Recreate legacy triggers so upgrades apply.
@@ -91,7 +104,7 @@ impl StorageState {
                 }).collect::<Vec<_>>().join(" OR ");
                 let purge = if event=="DELETE" || (table=="screenshots" && event=="UPDATE") {
                     let guard = if event=="UPDATE" {"AND OLD.is_deleted=0 AND NEW.is_deleted<>0"}else{""};
-                    format!("DELETE FROM recap_payloads WHERE kind IN ('batch','index','screen','summary','search') AND day IN (SELECT day FROM recap_days WHERE {conditions}) {guard};")
+                    format!("DELETE FROM recap_payloads WHERE kind IN ('batch','index','screen','summary','mainlines','search') AND day IN (SELECT day FROM recap_days WHERE {conditions}) {guard};")
                 }else{String::new()};
                 let when = if event == "UPDATE" { format!("WHEN {}", changes.join(" OR ")) } else { String::new() };
                 triggers.push_str(&format!(
@@ -697,6 +710,22 @@ impl StorageState {
         settings: &RecapSettings,
         generation: u64,
     ) -> Result<i64, String> {
+        self.recap_reserve_with_limit(day, role, run, input, output, settings, generation, 2)
+    }
+
+    /// Evidence agents share the same cumulative token and daily limits. A
+    /// larger request count never gives each step a fresh token allowance.
+    pub(crate) fn recap_reserve_with_limit(
+        &self,
+        day: &str,
+        role: &str,
+        run: &str,
+        input: u64,
+        output: u64,
+        settings: &RecapSettings,
+        generation: u64,
+        request_limit: u64,
+    ) -> Result<i64, String> {
         let mut guard = self.get_connection_named("recap_reserve")?;
         if generation != self.db_generation() {
             return Err("RECAP_SOURCE_CHANGED".into());
@@ -722,7 +751,7 @@ impl StorageState {
             if daily.0.saturating_add(input) > settings.screening_input_tokens {
                 return Err("RECAP_BUDGET_EXHAUSTED".into());
             }
-        } else if batch.2 >= 2
+        } else if batch.2 >= request_limit.min(16)
             || batch.0.saturating_add(input) > settings.batch_input_tokens
             || batch.1.saturating_add(output) > settings.batch_output_tokens
             || daily.0.saturating_add(input) > settings.daily_input_tokens
@@ -1067,6 +1096,7 @@ mod tests {
             for kind in [
                 "batch",
                 "summary",
+                "mainlines",
                 "index",
                 "screen",
                 "corrections",
@@ -1083,7 +1113,6 @@ mod tests {
             tx.commit().unwrap();
             for (table, expected) in [
                 ("recap_payloads", 2),
-                ("recap_summary_jobs", 0),
                 ("recap_usage", 1),
                 ("screenshots", 1),
             ] {
@@ -1092,6 +1121,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(count, expected, "{table}");
             }
+            let queued = conn
+                .prepare("SELECT day FROM recap_summary_jobs ORDER BY day")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                queued,
+                vec!["2026-01-02"],
+                "deleting one day preserves other days' pending relationships"
+            );
         }
         assert!(s.recap_is_deleted("2026-01-01").unwrap());
         assert!(!s
@@ -1234,6 +1275,8 @@ mod tests {
         conn.execute_batch(
             "DROP TRIGGER recap_correction_insert;
              DROP TRIGGER recap_correction_update;
+             DROP TRIGGER recap_batch_insert;
+             DROP TRIGGER recap_batch_update;
              DROP TABLE recap_summary_jobs;
              INSERT INTO recap_payloads VALUES('corrections','old','old',-1,x'00',x'00');",
         )
@@ -1319,6 +1362,116 @@ mod tests {
         assert_eq!(s.recap_usage("day").unwrap().screening_input_tokens, 3000);
         assert_eq!(s.recap_usage("day").unwrap().input_tokens, 3000);
     }
+    #[test]
+    fn evidence_agents_share_a_cumulative_budget_and_a_hard_request_cap() {
+        let (_temp, s) = storage();
+        let settings = RecapSettings::default();
+        let generation = s.db_generation();
+        for _ in 0..16 {
+            s.recap_reserve_with_limit(
+                "day",
+                "generation",
+                "agent-run",
+                100,
+                100,
+                &settings,
+                generation,
+                u64::MAX,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            s.recap_reserve_with_limit(
+                "day",
+                "generation",
+                "agent-run",
+                1,
+                1,
+                &settings,
+                generation,
+                u64::MAX
+            )
+            .unwrap_err(),
+            "RECAP_BUDGET_EXHAUSTED"
+        );
+        let usage = s.recap_usage("day").unwrap();
+        assert_eq!(
+            (usage.requests, usage.input_tokens, usage.output_tokens),
+            (16, 1600, 1600)
+        );
+        let limited = RecapSettings {
+            batch_input_tokens: 1000,
+            ..settings
+        };
+        s.recap_reserve_with_limit(
+            "day",
+            "generation",
+            "bounded-run",
+            900,
+            1,
+            &limited,
+            generation,
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            s.recap_reserve_with_limit(
+                "day",
+                "generation",
+                "bounded-run",
+                101,
+                1,
+                &limited,
+                generation,
+                16
+            )
+            .unwrap_err(),
+            "RECAP_BUDGET_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn batch_checkpoints_queue_derived_work_without_changing_correction_versions() {
+        let (_temp, s) = storage();
+        let guard = s.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "INSERT INTO recap_payloads VALUES('batch','batch','day',0,x'00',x'00')",
+            [],
+        )
+        .unwrap();
+        let job = || {
+            conn.query_row(
+                "SELECT version,completed_version FROM recap_summary_jobs WHERE day='day'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(job(), (0, -1));
+        conn.execute(
+            "INSERT INTO recap_payloads VALUES('corrections','day','day',-1,x'00',x'00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(job(), (1, -1));
+        conn.execute(
+            "UPDATE recap_summary_jobs SET completed_version=version WHERE day='day'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE recap_payloads SET data=x'01' WHERE kind='batch'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            job(),
+            (1, -1),
+            "only user corrections advance the run fence"
+        );
+    }
+
     #[test]
     fn future_captures_do_not_invalidate_closed_periods_but_source_edits_do() {
         let (_temp, s) = storage();

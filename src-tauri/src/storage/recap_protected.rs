@@ -75,7 +75,9 @@ impl StorageState {
         value: &T,
     ) -> Result<(), String> {
         authorization.check(self)?;
-        if day != authorization.date || !matches!(kind, "batch" | "index" | "screen" | "summary") {
+        if day != authorization.date
+            || !matches!(kind, "batch" | "index" | "screen" | "summary" | "mainlines")
+        {
             return Err("AUTH_REQUIRED".into());
         }
         self.recap_commit_payload_checked(kind, key, day, revision, generation, value, |conn| {

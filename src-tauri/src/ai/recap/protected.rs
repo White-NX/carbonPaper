@@ -486,20 +486,6 @@ pub(crate) fn prepare_with_filter(
     }))
 }
 
-pub(super) fn dates(storage: &StorageState) -> Result<Vec<String>, String> {
-    let mut dates = HashSet::new();
-    if storage.processing_stage.supports(Consumer::Recap) {
-        for slot in storage.processing_stage.recap_slots("day:")? {
-            if let Some(date) = slot.split(':').nth(1) {
-                dates.insert(date.to_owned());
-            }
-        }
-    }
-    let mut dates = dates.into_iter().collect::<Vec<_>>();
-    dates.sort();
-    Ok(dates)
-}
-
 /// Seed already generated periods/corrections on an authorized unlock, so later
 /// protected periods reuse exactly the user's existing task identities.
 pub(crate) fn sync_after_unlock(app: &AppHandle) -> Result<(), String> {
@@ -516,10 +502,7 @@ pub(crate) fn sync_after_unlock(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
     let today = chrono::Local::now().date_naive();
-    for date in [
-        today.pred_opt().unwrap_or(today).to_string(),
-        today.to_string(),
-    ] {
+    for date in runner::automatic_dates(today) {
         sync_day(app, &date)?;
     }
     Ok(())
@@ -581,6 +564,22 @@ pub(crate) fn sync_day(app: &AppHandle, date: &str) -> Result<(), String> {
                 &storage, date, "summary", &key, revision, &privacy, &sources, &summary,
             )?;
         }
+    }
+    if let Some(mainlines) = storage.recap_read_background::<super::mainlines::CachedMainlines>(
+        "mainlines",
+        date,
+        Some(revision),
+    )? {
+        mirror(
+            &storage,
+            date,
+            "mainlines",
+            date,
+            revision,
+            &privacy,
+            &sources,
+            &mainlines,
+        )?;
     }
     let corrections = storage
         .recap_read_background::<CorrectionHistory>("corrections", date, None)?

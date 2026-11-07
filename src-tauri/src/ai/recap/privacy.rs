@@ -3,6 +3,21 @@ use crate::sensitive_filter::SensitiveFilterConfig;
 
 use super::types::digest;
 
+/// Generated text and user-edited labels pass through the current filter again
+/// before a later model request, including searchable key details.
+pub(super) fn filter_activity(
+    filter: &crate::sensitive_filter::SensitiveFilterState,
+    activity: &mut super::types::RecapActivity,
+) {
+    for text in [&mut activity.task_title, &mut activity.text]
+        .into_iter()
+        .chain(activity.details.iter_mut().map(|d| &mut d.text))
+    {
+        *text = crate::mcp_server::filter_identity(filter, filter.mode(), text)
+            .unwrap_or_else(|_| "[censored]".into());
+    }
+}
+
 pub(crate) struct PrivacyFingerprint {
     hash: String,
 }

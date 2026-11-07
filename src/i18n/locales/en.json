@@ -83,7 +83,7 @@
     "summaryPending": "The period summary is pending. Activity details are available below.",
     "summaryUnavailable": "The period summary could not be updated. Activity details are still available.",
     "errorDetails": "View error details",
-    "remoteConsent": "Recaps and semantic screening send selected screen text to the model services you configure.",
+    "remoteConsent": "Recaps, task connections and semantic screening send selected screen text to the model services you configure.",
     "allowRemote": "Allow and continue",
     "progress": {
       "title": "Generation activity",
@@ -102,7 +102,10 @@
       "attempts": {
         "initial": "Organize activities",
         "repair": "Complete and repair",
-        "summary": "Summarize period"
+        "summary": "Summarize period",
+        "evidence": "Verify activity evidence",
+        "mainlines": "Connect daily tasks",
+        "mainline_evidence": "Verify task connections"
       },
       "stages": {
         "preparing": "Preparing recap",
@@ -119,7 +122,14 @@
         "partial": "Some content remains incomplete",
         "failed": "Generation failed",
         "cancelled": "Stopped",
-        "paused": "Waiting for fullscreen app to close"
+        "paused": "Waiting for fullscreen app to close",
+        "integrating": "Connecting daily tasks"
+      },
+      "tools": {
+        "search_day_evidence": "Search this day’s records",
+        "read_day_evidence": "Read record text",
+        "get_day_evidence_neighbors": "Read nearby records",
+        "read_task_activities": "Read task activities"
       }
     },
     "diagnostics": {
@@ -157,7 +167,9 @@
         "updating": "Updating result",
         "interrupted": "Request interrupted",
         "noHistory": "No generation history yet"
-      }
+      },
+      "evidenceCalls": "On-demand evidence",
+      "evidenceResults": "{{records}} records · {{activities}} activities"
     },
     "correction": {
       "action": "Correction",
@@ -175,7 +187,7 @@
       "missingProvider": "Previous model service removed",
       "manageModels": "Manage model services",
       "title": "Daily recap settings",
-      "description": "Summarize activities and task progress in each four-hour period. Automatic processing waits until the app is unlocked and the computer is idle.",
+      "description": "Organize completed periods and connect related tasks across the day.",
       "enabled": "Enable daily recaps",
       "provider": "Recap model",
       "defaultProvider": "Use the default AI model",
@@ -184,9 +196,9 @@
       "request_output_tokens": "Output limit per request (including thinking, tokens)",
       "answer_tokens": "Target recap text length (tokens)",
       "dailyTotal": "Daily generation budget: {{total}} tokens (input and output combined)",
-      "budgetHint": "The request output limit covers thinking and recap text. The text target controls recap length. Extraction and period summaries each use a bounded budget and share the daily allowance. The model context also limits each request.",
-      "batch_input_tokens": "Input limit per batch (tokens)",
-      "batch_output_tokens": "Output limit per batch (tokens)",
+      "budgetHint": "The request output limit covers thinking and recap text. The text target controls recap length. Activity extraction, evidence lookups, period summaries and daily task connections use bounded run budgets and share the daily allowance. The model context also limits each request.",
+      "batch_input_tokens": "Input limit per run (tokens)",
+      "batch_output_tokens": "Output limit per run (including thinking, tokens)",
       "daily_input_tokens": "Daily generation input limit (tokens)",
       "daily_output_tokens": "Daily generation output limit (tokens)",
       "screening_input_tokens": "Daily screening input limit (tokens)",
@@ -249,7 +261,12 @@
       "RECAP_INVALID_DETAIL": "Some key details have invalid sources. Try generating the recap again.",
       "RECAP_INVALID_SEARCH": "Enter a query and check the search options.",
       "RECAP_SEARCH_NOT_READY": "Semantic search is still being prepared. Keyword search is available.",
-      "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search."
+      "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search.",
+      "RECAP_INVALID_MAINLINES": "The model returned task connections that could not be used. Try again or view the period recaps.",
+      "RECAP_EVIDENCE_LIMIT": "The evidence lookup limit was reached. Organization will continue with available information.",
+      "RECAP_INVALID_TOOL_ARGUMENTS": "The model’s evidence request could not be used. Organization will continue with available information.",
+      "RECAP_UNKNOWN_TOOL": "The model requested an unavailable evidence tool. Organization will continue with available information.",
+      "RECAP_EVIDENCE_UNAVAILABLE": "This record is unavailable. Organization will continue with available information."
     },
     "keyDetails": "Key details",
     "detailSources": "{{count}} sources",
@@ -257,6 +274,15 @@
       "sources": "{{count}} sources",
       "activity": "Activity details",
       "openDay": "Open daily recap"
+    },
+    "periodRecaps": "Period recaps",
+    "mainlines": {
+      "title": "Main tasks of the day",
+      "count": "Main tasks · {{count}}",
+      "pending": "Main tasks are awaiting an update. Period recaps remain available.",
+      "unavailable": "Main tasks could not be updated. Period recaps remain available.",
+      "sources": "View connection sources",
+      "taskCount": "Subtasks · {{count}}"
     }
   },
   "appBound": {
