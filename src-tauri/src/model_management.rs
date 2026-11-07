@@ -508,6 +508,7 @@ pub async fn download_model(
     // network or authentication and should not break a partially restored setup.
     if model_files_complete(&download_path, spec.files) {
         prepare_search_model(&model_id, &download_path).await?;
+        crate::monitor::wake_automation(&app);
         return Ok(download_path.to_string_lossy().to_string());
     }
 
@@ -547,6 +548,7 @@ pub async fn download_model(
     {
         Ok(path) => {
             prepare_search_model(&model_id, &path).await?;
+            crate::monitor::wake_automation(&app);
             Ok(path.to_string_lossy().to_string())
         }
         Err(e) => Err(format!("download_model error: {}", e)),

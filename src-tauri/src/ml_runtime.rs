@@ -1032,6 +1032,7 @@ pub async fn download_rust_ocr_model(
     if let Ok(status) = inspect_model_status(&app) {
         if status.installed {
             cache_model_status(status.clone());
+            crate::monitor::wake_automation(&app);
             return Ok(status);
         }
     }
@@ -1177,6 +1178,7 @@ pub async fn download_rust_ocr_model(
     cache_model_status(status.clone());
     state.stop();
     MODEL_REPAIR_NOTIFICATION_SHOWN.store(false, Ordering::SeqCst);
+    crate::monitor::wake_automation(&app);
     Ok(status)
 }
 

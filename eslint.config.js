@@ -3,7 +3,7 @@ import react from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
-const frontendFiles = ['src/**/*.{js,jsx}', 'browser-extension/**/*.{js,jsx}'];
+const frontendFiles = ['src/**/*.{js,jsx}', 'public/startup.js', 'browser-extension/**/*.{js,jsx}'];
 const frontendTests = ['src/**/*.test.{js,jsx}', 'src/tests/**'];
 const translationRestrictions = [{
   selector: 'CallExpression:matches([callee.name="t"], [callee.property.name="t"])[arguments.1.type="Literal"][arguments.1.value=type(string)]',

@@ -117,13 +117,18 @@ pub fn get_onboarding_state() -> Result<OnboardingState, String> {
 ///
 /// Authentication: not required. Main window only. Returns JSON `null`.
 #[tauri::command]
-pub fn complete_onboarding(window: tauri::Window, version: u32) -> Result<(), String> {
+pub fn complete_onboarding(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    version: u32,
+) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
     let version = version.min(ONBOARDING_VERSION);
     let previous = registry_config::get_u32(VERSION_KEY).unwrap_or(0);
     if version > previous {
         registry_config::set_u32(VERSION_KEY, version)?;
     }
+    crate::monitor::wake_automation(&app);
     Ok(())
 }
 

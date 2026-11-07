@@ -38,6 +38,7 @@ mod index_progress;
 mod legacy_python_cleanup;
 mod legacy_vector_discard;
 mod logging;
+mod main_window;
 mod maintenance;
 mod maintenance_support;
 pub mod mcp_contract;
@@ -476,10 +477,8 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
         credential_state.set_foreground_state(true);
     }
 
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+    if app.get_webview_window("main").is_some() {
+        let _ = main_window::request_show(app);
         if show_ocr_model_repair {
             let _ = app.emit("show-ocr-model-repair", ());
         }
@@ -694,14 +693,18 @@ pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::err
 
     tracing::info!("Creating main window");
 
-    let window =
-        WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-            .title("carbonpaper")
-            .inner_size(1300.0, 750.0)
-            .decorations(false)
-            .transparent(true)
-            .visible(true)
-            .build()?;
+    let generation = app
+        .state::<main_window::MainWindowPresentationState>()
+        .begin_creation();
+    let url = format!("index.html?startup={generation}");
+
+    let window = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+        .title("carbonpaper")
+        .inner_size(1300.0, 750.0)
+        .decorations(false)
+        .transparent(true)
+        .visible(false)
+        .build()?;
 
     // 应用 Acrylic 效果
     let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
@@ -773,7 +776,7 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
 }
 
 pub(crate) fn hide_main_window_to_tray(window: &tauri::Window) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())?;
+    main_window::hide(window)?;
     let app = window.app_handle();
     settings_window::refresh_ui_foreground(app);
     let _ = app.emit("app-hidden", ());
@@ -861,7 +864,9 @@ pub fn run() {
         .manage(Arc::new(SensitiveFilterState::default()))
         .manage(credential_state)
         .manage(storage_state)
-        .manage(Arc::new(storage_startup::StorageStartupState::new(start_hidden)))
+        .manage(Arc::new(storage_startup::StorageStartupState::new()))
+        .manage(Arc::new(commands::migration::HmacMigrationRuntime::default()))
+        .manage(main_window::MainWindowPresentationState::new(!start_hidden))
         .manage(lightweight_state.clone())
         .manage(Arc::new(PowerState::new()))
         .manage(Arc::new(IdleState::new()))
@@ -872,6 +877,12 @@ pub fn run() {
         .manage(Arc::new(rerank::RerankQueryState::default()))
         .on_window_event(|window, event| {
             settings_window::on_window_event(window, event);
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .app_handle()
+                    .state::<main_window::MainWindowPresentationState>()
+                    .destroyed();
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     if error_window::HAS_CRITICAL_ERROR.load(Ordering::Relaxed) {
@@ -886,6 +897,7 @@ pub fn run() {
                 }
             }
         })
+        .on_page_load(main_window::on_page_load)
         .setup({
             let data_dir = data_dir.clone();
             let start_hidden = start_hidden;
@@ -915,19 +927,10 @@ pub fn run() {
                     }
                 }
 
-                // 只有非隐藏启动时才应用 acrylic 效果
+                // Background launches have no main window in the context.
                 if !start_hidden {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
-                    }
-                } else {
-                    // 隐藏启动：销毁窗口以实现真正的轻量模式，释放 WebView 内存
-                    if let Some(window) = app.get_webview_window("main") {
-                        if let Err(e) = window.destroy() {
-                            tracing::warn!("Failed to destroy window on hidden start: {}", e);
-                        } else {
-                            tracing::info!("Main window destroyed for lightweight mode");
-                        }
                     }
                 }
 
@@ -952,6 +955,7 @@ pub fn run() {
                 // Start power monitor (power saving mode)
                 power::start_power_monitor(app.handle().clone());
                 idle::start_idle_monitor(app.handle().clone());
+                monitor::start_automation(app.handle().clone());
 
                 match native_messaging::sync_installed_extension() {
                     Ok(true) => tracing::info!("Browser extension synced to latest version"),
@@ -1039,9 +1043,7 @@ pub fn run() {
             commands::storage::storage_batch_get_categories,
             storage_startup::storage_get_initialization_status,
             storage_startup::storage_retry_initialization,
-            commands::migration::storage_get_startup_vacuum_status,
             commands::migration::storage_is_startup_vacuum_in_progress,
-            commands::migration::storage_run_startup_vacuum_if_needed,
             commands::migration::storage_run_manual_vacuum,
             commands::migration::storage_check_hmac_migration_status,
             commands::migration::storage_run_hmac_migration,
@@ -1088,8 +1090,6 @@ pub fn run() {
             settings_window::close_settings_window,
             settings_window::settings_set_busy,
             settings_window::settings_monitor_action,
-            settings_window::take_settings_monitor_action,
-            settings_window::complete_settings_monitor_action,
             settings_window::settings_preferences_changed,
             settings_window::settings_debug_preview,
             commands::utility::set_advanced_config,
@@ -1161,6 +1161,7 @@ pub fn run() {
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
             commands::utility::hide_to_tray,
+            main_window::main_window_ready,
             // 轻量模式命令
             commands::utility::switch_to_lightweight_mode,
             commands::utility::switch_to_standard_mode,
@@ -1182,8 +1183,10 @@ pub fn run() {
         }));
     }
 
+    let mut context = tauri::generate_context!();
+    apply_startup_window_policy(&mut context.config_mut().app.windows, start_hidden);
     builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             // 阻止应用在所有窗口关闭时退出
@@ -1207,9 +1210,40 @@ pub fn run() {
         });
 }
 
+fn apply_startup_window_policy(
+    windows: &mut Vec<tauri::utils::config::WindowConfig>,
+    start_hidden: bool,
+) {
+    // Tauri creates configured windows before setup. Removing the main window
+    // here prevents both a visible flash and unnecessary WebView startup.
+    if start_hidden {
+        windows.retain(|window| window.label != "main");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_cold_start_never_creates_the_configured_main_window() {
+        let config: tauri::utils::config::Config =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let mut foreground = config.app.windows.clone();
+        apply_startup_window_policy(&mut foreground, false);
+        assert!(foreground.iter().any(|window| window.label == "main"));
+        assert!(
+            !foreground
+                .iter()
+                .find(|window| window.label == "main")
+                .unwrap()
+                .visible
+        );
+
+        let mut background = config.app.windows;
+        apply_startup_window_policy(&mut background, true);
+        assert!(background.is_empty());
+    }
 
     #[test]
     fn only_left_button_release_opens_window_from_tray() {

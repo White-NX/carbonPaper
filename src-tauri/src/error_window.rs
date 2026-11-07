@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
 /// Global flag indicating a critical error has occurred.
 /// When true, closing the main window will exit the process instead of hiding.
@@ -130,10 +130,7 @@ pub fn show_error_window(app: &tauri::AppHandle, message: &str) {
     let _ = app.emit("critical-error", &error);
 
     // Ensure main window is visible and focused
-    if let Some(main_win) = app.get_webview_window("main") {
-        let _ = main_win.show();
-        let _ = main_win.set_focus();
-    }
+    let _ = crate::main_window::request_show(app);
 }
 
 #[cfg(test)]

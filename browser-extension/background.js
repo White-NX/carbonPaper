@@ -11,6 +11,9 @@ const {
 
 const NM_HOST_NAME = 'com.carbonpaper.nmh';
 const MAX_RETRY = 30;
+const MAX_FAVICON_BYTES = 256 * 1024;
+const FAVICON_FETCH_TIMEOUT_MS = 5000;
+const MAX_FAVICON_DATA_URL_CHARS = 128 + 4 * Math.ceil(MAX_FAVICON_BYTES / 3);
 
 let nmPort = null;
 // Conservative default: do not connect until persisted state is loaded.
@@ -187,13 +190,8 @@ async function captureCurrentTab(retry = 0) {
     }
 
     // Convert favicon URL to base64 data URI (same format as local process icons)
-    let faviconBase64 = null;
     const faviconUrl = pageData.favicon || tab.favIconUrl;
-    if (faviconUrl && !faviconUrl.startsWith('data:')) {
-      faviconBase64 = await fetchAsBase64(faviconUrl);
-    } else if (faviconUrl && faviconUrl.startsWith('data:')) {
-      faviconBase64 = faviconUrl;
-    }
+    const faviconBase64 = await fetchAsBase64(faviconUrl);
 
     const payloadTemplate = (imageData) => ({
       type: 'save_screenshot',
@@ -257,21 +255,50 @@ async function computeHash(data) {
  * Used to convert favicon URLs to the same format as local process icons.
  */
 async function fetchAsBase64(url) {
+  if (typeof url !== 'string' || !url || url.length > MAX_FAVICON_DATA_URL_CHARS) {
+    return null;
+  }
+  if (url.startsWith('data:')) {
+    return url;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FAVICON_FETCH_TIMEOUT_MS);
+  let reader;
   try {
-    const response = await fetch(url);
-    const blob = await response.blob();
-    if (blob.size === 0) return null;
-    const buffer = await blob.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok || !response.body) return null;
+    if (Number(response.headers.get('content-length')) > MAX_FAVICON_BYTES) {
+      return null;
+    }
+
+    // Bound the decoded response body even when Content-Length is missing,
+    // incorrect, or describes compressed bytes. Never buffer an unlimited blob.
+    const bytes = new Uint8Array(MAX_FAVICON_BYTES);
+    reader = response.body.getReader();
+    let size = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > MAX_FAVICON_BYTES - size) return null;
+      bytes.set(value, size);
+      size += value.byteLength;
+    }
+    if (size === 0) return null;
+
     let binary = '';
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
+    for (let offset = 0; offset < size; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, size)));
     }
     const base64 = btoa(binary);
-    const mimeType = blob.type || 'image/x-icon';
+    const mimeType = (response.headers.get('content-type') || 'image/x-icon').split(';')[0].trim();
     return `data:${mimeType};base64,${base64}`;
   } catch (e) {
     return null;
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+    reader?.releaseLock();
   }
 }
 

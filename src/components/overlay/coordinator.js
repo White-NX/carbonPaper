@@ -3,7 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 /**
  * Which startup overlay wins when several want the screen, highest first.
  *
- * - fatal, maintenance and vacuum block the app outright.
+ * - fatal, storage initialization and maintenance block the app outright.
  * - auth is the lock screen; nothing personal is shown before it clears.
  * - onboarding owns the required-model download on a first run, so the
  *   standalone download card ranks below it. It also outranks the update
@@ -17,7 +17,6 @@ export const OVERLAY_PRIORITY = [
   // Database startup must settle before authentication and index maintenance.
   'storageInitialization',
   'maintenance',
-  'vacuum',
   'auth',
   'onboarding',
   'update',

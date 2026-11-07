@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { selectStorageDirectory } from '../../../lib/native_dialogs';
 import { withAuth } from '../../../lib/auth_api';
-import { runMonitorAction, notifySettingsChanged } from '../../../lib/settings_api';
+import { notifySettingsChanged } from '../../../lib/settings_api';
 import { useSettingsActivity } from '../SettingsActivityContext';
 
 const CANCELLED = 'Migration cancelled by user';
@@ -40,7 +40,6 @@ export function useStorageMigration({ storage, onRefresh, t }) {
     migrationRunRef.current = run;
     let unlistenProgress = null;
     let unlistenError = null;
-    let shouldRestartMonitor = true;
     const registerMigrationListener = async (eventName, handler) => {
       const unlisten = await listen(eventName, (evt) => {
         if (mountedRef.current) {
@@ -64,18 +63,6 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       setMigrationError('');
       setMigrationCancellation(idleCancellation());
       setIsUpdatingStoragePath(true);
-      try {
-        const monitorStatusRaw = await invoke('get_monitor_status');
-        const monitorStatus = typeof monitorStatusRaw === 'string' ? JSON.parse(monitorStatusRaw) : monitorStatusRaw;
-        shouldRestartMonitor = !monitorStatus?.stopped;
-      } catch {
-        shouldRestartMonitor = true;
-      }
-
-      if (shouldRestartMonitor) {
-        await runMonitorAction('maintenance-stop');
-      }
-
       if (shouldMigrateData) {
         setIsMigrating(true);
         setMigrationProgress({ total_files: 0, copied_files: 0, current_file: '' });
@@ -125,9 +112,6 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       if (mountedRef.current) {
         setIsMigrating(false);
         setIsUpdatingStoragePath(false);
-      }
-      if (shouldRestartMonitor) {
-        try { await runMonitorAction('maintenance-start'); } catch { }
       }
       if (migrationRunRef.current === run) migrationRunRef.current = null;
     }

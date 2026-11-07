@@ -1,4 +1,8 @@
 {
+  "startupScreen": {
+    "tagline": "找回屏幕上的片刻。",
+    "minimize": "最小化"
+  },
   "storageStartup": {
     "title": "正在准备历史记录",
     "tip": "准备完成后即可继续使用。历史记录较多时可能需要几分钟。",
@@ -399,7 +403,8 @@
           "startFailedTitle": "捕获记录服务启动失败",
           "unavailableTitle": "捕获记录服务不可用",
           "startFailedFallback": "启动后端服务失败",
-          "offlineFallback": "后端服务离线"
+          "offlineFallback": "后端服务离线",
+          "restartLimit": "截图采集多次中断，已暂停自动重试。您可以手动重新启动。"
         }
       }
     },
