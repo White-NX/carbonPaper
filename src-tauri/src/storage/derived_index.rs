@@ -1081,6 +1081,7 @@ impl StorageState {
         query: &[f32],
         k: usize,
         deadline: std::time::Instant,
+        metrics: Option<std::sync::Arc<super::VectorQueryMetrics>>,
     ) -> Result<Vec<ScoredSubject>, String> {
         if query.is_empty() {
             return Err("CLIP query vector must not be empty".to_string());
@@ -1094,6 +1095,7 @@ impl StorageState {
             k,
             TopKOptions {
                 deadline: Some(deadline),
+                metrics,
                 ..TopKOptions::default()
             },
         )
@@ -1866,7 +1868,10 @@ pub(super) fn read_derived_data_epoch(
 /// Single definition of "query-visible": a completed ledger row whose model
 /// contract and fingerprint still match the stored vector. Every projection
 /// below shares it so the resident cache cannot drift from the SQL readers.
-fn visible_embedding_source_with_indexes(embedding_index: &str, job_index: &str) -> String {
+pub(super) fn visible_embedding_source_with_indexes(
+    embedding_index: &str,
+    job_index: &str,
+) -> String {
     format!(
         r#"
         FROM derived_embeddings e {embedding_index}

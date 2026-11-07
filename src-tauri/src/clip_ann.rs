@@ -5,7 +5,7 @@
 //! as a bounded tail, including tombstones that suppress stale base entries.
 
 use crate::ann_format::{
-    validate_ann_recovered_probe, validate_ann_search_result, FlatFileWriter, Header,
+    validate_ann_recovered_probe, validate_ann_search_result, AnnReadError, FlatFileWriter, Header,
     MappedFlatIndex, ANN_ALGORITHM, ANN_CONNECTIVITY, ANN_EXPANSION_ADD,
     ANN_IMPLEMENTATION_VERSION, ANN_METRIC, ANN_QUANTIZATION, FORMAT_VERSION,
 };
@@ -44,8 +44,10 @@ use windows::Win32::System::JobObjects::{
 };
 use zeroize::Zeroizing;
 
+mod progress;
 mod query_snapshot;
 mod resumable;
+pub(crate) use progress::AnnBuildProgress;
 pub(crate) use query_snapshot::ClipAnnSnapshot;
 pub(crate) use resumable::run_scheduled_slice;
 
@@ -238,6 +240,7 @@ pub struct ClipAnnState {
     last_error: RwLock<Option<String>>,
     arm: Mutex<ArmCoordinator>,
     arm_tx: watch::Sender<ArmStatus>,
+    progress_state: Mutex<progress::AnnProgressState>,
 }
 
 impl Default for ClipAnnState {
@@ -250,6 +253,7 @@ impl Default for ClipAnnState {
             last_error: RwLock::new(None),
             arm: Mutex::new(ArmCoordinator::default()),
             arm_tx,
+            progress_state: Mutex::new(progress::AnnProgressState::default()),
         }
     }
 }
@@ -258,6 +262,7 @@ impl Default for ClipAnnState {
 struct ArmCoordinator {
     token: u64,
     status: ArmStatus,
+    rebuild_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,7 +432,53 @@ pub struct ClipAnnQuery {
     pub tail_rows: usize,
 }
 
+/// In-memory retrieval readiness; reading this never opens the database or index files.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClipSearchStatus {
+    pub ready: bool,
+    pub ann_state: &'static str,
+    pub ann_generation: Option<u64>,
+    pub fallback_reason: Option<&'static str>,
+}
+
+/// Public, read-only readiness for the visual search notice. Contains no user content.
+#[tauri::command]
+pub async fn get_clip_search_status(
+    state: tauri::State<'_, Arc<ClipAnnState>>,
+) -> Result<ClipSearchStatus, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.search_status())
+        .await
+        .map_err(|error| format!("Failed to read CLIP search readiness: {error}"))
+}
+
 impl ClipAnnState {
+    pub(crate) fn search_status(&self) -> ClipSearchStatus {
+        self.search_status_enabled(enabled())
+    }
+
+    fn search_status_enabled(&self, enabled: bool) -> ClipSearchStatus {
+        let generation = self.generation.read().unwrap_or_else(|e| e.into_inner());
+        let (ann_state, fallback_reason) = if !enabled {
+            ("disabled", Some("ann_disabled"))
+        } else if generation.is_some() {
+            ("armed", None)
+        } else {
+            match *self.arm_tx.borrow() {
+                ArmStatus::Loading => ("arming", Some("generation_loading")),
+                ArmStatus::Missing => ("exact_fallback", Some("generation_missing")),
+                ArmStatus::Failed => ("failed", Some("generation_load_failed")),
+                ArmStatus::Idle | ArmStatus::Ready => ("exact_fallback", Some("reader_unloaded")),
+            }
+        };
+        ClipSearchStatus {
+            ready: enabled && generation.is_some(),
+            ann_state,
+            ann_generation: generation.as_ref().map(|reader| reader.manifest.generation),
+            fallback_reason,
+        }
+    }
+
     fn generation_snapshot_with_tail<F, T>(
         &self,
         storage: &StorageState,
@@ -454,14 +505,17 @@ impl ClipAnnState {
         Ok(Some((Arc::clone(generation), tail)))
     }
 
-    pub(crate) fn prepare_query(
+    pub(crate) fn prepare_query_with_reason(
         &self,
         storage: &StorageState,
         query: &[f32],
         deadline: Option<Instant>,
-    ) -> Result<Option<ClipAnnSnapshot>, String> {
-        if !enabled() || query.len() != CLIP_DIMENSIONS {
-            return Ok(None);
+    ) -> Result<(Option<ClipAnnSnapshot>, &'static str), String> {
+        if !enabled() {
+            return Ok((None, "ann_disabled"));
+        }
+        if query.len() != CLIP_DIMENSIONS {
+            return Ok((None, "dimension_mismatch"));
         }
         check_ann_deadline(deadline)?;
         let authorization = storage.protected_query_session()?;
@@ -471,11 +525,21 @@ impl ClipAnnState {
                 .load(storage, generation.manifest.covered_epoch, deadline)
         }) {
             Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return Ok(None),
-            Err(error) if error.starts_with("ann_tail_too_large:") => return Ok(None),
+            Ok(None) => {
+                return Ok((
+                    None,
+                    self.search_status()
+                        .fallback_reason
+                        .unwrap_or("generation_unusable"),
+                ))
+            }
+            Err(error) if error.starts_with("ann_tail_too_large:") => {
+                return Ok((None, "tail_limit_exceeded"))
+            }
             Err(error) => return Err(error),
         };
-        ClipAnnSnapshot::new(generation, tail, query, deadline, authorization).map(Some)
+        ClipAnnSnapshot::new(generation, tail, query, deadline, authorization)
+            .map(|snapshot| (Some(snapshot), "none"))
     }
 
     pub fn has_generation(&self) -> bool {
@@ -505,7 +569,12 @@ impl ClipAnnState {
         *generation = None;
         arm.token = arm.token.wrapping_add(1);
         arm.status = ArmStatus::Idle;
+        arm.rebuild_required = false;
         self.arm_tx.send_replace(ArmStatus::Idle);
+        self.progress_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     pub(crate) fn evict_reader_if_idle(&self, ttl: Duration) -> bool {
@@ -568,6 +637,14 @@ impl ClipAnnState {
         Some(token)
     }
 
+    fn begin_reader_reload(&self) -> Option<u64> {
+        let _operation = self.build_lock.try_lock().ok()?;
+        if self.rebuild_required() {
+            return None;
+        }
+        self.begin_arm()
+    }
+
     fn arm_is_current(&self, token: u64) -> bool {
         let arm = self.arm.lock().unwrap_or_else(|error| error.into_inner());
         arm.token == token && arm.status == ArmStatus::Loading
@@ -580,12 +657,31 @@ impl ClipAnnState {
             .token
     }
 
+    fn rebuild_required(&self) -> bool {
+        self.arm
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .rebuild_required
+    }
+
+    fn require_rebuild(&self, token: u64) -> bool {
+        let mut arm = self.arm.lock().unwrap_or_else(|error| error.into_inner());
+        if arm.token != token {
+            return false;
+        }
+        arm.rebuild_required = true;
+        true
+    }
+
     fn finish_arm(&self, token: u64, status: ArmStatus) -> bool {
         let mut arm = self.arm.lock().unwrap_or_else(|error| error.into_inner());
         if arm.token != token || arm.status != ArmStatus::Loading {
             return false;
         }
         arm.status = status;
+        if status == ArmStatus::Missing {
+            arm.rebuild_required = true;
+        }
         self.arm_tx.send_replace(status);
         true
     }
@@ -617,6 +713,11 @@ impl ClipAnnState {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = None;
         arm.status = ArmStatus::Ready;
+        arm.rebuild_required = false;
+        self.progress_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         self.arm_tx.send_replace(ArmStatus::Ready);
         true
     }
@@ -648,11 +749,12 @@ impl ClipAnnState {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = None;
         arm.status = ArmStatus::Ready;
+        arm.rebuild_required = false;
         self.arm_tx.send_replace(ArmStatus::Ready);
         Ok(true)
     }
 
-    fn fail_arm(&self, token: u64, error: String) -> bool {
+    fn fail_arm(&self, token: u64, error: String, rebuild_required: bool) -> bool {
         let mut generation = self
             .generation
             .write()
@@ -667,6 +769,7 @@ impl ClipAnnState {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = Some(error);
         arm.status = ArmStatus::Failed;
+        arm.rebuild_required = rebuild_required;
         self.arm_tx.send_replace(ArmStatus::Failed);
         true
     }
@@ -700,6 +803,7 @@ impl ClipAnnState {
         let mut arm = self.arm.lock().unwrap_or_else(|error| error.into_inner());
         *slot = Some(Arc::new(generation));
         arm.status = ArmStatus::Ready;
+        arm.rebuild_required = false;
         self.arm_tx.send_replace(ArmStatus::Ready);
     }
 
@@ -849,6 +953,7 @@ fn exact_candidates(
                 .filter(|v| v.len() == query.len())
                 .map(|v| (row.subject_key.as_str(), dot_product(query, v)))
         }),
+        None,
     )
 }
 
@@ -859,9 +964,26 @@ fn exact_candidates_with_tail<'a>(
     deadline: Option<Instant>,
     changed: impl Fn(&str) -> bool,
     tail_scores: impl Iterator<Item = (&'a str, f32)>,
+    metrics: Option<&crate::storage::VectorQueryMetrics>,
 ) -> Result<Vec<ScoredSubject>, String> {
+    let started = Instant::now();
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| {
+            progress.mode = "flat_exact";
+            progress.phase = "vector_scan";
+            progress.total_rows = Some(generation.flat.rows());
+        });
+    }
     let mut top = BoundedTopK::new(k);
     for ordinal in 0..generation.flat.rows() {
+        if ordinal % 256 == 0 {
+            if let Some(metrics) = metrics {
+                metrics.update(|progress| {
+                    progress.rows_scanned = ordinal;
+                    progress.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+                });
+            }
+        }
         if ordinal % 4096 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
@@ -872,6 +994,13 @@ fn exact_candidates_with_tail<'a>(
             top.push(dot_product(query, &generation.flat.vector(ordinal)?), key);
         }
     }
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| {
+            progress.rows_scanned = generation.flat.rows();
+            progress.phase = "tail_merge";
+            progress.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+        });
+    }
     for (index, (key, score)) in tail_scores.enumerate() {
         if index % 1024 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
@@ -879,6 +1008,12 @@ fn exact_candidates_with_tail<'a>(
             return Err("query_deadline_exceeded_during_flat_exact".to_string());
         }
         top.push(score, key);
+    }
+    if let Some(metrics) = metrics {
+        metrics.update(|progress| {
+            progress.phase = "complete";
+            progress.scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+        });
     }
     Ok(top.into_sorted())
 }
@@ -892,6 +1027,22 @@ pub fn spawn_startup_arm(app: AppHandle) {
     let Some(arm_token) = state.begin_arm() else {
         return;
     };
+    spawn_arm(app, state, arm_token);
+}
+
+/// Reload an evicted reader without mistaking its absence in memory for a
+/// missing or damaged persistent generation. Concurrent queries join one arm.
+pub(crate) fn ensure_reader_loaded(app: &AppHandle) {
+    if !enabled() {
+        return;
+    }
+    let state = app.state::<Arc<ClipAnnState>>().inner().clone();
+    if let Some(token) = state.begin_reader_reload() {
+        spawn_arm(app.clone(), state.clone(), token);
+    }
+}
+
+fn spawn_arm(app: AppHandle, state: Arc<ClipAnnState>, arm_token: u64) {
     #[derive(Debug)]
     enum StartupArmOutcome {
         Installed {
@@ -913,7 +1064,9 @@ pub fn spawn_startup_arm(app: AppHandle) {
         let result = tokio::task::spawn_blocking(move || {
             let _publish_guard = load_storage.derived_generation_publish_guard();
             if load_storage.is_migration_in_progress() {
-                return Err("ANN arm deferred during data migration".to_string());
+                return Err(GenerationLoadError::Deferred(
+                    "ANN arm deferred during data migration".to_string(),
+                ));
             }
             if !load_state.arm_is_current(arm_token) {
                 return Ok(StartupArmOutcome::Discarded);
@@ -947,22 +1100,34 @@ pub fn spawn_startup_arm(app: AppHandle) {
                     rows,
                     expansion_search
                 );
+                state.emit_build_progress(&app);
             }
             Ok(Ok(StartupArmOutcome::Missing)) => {
                 tracing::info!("[CLIP:ANN] no persistent generation; exact fallback active");
-                state.finish_arm(arm_token, ArmStatus::Missing);
+                if !state.finish_arm(arm_token, ArmStatus::Missing) {
+                    return;
+                }
+                restore_recovery_progress(&app, &state, arm_token).await;
                 drop(_operation_guard);
-                spawn_missing_generation_bootstrap(app, state);
+                spawn_missing_generation_bootstrap(app, state, arm_token);
                 return;
             }
             Ok(Ok(StartupArmOutcome::Discarded)) => {}
             Ok(Err(error)) => {
-                tracing::warn!("[CLIP:ANN] startup arm failed: {error}");
-                state.fail_arm(arm_token, error);
-                let _ = maybe_rebuild(&app, false).await;
+                let (message, rebuild_required) = error.into_parts();
+                tracing::warn!(rebuild_required, "[CLIP:ANN] reader arm failed: {message}");
+                if state.fail_arm(arm_token, message, rebuild_required) && rebuild_required {
+                    restore_recovery_progress(&app, &state, arm_token).await;
+                    drop(_operation_guard);
+                    spawn_missing_generation_bootstrap(app, state, arm_token);
+                }
             }
             Err(error) => {
-                state.fail_arm(arm_token, format!("ANN startup task failed: {error}"));
+                state.fail_arm(
+                    arm_token,
+                    format!("ANN startup task failed: {error}"),
+                    false,
+                );
             }
         }
     });
@@ -970,13 +1135,37 @@ pub fn spawn_startup_arm(app: AppHandle) {
 
 /// Arrange a one-time bootstrap for an installation whose index is settled but
 /// has no persisted generation yet.
-fn spawn_missing_generation_bootstrap(app: AppHandle, state: Arc<ClipAnnState>) {
+async fn restore_recovery_progress(app: &AppHandle, state: &Arc<ClipAnnState>, token: u64) {
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let read_app = app.clone();
+    let read_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _publish = storage.derived_generation_publish_guard();
+        if storage.is_migration_in_progress() {
+            return Ok(());
+        }
+        read_state.restore_recovery_progress(&read_app, &storage, token)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("[CLIP:ANN] failed to restore construction progress: {error}")
+        }
+        Err(error) => tracing::warn!("[CLIP:ANN] construction progress task failed: {error}"),
+    }
+}
+
+fn spawn_missing_generation_bootstrap(app: AppHandle, state: Arc<ClipAnnState>, token: u64) {
     tauri::async_runtime::spawn(async move {
         // Wait for the index sentinel (settled at startup by the legacy
         // discard task) and for any other maintenance task to finish, rather
         // than being postponed to the next launch.
         loop {
-            if state.has_generation() {
+            if state.has_generation()
+                || state.lifecycle_token() != token
+                || !state.rebuild_required()
+            {
                 return;
             }
             let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -989,7 +1178,7 @@ fn spawn_missing_generation_bootstrap(app: AppHandle, state: Arc<ClipAnnState>) 
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        if state.has_generation() {
+        if state.has_generation() || state.lifecycle_token() != token || !state.rebuild_required() {
             return;
         }
         let result = maybe_rebuild(&app, false).await;
@@ -1070,7 +1259,94 @@ fn write_ann_snapshot_page(
     Ok(())
 }
 
-fn load_current_generation(storage: &StorageState) -> Result<Option<GenerationReader>, String> {
+#[derive(Debug)]
+enum GenerationLoadError {
+    RebuildRequired(String),
+    Deferred(String),
+}
+
+impl From<String> for GenerationLoadError {
+    fn from(message: String) -> Self {
+        Self::Deferred(message)
+    }
+}
+
+impl From<std::io::Error> for GenerationLoadError {
+    fn from(error: std::io::Error) -> Self {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+        ) {
+            Self::RebuildRequired(format!(
+                "ANN generation file is missing or truncated: {error}"
+            ))
+        } else {
+            Self::Deferred(format!(
+                "ANN generation file is temporarily unavailable: {error}"
+            ))
+        }
+    }
+}
+
+impl From<AnnReadError> for GenerationLoadError {
+    fn from(error: AnnReadError) -> Self {
+        match error {
+            AnnReadError::Io(error) => error.into(),
+            AnnReadError::Invalid(message) => Self::RebuildRequired(message),
+        }
+    }
+}
+
+impl GenerationLoadError {
+    fn into_parts(self) -> (String, bool) {
+        match self {
+            Self::RebuildRequired(message) => (message, true),
+            Self::Deferred(message) => (message, false),
+        }
+    }
+}
+
+fn validate_generation_files(
+    data_dir: &Path,
+    manifest: &DerivedAnnGeneration,
+) -> Result<(), GenerationLoadError> {
+    validate_manifest(manifest).map_err(GenerationLoadError::RebuildRequired)?;
+    let directory = data_dir.join("derived-indexes");
+    for (name, expected) in [
+        (&manifest.flat_file_name, &manifest.flat_checksum_sha256),
+        (&manifest.ann_file_name, &manifest.ann_checksum_sha256),
+    ] {
+        let path = directory.join(name);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(GenerationLoadError::RebuildRequired(
+                    "ANN generation path is not a file".into(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GenerationLoadError::RebuildRequired(format!(
+                    "ANN generation file is missing: {name}"
+                )))
+            }
+            Err(error) => {
+                return Err(GenerationLoadError::Deferred(format!(
+                    "ANN generation file is unavailable: {error}"
+                )))
+            }
+        }
+        if sha256_file(&path)? != *expected {
+            return Err(GenerationLoadError::RebuildRequired(
+                "ANN generation checksum mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_current_generation(
+    storage: &StorageState,
+) -> Result<Option<GenerationReader>, GenerationLoadError> {
     let Some(manifest) = storage.get_derived_ann_generation(DerivedIndexKind::ClipImage)? else {
         return Ok(None);
     };
@@ -1079,74 +1355,76 @@ fn load_current_generation(storage: &StorageState) -> Result<Option<GenerationRe
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
+    validate_generation_files(&data_dir, &manifest)?;
     let key_id = MappedFlatIndex::encryption_key_id(
         &data_dir
             .join("derived-indexes")
             .join(&manifest.flat_file_name),
     )?;
     let encryption = storage.protected_ann_read_key(&key_id)?;
-    open_generation(&data_dir, manifest, encryption).map(Some)
-}
-
-fn open_generation(
-    data_dir: &Path,
-    manifest: DerivedAnnGeneration,
-    encryption: Arc<CipherKey>,
-) -> Result<GenerationReader, String> {
-    validate_manifest(&manifest)?;
-    let directory = data_dir.join("derived-indexes");
-    let flat_path = directory.join(&manifest.flat_file_name);
-    let ann_path = directory.join(&manifest.ann_file_name);
-    if sha256_file(&flat_path)? != manifest.flat_checksum_sha256
-        || sha256_file(&ann_path)? != manifest.ann_checksum_sha256
-    {
-        return Err("ANN generation checksum mismatch".to_string());
-    }
-    open_generation_validated(data_dir, manifest, encryption)
+    open_generation_validated(&data_dir, manifest, encryption).map(Some)
 }
 
 fn open_generation_validated(
     data_dir: &Path,
     manifest: DerivedAnnGeneration,
     encryption: Arc<CipherKey>,
-) -> Result<GenerationReader, String> {
-    validate_manifest(&manifest)?;
+) -> Result<GenerationReader, GenerationLoadError> {
+    validate_manifest(&manifest).map_err(GenerationLoadError::RebuildRequired)?;
     let directory = data_dir.join("derived-indexes");
     let flat_path = directory.join(&manifest.flat_file_name);
     let ann_path = directory.join(&manifest.ann_file_name);
-    let flat = MappedFlatIndex::open(&flat_path, encryption.clone())?;
+    let flat = MappedFlatIndex::open_checked(&flat_path, encryption.clone())?;
     if flat.header.generation != manifest.generation
         || flat.header.covered_epoch != manifest.covered_epoch
         || flat.header.row_count != manifest.row_count
         || flat.header.dimensions != manifest.dimensions
         || flat.header.expansion_search != manifest.expansion_search
     {
-        return Err("ANN flat header does not match manifest".to_string());
+        return Err(GenerationLoadError::RebuildRequired(
+            "ANN flat header does not match manifest".into(),
+        ));
     }
-    let mut ann_file = fs::File::open(&ann_path)
-        .map_err(|error| format!("Failed to open ANN graph {}: {error}", ann_path.display()))?;
-    let size = ann_file.metadata().map_err(|e| e.to_string())?.len();
+    let mut ann_file = fs::File::open(&ann_path)?;
+    let size = ann_file.metadata()?.len();
     if size > 512 * 1024 * 1024 {
-        return Err("ANN graph exceeds the read memory budget".into());
+        return Err(GenerationLoadError::Deferred(
+            "ANN graph exceeds the read memory budget".into(),
+        ));
     }
-    let mut encrypted = vec![0u8; size as usize];
-    ann_file
-        .read_exact(&mut encrypted)
-        .map_err(|e| e.to_string())?;
+    let mut encrypted = Vec::new();
+    encrypted
+        .try_reserve_exact(size as usize)
+        .map_err(|error| {
+            GenerationLoadError::Deferred(format!("ANN graph read allocation failed: {error}"))
+        })?;
+    encrypted.resize(size as usize, 0);
+    ann_file.read_exact(&mut encrypted)?;
     let mut extra = [0u8; 1];
-    if ann_file.read(&mut extra).map_err(|e| e.to_string())? != 0 {
-        return Err("ANN graph changed while reading".into());
+    if ann_file.read(&mut extra)? != 0 {
+        return Err(GenerationLoadError::Deferred(
+            "ANN graph changed while reading".into(),
+        ));
     }
-    let ann_bytes =
-        encryption.open(&flat.header.graph_identity(manifest.row_count)?, &encrypted)?;
+    let identity = flat
+        .header
+        .graph_identity(manifest.row_count)
+        .map_err(GenerationLoadError::RebuildRequired)?;
+    let ann_bytes = encryption
+        .open(&identity, &encrypted)
+        .map_err(GenerationLoadError::RebuildRequired)?;
     drop(encrypted);
-    let metadata = Index::metadata_from_buffer(&ann_bytes)
-        .map_err(|error| format!("ANN metadata read failed: {error}"))?;
+    let metadata = Index::metadata_from_buffer(&ann_bytes).map_err(|error| {
+        GenerationLoadError::RebuildRequired(format!("ANN metadata read failed: {error}"))
+    })?;
     let options: usearch::IndexOptions = metadata.into();
-    let index = Index::new(&options).map_err(|error| format!("ANN view init failed: {error}"))?;
-    unsafe { index.view_from_buffer(&ann_bytes) }
-        .map_err(|error| format!("ANN buffer view failed: {error}"))?;
-    apply_expansion_search(&index, manifest.expansion_search as usize)?;
+    let index = Index::new(&options)
+        .map_err(|error| GenerationLoadError::Deferred(format!("ANN view init failed: {error}")))?;
+    unsafe { index.view_from_buffer(&ann_bytes) }.map_err(|error| {
+        GenerationLoadError::RebuildRequired(format!("ANN buffer view failed: {error}"))
+    })?;
+    apply_expansion_search(&index, manifest.expansion_search as usize)
+        .map_err(GenerationLoadError::Deferred)?;
     if index.expansion_search() != manifest.expansion_search as usize
         || index.dimensions() != manifest.dimensions as usize
         || index.size() != manifest.row_count as usize
@@ -1154,22 +1432,30 @@ fn open_generation_validated(
         || index.metric_kind() != MetricKind::IP
         || index.scalar_kind() != ScalarKind::I8
     {
-        return Err("ANN graph contract does not match manifest".to_string());
+        return Err(GenerationLoadError::RebuildRequired(
+            "ANN graph contract does not match manifest".into(),
+        ));
     }
     if manifest.row_count > 0 {
-        let probe = flat.vector(0)?;
+        let probe = flat
+            .vector(0)
+            .map_err(GenerationLoadError::RebuildRequired)?;
         if !index.contains(1) {
-            return Err("ANN self-test is missing the probe ordinal".to_string());
+            return Err(GenerationLoadError::RebuildRequired(
+                "ANN self-test is missing the probe ordinal".into(),
+            ));
         }
         let mut recovered = vec![0.0f32; manifest.dimensions as usize];
-        let vectors_found = index
-            .get(1, &mut recovered)
-            .map_err(|error| format!("ANN probe recovery failed: {error}"))?;
-        let recovered_cosine = validate_ann_recovered_probe(&probe, &recovered, vectors_found)?;
-        let result = index
-            .search(&probe, 1)
-            .map_err(|error| format!("ANN self-test failed: {error}"))?;
-        validate_ann_search_result(&result.keys, &result.distances, manifest.row_count)?;
+        let vectors_found = index.get(1, &mut recovered).map_err(|error| {
+            GenerationLoadError::RebuildRequired(format!("ANN probe recovery failed: {error}"))
+        })?;
+        let recovered_cosine = validate_ann_recovered_probe(&probe, &recovered, vectors_found)
+            .map_err(GenerationLoadError::RebuildRequired)?;
+        let result = index.search(&probe, 1).map_err(|error| {
+            GenerationLoadError::Deferred(format!("ANN self-test failed: {error}"))
+        })?;
+        validate_ann_search_result(&result.keys, &result.distances, manifest.row_count)
+            .map_err(GenerationLoadError::RebuildRequired)?;
         tracing::info!(
             "[CLIP:ANN] self-test probe_key=1 returned_key={} distance={:.6} recovered_cosine={:.6}",
             result.keys[0],
@@ -1357,15 +1643,12 @@ fn resolve_ml_executable(app: &AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "carbonpaper-ml.exe was not found for ANN construction".to_string())
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 1024 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -1437,6 +1720,24 @@ mod tests {
         keys: &[&str],
         vectors: &[Vec<f32>],
     ) -> GenerationReader {
+        test_reader_with_key(
+            data_dir,
+            generation,
+            keys,
+            vectors,
+            crate::ann_format::test_key(),
+            1,
+        )
+    }
+
+    fn test_reader_with_key(
+        data_dir: &Path,
+        generation: u64,
+        keys: &[&str],
+        vectors: &[Vec<f32>],
+        encryption: Arc<CipherKey>,
+        epoch: u64,
+    ) -> GenerationReader {
         assert_eq!(keys.len(), vectors.len());
         let dimensions = vectors.first().map(Vec::len).unwrap_or(2) as u32;
         let directory = data_dir.join("derived-indexes");
@@ -1446,7 +1747,7 @@ mod tests {
         let key_bytes = keys.iter().map(|key| key.len() as u64).sum();
         let header = Header::for_snapshot(
             generation,
-            1,
+            epoch,
             keys.len() as u64,
             dimensions,
             "clip_image",
@@ -1454,12 +1755,11 @@ mod tests {
             CLIP_VECTOR_SPACE_REVISION,
             96,
             key_bytes,
-            &crate::ann_format::test_key(),
+            &encryption,
             crate::ann_format::TEST_SNAPSHOT_ID,
         )
         .unwrap();
-        let mut writer =
-            FlatFileWriter::create(&flat_path, header, crate::ann_format::test_key()).unwrap();
+        let mut writer = FlatFileWriter::create(&flat_path, header, encryption.clone()).unwrap();
         for key in keys {
             writer.push_key(key).unwrap();
         }
@@ -1467,7 +1767,7 @@ mod tests {
             writer.push_vector(vector).unwrap();
         }
         writer.finish().unwrap();
-        let flat = MappedFlatIndex::open(&flat_path, crate::ann_format::test_key()).unwrap();
+        let flat = MappedFlatIndex::open(&flat_path, encryption.clone()).unwrap();
 
         let mut options = usearch::IndexOptions::default();
         options.dimensions = dimensions as usize;
@@ -1491,7 +1791,7 @@ mod tests {
         built.save_to_buffer(&mut ann_bytes).unwrap();
         fs::write(
             &ann_path,
-            crate::ann_format::test_key()
+            encryption
                 .seal(
                     &flat.header.graph_identity(keys.len() as u64).unwrap(),
                     &ann_bytes,
@@ -1505,8 +1805,12 @@ mod tests {
         unsafe { index.view_from_buffer(&ann_bytes) }.unwrap();
         apply_expansion_search(&index, 96).unwrap();
 
+        let mut manifest = test_manifest(generation, keys.len() as u64, dimensions);
+        manifest.covered_epoch = epoch;
+        manifest.flat_checksum_sha256 = sha256_file(&flat_path).unwrap();
+        manifest.ann_checksum_sha256 = sha256_file(&ann_path).unwrap();
         GenerationReader {
-            manifest: test_manifest(generation, keys.len() as u64, dimensions),
+            manifest,
             flat,
             data_dir: data_dir.to_path_buf(),
             tail_cache: query_snapshot::TailCache::default(),
@@ -2082,5 +2386,172 @@ mod tests {
         assert_eq!(&*pinned.flat.vector(0).unwrap(), &[1.0, 0.0]);
         drop(pinned);
         assert!(lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn search_readiness_distinguishes_missing_and_unloaded_readers() {
+        let state = ClipAnnState::default();
+        let token = state.begin_arm().unwrap();
+        assert_eq!(
+            state.search_status_enabled(true).fallback_reason,
+            Some("generation_loading")
+        );
+        state.finish_arm(token, ArmStatus::Missing);
+        let missing = state.search_status_enabled(true);
+        assert!(!missing.ready);
+        assert_eq!(missing.fallback_reason, Some("generation_missing"));
+
+        let temp = tempfile::tempdir().unwrap();
+        state.install_for_test(test_reader(temp.path(), 46, &["a"], &[vec![1.0, 0.0]]));
+        let ready = state.search_status_enabled(true);
+        assert!(ready.ready);
+        assert_eq!(ready.ann_generation, Some(46));
+        assert_eq!(ready.fallback_reason, None);
+        assert!(!state.search_status_enabled(false).ready);
+        assert!(state.evict_reader_if_idle(Duration::ZERO));
+        assert_eq!(
+            state.search_status_enabled(true).fallback_reason,
+            Some("reader_unloaded")
+        );
+    }
+
+    fn persistent_test_generation() -> (tempfile::TempDir, StorageState, ClipAnnState) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_with_schema(temp.path().to_path_buf());
+        let mut vector = vec![0.0; CLIP_DIMENSIONS];
+        vector[0] = 1.0;
+        let reader = test_reader_with_key(
+            temp.path(),
+            91,
+            &["a"],
+            &[vector],
+            storage.protected_ann_write_key().unwrap(),
+            0,
+        );
+        let state = ClipAnnState::default();
+        assert!(state
+            .publish_from_lifecycle(
+                state.lifecycle_token(),
+                &storage,
+                PreparedGeneration::new(reader)
+            )
+            .unwrap());
+        (temp, storage, state)
+    }
+
+    #[test]
+    fn evicted_reader_reloads_the_same_persistent_generation_without_rebuilding() {
+        let (temp, storage, state) = persistent_test_generation();
+        let manifest = storage
+            .get_derived_ann_generation(DerivedIndexKind::ClipImage)
+            .unwrap()
+            .unwrap();
+        assert!(state.evict_reader_if_idle(Duration::ZERO));
+        assert!(!state.rebuild_required());
+        let token = state
+            .begin_reader_reload()
+            .expect("the next query starts a reload");
+        assert!(
+            state.begin_reader_reload().is_none(),
+            "concurrent queries join the same reload"
+        );
+        let reader = load_current_generation(&storage).unwrap().unwrap();
+        assert!(state.install_from_arm(token, &storage, reader));
+        assert_eq!(
+            state.pin_generation().unwrap().manifest.generation,
+            manifest.generation
+        );
+        assert_eq!(
+            storage
+                .get_derived_ann_generation(DerivedIndexKind::ClipImage)
+                .unwrap()
+                .unwrap()
+                .generation,
+            manifest.generation
+        );
+        assert_eq!(
+            sha256_file(
+                &temp
+                    .path()
+                    .join("derived-indexes")
+                    .join(manifest.ann_file_name)
+            )
+            .unwrap(),
+            manifest.ann_checksum_sha256
+        );
+        assert!(state.resumable_worker.try_lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_or_corrupt_persistent_files_require_reconstruction() {
+        for corrupt in [false, true] {
+            let (temp, storage, state) = persistent_test_generation();
+            assert!(state.evict_reader_if_idle(Duration::ZERO));
+            let path = temp.path().join("derived-indexes/clip_image-91.cpdann");
+            if corrupt {
+                fs::write(&path, b"damaged graph").unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            let token = state.begin_reader_reload().unwrap();
+            let (message, rebuild) = match load_current_generation(&storage) {
+                Err(error) => error.into_parts(),
+                Ok(_) => panic!("a missing or damaged graph must not be loaded"),
+            };
+            assert!(rebuild);
+            assert!(state.fail_arm(token, message, rebuild));
+            assert!(state.rebuild_required());
+            assert!(
+                state.begin_reader_reload().is_none(),
+                "queries must leave recovery to the builder"
+            );
+            assert_eq!(
+                storage
+                    .get_derived_ann_generation(DerivedIndexKind::ClipImage)
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                91
+            );
+        }
+    }
+
+    #[test]
+    fn temporarily_locked_generation_retries_loading_without_reconstruction() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (temp, storage, state) = persistent_test_generation();
+        assert!(state.evict_reader_if_idle(Duration::ZERO));
+        let path = temp.path().join("derived-indexes/clip_image-91.cpdann");
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let token = state.begin_reader_reload().unwrap();
+        let (message, rebuild) = match load_current_generation(&storage) {
+            Err(error) => error.into_parts(),
+            Ok(_) => panic!("a locked graph must defer loading"),
+        };
+        assert!(!rebuild);
+        assert!(state.fail_arm(token, message, rebuild));
+        assert!(!state.rebuild_required());
+        drop(locked);
+        let token = state.begin_reader_reload().unwrap();
+        let reader = load_current_generation(&storage).unwrap().unwrap();
+        assert!(state.install_from_arm(token, &storage, reader));
+        assert_eq!(state.pin_generation().unwrap().manifest.generation, 91);
+    }
+
+    #[test]
+    fn deferred_reader_authorization_can_retry_without_requesting_reconstruction() {
+        let state = ClipAnnState::default();
+        let token = state.begin_reader_reload().unwrap();
+        let (message, rebuild) =
+            GenerationLoadError::from("AUTH_REQUIRED".to_string()).into_parts();
+        assert!(!rebuild);
+        assert!(state.fail_arm(token, message, rebuild));
+        assert!(!state.rebuild_required());
+        assert!(state.begin_reader_reload().is_some());
     }
 }

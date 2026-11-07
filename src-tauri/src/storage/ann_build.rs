@@ -5,6 +5,23 @@ use crate::task_error::TaskError;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub(super) fn frozen_input_page_sql() -> String {
+    // With both cursor bounds, SQLite can choose a range scan of the job
+    // primary key for every embedding. The completed-job covering index keeps
+    // this join a point lookup, including every visibility contract field.
+    let source = super::derived_index::visible_embedding_source_with_indexes(
+        "",
+        "INDEXED BY idx_derived_jobs_completed_visibility",
+    );
+    format!(
+        "SELECT e.subject_key, e.dimensions,
+                cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key)
+         {source}
+           AND e.subject_key > ?2 AND e.subject_key <= ?4
+         ORDER BY e.subject_key LIMIT ?3"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AnnCheckpointFile {
     pub name: String,
@@ -156,10 +173,7 @@ impl StorageState {
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         current_dataset(&tx, &state.dataset_id)?;
-        let sql = super::derived_index::visible_embedding_page_sql().replace(
-            "AND e.subject_key > ?2",
-            "AND e.subject_key > ?2 AND e.subject_key <= ?4",
-        );
+        let sql = frozen_input_page_sql();
         let page = {
             let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt

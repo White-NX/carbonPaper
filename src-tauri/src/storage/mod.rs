@@ -42,6 +42,7 @@ mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
 mod types;
+mod vector_query_metrics;
 pub(crate) mod wire_time;
 
 pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
@@ -62,6 +63,7 @@ pub(crate) use screenshot_reader::ScreenshotReader;
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use timeline::TimelineRecord;
 pub use types::*;
+pub(crate) use vector_query_metrics::VectorQueryMetrics;
 
 use crate::credential_manager::{
     derive_db_key_from_public_key, load_public_key_from_file, CredentialManagerState,

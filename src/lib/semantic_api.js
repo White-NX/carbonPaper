@@ -9,6 +9,11 @@ export async function getBlindIndexRepairStatus() {
   return invoke('get_blind_index_repair_status');
 }
 
+/** Lightweight ANN readiness; does not load vectors or scan the screenshot store. */
+export async function getClipSearchStatus() {
+  return invoke('get_clip_search_status');
+}
+
 /**
  * What a CLIP backfill would cover and cost.
  *

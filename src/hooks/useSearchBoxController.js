@@ -62,6 +62,20 @@ function indexTaskLabel(run, percent, kind, t) {
   });
 }
 
+function annTaskLabel(run, percent, t) {
+  const state = {
+    waiting_for_unlock: 'WaitingForUnlock',
+    waiting_for_verification: 'WaitingForVerification',
+    retry_wait: 'RetryWait', failed: 'Failed',
+  }[run?.phase] || {
+    waiting_for_ac_power: 'WaitingForPower',
+    waiting_for_idle: 'WaitingForIdle', input_resumed: 'WaitingForIdle',
+  }[run?.wait_reason];
+  return t(`search.task.annIndex${state || (percent === null ? 'Preparing' : 'SummaryPlaceholder')}`, {
+    progress: percent === null ? '…' : Math.round(percent),
+  });
+}
+
 export function useSearchBoxController({
   onSelectResult,
   onSubmit,
@@ -299,15 +313,21 @@ export function useSearchBoxController({
   const clipIndexPercent = indexRunPercent(backgroundIndex.clip);
   const semanticIndexTaskLabel = indexTaskLabel(backgroundIndex.semantic, semanticIndexPercent, 'semantic', t);
   const clipIndexTaskLabel = indexTaskLabel(backgroundIndex.clip, clipIndexPercent, 'clip', t);
+  const hasAnnIndexTask = Boolean(backgroundIndex.ann?.recovery_needed
+    && (isIndexTaskPending(backgroundIndex.ann) || backgroundIndex.ann.phase === 'failed'));
+  const annIndexPercent = Number.isFinite(backgroundIndex.ann?.percent)
+    ? Math.max(0, Math.min(100, backgroundIndex.ann.percent)) : null;
+  const annIndexTaskLabel = annTaskLabel(backgroundIndex.ann, annIndexPercent, t);
 
   const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels
-    || hasSemanticIndexTask || hasClipIndexTask;
+    || hasSemanticIndexTask || hasClipIndexTask || hasAnnIndexTask;
   const progressFillPercent = (() => {
     if (hasDeleteTask) return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
     if (hasClusterTask) return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
     if (isDownloadingModels) return downloadProgress <= 0 ? 8 : Math.min(100, downloadProgress);
     // Cleanup and downloads take precedence over long index backfills; the
     // dropdown still shows each pending task independently.
+    if (hasAnnIndexTask) return annIndexPercent;
     if (hasClipIndexTask) {
       return clipIndexPercent;
     }
@@ -318,6 +338,7 @@ export function useSearchBoxController({
   })();
   const progressActive = (() => {
     if (hasDeleteTask || hasClusterTask || isDownloadingModels) return true;
+    if (hasAnnIndexTask) return backgroundIndex.ann.running;
     if (hasClipIndexTask) return backgroundIndex.clip.running;
     if (hasSemanticIndexTask) return backgroundIndex.semantic.running;
     return false;
@@ -333,6 +354,7 @@ export function useSearchBoxController({
     if (isDownloadingModels) {
       return t('search.task.modelDownloadSummaryPlaceholder', { progress: Math.round(downloadProgress) });
     }
+    if (hasAnnIndexTask) return annIndexTaskLabel;
     if (hasClipIndexTask) {
       return clipIndexTaskLabel;
     }
@@ -463,6 +485,8 @@ export function useSearchBoxController({
     hasClipIndexTask,
     clipIndexPercent,
     clipIndexTaskLabel,
+    hasAnnIndexTask,
+    annIndexTaskLabel,
     showProgressBar,
     progressFillPercent,
     progressActive,

@@ -185,6 +185,7 @@ const COMMAND_TIERS = {
   'clip_index::clip_index_stop_now': 'runtime_public',
   'clip_index::get_clip_backfill_offer': 'public',
   'clip_index::set_clip_backfill_decision': 'session_required',
+  'clip_ann::get_clip_search_status': 'public',
   'rerank::nl_rerank_stop_now': 'runtime_public',
   'blind_index_repair::get_blind_index_repair_status': 'public',
   'clip_ann::clip_ann_retry_now': 'session_required',
