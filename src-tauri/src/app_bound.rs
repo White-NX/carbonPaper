@@ -27,7 +27,11 @@ pub struct AppBoundStatus {
 }
 
 fn executable_directory() -> Result<PathBuf, String> {
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Match the service's kernel image path rather than the loader's spelling
+    // of current_exe, which can retain caller-supplied path aliases.
+    let executable = identity::inspect_process(std::process::id())
+        .map_err(|e| e.to_string())?
+        .image;
     executable
         .parent()
         .map(Path::to_path_buf)
@@ -119,11 +123,41 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
         return Ok(false);
     }
     #[cfg(not(feature = "app-bound-dev"))]
-    match try_delegate_startup(args) {
+    {
+        if cfg!(debug_assertions) {
+            return Ok(false);
+        }
+        let directory = executable_directory()?;
+        let root = identity::protected_root().map_err(|e| e.to_string())?;
+        delegate_startup_in_directory(&directory, &root, || try_delegate_startup(args, &directory))
+    }
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn protected_runtime_directory(directory: &Path, root: &Path) -> bool {
+    directory
+        .parent()
+        .is_some_and(|parent| identity::path_eq(parent, &root.join("Runtime")))
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn delegate_startup_in_directory(
+    directory: &Path,
+    root: &Path,
+    delegate: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    // Classify the image location without relying on an activation or manifest
+    // that may itself need repair. Every protected startup, including the CNG
+    // helper, must be sanitized before any argument or recovery branch runs.
+    if protected_runtime_directory(directory, root) {
+        sanitize_runtime_environment(directory)?;
+    }
+    match delegate() {
         Ok(result) => Ok(result),
         Err(_) => {
-            // Keep archive capture and the repair UI usable. The unprotected
-            // copy cannot pass the service's process identity verification.
+            // Keep archive capture and repair usable after delegation failures.
+            // A protected copy reaches this only after successful sanitization;
+            // failed delegation never enables its broker access.
             REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Release);
             Ok(false)
         }
@@ -131,8 +165,8 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
 }
 
 #[cfg(not(feature = "app-bound-dev"))]
-fn try_delegate_startup(args: &[String]) -> Result<bool, String> {
-    if cfg!(debug_assertions) || args.iter().any(|arg| arg == "--cng-unlock") {
+fn try_delegate_startup(args: &[String], directory: &Path) -> Result<bool, String> {
+    if args.iter().any(|arg| arg == "--cng-unlock") {
         return Ok(false);
     }
     if args.iter().any(|arg| arg == "--repair-protected-runtime") {
@@ -142,8 +176,7 @@ fn try_delegate_startup(args: &[String]) -> Result<bool, String> {
     let Some(active) = identity::active_runtime().map_err(|e| e.to_string())? else {
         return Ok(false);
     };
-    if identity::path_eq(&active, &executable_directory()?) {
-        sanitize_runtime_environment()?;
+    if identity::path_eq(&active, directory) {
         PROTECTED_ENVIRONMENT_READY.store(true, std::sync::atomic::Ordering::Release);
         return Ok(false);
     }
@@ -182,7 +215,7 @@ fn try_delegate_startup(args: &[String]) -> Result<bool, String> {
 }
 
 #[cfg(not(feature = "app-bound-dev"))]
-fn sanitize_runtime_environment() -> Result<(), String> {
+fn sanitize_runtime_environment(executable: &Path) -> Result<(), String> {
     for key in [
         "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
@@ -192,13 +225,12 @@ fn sanitize_runtime_environment() -> Result<(), String> {
     ] {
         std::env::remove_var(key);
     }
-    let executable = executable_directory()?;
     let system = identity::system_directory().map_err(|e| e.to_string())?;
-    std::env::set_current_dir(&executable).map_err(|e| e.to_string())?;
+    std::env::set_current_dir(executable).map_err(|e| e.to_string())?;
     std::env::set_var(
         "PATH",
         std::env::join_paths([
-            executable,
+            executable.to_path_buf(),
             system.clone(),
             system.join("WindowsPowerShell/v1.0"),
             system.join("Wbem"),
@@ -466,3 +498,7 @@ pub async fn app_bound_uninstall(
     .await
     .map_err(|e| e.to_string())?
 }
+
+#[cfg(all(test, windows, not(feature = "app-bound-dev")))]
+#[path = "app_bound_tests.rs"]
+mod tests;
