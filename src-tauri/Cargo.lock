@@ -58,6 +58,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -676,6 +677,7 @@ dependencies = [
 name = "carbonpaper"
 version = "0.9.1"
 dependencies = [
+ "aead",
  "aes-gcm",
  "aho-corasick",
  "anyhow",

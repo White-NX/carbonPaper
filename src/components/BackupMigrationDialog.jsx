@@ -1,92 +1,18 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { selectBackupExportPath, selectBackupImportPath } from '../lib/native_dialogs';
 import { Dialog } from './Dialog';
 import { Lock, FileUp, FileDown, ShieldAlert, CheckCircle2, RefreshCw } from 'lucide-react';
-import { withAuth } from '../lib/auth_api';
-import { useSettingsActivity } from './settings/SettingsActivityContext';
-import { notifySettingsChanged } from '../lib/settings_api';
+import { Button } from './ui/Button';
+import { Banner } from './ui/Banner';
+import { ProgressBlock } from './overlay/ProgressBlock';
+import { useBackupMigration } from '../hooks/useBackupMigration';
 
 export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export' }) {
   const { t } = useTranslation();
-  const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [status, setStatus] = useState('idle'); // idle, processing, success, error
-  const [error, setError] = useState('');
-  const [progress, setProgress] = useState(null);
-  useSettingsActivity('backup', { busy: status === 'processing' });
-
-  useEffect(() => {
-    let unlistenPromise;
-    if (status === 'processing') {
-      unlistenPromise = listen('backup-migration-progress', (event) => {
-        setProgress(event.payload);
-      });
-    }
-    return () => {
-      if (unlistenPromise) {
-        unlistenPromise.then(unlisten => unlisten());
-      }
-    };
-  }, [status]);
-
-  const handleAction = async () => {
-    if (mode === 'export' && password !== confirmPassword) {
-      setError(t('settings.backup.error_password_mismatch'));
-      return;
-    }
-    if (!password) {
-      setError(t('settings.backup.error_password_empty'));
-      return;
-    }
-
-    try {
-      setError('');
-      setProgress(null);
-      setStatus('processing');
-
-      if (mode === 'export') {
-        const filePath = await selectBackupExportPath();
-        if (!filePath) {
-          setStatus('idle');
-          return;
-        }
-
-        await withAuth(() => invoke('storage_export_backup', { password, exportPath: filePath }), { autoPrompt: true });
-      } else {
-        const filePath = await selectBackupImportPath();
-        if (!filePath) {
-          setStatus('idle');
-          return;
-        }
-
-        await withAuth(() => invoke('storage_import_backup', { password, backupZipPath: filePath }), { autoPrompt: true });
-      }
-
-      setStatus('success');
-      if (mode === 'import') await notifySettingsChanged(['storage', 'records']);
-    } catch (err) {
-      console.error('Backup migration failed:', err);
-      setStatus('error');
-      setError(typeof err === 'string' ? err : (err?.message || String(err)));
-    }
-  };
-
-  const reset = () => {
-    setPassword('');
-    setConfirmPassword('');
-    setStatus('idle');
-    setError('');
-    setProgress(null);
-  };
-
-  const handleClose = () => {
-    if (status === 'processing') return;
-    reset();
-    onClose();
-  };
+  const {
+    password, setPassword, confirmPassword, setConfirmPassword,
+    status, error, progress, cancelState, handleAction, handleCancel, handleClose, handleRetry,
+  } = useBackupMigration({ mode, t, onClose });
 
   const title = mode === 'export' 
     ? t('settings.backup.export_title')
@@ -97,14 +23,11 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
       <div className="p-6 space-y-6">
         {status === 'idle' && (
           <>
-            <div className="p-4 bg-ide-accent/5 border border-ide-accent/10 rounded-xl flex gap-3 items-start">
-              <ShieldAlert className="w-5 h-5 text-ide-accent shrink-0 mt-0.5" />
-              <div className="text-xs text-ide-muted leading-relaxed">
-                {mode === 'export' 
-                  ? t('settings.backup.export_hint')
-                  : t('settings.backup.import_hint')}
-              </div>
-            </div>
+            <Banner icon={ShieldAlert} className="p-4 rounded-xl">
+              {mode === 'export'
+                ? t('settings.backup.export_hint')
+                : t('settings.backup.import_hint')}
+            </Banner>
 
             <div className="space-y-4">
               <div className="space-y-1.5">
@@ -115,7 +38,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     className="w-full bg-ide-panel border border-ide-border rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-ide-accent"
-                    placeholder="Enter Password"
+                    placeholder={t('settings.backup.password_placeholder')}
                   />
                   <Lock className="absolute left-3 top-2.5 w-4 h-4 text-ide-muted" />
                 </div>
@@ -130,7 +53,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
                       className="w-full bg-ide-panel border border-ide-border rounded-lg pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-ide-accent"
-                      placeholder="Confirm Password"
+                      placeholder={t('settings.backup.confirm_password_placeholder')}
                     />
                     <Lock className="absolute left-3 top-2.5 w-4 h-4 text-ide-muted" />
                   </div>
@@ -139,25 +62,20 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
             </div>
 
             {error && (
-              <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-xs text-red-500">
-                {error}
-              </div>
+              <Banner tone="error">{error}</Banner>
             )}
 
             <div className="flex justify-end gap-3 pt-2">
-              <button
+              <Button size="md"
                 onClick={handleClose}
-                className="px-4 py-2 border border-ide-border rounded-lg text-sm hover:bg-ide-panel transition-colors"
               >
                 {t('common.cancel')}
-              </button>
-              <button
+              </Button>
+              <Button variant="primary" size="md" icon={mode === 'export' ? FileDown : FileUp}
                 onClick={handleAction}
-                className="px-4 py-2 bg-ide-accent text-white rounded-lg text-sm font-medium hover:bg-ide-accent/90 transition-colors flex items-center gap-2"
               >
-                {mode === 'export' ? <FileDown className="w-4 h-4" /> : <FileUp className="w-4 h-4" />}
                 {mode === 'export' ? t('settings.backup.export_btn') : t('settings.backup.import_btn')}
-              </button>
+              </Button>
             </div>
           </>
         )}
@@ -166,24 +84,24 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
           <div className="py-8 flex flex-col items-center justify-center space-y-4">
             <RefreshCw className="w-10 h-10 text-ide-accent animate-spin" />
             <div className="text-center w-full max-w-sm">
-              <div className="text-sm font-medium">{t('settings.backup.processing')}</div>
-              {progress && progress.total_files > 0 ? (
-                <div className="mt-4 space-y-2">
-                  <div className="flex items-center justify-between text-xs text-ide-muted">
-                    <span className="truncate max-w-[200px] text-left">{progress.current_file}</span>
-                    <span className="shrink-0 ml-4">{progress.copied_files} / {progress.total_files}</span>
-                  </div>
-                  <div className="w-full bg-ide-panel border border-ide-border rounded-full h-2 overflow-hidden">
-                    <div 
-                      className="bg-ide-accent h-full transition-all duration-300 ease-out" 
-                      style={{ width: `${Math.max(2, (progress.copied_files / progress.total_files) * 100)}%` }} 
-                    />
-                  </div>
-                </div>
-              ) : (
-                <div className="text-xs text-ide-muted mt-1">{t('settings.backup.processing_hint')}</div>
-              )}
+              <div className="text-sm font-medium">
+                {cancelState === 'pending' ? t('settings.backup.cancelling')
+                  : cancelState === 'finishing' ? t('settings.backup.phases.finalize')
+                    : progress?.phase ? t(`settings.backup.phases.${progress.phase}`) : t('settings.backup.processing')}
+              </div>
+              <ProgressBlock
+                label={t('settings.backup.processing_hint')}
+                percent={progress?.total_files > 0 ? progress.copied_files / progress.total_files * 100 : undefined}
+                className="mt-4 text-left"
+              />
             </div>
+            {error && <Banner tone="error">{error}</Banner>}
+            <Button size="md"
+              onClick={handleCancel}
+              disabled={cancelState !== 'idle'}
+            >
+              {t('common.cancel')}
+            </Button>
           </div>
         )}
 
@@ -198,12 +116,12 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                   : t('settings.backup.import_success_hint')}
               </p>
             </div>
-            <button
+            <Button size="md"
               onClick={handleClose}
-              className="mt-4 px-6 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm font-medium hover:bg-ide-hover transition-colors"
+              className="mt-4 px-6"
             >
               {t('common.close')}
-            </button>
+            </Button>
           </div>
         )}
 
@@ -219,18 +137,16 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
               </p>
             </div>
             <div className="flex gap-3 pt-2">
-              <button
-                onClick={() => setStatus('idle')}
-                className="px-4 py-2 border border-ide-border rounded-lg text-sm hover:bg-ide-panel transition-colors"
+              <Button size="md"
+                onClick={handleRetry}
               >
                 {t('common.retry')}
-              </button>
-              <button
+              </Button>
+              <Button size="md"
                 onClick={handleClose}
-                className="px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm hover:bg-ide-hover transition-colors"
               >
                 {t('common.close')}
-              </button>
+              </Button>
             </div>
           </div>
         )}

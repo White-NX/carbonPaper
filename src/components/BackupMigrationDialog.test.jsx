@@ -14,10 +14,10 @@ vi.mock('../lib/native_dialogs', () => ({ selectBackupExportPath: vi.fn(async ()
 describe('backup selection cancellation', () => {
   it.each(['export', 'import'])('keeps the %s form open without authenticating or starting work', async (mode) => {
     render(<BackupMigrationDialog isOpen mode={mode} onClose={vi.fn()} />);
-    fireEvent.change(screen.getByPlaceholderText('Enter Password'), { target: { value: 'review-password' } });
-    if (mode === 'export') fireEvent.change(screen.getByPlaceholderText('Confirm Password'), { target: { value: 'review-password' } });
+    fireEvent.change(screen.getByPlaceholderText('settings.backup.password_placeholder'), { target: { value: 'review-password' } });
+    if (mode === 'export') fireEvent.change(screen.getByPlaceholderText('settings.backup.confirm_password_placeholder'), { target: { value: 'review-password' } });
     fireEvent.click(screen.getByRole('button', { name: `settings.backup.${mode}_btn` }));
-    await waitFor(() => expect(screen.getByPlaceholderText('Enter Password')).toBeVisible());
+    await waitFor(() => expect(screen.getByPlaceholderText('settings.backup.password_placeholder')).toBeVisible());
     expect(mode === 'export' ? selectBackupExportPath : selectBackupImportPath).toHaveBeenCalledTimes(1);
     expect(withAuth).not.toHaveBeenCalled();
     expect(invoke).not.toHaveBeenCalled();

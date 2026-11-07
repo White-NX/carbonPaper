@@ -1,6 +1,7 @@
 import { open, save } from '@tauri-apps/plugin-dialog';
 
-const backupFilters = [{ name: 'CarbonPaper Backup', extensions: ['zip'] }];
+const backupExportFilters = [{ name: 'CarbonPaper Backup', extensions: ['cpbackup'] }];
+const backupImportFilters = [{ name: 'CarbonPaper Backup', extensions: ['cpbackup', 'zip'] }];
 
 function singlePath(selection) {
   if (Array.isArray(selection)) {
@@ -15,11 +16,11 @@ function singlePath(selection) {
 // The dialog plugin attaches native UI to the calling WebView. These helpers
 // select paths only; callers authenticate the protected operation afterwards.
 export async function selectBackupExportPath() {
-  return singlePath(await save({ filters: backupFilters, defaultPath: 'CarbonPaper_Backup.zip' }));
+  return singlePath(await save({ filters: backupExportFilters, defaultPath: 'CarbonPaper_Backup.cpbackup' }));
 }
 
 export async function selectBackupImportPath() {
-  return singlePath(await open({ filters: backupFilters, multiple: false, directory: false }));
+  return singlePath(await open({ filters: backupImportFilters, multiple: false, directory: false }));
 }
 
 export async function selectStorageDirectory() {

@@ -94,6 +94,7 @@ const COMMAND_TIERS = {
   'commands::migration::storage_run_hmac_migration': 'session_required',
   'commands::migration::storage_export_backup': 'session_required',
   'commands::migration::storage_import_backup': 'session_required',
+  'commands::migration::storage_backup_cancel': 'session_required',
   'analysis::get_analysis_overview': 'session_required',
   'commands::mcp::mcp_set_enabled': 'session_required',
   'commands::mcp::mcp_get_status': 'public',
