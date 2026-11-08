@@ -78,8 +78,10 @@ let setEnabledError;
 
 function t(key, values = {}) {
   if (key.endsWith('.variants.cursor.prompt')) {
-    return `Cursor ${values.skillName} ${values.repo} ${values.endpoint} schema ${values.toolSchemaVersion} Authorization: Bearer <CarbonPaper token>`;
+    return `Cursor ${values.skillName} ${values.repo} ${values.endpoint} schema ${values.toolSchemaVersion} Authorization: Bearer <${values.credentialPlaceholder}> ${values.credentialInstructions}`;
   }
+  if (key === 'settings.ai_embedding.token.placeholder') return 'CarbonPaper token';
+  if (key === 'settings.security.credentials.placeholder') return 'unattended Agent credential';
   return key;
 }
 
@@ -253,5 +255,53 @@ describe('useAiEmbeddingController Agent onboarding', () => {
     });
     expect(result.current.mcpOperationLoading).toBe(false);
     expect(result.current.smokeTestReport).toEqual(smokeReport);
+  });
+
+  it('blocks interactive token and smoke-test actions in unattended mode and copies a separate-credential setup prompt', async () => {
+    statusResponse = { ...statusResponse, mode: 'unattended' };
+    const { result } = renderHook(() => useAiEmbeddingController({ t }));
+    await waitFor(() => expect(result.current.mode).toBe('unattended'));
+    await act(async () => {
+      result.current.requestResetToken();
+      await result.current.handleResetToken();
+      await result.current.handleCopyCurrentToken();
+      await result.current.handleRunMcpSmokeTest();
+    });
+    expect(result.current.showResetConfirm).toBe(false);
+    for (const command of ['mcp_reset_token', 'mcp_copy_token_to_clipboard', 'mcp_run_smoke_test']) expect(invoke).not.toHaveBeenCalledWith(command);
+    act(() => result.current.handleAgentVariantChange('cursor'));
+    await act(async () => result.current.handleCopyAgentSetupPrompt());
+    const prompt = writeText.mock.calls.at(-1)[0];
+    expect(prompt).toContain('<unattended Agent credential>');
+    expect(prompt).toContain('settings.security.credentials.setupInstructions');
+    expect(prompt).not.toContain('<CarbonPaper token>');
+  });
+
+  it('leaves automatic unattended restore to the backend and does not claim that pending preparation is running', async () => {
+    statusResponse = { ...statusResponse, mode: 'unattended', running: false, state: 'stopped' };
+    const { result } = renderHook(() => useAiEmbeddingController({ t }));
+    await waitFor(() => expect(result.current.mode).toBe('unattended'));
+    expect(invoke).not.toHaveBeenCalledWith('mcp_set_enabled', expect.anything());
+    statusResponse = { ...statusResponse, state: 'preparing' };
+    await act(async () => result.current.startMcpService({ auto: false }));
+    expect(result.current.running).toBe(false);
+    expect(result.current.shouldShowStartButton).toBe(false);
+    expect(result.current.statusMessage).toBe('settings.security.access.preparing');
+  });
+
+  it('invalidates interactive diagnostics immediately when the Agent permission changes mode', async () => {
+    const { result } = renderHook(() => useAiEmbeddingController({ t }));
+    await waitFor(() => expect(result.current.mode).toBe('interactive'));
+    await act(async () => result.current.handleRunMcpSmokeTest());
+    act(() => result.current.requestResetToken());
+    expect(result.current.showResetConfirm).toBe(true);
+    await waitFor(() => expect(eventListeners.has('agent-access-changed')).toBe(true));
+    statusResponse = { ...statusResponse, mode: 'unattended' };
+    act(() => eventListeners.get('agent-access-changed')({ payload: {} }));
+    await waitFor(() => expect(result.current.mode).toBe('unattended'));
+    expect(result.current.showResetConfirm).toBe(false);
+    expect(result.current.smokeTestReport).toBeNull();
+    await act(async () => result.current.handleCopyAgentDiagnostics());
+    expect(JSON.parse(writeText.mock.calls.at(-1)[0])).toMatchObject({ mcp_mode: 'unattended', smoke_test: null });
   });
 });

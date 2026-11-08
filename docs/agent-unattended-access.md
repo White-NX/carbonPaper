@@ -34,10 +34,57 @@ All ten existing read tools are available. The two summary-write tools are
 omitted from the catalog and rejected if called directly. In-process AI tools
 continue to use the authenticated interactive dispatcher.
 
+## Settings and introduction
+
+Privacy settings present one colored **Security level** control that combines
+automatic locking and unattended permission:
+
+| Level | Automatic locking | Unattended permission |
+| --- | --- | --- |
+| Strict | 15 minutes; backgrounding also locks the existing UI session | Off |
+| Relaxed (recommended) | No automatic expiry; manual locking and application exit still end the session | Off |
+| Unattended | No automatic expiry; manual locking and application exit still end the UI session | On |
+| Custom | Individually adjustable | Individually adjustable |
+
+Custom preserves its explicit selection even when its values match a preset.
+The old standalone unlock-duration row is consolidated into Custom. Background
+organization, content categories and PII filtering remain independent settings.
+Installing protected components can be done separately from enabling background
+organization through **Install components** in Privacy settings.
+
+Selecting Unattended or switching unattended permission on first presents a risk
+decision. Cancelling keeps the effective policy unchanged. Enabling permission
+then requires fresh native Windows verification before the coordinated settings
+are saved. Applying a policy serializes with MCP listener transitions; failed
+permission changes restore the previous timeout preference without recreating
+revoked credentials. Permission changes reconcile service authority and the
+desktop writer state; a retired view is prepared again only after fresh consent.
+
+The introduction appears once after authenticated startup, following required
+setup and the search-index upgrade. It explains the historical and future text
+scope, locked/startup behavior and credential exposure, recommends Relaxed when
+unattended access is unnecessary, then offers the same presets and Custom fields.
+Choices remain a draft until **Apply settings**. The risk decision stays within
+the active wizard, so it remains usable under startup overlay coordination.
+**Keep current settings** records the introduction as seen without changing
+permissions; **Feature guide** in Privacy settings reopens it.
+
+**AI → Agent access** retains connection and privacy-filter controls and manages
+unattended credentials. Text preparation must finish before creating a labeled
+credential; interrupted preparation offers an explicit continuation action.
+Each credential has an optional expiry, last-use information, replacement and
+independent revocation. Interactive token-copy, token-rotation and smoke-test
+controls are shown only in interactive mode. Setup instructions use the active
+mode's credential placeholder and never include an actual bearer secret.
+
 ## Application commands
 
 The native settings/main-window commands are:
 
+- `security_get_policy`: public policy metadata, runtime availability, progress
+  and the introduction marker, restricted to the main/settings windows.
+- `security_set_policy`: authenticated coordinated preset or Custom mutation.
+- `security_acknowledge_intro`: window-authorized UI progress marker only.
 - `agent_access_get_status`: availability, preparation progress and credential
   metadata. It returns no archive text, paths, keys or bearer secrets. Labels
   are omitted while the UI is locked.

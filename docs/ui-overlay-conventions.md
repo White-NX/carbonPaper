@@ -32,6 +32,7 @@ or a fatal surface.
 | Rust index maintenance (`maintenance`) | Main window, `OverlayShell`, `maintenance` | Completes automatically; maintenance offers its own unlock action when required. |
 | Storage initialization (`storageInitialization`) | Main window, `StorageInitializationOverlay` / `OverlayShell`, `maintenance` | Rust starts preparation and any required database compaction before admitting capture, including background launches. The overlay observes this job before the login flow; failed preparation offers an explicit retry. Recreated hidden-start windows read the current application-owned job before requesting progress; application access stays gated until readiness is confirmed. |
 | First-run onboarding and What's New (`onboarding`) | Main window, `OnboardingOverlay` / `OverlayShell`, `prompt` | Wizard navigation follows its step state; What's New can defer while idle. Applying choices blocks dismissal. |
+| Security-level introduction (`securityOnboarding`) | Main window, `SecurityOnboardingOverlay` / `OverlayShell`, `prompt`; reopened from Privacy settings using `Dialog` | Explains persistent text access and its risks, then offers presets or detailed choices. Unattended choices require an explicit risk decision within the wizard. Apply blocks dismissal; keeping existing settings records the introduction as seen. |
 | Update offer/progress (`update`) | Main window, `UpdateModal` / `OverlayShell`, `prompt` | Explicit later/hide/retry controls; hiding progress leaves the operation running. |
 | Required-model download (`modelDownload`) | Main window, `Mask` / `OverlayShell`, `prompt` | Explicit background/retry actions; shares the download controller with onboarding. |
 | Search-index security upgrade (`hmac`) | Main window, `HmacMigrationDialog` / `OverlayShell`, `prompt` | Rust admits one application-owned upgrade after explicit authentication. The view recovers current progress on mount; Close/Escape hides progress while the upgrade continues. |
@@ -129,7 +130,7 @@ A new startup overlay needs an id in `OVERLAY_PRIORITY`, placed with a comment
 that says why it ranks where it does.
 
 The current grant order is `fatal`, `storageInitialization`, `maintenance`, `auth`,
-`onboarding`, `update`, `modelDownload`, `hmac`, `clipBackfill`, then `appBound`.
+`onboarding`, `update`, `modelDownload`, `hmac`, `securityOnboarding`, `clipBackfill`, then `appBound`.
 This controls which startup view renders; CSS layer bands control stacking
 against ordinary dialogs and the explicit settings discard decision.
 

@@ -306,7 +306,9 @@
     "cancelled": "Cancelled. Your current settings are unchanged.",
     "backgroundDisabled": "Enable background processing first.",
     "packageUnavailable": "This build does not provide this feature. Use an official release package.",
-    "failed": "Unable to complete this operation. Try again or repair the background component."
+    "failed": "Unable to complete this operation. Try again or repair the background component.",
+    "installComponents": "Install components",
+    "componentsHint": "Install components to authorize background organization and unattended Agent access separately. Windows requests administrator approval and the app restarts."
   },
   "notifications": {
     "ocr_model_repair": {
@@ -456,10 +458,10 @@
         "title": "Protected by Windows CNG",
         "description": "Records are encrypted on this computer. Verify with Windows Hello to access them."
       },
-      "unlock_label": "Unlock protection",
+      "unlock_label": "Access security",
       "session": {
-        "title": "Unlock duration",
-        "description": "Verify again to view records after this time has elapsed.",
+        "title": "Automatic locking",
+        "description": "Positive durations lock when verification expires or the app enters the background. Manual locking and app exit remain available.",
         "options": {
           "5m": {
             "label": "5 minutes",
@@ -467,7 +469,7 @@
           },
           "15m": {
             "label": "15 minutes",
-            "description": "Recommended"
+            "description": "Used by Strict"
           },
           "1h": {
             "label": "1 hour",
@@ -478,15 +480,108 @@
             "description": "Lower security"
           },
           "until_close": {
-            "label": "Until app exits",
-            "description": "Stay unlocked until the app fully exits."
+            "label": "No automatic locking",
+            "description": "Stay unlocked until you lock manually or fully exit the app."
           }
         },
         "current": {
           "unlocked": "Unlocked",
           "locked": "Locked"
         },
-        "lock_now": "Lock now"
+        "lock_now": "Lock now",
+        "currentTimeout": "Current: {{seconds}} seconds"
+      },
+      "level": {
+        "title": "Security level",
+        "description": "Choose how long the app stays unlocked and whether Agents may read text while it is locked.",
+        "options": {
+          "strict": {
+            "label": "Strict",
+            "description": "Lock after 15 minutes or when backgrounded. Unattended access is off."
+          },
+          "relaxed": {
+            "label": "Relaxed (recommended)",
+            "description": "Stay unlocked without automatic locking. Unattended access is off."
+          },
+          "unattended": {
+            "label": "Unattended",
+            "description": "Stay unlocked and allow Agents to read text while the app is locked."
+          },
+          "custom": {
+            "label": "Custom",
+            "description": "Adjust automatic locking and unattended permission separately."
+          }
+        }
+      },
+      "access": {
+        "title": "Unattended Agent access",
+        "description": "Allow separately authorized Agents to read prepared text history independently of app locking.",
+        "active": "Unattended permission is active. Locking CarbonPaper leaves these credentials valid. Disabling permission revokes all of them.",
+        "requirements": "Unattended access requires available protected components. Install or repair them under “Continue organizing after restart” in Privacy settings.",
+        "preparing": "Preparing text history…",
+        "resume": "Continue preparation",
+        "resumed": "Preparation has been resumed.",
+        "phases": {
+          "ready": "Text history is ready for unattended access.",
+          "preparing": "Preparing text history. Access becomes available when preparation finishes.",
+          "waiting": "Text history needs an unlocked app to finish preparation. Unlock CarbonPaper, then continue preparation.",
+          "error": "Preparation was interrupted. Continue preparation to retry.",
+          "unavailable": "Protected components are unavailable. Install or repair them in Privacy settings.",
+          "disabled": "Unattended permission is off. Change the security level in Privacy settings to enable it."
+        },
+        "manageComponents": "Manage required components"
+      },
+      "warning": {
+        "title": "Enable unattended access?",
+        "message": "Unattended access reduces CarbonPaper’s security. Programs holding a credential can read all prepared historical text and future records while the app is locked, including after Windows sign-in and app startup. Locking the app does not revoke this permission. Unless unattended access is essential, use “Relaxed (recommended)”.",
+        "confirm": "Accept risk and enable"
+      },
+      "feedback": {
+        "loading": "Loading security settings…",
+        "applying": "Applying…",
+        "cancelled": "Cancelled. Your settings have been kept.",
+        "readFailed": "Security settings could not be loaded. Retry to see the current policy.",
+        "verificationUnavailable": "Windows verification is unavailable. Please try again when Windows Hello is available."
+      },
+      "credentials": {
+        "title": "Unattended credentials",
+        "description": "Give each Agent its own read-only credential for text history, then replace or revoke it independently.",
+        "manageLevel": "Security settings",
+        "label": "Agent name",
+        "expiry": "Expires after",
+        "expiryOptions": {
+          "1d": "1 day",
+          "30d": "30 days",
+          "90d": "90 days",
+          "never": "No expiry"
+        },
+        "createAndCopy": "Create and copy credential",
+        "replaceAndCopy": "Replace and copy credential",
+        "replace": "Replace",
+        "revoke": "Revoke",
+        "replaceMessage": "Replacing “{{label}}” copies a new credential once, then invalidates the previous credential. Update the Agent’s secret configuration.",
+        "delivery": "Windows verification is required. The credential is copied once to the Windows clipboard; paste it into the Agent’s local secret configuration. A lost credential must be replaced.",
+        "created": "Credential copied to the Windows clipboard. Paste it into the Agent’s local secret configuration now.",
+        "replaced": "New credential copied. The previous credential has been revoked.",
+        "clipboardFailed": "The credential could not be delivered to the clipboard. The new credential has been revoked; create it again.",
+        "revokedNotice": "Credential revoked. Text already returned to the Agent cannot be recalled.",
+        "empty": "No credentials yet. Create one after text preparation finishes.",
+        "neverUsed": "Never used",
+        "expires": "Expiry: {{date}}",
+        "lastUsed": "Last used: {{date}}",
+        "states": {
+          "active": "Active",
+          "expired": "Expired",
+          "revoked": "Revoked"
+        },
+        "revokeTitle": "Revoke this credential?",
+        "revokeMessage": "Revoke “{{label}}”? The Agent will lose access. Other credentials remain active; text already returned cannot be recalled.",
+        "placeholder": "unattended Agent credential",
+        "setupInstructions": "Use a separate unattended credential from CarbonPaper’s Agent access settings. Create or replace it and paste the once-copied value into the client’s local secret configuration. This credential grants read-only access to prepared text history while the app is locked; summary-write tools are unavailable. If preparation is incomplete, unlock CarbonPaper and continue preparation.",
+        "readFailed": "Unattended credentials could not be loaded. Please retry.",
+        "replacementIncomplete": "The new credential was copied, but revocation of the previous credential could not be confirmed. Review the credential list and revoke the previous one.",
+        "limitReached": "The credential limit has been reached. Revoke an unused credential before creating another.",
+        "invalid": "This credential request is no longer valid. Check its name, expiry and current status, then retry."
       }
     },
     "advanced": {
@@ -873,9 +968,9 @@
       "connectionDetails": "Connection details"
     },
     "ai_embedding": {
-      "title": "AI assistant access",
-      "description": "Expose a local MCP (Model Context Protocol) HTTP server so that AI assistants can query your snapshot data, OCR text, and smart clusters.",
-      "mcp_description": "When enabled, starts a local MCP service that lets AI tools query snapshot data, including screenshot metadata, OCR text, and smart cluster information. Be mindful of privacy and only authorize AI tools you trust.",
+      "title": "Agent access",
+      "description": "Let trusted Agents search historical text, recaps and smart-cluster information through a local connection.",
+      "mcp_description": "The local MCP connection lets Agents read record information, recognized words and recaps. Choose trusted Agents and configure access security and privacy filters for your needs.",
       "enable_label": "Enable MCP Server",
       "start_button": "Start",
       "starting": "Starting",
@@ -889,12 +984,14 @@
       },
       "token": {
         "title": "Access Token",
-        "description": "The token is used for API authentication. It is only shown once when generated.",
+        "description": "An interactive token connects Agents to an unlocked app. Copy it for setup or reset it to invalidate existing clients.",
         "copy": "Copy",
         "copied": "Copied",
         "reset": "Reset Token",
         "reset_confirm_title": "Reset Access Token?",
-        "reset_confirm_message": "The current token will be permanently invalidated. All clients using the old token will lose access. A new token will be generated."
+        "reset_confirm_message": "The current token will be permanently invalidated. All clients using the old token will lose access. A new token will be generated.",
+        "placeholder": "CarbonPaper token",
+        "setupInstructions": "Ask me to use Copy token in CarbonPaper and store it in the client’s local secret configuration. Keep the token out of prompts, logs and repositories."
       },
       "status": {
         "stopped": "MCP server is stopped",
@@ -922,22 +1019,22 @@
           "codex": {
             "label": "Codex",
             "description": "Install the native Skill and configure Codex's Streamable HTTP MCP connection.",
-            "prompt": "Configure CarbonPaper local-memory access in Codex.\n\n1. Fetch the {{skillName}} directory from {{repo}} and install it as a Codex Skill. It targets tool contract v{{toolSchemaVersion}}.\n2. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n3. Configure the header Authorization: Bearer <CarbonPaper token>. Do not put the token in prompts or logs; ask me to use Copy token in CarbonPaper and store it in Codex's local secret configuration.\n4. Use the Skill for screenshot history, OCR, and smart-cluster summary requests. search_nl is Chinese-CLIP text-to-image visual retrieval, not a Python-only feature.\n5. tools/list is a stable contract; temporary readiness comes from CarbonPaper diagnostics and call results. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only local data needed for my explicit request. When finished, report the configuration location and connection-test result."
+            "prompt": "Configure CarbonPaper local-memory access in Codex.\n\n1. Fetch the {{skillName}} directory from {{repo}} and install it as a Codex Skill. It targets tool contract v{{toolSchemaVersion}}.\n2. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n3. Configure the header Authorization: Bearer <{{credentialPlaceholder}}>. {{credentialInstructions}}\n4. Use the Skill for screenshot history, OCR, and smart-cluster summary requests. search_nl is Chinese-CLIP text-to-image visual retrieval, not a Python-only feature.\n5. tools/list is a stable contract; temporary readiness comes from CarbonPaper diagnostics and call results. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only local data needed for my explicit request. When finished, report the configuration location and connection-test result."
           },
           "claude": {
             "label": "Claude",
             "description": "Configure Claude Desktop or Claude Code and use the Skill documents as project guidance.",
-            "prompt": "Configure CarbonPaper local-memory access for Claude Desktop or Claude Code.\n\n1. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n2. Configure Authorization: Bearer <CarbonPaper token>. Do not put the token in chat, project instructions, or logs; ask me to copy it separately from CarbonPaper and store it in the client's local secret configuration.\n3. Read {{skillName}}/SKILL.md and its references from {{repo}} as the CarbonPaper workflow guide. The current tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP text-to-image visual retrieval and must not be described as Python-dependent. tools/list always exposes the static contract; temporary readiness is reported when a tool is called.\n5. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only data needed for my explicit request. Report the configuration location and connection-test result when done."
+            "prompt": "Configure CarbonPaper local-memory access for Claude Desktop or Claude Code.\n\n1. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n2. Configure Authorization: Bearer <{{credentialPlaceholder}}>. {{credentialInstructions}}\n3. Read {{skillName}}/SKILL.md and its references from {{repo}} as the CarbonPaper workflow guide. The current tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP text-to-image visual retrieval and must not be described as Python-dependent. tools/list always exposes the static contract; temporary readiness is reported when a tool is called.\n5. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only data needed for my explicit request. Report the configuration location and connection-test result when done."
           },
           "cursor": {
             "label": "Cursor",
             "description": "Configure Cursor MCP and add the Skill workflow to local project rules or Agent context.",
-            "prompt": "Configure CarbonPaper local-memory access in Cursor.\n\n1. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n2. Configure Authorization: Bearer <CarbonPaper token>. Do not put the token in chat, repository files, or committed rules; ask me to copy it separately from CarbonPaper and store it in Cursor's private local configuration.\n3. Read {{skillName}}/SKILL.md and its references from {{repo}}, then add the applicable workflow to local Agent context. The tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP visual retrieval, not a Python-only path. tools/list is static and temporary backend unavailability is a call-time result.\n5. On AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Report the configuration location and MCP connection-test result without printing the token."
+            "prompt": "Configure CarbonPaper local-memory access in Cursor.\n\n1. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n2. Configure Authorization: Bearer <{{credentialPlaceholder}}>. {{credentialInstructions}}\n3. Read {{skillName}}/SKILL.md and its references from {{repo}}, then add the applicable workflow to local Agent context. The tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP visual retrieval, not a Python-only path. tools/list is static and temporary backend unavailability is a call-time result.\n5. On AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Report the configuration location and MCP connection-test result without printing the token."
           },
           "generic": {
             "label": "Generic",
             "description": "For other Agents that support Streamable HTTP MCP.",
-            "prompt": "Configure local CarbonPaper MCP access.\n\n1. Add a Streamable HTTP MCP server named carbonpaper at {{endpoint}}.\n2. Use Authorization: Bearer <CarbonPaper token>. Do not place the token in prompts, logs, or repositories; ask me to copy it separately from CarbonPaper and store it in the client's local secret configuration.\n3. Read the workflow in the {{skillName}} directory at {{repo}}. The current tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP text-to-image visual retrieval. tools/list is a static contract; live readiness is a call-time result.\n5. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only data needed for explicit requests, then validate the setup with ping, tools/list, and a read-only query."
+            "prompt": "Configure local CarbonPaper MCP access.\n\n1. Add a Streamable HTTP MCP server named carbonpaper at {{endpoint}}.\n2. Use Authorization: Bearer <{{credentialPlaceholder}}>. {{credentialInstructions}}\n3. Read the workflow in the {{skillName}} directory at {{repo}}. The current tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP text-to-image visual retrieval. tools/list is a static contract; live readiness is a call-time result.\n5. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only data needed for explicit requests, then validate the setup with ping, tools/list, and a read-only query."
           }
         }
       },
@@ -2227,5 +2324,38 @@
     "untitled": "Untitled window",
     "previewUnavailable": "Open the capture to view it",
     "fileExplorer": "File Explorer"
+  },
+  "securityWizard": {
+    "title": "Choose how Agents access your history",
+    "open": "Feature guide",
+    "step": "Step {{current}} of {{total}}",
+    "back": "Back",
+    "next": "Next",
+    "apply": "Apply settings",
+    "later": "Keep current settings",
+    "steps": {
+      "0": {
+        "title": "Access for unattended Agents"
+      },
+      "1": {
+        "title": "Understand the risk"
+      },
+      "2": {
+        "title": "Choose a security level"
+      }
+    },
+    "intro": {
+      "history": "Agents can search and read all prepared historical text, including recognized words, window titles, recorded web addresses and recaps. Future records continue to sync.",
+      "startup": "When enabled, permission is independent of app unlocking. It resumes after Windows sign-in when CarbonPaper starts in the background. Fully exiting the app stops the local connection.",
+      "scope": "This permission provides read-only text history. Use the unlocked app to view screenshot images or edit records."
+    },
+    "risk": {
+      "title": "Locking leaves Agent permission active",
+      "lock": "Unattended permission reduces CarbonPaper’s security. A valid credential keeps working while the application is locked.",
+      "credential": "A leaked credential lets other local programs read your history. A connected Agent may also send the text it reads to the services it uses.",
+      "recommendation": "Choose “Relaxed (recommended)” unless unattended access is essential. It keeps the app unlocked after verification and preserves ordinary session-based Agent access.",
+      "revoke": "Revoke an individual credential in Agent access settings, or disable unattended permission to revoke all credentials. Text already returned cannot be recalled."
+    },
+    "credentials": "After enabling, create a separate credential for each Agent in AI → Agent access. Background organization and privacy filters are configured independently."
   }
 }

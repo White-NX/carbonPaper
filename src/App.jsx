@@ -38,6 +38,7 @@ import { useTauriEventListener } from './hooks/useTauriEventListener';
 import { initAuthListeners } from './lib/auth_api';
 import { downloadSizeMb, missingRequiredModels } from './lib/modelSizes';
 import OnboardingOverlay from './components/onboarding/OnboardingOverlay';
+import SecurityOnboardingOverlay from './components/settings/security/SecurityOnboardingOverlay';
 import { useOnboarding } from './components/onboarding/useOnboarding';
 import { OverlayCoordinatorProvider, useOverlayCoordinator } from './components/overlay';
 
@@ -301,6 +302,8 @@ function App() {
             retry: requiredDownload.retryModelDownload,
           }}
         />
+
+        <SecurityOnboardingOverlay enabled={initialization.ready && isAuthenticated} onSessionTimeoutChange={setSessionTimeout} />
 
         <UpdateModal
           isVisible={updateModalVisible}

@@ -22,6 +22,8 @@ export const OVERLAY_PRIORITY = [
   'update',
   'modelDownload',
   'hmac',
+  // Introduce access choices after required setup and upgrades, before optional offers.
+  'securityOnboarding',
   'clipBackfill',
   'appBound',
 ];

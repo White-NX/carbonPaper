@@ -66,6 +66,11 @@ describe('ProtectedProcessingCard', () => {
     render(<ProtectedProcessingCard backgroundEnabled={false} />);
     await waitFor(() => expect(getAppBoundStatus).toHaveBeenCalled());
     expect(screen.getByRole('button', { name: '启用' })).toBeDisabled();
+    const install = screen.getByRole('button', { name: '安装组件' });
+    expect(install).toBeEnabled();
+    fireEvent.click(install);
+    await waitFor(() => expect(installAppBound).toHaveBeenCalledWith(false));
+    expect(setAppBoundPolicy).not.toHaveBeenCalled();
   });
 
   it('keeps current status after cancelled removal', async () => {

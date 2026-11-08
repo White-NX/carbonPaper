@@ -6,6 +6,7 @@
 //! 3. OCR data storage and search
 
 mod agent_access;
+pub(crate) use agent_access::AgentPreparationProgress;
 mod ann_build;
 mod background_scheduler;
 pub(crate) mod backup;

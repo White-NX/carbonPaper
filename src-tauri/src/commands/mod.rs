@@ -29,6 +29,7 @@ pub mod credential;
 pub mod mcp;
 pub mod migration;
 pub mod recap;
+pub mod security;
 pub mod smart_cluster;
 pub mod storage;
 pub mod utility;

@@ -306,7 +306,9 @@
     "cancelled": "已取消，当前设置保持不变。",
     "backgroundDisabled": "请先开启后台自动整理。",
     "packageUnavailable": "此构建暂不提供该功能，请使用正式发布的安装包。",
-    "failed": "暂时无法完成操作，请重试或修复后台组件。"
+    "failed": "暂时无法完成操作，请重试或修复后台组件。",
+    "installComponents": "安装组件",
+    "componentsHint": "安装组件后，可分别授权后台整理和无人值守智能体访问。Windows 将请求管理员授权，应用会重新启动。"
   },
   "notifications": {
     "ocr_model_repair": {
@@ -456,10 +458,10 @@
         "title": "数据受到 Windows CNG 保护",
         "description": "记录以加密形式保存在这台电脑上，通过 Windows Hello 验证后即可访问。"
       },
-      "unlock_label": "解锁保护",
+      "unlock_label": "访问安全",
       "session": {
-        "title": "解锁有效期",
-        "description": "超过设定时间后，查看记录需要重新验证。",
+        "title": "自动锁定",
+        "description": "设置时长时，验证到期或应用进入后台会锁定。也可随时手动锁定或退出应用。",
         "options": {
           "5m": {
             "label": "5 分钟",
@@ -467,7 +469,7 @@
           },
           "15m": {
             "label": "15 分钟",
-            "description": "推荐"
+            "description": "严格等级采用此时长"
           },
           "1h": {
             "label": "1 小时",
@@ -478,15 +480,108 @@
             "description": "较低安全性"
           },
           "until_close": {
-            "label": "直到退出应用",
-            "description": "保持解锁，直到完全退出应用。"
+            "label": "不自动锁定",
+            "description": "保持解锁，直到手动锁定或完全退出应用。"
           }
         },
         "current": {
           "unlocked": "已解锁",
           "locked": "已锁定"
         },
-        "lock_now": "立即锁定"
+        "lock_now": "立即锁定",
+        "currentTimeout": "当前：{{seconds}} 秒"
+      },
+      "level": {
+        "title": "安全等级",
+        "description": "统一设置解锁时长，以及智能体能否在应用锁定时读取文本。",
+        "options": {
+          "strict": {
+            "label": "严格",
+            "description": "15 分钟后或进入后台时锁定；关闭无人值守访问。"
+          },
+          "relaxed": {
+            "label": "宽松（建议）",
+            "description": "解锁后不自动锁定；关闭无人值守访问。"
+          },
+          "unattended": {
+            "label": "无人值守",
+            "description": "解锁后不自动锁定；允许智能体在应用锁定时读取文本。"
+          },
+          "custom": {
+            "label": "自定义",
+            "description": "分别调整自动锁定和无人值守权限。"
+          }
+        }
+      },
+      "access": {
+        "title": "无人值守智能体访问",
+        "description": "允许单独授权的智能体独立于应用锁定状态，读取已准备的文本历史。",
+        "active": "无人值守权限已开启。锁定 CarbonPaper 后这些凭据仍有效，关闭此权限会撤销全部凭据。",
+        "requirements": "无人值守访问需要可用的受保护组件。请在隐私设置的“重启后继续后台整理”中安装或修复组件。",
+        "preparing": "正在准备文本历史…",
+        "resume": "继续准备",
+        "resumed": "已恢复文本历史准备。",
+        "phases": {
+          "ready": "文本历史已准备完成，可用于无人值守访问。",
+          "preparing": "正在准备文本历史，完成后即可访问。",
+          "waiting": "文本历史需要在解锁后补全。请先解锁 CarbonPaper，再继续准备。",
+          "error": "文本历史准备已中断，请继续准备以重试。",
+          "unavailable": "受保护组件暂不可用，请在隐私设置中安装或修复。",
+          "disabled": "无人值守权限未开启，可在隐私设置中调整安全等级。"
+        },
+        "manageComponents": "管理所需组件"
+      },
+      "warning": {
+        "title": "开启无人值守访问？",
+        "message": "无人值守访问将降低 CarbonPaper 的安全性。持有凭据的程序可在应用锁定时，读取已准备的全部历史文本和后续记录，包括 Windows 重新登录并启动应用之后。锁定应用不会撤销此权限。除非确实需要无人值守访问，建议选择“宽松（建议）”。",
+        "confirm": "接受风险并开启"
+      },
+      "feedback": {
+        "loading": "正在读取安全设置…",
+        "applying": "正在应用…",
+        "cancelled": "已取消，保留当前设置。",
+        "readFailed": "无法读取安全设置，请重试以查看当前策略。",
+        "verificationUnavailable": "Windows 身份验证暂不可用，请在 Windows Hello 可用后重试。"
+      },
+      "credentials": {
+        "title": "无人值守凭据",
+        "description": "为每个智能体创建独立的文本只读凭据，按需单独替换或撤销。",
+        "manageLevel": "安全设置",
+        "label": "智能体名称",
+        "expiry": "有效期",
+        "expiryOptions": {
+          "1d": "1 天",
+          "30d": "30 天",
+          "90d": "90 天",
+          "never": "永不过期"
+        },
+        "createAndCopy": "创建并复制凭据",
+        "replaceAndCopy": "替换并复制凭据",
+        "replace": "替换",
+        "revoke": "撤销",
+        "replaceMessage": "替换“{{label}}”后，新凭据将复制一次，原凭据随即失效。请更新智能体的私密配置。",
+        "delivery": "需要 Windows 身份验证。凭据仅复制一次到 Windows 剪贴板，请粘贴到智能体的本地私密配置；遗失后需重新替换。",
+        "created": "凭据已复制到 Windows 剪贴板，请立即粘贴到智能体的本地私密配置。",
+        "replaced": "新凭据已复制，原凭据已撤销。",
+        "clipboardFailed": "凭据未能交付到剪贴板，新凭据已撤销，请重新创建。",
+        "revokedNotice": "凭据已撤销，已交付给智能体的文字无法收回。",
+        "empty": "尚无凭据。文本历史准备完成后即可创建。",
+        "neverUsed": "尚未使用",
+        "expires": "到期时间：{{date}}",
+        "lastUsed": "最近使用：{{date}}",
+        "states": {
+          "active": "有效",
+          "expired": "已过期",
+          "revoked": "已撤销"
+        },
+        "revokeTitle": "撤销此凭据？",
+        "revokeMessage": "撤销“{{label}}”后，该智能体将失去访问权限。其他凭据仍有效，已经交付的文字无法收回。",
+        "placeholder": "无人值守智能体凭据",
+        "setupInstructions": "请使用 CarbonPaper“智能体访问”设置中的独立无人值守凭据。创建或替换凭据后，将仅复制一次的值粘贴到客户端的本地私密配置。该凭据可在应用锁定时读取已准备的文本历史，摘要写入工具不可用。若文本历史尚未准备完成，请解锁 CarbonPaper 并继续准备。",
+        "readFailed": "无法读取无人值守凭据，请重试。",
+        "replacementIncomplete": "新凭据已复制，但未能确认原凭据已撤销。请查看凭据列表并撤销原凭据。",
+        "limitReached": "已达到凭据上限，请先撤销不再使用的凭据。",
+        "invalid": "此凭据请求已失效，请检查名称、有效期和当前状态后重试。"
       }
     },
     "advanced": {
@@ -873,9 +968,9 @@
       "connectionDetails": "连接详情"
     },
     "ai_embedding": {
-      "title": "AI 助手访问",
-      "description": "管理人工智能嵌入服务",
-      "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、智能归档信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
+      "title": "智能体访问",
+      "description": "让可信智能体通过本机连接检索历史文字、回顾和智能归档信息。",
+      "mcp_description": "本机 MCP 连接允许智能体读取记录信息、识别文字与回顾。请选择可信智能体，并按需要设置访问安全和隐私过滤。",
       "enable_label": "MCP 服务",
       "start_button": "启动",
       "starting": "启动中",
@@ -889,12 +984,14 @@
       },
       "token": {
         "title": "授权令牌",
-        "description": "AI 工具连接时需要使用此令牌进行身份验证。",
+        "description": "普通会话令牌用于连接已解锁的应用。可复制令牌完成配置，或重置以使原有客户端失效。",
         "copy": "复制",
         "copied": "已复制",
         "reset": "重置令牌",
         "reset_confirm_title": "重置授权令牌",
-        "reset_confirm_message": "重置令牌将使所有已配置的 AI 工具连接失效，需要重新配置。确定继续？"
+        "reset_confirm_message": "重置令牌将使所有已配置的 AI 工具连接失效，需要重新配置。确定继续？",
+        "placeholder": "CarbonPaper token",
+        "setupInstructions": "请让我在 CarbonPaper 中单独复制令牌，再存入客户端的本地私密配置。不要把令牌写入提示词、日志或仓库。"
       },
       "status": {
         "stopped": "服务已停止",
@@ -922,22 +1019,22 @@
           "codex": {
             "label": "Codex",
             "description": "安装原生 Skill，并配置 Codex 的 Streamable HTTP MCP 连接。",
-            "prompt": "请在 Codex 中配置 CarbonPaper 本地记忆访问。\n\n1. 从 {{repo}} 获取 {{skillName}} 目录，安装为 Codex Skill；它对应工具契约 v{{toolSchemaVersion}}。\n2. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n3. 配置请求头 Authorization: Bearer <CarbonPaper token>。不要让我把令牌写入提示词或日志；请让我在 CarbonPaper 中单独点击“复制令牌”，再将它存入 Codex 的本地安全配置。\n4. 使用该 Skill 处理截图历史、OCR 和智能归档摘要请求。search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不是 Python-only 功能。\n5. tools/list 是稳定契约；临时可用性以 CarbonPaper 诊断和调用结果为准。如果返回 AUTH_REQUIRED，请提示我先在应用中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的本机数据。完成后告诉我配置文件位置和连接验证结果。"
+            "prompt": "请在 Codex 中配置 CarbonPaper 本地记忆访问。\n\n1. 从 {{repo}} 获取 {{skillName}} 目录，安装为 Codex Skill；它对应工具契约 v{{toolSchemaVersion}}。\n2. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n3. 配置请求头 Authorization: Bearer <{{credentialPlaceholder}}>。 {{credentialInstructions}}\n4. 使用该 Skill 处理截图历史、OCR 和智能归档摘要请求。search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不是 Python-only 功能。\n5. tools/list 是稳定契约；临时可用性以 CarbonPaper 诊断和调用结果为准。如果返回 AUTH_REQUIRED，请提示我先在应用中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的本机数据。完成后告诉我配置文件位置和连接验证结果。"
           },
           "claude": {
             "label": "Claude",
             "description": "配置 Claude Desktop 或 Claude Code，并将 Skill 文档作为项目说明使用。",
-            "prompt": "请为 Claude Desktop 或 Claude Code 配置 CarbonPaper 本地记忆访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n2. 配置请求头 Authorization: Bearer <CarbonPaper token>。不要把令牌写入聊天、项目说明或日志；请让我从 CarbonPaper 单独复制后，存入 Claude 客户端支持的本地安全配置。\n3. 从 {{repo}} 读取 {{skillName}}/SKILL.md 及其 references，作为 CarbonPaper 工作流说明；当前工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不应描述为依赖 Python。tools/list 始终静态暴露工具，临时可用性由调用结果决定。\n5. 如果返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的数据。完成后报告配置位置和连接测试结果。"
+            "prompt": "请为 Claude Desktop 或 Claude Code 配置 CarbonPaper 本地记忆访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n2. 配置请求头 Authorization: Bearer <{{credentialPlaceholder}}>。 {{credentialInstructions}}\n3. 从 {{repo}} 读取 {{skillName}}/SKILL.md 及其 references，作为 CarbonPaper 工作流说明；当前工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不应描述为依赖 Python。tools/list 始终静态暴露工具，临时可用性由调用结果决定。\n5. 如果返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的数据。完成后报告配置位置和连接测试结果。"
           },
           "cursor": {
             "label": "Cursor",
             "description": "配置 Cursor MCP，并将 Skill 工作流加入项目规则或 Agent 上下文。",
-            "prompt": "请在 Cursor 中配置 CarbonPaper 本地记忆访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n2. 配置 Authorization: Bearer <CarbonPaper token>。不要把令牌写入聊天、仓库文件或可提交的规则；请让我从 CarbonPaper 单独复制，并存入 Cursor 的本地私密配置。\n3. 从 {{repo}} 读取 {{skillName}}/SKILL.md 和 references，将适用工作流加入本地 Agent 上下文；工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 视觉检索，不是 Python-only 路径。tools/list 为静态契约，后端临时不可用应在调用时报告。\n5. 收到 AUTH_REQUIRED 时，提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 完成后报告配置位置和 MCP 连接验证结果，不要输出令牌。"
+            "prompt": "请在 Cursor 中配置 CarbonPaper 本地记忆访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n2. 配置 Authorization: Bearer <{{credentialPlaceholder}}>。 {{credentialInstructions}}\n3. 从 {{repo}} 读取 {{skillName}}/SKILL.md 和 references，将适用工作流加入本地 Agent 上下文；工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 视觉检索，不是 Python-only 路径。tools/list 为静态契约，后端临时不可用应在调用时报告。\n5. 收到 AUTH_REQUIRED 时，提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 完成后报告配置位置和 MCP 连接验证结果，不要输出令牌。"
           },
           "generic": {
             "label": "通用",
             "description": "适用于支持 Streamable HTTP MCP 的其他 Agent。",
-            "prompt": "请配置 CarbonPaper 本地 MCP 访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器：{{endpoint}}。\n2. 认证头为 Authorization: Bearer <CarbonPaper token>。不要把令牌写入提示词、日志或仓库；请让我从 CarbonPaper 单独复制并存入客户端的本地安全配置。\n3. 从 {{repo}} 的 {{skillName}} 目录读取工作流说明；当前工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 文本到图像的视觉检索；tools/list 是静态契约，实时可用性由调用结果决定。\n5. 如果返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 只读取完成明确请求所需的数据，并在配置后执行 ping、tools/list 和只读查询验证。"
+            "prompt": "请配置 CarbonPaper 本地 MCP 访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器：{{endpoint}}。\n2. 认证头为 Authorization: Bearer <{{credentialPlaceholder}}>。 {{credentialInstructions}}\n3. 从 {{repo}} 的 {{skillName}} 目录读取工作流说明；当前工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 文本到图像的视觉检索；tools/list 是静态契约，实时可用性由调用结果决定。\n5. 如果返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 只读取完成明确请求所需的数据，并在配置后执行 ping、tools/list 和只读查询验证。"
           }
         }
       },
@@ -2227,5 +2324,38 @@
     "untitled": "未命名窗口",
     "previewUnavailable": "打开截图查看内容",
     "fileExplorer": "文件资源管理器"
+  },
+  "securityWizard": {
+    "title": "选择智能体访问历史的方式",
+    "open": "功能介绍",
+    "step": "第 {{current}} 步，共 {{total}} 步",
+    "back": "上一步",
+    "next": "下一步",
+    "apply": "应用设置",
+    "later": "保留当前设置",
+    "steps": {
+      "0": {
+        "title": "面向无人值守智能体的访问"
+      },
+      "1": {
+        "title": "了解安全风险"
+      },
+      "2": {
+        "title": "选择安全等级"
+      }
+    },
+    "intro": {
+      "history": "智能体可检索和读取全部已准备的历史文字，包括识别文字、窗口标题、记录的网址与回顾，后续记录会继续同步。",
+      "startup": "开启后，权限独立于应用解锁状态。Windows 登录后随 CarbonPaper 后台启动恢复；完全退出应用时，本机连接停止。",
+      "scope": "该权限用于只读文本历史。查看截图图片或修改记录，请使用已解锁的应用。"
+    },
+    "risk": {
+      "title": "锁定后智能体权限仍有效",
+      "lock": "无人值守权限会降低 CarbonPaper 的安全性。应用锁定后，有效凭据仍可继续使用。",
+      "credential": "凭据泄露会让其他本机程序读取你的历史文字；连接的智能体还可能把读到的内容发送给它使用的服务。",
+      "recommendation": "除非确实需要无人值守访问，建议选择“宽松（建议）”。它在验证后保持应用解锁，并保留依赖普通会话的智能体访问。",
+      "revoke": "在“智能体访问”中可撤销单个凭据，关闭无人值守会撤销全部凭据。已经交付给智能体的文字无法收回。"
+    },
+    "credentials": "开启后，请在“AI → 智能体访问”为每个智能体创建独立凭据。后台整理和隐私过滤仍可分别设置。"
   }
 }

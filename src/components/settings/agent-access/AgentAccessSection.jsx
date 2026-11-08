@@ -4,6 +4,7 @@ import { useAiEmbeddingController } from '../useAiEmbeddingController';
 import AgentAccessDialogs from './AgentAccessDialogs';
 import AgentAccessHeader from './AgentAccessHeader';
 import McpServiceCard from './McpServiceCard';
+import UnattendedCredentialsCard from './UnattendedCredentialsCard';
 
 export default function AgentAccessSection() {
   const { t } = useTranslation();
@@ -11,6 +12,7 @@ export default function AgentAccessSection() {
     enabled,
     port,
     running,
+    mode,
     loading,
     actionLoading,
     restoreLoading,
@@ -44,6 +46,7 @@ export default function AgentAccessSection() {
     handleToggle,
     handleConfirmEnable,
     handleResetToken,
+    requestResetToken,
     filterLevel,
     handleLevelChange,
     handleCategoryToggle,
@@ -77,6 +80,7 @@ export default function AgentAccessSection() {
         enabled={enabled}
         port={port}
         running={running}
+        mode={mode}
         actionLoading={actionLoading}
         restoreLoading={restoreLoading}
         error={error}
@@ -102,7 +106,7 @@ export default function AgentAccessSection() {
         statusMessage={statusMessage}
         onStartService={startMcpService}
         onToggle={handleToggle}
-        onRequestResetToken={() => setShowResetConfirm(true)}
+        onRequestResetToken={requestResetToken}
         onLevelChange={handleLevelChange}
         onCategoryToggle={handleCategoryToggle}
         onFilterModeChange={handleFilterModeChange}
@@ -118,6 +122,8 @@ export default function AgentAccessSection() {
         onRunSmokeTest={handleRunMcpSmokeTest}
       />
 
+      <UnattendedCredentialsCard />
+
       <AgentAccessDialogs
         showPrivacyDialog={showPrivacyDialog}
         onClosePrivacyDialog={() => setShowPrivacyDialog(false)}
@@ -125,7 +131,7 @@ export default function AgentAccessSection() {
         onConfirmTextChange={setConfirmText}
         confirmTextExpected={CONFIRM_TEXT}
         onConfirmEnable={handleConfirmEnable}
-        showResetConfirm={showResetConfirm}
+        showResetConfirm={mode === 'interactive' && showResetConfirm}
         onCloseResetConfirm={() => setShowResetConfirm(false)}
         onResetToken={handleResetToken}
       />

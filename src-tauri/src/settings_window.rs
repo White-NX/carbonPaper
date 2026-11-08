@@ -239,6 +239,7 @@ pub fn settings_preferences_changed(
                     | "power"
                     | "autostart"
                     | "session"
+                    | "security"
                     | "models"
                     | "records"
                     | "storage"

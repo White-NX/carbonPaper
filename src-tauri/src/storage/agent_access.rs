@@ -754,18 +754,17 @@ impl StorageState {
     }
     pub(crate) fn disable_agent_access(&self) -> Result<(), String> {
         self.agent_writer.request(Request::AgentDisable {})?;
+        self.finish_agent_access_disable()
+    }
+    pub(crate) fn finish_agent_access_disable(&self) -> Result<(), String> {
         self.agent_writer.cancelled.store(true, Ordering::Release);
+        self.agent_writer.configured.store(false, Ordering::Release);
         let _sync = self
             .agent_writer
             .sync_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let binding = self.agent_binding();
-        let guard = self.get_connection_named("agent_disable")?;
-        db(guard
-            .as_ref()
-            .unwrap()
-            .execute_batch("DELETE FROM agent_access_state;DELETE FROM agent_outbox;DELETE FROM agent_projection_gaps;"))?;
         *self
             .agent_writer
             .keys
@@ -783,6 +782,8 @@ impl StorageState {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.agent_writer.progress_phase("disabled", None);
+        let guard = self.get_connection_named("agent_disable")?;
+        db(guard.as_ref().unwrap().execute_batch("DELETE FROM agent_access_state;DELETE FROM agent_outbox;DELETE FROM agent_projection_gaps;"))?;
         drop(guard);
         if let Some(binding) = binding {
             for suffix in ["", "-wal", "-shm", "-journal"] {

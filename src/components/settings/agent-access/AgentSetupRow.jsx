@@ -25,6 +25,7 @@ const AGENT_THEME_CLASSES = {
 
 export default function AgentSetupRow({
   port,
+  mode = 'interactive',
   agentSkill,
   agentVariant,
   agentPromptCopied,
@@ -86,10 +87,12 @@ export default function AgentSetupRow({
         <div className="min-w-0">
           <span className="text-ide-muted">{t('settings.ai_embedding.connection_info.auth_header')}</span>{' '}
           <code className="break-all text-ide-text font-mono">
-            Authorization: Bearer &lt;CarbonPaper token&gt;
+            Authorization: Bearer &lt;{t(mode === 'unattended' ? 'settings.security.credentials.placeholder' : 'settings.ai_embedding.token.placeholder')}&gt;
           </code>
         </div>
       </div>
+
+      {mode === 'unattended' && <p className="text-xs text-ide-muted">{t('settings.security.credentials.setupInstructions')}</p>}
 
       <div className="flex flex-wrap items-center gap-2">
         <SettingsButton

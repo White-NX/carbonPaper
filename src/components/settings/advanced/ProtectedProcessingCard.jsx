@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ShieldCheck } from 'lucide-react';
 import { SettingsDisclosure } from '../SettingsPrimitives';
+import { Button } from '../../ui/Button';
 import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
 import {
   getAppBoundStatus, installAppBound, setAppBoundPolicy, uninstallAppBound, appBoundErrorMessage,
@@ -69,7 +70,7 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
     : t('appBound.inactive');
 
   return (
-    <section className="space-y-3" aria-label={t('appBound.title')}>
+    <section id="protected-components" className="space-y-3 scroll-mt-6" aria-label={t('appBound.title')}>
       <h3 className="flex items-center gap-2 px-1 text-sm font-semibold text-ide-accent">
         <ShieldCheck size={16} />{t('appBound.title')}
       </h3>
@@ -89,9 +90,10 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
               ? t('appBound.disable') : t('appBound.enable')}
           </button>
         </div>
-        {!status?.installed && <p className="text-xs text-ide-muted">
-          {t('appBound.installHint')}
-        </p>}
+        {status && !status.installed && <div className="space-y-2">
+          <p className="text-xs leading-relaxed text-ide-muted">{t('appBound.componentsHint')}</p>
+          <Button disabled={!status.supported || !status.package_available} loading={busy} onClick={() => run(() => installAppBound(false))}>{t('appBound.installComponents')}</Button>
+        </div>}
         {status?.supported === false && <p className="text-xs text-ide-muted">
           {t('appBound.packageUnavailable')}
         </p>}

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::Emitter;
 
-async fn service(request: Request) -> Result<Response, String> {
+pub(super) async fn service(request: Request) -> Result<Response, String> {
     tokio::task::spawn_blocking(move || {
         carbonpaper_app_bound::windows::transport::call(request)
             .map_err(|e| format!("AGENT_SERVICE_UNAVAILABLE: {e}"))
@@ -17,7 +17,10 @@ async fn service(request: Request) -> Result<Response, String> {
     .await
     .map_err(|e| e.to_string())?
 }
-async fn fresh_verification(app: &tauri::AppHandle, window: &tauri::Window) -> Result<(), String> {
+pub(super) async fn fresh_verification(
+    app: &tauri::AppHandle,
+    window: &tauri::Window,
+) -> Result<(), String> {
     let owner = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
     crate::commands::credential::verify_user_for_owner(app.clone(), owner).await?;
     Ok(())
@@ -68,40 +71,84 @@ pub async fn agent_access_set_enabled(
         super::check_auth_required(&credential_state)?;
     }
     let _guard = mcp_state.lock_lifecycle().await;
-    let storage = storage_state.inner().clone();
+    super::check_auth_required(&credential_state)?;
+    set_enabled_under_lifecycle(
+        &app,
+        &credential_state,
+        storage_state.inner(),
+        &mcp_state,
+        enabled,
+    )
+    .await?;
+    let _ = app.emit("agent-access-changed", json!({"enabled":enabled}));
+    Ok(json!({"enabled":enabled,"preparation":storage_state.agent_preparation()}))
+}
+
+/// Caller holds the MCP lifecycle lock and has checked session/window consent.
+pub(super) async fn set_enabled_under_lifecycle(
+    app: &tauri::AppHandle,
+    credentials: &CredentialManagerState,
+    storage: &Arc<StorageState>,
+    runtime: &McpRuntimeState,
+    enabled: bool,
+) -> Result<(), String> {
     if enabled {
-        tokio::task::spawn_blocking(move || storage.begin_agent_access())
+        if storage.agent_access_enabled() {
+            let Response::AgentStatus(status) = service(Request::AgentStatus {}).await? else {
+                return Err("AGENT_INVALID_STATUS".into());
+            };
+            if !status.enabled {
+                // A retired service view cannot be revived with cached writer
+                // keys. The caller has fresh consent to prepare a new generation.
+                crate::mcp_server::stop_server(runtime).await;
+                let writer = storage.clone();
+                tokio::task::spawn_blocking(move || writer.finish_agent_access_disable())
+                    .await
+                    .map_err(|e| e.to_string())??;
+            }
+        }
+        let was_enabled = storage.agent_access_enabled();
+        let writer = storage.clone();
+        tokio::task::spawn_blocking(move || writer.begin_agent_access())
             .await
             .map_err(|e| e.to_string())??;
-        let mut policy = storage_state.load_policy()?;
-        policy
-            .as_object_mut()
-            .ok_or("Invalid policy")?
-            .insert("mcp_enabled".into(), json!(true));
-        storage_state.save_policy(&policy)?;
-        crate::mcp_server::stop_server(&mcp_state).await;
+        let persist = (|| {
+            let mut policy = storage.load_policy()?;
+            policy
+                .as_object_mut()
+                .ok_or("Invalid policy")?
+                .insert("mcp_enabled".into(), json!(true));
+            storage.save_policy(&policy)
+        })();
+        if let Err(error) = persist {
+            if !was_enabled {
+                let writer = storage.clone();
+                let _ = tokio::task::spawn_blocking(move || writer.disable_agent_access()).await;
+            }
+            return Err(error);
+        }
+        crate::mcp_server::stop_server(runtime).await;
     } else {
-        // Revoke in the service before shutdown or waiting for backfill, so
-        // already admitted requests cannot return while disable is completing.
+        // Retire service authority before waiting for reader or exporter work.
         service(Request::AgentDisable {}).await?;
-        crate::mcp_server::stop_server(&mcp_state).await;
-        tokio::task::spawn_blocking(move || storage.disable_agent_access())
+        crate::mcp_server::stop_server(runtime).await;
+        let writer = storage.clone();
+        tokio::task::spawn_blocking(move || writer.finish_agent_access_disable())
             .await
             .map_err(|e| e.to_string())??;
-        if storage_state.load_policy()?["mcp_enabled"].as_bool() == Some(true)
-            && credential_state.is_session_valid()
+        if storage.load_policy()?["mcp_enabled"].as_bool() == Some(true)
+            && credentials.is_session_valid()
         {
             let _ = crate::mcp_server::auto_start_under_lifecycle(
                 app.clone(),
-                &credential_state,
-                &storage_state,
-                &mcp_state,
+                credentials,
+                storage,
+                runtime,
             )
             .await;
         }
     }
-    let _ = app.emit("agent-access-changed", json!({"enabled":enabled}));
-    Ok(json!({"enabled":enabled,"preparation":storage_state.agent_preparation()}))
+    Ok(())
 }
 
 /// Authentication and UI authorization required; resumes an interrupted text
@@ -147,6 +194,19 @@ pub async fn agent_access_issue_credential(
     fresh_verification(&app, &window).await?;
     super::check_auth_required(&credential_state)?;
     let _guard = mcp_state.lock_lifecycle().await;
+    super::check_auth_required(&credential_state)?;
+    if let Some(id) = &replace_grant_id {
+        let Response::AgentStatus(status) = service(Request::AgentStatus {}).await? else {
+            return Err("AGENT_INVALID_GRANT".into());
+        };
+        if !status
+            .grants
+            .iter()
+            .any(|grant| &grant.id == id && !grant.revoked)
+        {
+            return Err("AGENT_INVALID_GRANT".into());
+        }
+    }
     let secret = zeroize::Zeroizing::new(crate::mcp_token::generate_token());
     let hash = hex::encode(crate::mcp_token::hash_token(&secret));
     let Response::AgentGrant(grant) = service(Request::AgentIssue {
@@ -164,7 +224,10 @@ pub async fn agent_access_issue_credential(
         return Err(format!("AGENT_CLIPBOARD_FAILED: {error}"));
     }
     if let Some(id) = replace_grant_id {
-        service(Request::AgentRevoke { grant_id: id }).await?;
+        if let Err(error) = service(Request::AgentRevoke { grant_id: id }).await {
+            let _ = app.emit("agent-access-changed", json!({"credential_changed":true}));
+            return Err(format!("AGENT_REPLACEMENT_REVOCATION_FAILED: {error}"));
+        }
     }
     let _ = app.emit("agent-access-changed", json!({"credential_changed":true}));
     Ok(json!({"grant":grant,"copied_to_clipboard":true}))

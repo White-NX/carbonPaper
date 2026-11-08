@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2, RefreshCw } from 'lucide-react';
+import { Banner } from '../../ui/Banner';
 import { SettingsSwitch } from '../SettingsControls';
 import AccessTokenRow from './AccessTokenRow';
 import AgentSetupRow from './AgentSetupRow';
@@ -18,6 +19,7 @@ export default function McpServiceCard({
   enabled,
   port,
   running,
+  mode,
   actionLoading,
   restoreLoading,
   error,
@@ -96,13 +98,9 @@ export default function McpServiceCard({
         </div>
       </div>
 
-      {error && (
-        <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
-          <p className="text-xs text-red-400">{error}</p>
-        </div>
-      )}
+      {error && <Banner tone="error">{error}</Banner>}
 
-      {enabled && (
+      {enabled && mode === 'interactive' && (
         <>
           <RowDivider />
           <AccessTokenRow
@@ -114,7 +112,7 @@ export default function McpServiceCard({
         </>
       )}
 
-      {enabled && (
+      {enabled && mode === 'interactive' && (
         <>
           <RowDivider />
           <McpSmokeTestRow
@@ -131,6 +129,7 @@ export default function McpServiceCard({
           <RowDivider />
           <AgentSetupRow
             port={port}
+            mode={mode}
             agentSkill={agentSkill}
             agentVariant={agentVariant}
             agentPromptCopied={agentPromptCopied}
@@ -145,7 +144,7 @@ export default function McpServiceCard({
       {enabled && running && (
         <>
           <RowDivider />
-          <ConnectionInfoRow port={port} />
+          <ConnectionInfoRow port={port} mode={mode} />
         </>
       )}
 

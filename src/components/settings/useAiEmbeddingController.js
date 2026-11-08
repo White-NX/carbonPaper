@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../lib/auth_api';
 import { useTauriEventListener } from '../../hooks/useTauriEventListener';
+import { usePolling } from '../../hooks/usePolling';
 import {
   AGENT_SETUP_VARIANTS,
   AGENT_SKILL_NAME,
@@ -14,6 +15,7 @@ import { useSettingsActive, useSettingsActivity } from './SettingsActivityContex
 function isCurrentMcpSmokeReport(report, status) {
   if (
     !report
+    || (status.mode && status.mode !== 'interactive')
     || report.runtime_generation == null
     || report.runtime_generation !== status.runtime_generation
   ) {
@@ -35,6 +37,7 @@ export function useAiEmbeddingController({ t }) {
     return saved > 0 ? saved : 23816;
   });
   const [running, setRunning] = useState(false);
+  const [mode, setMode] = useState(null);
   const [serviceState, setServiceState] = useState(() => (
     localStorage.getItem('mcpEnabled') === 'true' ? 'pending_auth' : 'disabled'
   ));
@@ -100,6 +103,7 @@ export function useAiEmbeddingController({ t }) {
       const serviceFingerprint = JSON.stringify([
         Boolean(status.enabled),
         Boolean(status.running),
+        status.mode || 'interactive',
         status.state || '',
         status.port || null,
         status.active_port || null,
@@ -115,6 +119,7 @@ export function useAiEmbeddingController({ t }) {
       serviceFingerprintRef.current = serviceFingerprint;
 
       setEnabled(status.enabled);
+      setMode(status.mode || 'interactive');
       setPort(status.port);
       setRunning(Boolean(status.running && status.port_consistent !== false));
       setServiceState(status.state || (status.enabled ? (status.running ? 'running' : 'pending_auth') : 'disabled'));
@@ -128,6 +133,7 @@ export function useAiEmbeddingController({ t }) {
       if (status.port) localStorage.setItem('mcpPort', String(status.port));
 
       await loadFilterConfig();
+      return status;
     } catch (e) {
       if (requestId !== statusRequestRef.current) return;
       console.error('Failed to load MCP status:', e);
@@ -150,8 +156,14 @@ export function useAiEmbeddingController({ t }) {
     invalidateSmokeTestReport();
     loadStatus();
   }, [invalidateSmokeTestReport, loadStatus], active);
+  useTauriEventListener('agent-access-changed', () => {
+    invalidateSmokeTestReport();
+    setTokenCopied(false); setAgentPromptCopied(false); setDiagnosticsCopied(false); setShowResetConfirm(false);
+    loadStatus();
+  }, [invalidateSmokeTestReport, loadStatus], active);
 
   const startMcpService = useCallback(async ({ auto = false, operation: existingOperation = null } = {}) => {
+    if (auto && mode !== 'interactive') return null;
     const operation = existingOperation || beginMcpOperation(auto ? 'restore' : 'start');
     if (!operation) return null;
     const ownsOperation = existingOperation === null;
@@ -165,8 +177,6 @@ export function useAiEmbeddingController({ t }) {
         { autoPrompt: !auto },
       );
       setEnabled(true);
-      setRunning(true);
-      setServiceState('running');
       setStatusError('');
       localStorage.setItem('mcpEnabled', 'true');
       if (result.port) {
@@ -174,6 +184,7 @@ export function useAiEmbeddingController({ t }) {
         localStorage.setItem('mcpPort', String(result.port));
       }
       setTokenCopied(false);
+      await loadStatus();
       return true;
     } catch (e) {
       const message = String(e);
@@ -190,7 +201,7 @@ export function useAiEmbeddingController({ t }) {
       setBusy(false);
       if (ownsOperation) finishMcpOperation(operation);
     }
-  }, [beginMcpOperation, finishMcpOperation, invalidateSmokeTestReport]);
+  }, [beginMcpOperation, finishMcpOperation, invalidateSmokeTestReport, loadStatus, mode]);
 
   const handleToggle = async () => {
     if (!enabled) {
@@ -243,6 +254,7 @@ export function useAiEmbeddingController({ t }) {
   };
 
   const handleResetToken = async () => {
+    if (mode !== 'interactive') return;
     const operation = beginMcpOperation('reset-token');
     if (!operation) return;
     setShowResetConfirm(false);
@@ -261,6 +273,7 @@ export function useAiEmbeddingController({ t }) {
   };
 
   const handleCopyCurrentToken = async () => {
+    if (mode !== 'interactive') return;
     try {
       await withAuth(() => invoke('mcp_copy_token_to_clipboard'), { autoPrompt: true });
       setTokenCopied(true);
@@ -276,6 +289,8 @@ export function useAiEmbeddingController({ t }) {
       repo: agentSkill.source_repository,
       toolSchemaVersion: agentSkill.tool_schema_version ?? '?',
       endpoint,
+      credentialPlaceholder: t(mode === 'unattended' ? 'settings.security.credentials.placeholder' : 'settings.ai_embedding.token.placeholder'),
+      credentialInstructions: t(mode === 'unattended' ? 'settings.security.credentials.setupInstructions' : 'settings.ai_embedding.token.setupInstructions'),
     });
     try {
       await navigator.clipboard.writeText(prompt);
@@ -293,6 +308,7 @@ export function useAiEmbeddingController({ t }) {
   };
 
   const handleRunMcpSmokeTest = async () => {
+    if (mode !== 'interactive') return null;
     const operation = beginMcpOperation('smoke-test');
     if (!operation) return null;
     const requestId = smokeTestRequestRef.current + 1;
@@ -333,6 +349,7 @@ export function useAiEmbeddingController({ t }) {
         carbonpaper_version: status.server_version,
         mcp_endpoint: `http://127.0.0.1:${status.port}/mcp`,
         mcp_state: status.state,
+        mcp_mode: status.mode || 'interactive',
         skill: status.skill,
         capabilities: status.capabilities,
         smoke_test: reportIsCurrent ? smokeTestReport : null,
@@ -347,10 +364,12 @@ export function useAiEmbeddingController({ t }) {
   const normalizedServiceState = enabled
     ? (running ? 'running' : serviceState || 'pending_auth')
     : 'disabled';
-  const shouldShowStartButton = enabled && normalizedServiceState !== 'running';
+  const shouldShowStartButton = enabled && ['stopped', 'error', 'pending_auth'].includes(normalizedServiceState);
   const statusBadge = {
     running: { label: t('settings.serviceStates.running'), className: 'text-ide-info-success' },
     pending_auth: { label: t('settings.serviceStates.waiting'), className: 'text-ide-warning' },
+    waiting_for_unlock: { label: t('settings.serviceStates.waiting'), className: 'text-ide-warning' },
+    preparing: { label: t('settings.security.access.preparing'), className: 'text-ide-warning' },
     error: { label: t('settings.serviceStates.error'), className: 'text-ide-error' },
     stopped: { label: t('settings.serviceStates.stopped'), className: 'text-ide-muted' },
   }[normalizedServiceState] || { label: t('settings.serviceStates.stopped'), className: 'text-ide-muted' };
@@ -363,6 +382,8 @@ export function useAiEmbeddingController({ t }) {
     if (normalizedServiceState === 'pending_auth') {
       return t('settings.ai_embedding.status.pending_auth');
     }
+    if (normalizedServiceState === 'preparing') return t('settings.security.access.preparing');
+    if (normalizedServiceState === 'waiting_for_unlock') return t('settings.security.access.phases.waiting');
     if (normalizedServiceState === 'error') {
       return statusError || t('settings.ai_embedding.status.error');
     }
@@ -371,6 +392,7 @@ export function useAiEmbeddingController({ t }) {
 
   useEffect(() => {
     if (!active) return;
+    if (mode !== 'interactive') return;
     if (!enabled || running) {
       restoreAttemptRef.current = '';
       return;
@@ -393,6 +415,7 @@ export function useAiEmbeddingController({ t }) {
     });
   }, [
     active,
+    mode,
     enabled,
     running,
     normalizedServiceState,
@@ -403,20 +426,13 @@ export function useAiEmbeddingController({ t }) {
     startMcpService,
   ]);
 
-  useEffect(() => {
-    if (!active || !enabled || running) return undefined;
-
-    const timer = window.setInterval(() => {
-      loadStatus();
-    }, 5000);
-
-    return () => window.clearInterval(timer);
-  }, [active, enabled, running, loadStatus]);
+  usePolling(loadStatus, { intervalMs: 5000, enabled: active && enabled && !running });
 
   return {
     enabled,
     port,
     running,
+    mode,
     loading,
     actionLoading,
     restoreLoading,
@@ -432,7 +448,7 @@ export function useAiEmbeddingController({ t }) {
     agentSkill,
     smokeTestLoading,
     smokeTestReport,
-    mcpOperationLoading: actionLoading || restoreLoading || smokeTestLoading,
+    mcpOperationLoading: mode === null || actionLoading || restoreLoading || smokeTestLoading,
     showResetConfirm,
     setShowResetConfirm,
     ...sensitiveFilter,
@@ -441,6 +457,7 @@ export function useAiEmbeddingController({ t }) {
     handleToggle,
     handleConfirmEnable,
     handleResetToken,
+    requestResetToken: () => { if (mode === 'interactive') setShowResetConfirm(true); },
     handleCopyCurrentToken,
     handleCopyAgentSetupPrompt,
     handleAgentVariantChange,

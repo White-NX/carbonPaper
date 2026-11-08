@@ -101,6 +101,9 @@ const COMMAND_TIERS = {
   'analysis::get_analysis_overview': 'session_required',
   'commands::mcp::mcp_set_enabled': 'session_required',
   'commands::agent_access::agent_access_get_status': 'public',
+  'commands::security::security_get_policy': 'public',
+  'commands::security::security_set_policy': 'session_required',
+  'commands::security::security_acknowledge_intro': 'public',
   'commands::agent_access::agent_access_set_enabled': 'session_required',
   'commands::agent_access::agent_access_resume': 'session_required',
   'commands::agent_access::agent_access_issue_credential': 'session_required',
@@ -304,6 +307,9 @@ function checkCommandGuardImplementations() {
   }
   const settingsCommands = [
   'commands::agent_access::agent_access_get_status',
+  'commands::security::security_get_policy',
+  'commands::security::security_set_policy',
+  'commands::security::security_acknowledge_intro',
   'commands::agent_access::agent_access_set_enabled',
   'commands::agent_access::agent_access_resume',
   'commands::agent_access::agent_access_issue_credential',
