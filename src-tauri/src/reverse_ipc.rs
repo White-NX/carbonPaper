@@ -396,6 +396,7 @@ async fn process_nmh_request(
 
                     // Dispatch to OCR pipeline if we have a screenshot_id
                     if let Some(screenshot_id) = result.screenshot_id {
+                        crate::tray_panel::records_changed(&app_handle);
                         if let Err(error) = storage.processing_stage.put_recap_metadata(
                             &storage,
                             screenshot_id,

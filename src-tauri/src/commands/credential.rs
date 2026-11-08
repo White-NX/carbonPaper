@@ -73,13 +73,39 @@ pub async fn credential_verify_user(
             .hwnd()
             .map_err(|e| format!("Failed to get calling window handle: {}", e))?
             .0 as isize;
-        let credentials = state.inner().clone();
-        let storage = storage_state.inner().clone();
-        state
+        let _ = (&state, &storage_state);
+        verify_user_for_owner(app, owner_hwnd).await
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = &app;
+        let _ = &window;
+        let _ = &state;
+        let _ = &storage_state;
+        Err("Windows Hello is only available on Windows".to_string())
+    }
+}
+
+/// The native panel and WebViews share verification admission, owner selection,
+/// and completion. This is not an IPC command.
+pub(crate) async fn verify_user_for_owner(
+    app: tauri::AppHandle,
+    owner_hwnd: isize,
+) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        if owner_hwnd == 0 {
+            return Err("Missing authentication owner window".into());
+        }
+        let credentials = app.state::<Arc<CredentialManagerState>>().inner().clone();
+        let storage = app.state::<Arc<StorageState>>().inner().clone();
+        let coordinator = credentials.clone();
+        coordinator
             .verification
             .run(async move {
                 let verification_state = credentials.clone();
-                tokio::task::spawn_blocking(move || {
+                let verification = tokio::task::spawn_blocking(move || {
                     credential_manager::force_verify_and_unlock_master_key(
                         &verification_state,
                         Some(owner_hwnd),
@@ -87,7 +113,9 @@ pub async fn credential_verify_user(
                     .map_err(|e| format!("Verification failed: {}", e))
                 })
                 .await
-                .map_err(|e| format!("Verification task failed: {}", e))??;
+                .map_err(|e| format!("Verification task failed: {}", e));
+                crate::tray_panel::authentication_dialog_finished(&app, owner_hwnd);
+                verification??;
 
                 // Run completion work once, even if the original window closes.
                 let key_storage = storage.clone();
@@ -127,10 +155,7 @@ pub async fn credential_verify_user(
 
     #[cfg(not(windows))]
     {
-        let _ = &app;
-        let _ = &window;
-        let _ = &state;
-        let _ = &storage_state;
+        let _ = (app, owner_hwnd);
         Err("Windows Hello is only available on Windows".to_string())
     }
 }

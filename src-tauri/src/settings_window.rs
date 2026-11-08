@@ -84,9 +84,24 @@ pub async fn open_settings_window(
     section: Option<String>,
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
+    let monitor = window.current_monitor().ok().flatten();
+    open_window(&app, &state, navigation_target(tab, section), monitor)
+}
+
+pub(crate) async fn open_from_native(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<SettingsWindowState>();
+    let monitor = app.primary_monitor().ok().flatten();
+    open_window(app, &state, navigation_target(None, None), monitor)
+}
+
+fn open_window(
+    app: &tauri::AppHandle,
+    state: &SettingsWindowState,
+    target: NavigationTarget,
+    monitor: Option<tauri::Monitor>,
+) -> Result<(), String> {
     let _opening = state.opening.lock().map_err(|e| e.to_string())?;
-    let target = navigation_target(tab, section);
-    crate::cancel_auto_lightweight_timer(&app);
+    crate::cancel_auto_lightweight_timer(app);
     if let Some(existing) = app.get_webview_window(LABEL) {
         existing.unminimize().map_err(|e| e.to_string())?;
         existing.show().map_err(|e| e.to_string())?;
@@ -96,7 +111,6 @@ pub async fn open_settings_window(
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
-    let monitor = window.current_monitor().ok().flatten();
     let (width, height, min_width, min_height) = monitor
         .as_ref()
         .map(|monitor| {
@@ -109,17 +123,16 @@ pub async fn open_settings_window(
         target.tab,
         target.section.as_deref().unwrap_or("")
     );
-    let settings =
-        tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::App(url.into()))
-            .title("CarbonPaper")
-            .inner_size(width, height)
-            .min_inner_size(min_width, min_height)
-            .resizable(true)
-            .decorations(false)
-            .transparent(false)
-            .visible(false)
-            .build()
-            .map_err(|e| e.to_string())?;
+    let settings = tauri::WebviewWindowBuilder::new(app, LABEL, tauri::WebviewUrl::App(url.into()))
+        .title("CarbonPaper")
+        .inner_size(width, height)
+        .min_inner_size(min_width, min_height)
+        .resizable(true)
+        .decorations(false)
+        .transparent(false)
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())?;
     if let Some(monitor) = monitor {
         let scale = monitor.scale_factor();
         let position = monitor.position();
@@ -131,7 +144,7 @@ pub async fn open_settings_window(
     }
     settings.show().map_err(|e| e.to_string())?;
     settings.set_focus().map_err(|e| e.to_string())?;
-    refresh_ui_foreground(&app);
+    refresh_ui_foreground(app);
     let _ = app.emit_to("main", "settings-window-changed", true);
     Ok(())
 }
@@ -275,6 +288,7 @@ pub fn broadcast_auth_state(app: &tauri::AppHandle) {
         return;
     };
     let valid = credentials.is_session_valid();
+    crate::tray_panel::auth_changed(app);
     if !valid {
         if let Some(search) = app.try_state::<crate::ai::recap::RecapSearchRuntime>() {
             search.clear();
@@ -297,11 +311,15 @@ pub fn broadcast_auth_state(app: &tauri::AppHandle) {
 }
 
 pub fn refresh_ui_foreground(app: &tauri::AppHandle) {
-    let foreground = ["main", LABEL].iter().any(|label| {
+    let web_ui_visible = ["main", LABEL].iter().any(|label| {
         app.get_webview_window(label).is_some_and(|window| {
             window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
         })
     });
+    if web_ui_visible {
+        crate::tray_panel::finish_handoff(app);
+    }
+    let foreground = web_ui_visible || crate::tray_panel::is_visible_or_handoff(app);
     if let Some(credentials) = app.try_state::<Arc<crate::CredentialManagerState>>() {
         credentials.set_foreground_state(foreground);
     }

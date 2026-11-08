@@ -546,6 +546,10 @@ export const resumeOfficeDocument = async (screenshotId) => {
     return withAuth(() => invoke('office_resume_document', { screenshotId }));
 };
 
+export const getMonitorFilters = (authOptions = { promptMode: 'defer' }) => {
+    return withAuth(() => invoke('monitor_get_filters'), authOptions);
+};
+
 export const updateMonitorFilters = async (filters, authOptions = { autoPrompt: true }) => {
     return withAuth(async () => {
         try {

@@ -88,6 +88,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
 window-vibrancy = "0.5"
+raw-window-handle = "0.6"
 open = "5"
 rapidocr-core = { version = "=0.2.2", default-features = false, features = ["tokio", "directml"] }
 memmap2 = "0.9"
@@ -100,6 +101,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
 windows = { version = "0.58", features = [
+    "Foundation_Numerics",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Security_Authorization",
@@ -125,6 +127,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Controls",
     "Graphics_Capture",
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",

@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import WorkspaceTimelines from './components/WorkspaceTimelines';
 import { useSettingsHost } from './hooks/useSettingsHost';
 import { useSavedCaptureFilters } from './components/settings/hooks/useSavedCaptureFilters';
+import { useTrayNavigation } from './hooks/useTrayNavigation';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
 import AppBoundUpgradePrompt from './components/AppBoundUpgradePrompt';
@@ -165,12 +166,26 @@ function App() {
     clearSelection,
     bumpTimelineRefresh,
   } = useSelectedSnapshot();
+  const handleTrayNavigation = useCallback((intent) => {
+    if (intent.kind === 'search' && typeof intent.query === 'string') {
+      setActiveTab('advanced-search');
+      setAdvancedSearchParams({ query: intent.query, refreshKey: Date.now() });
+    } else if (intent.kind === 'snapshot' && Number.isSafeInteger(intent.id) && Number.isSafeInteger(intent.timestamp_ms)) {
+      setSelectedEvent({ id: intent.id, timestamp: intent.timestamp_ms });
+      setHighlightedEventId(intent.id);
+      setTimelineJump({ time: intent.timestamp_ms, ts: Date.now() });
+      setActiveTab('preview');
+    } else if (intent.kind === 'timeline') {
+      setActiveTab('preview');
+    }
+  }, [setSelectedEvent, setHighlightedEventId, setTimelineJump]);
+  useTrayNavigation({ enabled: isAuthenticated && initialization.ready, onNavigate: handleTrayNavigation });
   const { showSettings, openSettings } = useSettingsHost({
     onRecordsChanged: bumpTimelineRefresh,
     onClosed: refreshRequiredModels,
     onError: (error) => reportBackendError(t('settings.title'), String(error)),
   });
-  useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: isAuthenticated && initialization.ready });
+  useSavedCaptureFilters({ enabled: isAuthenticated && initialization.ready });
   const {
     updateModalVisible,
     updateInfo,

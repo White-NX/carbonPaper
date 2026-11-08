@@ -6,6 +6,7 @@ import { Maximize2, Minus, Settings, X } from 'lucide-react';
 import { withAuth, initAuthListeners } from '../../lib/auth_api';
 import { notifySettingsChanged } from '../../lib/settings_api';
 import { useAppTheme } from '../../hooks/useAppTheme';
+import { useSavedCaptureFilters } from './hooks/useSavedCaptureFilters';
 import { usePowerSavingState } from '../../hooks/useAppWindowState';
 import { useAuthSession } from '../../hooks/useAuthSession';
 import { useTauriEventListener } from '../../hooks/useTauriEventListener';
@@ -17,6 +18,7 @@ import { SettingsActivityProvider, useSettingsActivity, useSettingsWindowActivit
 import { SettingsErrorBanner } from './SettingsPrimitives';
 
 function SettingsWindowFrame({ auth }) {
+  useSavedCaptureFilters({ enabled: auth.isAuthenticated });
   const { t } = useTranslation();
   const { dirty, busy } = useSettingsWindowActivity();
   const [closeIntent, setCloseIntent] = useState(null);

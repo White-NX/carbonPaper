@@ -70,6 +70,15 @@ impl MonitorState {
         self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_IDLE
     }
 
+    pub(crate) fn pause_until_ms(&self) -> Option<i64> {
+        self.automation
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .timed_pause
+            .map(|pause| pause.until_ms)
+    }
+
     pub(crate) fn defer_maintenance_resume(&self) {
         self.maintenance_resume_pending
             .store(true, Ordering::SeqCst);
@@ -166,6 +175,7 @@ fn monitor_status_value(state: &MonitorState, capture_state: &CaptureState) -> V
         .unwrap_or_else(|error| error.into_inner());
     serde_json::json!({
         "paused": running && capture_state.paused.load(Ordering::SeqCst),
+        "pause_until_ms": policy.timed_pause.map(|pause| pause.until_ms),
         "stopped": !running,
         "starting": state.automation.starting.load(Ordering::SeqCst),
         "auto_start_suppressed": policy.manual_stop || policy.error.is_some(),
@@ -197,14 +207,14 @@ fn apply_monitor_side_effects(
     payload: &Value,
     capture_state: Option<&CaptureState>,
     storage: Option<&StorageState>,
-) {
+) -> Result<(), String> {
     match command {
         "update_filters" => {
             let Some(capture_state) = capture_state else {
-                return;
+                return Ok(());
             };
             let Some(storage) = storage else {
-                return;
+                return Ok(());
             };
             // Update Rust-side exclusion settings
             let filters = payload
@@ -240,13 +250,17 @@ fn apply_monitor_side_effects(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                capture_state.update_exclusion_settings(processes, titles, ignore_protected);
-                capture_state.save_exclusion_settings(&data_dir);
+                capture_state.update_exclusion_settings(
+                    &data_dir,
+                    processes,
+                    titles,
+                    ignore_protected,
+                )?;
             }
         }
         "update_advanced_config" => {
             let Some(capture_state) = capture_state else {
-                return;
+                return Ok(());
             };
             let ocr_timeout_secs = payload
                 .get("ocr_timeout_secs")
@@ -262,6 +276,7 @@ fn apply_monitor_side_effects(
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn dispatch_typed_monitor_command(
@@ -274,7 +289,7 @@ fn dispatch_typed_monitor_command(
         .get("command")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    apply_monitor_side_effects(command, &payload, capture_state, storage);
+    apply_monitor_side_effects(command, &payload, capture_state, storage)?;
     Ok(serde_json::json!({ "status": "success" }))
 }
 
@@ -317,6 +332,7 @@ pub async fn monitor_search_nl(
 
 #[tauri::command]
 pub async fn monitor_update_filters(
+    app: AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     capture_state: State<'_, Arc<CaptureState>>,
     storage: State<'_, Arc<StorageState>>,
@@ -327,7 +343,48 @@ pub async fn monitor_update_filters(
         "command": "update_filters",
         "filters": filters,
     });
-    dispatch_typed_monitor_command(Some(&capture_state), Some(&storage), payload)
+    let result = dispatch_typed_monitor_command(Some(&capture_state), Some(&storage), payload)?;
+    let _ = app.emit("capture-filters-changed", ());
+    crate::tray_panel::refresh_public(&app);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn monitor_get_filters(
+    window: tauri::Window,
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    storage: State<'_, Arc<StorageState>>,
+) -> Result<Option<Value>, String> {
+    crate::settings_window::check_settings_ui(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+    let capture = capture_state.inner().clone();
+    let read_credentials = credential_state.inner().clone();
+    let read_storage = storage.inner().clone();
+    let generation = storage.db_generation();
+    let data_dir = storage
+        .data_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let result = tokio::task::spawn_blocking(move || {
+        capture.saved_exclusion_settings_guarded(&data_dir, || {
+            read_credentials.is_session_valid()
+                && read_storage.db_generation() == generation
+                && *read_storage
+                    .data_dir
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    == data_dir
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    crate::commands::check_auth_required(&credential_state)?;
+    if storage.db_generation() != generation {
+        return Err("CAPTURE_FILTERS_CHANGED".into());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -346,7 +403,7 @@ pub async fn monitor_update_advanced_config(
         &payload,
         Some(&capture_state),
         None,
-    );
+    )?;
     Ok(serde_json::json!({ "status": "success" }))
 }
 
@@ -533,7 +590,9 @@ pub(crate) enum MonitorAction {
     Start,
     Stop,
     Pause,
+    PauseFor(u32),
     Resume,
+    ExpireTimedPause,
     ResumeAfterPowerSaving,
     Restart,
     TogglePause,
@@ -573,6 +632,11 @@ async fn apply_control(
 ) -> Result<String, String> {
     let state = app.state::<MonitorState>();
     let _control = state.control.lock().await;
+    if let MonitorAction::PauseFor(minutes) = action {
+        if minutes == 0 || minutes > 24 * 60 || !state.is_running() {
+            return Err("Invalid timed pause or monitor is not running".into());
+        }
+    }
     {
         let mut policy = state
             .automation
@@ -591,6 +655,9 @@ async fn apply_control(
                 .paused
                 .load(Ordering::SeqCst);
             policy.user_action(action, paused);
+        }
+        if action == MonitorAction::ExpireTimedPause {
+            policy.expire_timed_pause();
         }
     }
     // The power loop can select Start before maintenance records its rejected
@@ -621,7 +688,18 @@ async fn apply_control(
             Err(error) => Err(error),
         },
         MonitorAction::Pause => set_capture_paused(app, true),
+        MonitorAction::PauseFor(_) => set_capture_paused(app, true),
         MonitorAction::Resume => set_capture_paused(app, false),
+        MonitorAction::ExpireTimedPause => {
+            if state.is_running() {
+                set_capture_paused(app, false)
+            } else {
+                app.state::<Arc<CaptureState>>()
+                    .paused
+                    .store(false, Ordering::SeqCst);
+                Ok("Timed pause expired".into())
+            }
+        }
         MonitorAction::ResumeAfterPowerSaving => {
             // Re-check under the control lock: a user pause/stop may have
             // superseded this restore after the power loop chose its action.
