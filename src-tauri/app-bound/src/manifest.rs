@@ -33,12 +33,14 @@ const REQUIRED_FILES: &[&str] = &[
     "carbonpaper-ml.exe",
     "carbonpaper-office.exe",
     "carbonpaper-nmh.exe",
+    "carbonpaper-mcp-reader.exe",
 ];
 #[cfg(feature = "development-runtime")]
 const REQUIRED_FILES: &[&str] = &[
     "carbonpaper-key-service.exe",
     "carbonpaper-protected-setup.exe",
     "development-client.json",
+    "carbonpaper-mcp-reader.exe",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

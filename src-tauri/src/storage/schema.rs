@@ -112,6 +112,9 @@ impl StorageState {
             .allow_plaintext_fixtures(self.credential_state.storage_fixture_for_tests());
         self.protected.initialize(&conn)?;
         self.protected.register_functions(&conn)?;
+        if let Err(error) = self.restore_agent_access(&conn) {
+            tracing::warn!("Agent access restoration deferred: {error}");
+        }
         self.migrate_protected_content_with_progress(&conn, progress)?;
         let protected_dur = protected_started.elapsed();
         progress(InitializationProgress::phase(
@@ -864,6 +867,7 @@ impl StorageState {
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
         super::blind_index::ensure_schema(conn)?;
+        self.init_agent_access_tables(conn)?;
         #[cfg(test)]
         {
             self.protected.allow_plaintext_fixtures(true);

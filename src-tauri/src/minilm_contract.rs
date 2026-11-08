@@ -13,14 +13,14 @@ use crate::maintenance_support;
 use crate::storage::{DerivedIndexJobSpec, DerivedIndexKind};
 use sha2::{Digest, Sha256};
 
-pub const MINILM_MODEL_ID: &str = "paraphrase-multilingual-MiniLM-L12-v2";
 /// Compatibility contract for the shared MiniLM vector space. Rows copied from
 /// the retired Chroma collection carried no per-row runtime provenance, so the
 /// derived index records the reviewed vector-space contract instead of
 /// pretending every row came from one concrete ONNX artifact revision.
-pub const MINILM_VECTOR_SPACE_REVISION: &str = "minilm-l12-vector-space-v1";
+pub use crate::semantic_models::{
+    MINILM_DIMENSIONS, MINILM_MODEL_ID, MINILM_VECTOR_SPACE_REVISION,
+};
 pub const MINILM_EMBEDDING_VERSION: u32 = 1;
-pub const MINILM_DIMENSIONS: usize = 384;
 /// Zero (or numerically negligible) vectors would poison cosine/ANN queries;
 /// they are quarantined as diagnostics instead of written.
 pub const MINILM_MIN_L2_NORM: f32 = 1e-6;

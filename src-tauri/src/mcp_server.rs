@@ -27,7 +27,6 @@ use crate::pii;
 use crate::sensitive_filter::{FilterMode, SensitiveFilterState};
 use crate::storage::smart_cluster::{SmartClusterSummaryRecord, SmartClusterSummaryUpsert};
 use crate::storage::{OcrResult, StorageState};
-use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
 pub(crate) mod page;
@@ -54,6 +53,7 @@ pub struct McpRuntimeState {
     token_hash: Mutex<Option<[u8; 32]>>,
     last_error: Mutex<Option<String>>,
     generation: AtomicU64,
+    mode: Mutex<&'static str>,
 }
 
 impl Default for McpRuntimeState {
@@ -72,6 +72,7 @@ impl McpRuntimeState {
             token_hash: Mutex::new(None),
             last_error: Mutex::new(None),
             generation: AtomicU64::new(0),
+            mode: Mutex::new("interactive"),
         }
     }
 
@@ -81,6 +82,23 @@ impl McpRuntimeState {
             Some(h) => !h.is_finished(),
             None => false,
         }
+    }
+
+    pub(crate) fn mode(&self) -> &'static str {
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn install_reader(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+        shutdown: oneshot::Sender<()>,
+        port: u16,
+    ) {
+        *self.server_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner()) = "unattended";
+        self.set_active_port(port);
+        self.clear_last_error();
+        self.bump_generation();
     }
 
     /// Serializes listener lifecycle, token-rotation, and smoke-test work.
@@ -436,73 +454,9 @@ fn tool_call_response(id: Option<Value>, result: Result<Value, String>) -> JsonR
 
 // ==================== Privacy filtering ====================
 
-/// A record withheld because the filter mode is [`FilterMode::Reject`].
-#[derive(Debug)]
-pub(crate) struct Rejected;
-
-/// One-line identity fields such as window titles: replaced, never removed.
-pub(crate) fn filter_identity(
-    filter: &SensitiveFilterState,
-    mode: FilterMode,
-    text: &str,
-) -> Result<String, Rejected> {
-    let findings = filter.inspect(text, pii::Context::default());
-    if !findings.is_flagged() {
-        return Ok(filter.kept_text(text, &findings));
-    }
-    match mode {
-        FilterMode::Reject => Err(Rejected),
-        FilterMode::RemoveParagraph => Ok(CENSORED_LABEL.to_string()),
-        FilterMode::Mask => Ok(filter.masked_text(text, &findings)),
-    }
-}
-
-/// An OCR segment or link text. `Ok(None)` drops it, which is what the
-/// default mode does with every segment that has a sensitive word or
-/// personal information.
-fn filter_segment(
-    filter: &SensitiveFilterState,
-    mode: FilterMode,
-    text: &str,
-    context: pii::Context,
-) -> Result<Option<String>, Rejected> {
-    let findings = filter.inspect(text, context);
-    if !findings.is_flagged() {
-        return Ok(Some(filter.kept_text(text, &findings)));
-    }
-    match mode {
-        FilterMode::Reject => Err(Rejected),
-        FilterMode::RemoveParagraph => Ok(None),
-        FilterMode::Mask => Ok(Some(filter.masked_text(text, &findings))),
-    }
-}
-
-/// Text joined from several OCR segments, such as a search snippet. The
-/// segments can no longer be told apart, so the default mode replaces the
-/// whole text and keeps the hit; the snapshot details still return the
-/// clean segments.
-pub(crate) fn filter_joined_text(
-    filter: &SensitiveFilterState,
-    mode: FilterMode,
-    text: &str,
-) -> Result<String, Rejected> {
-    Ok(filter_segment(filter, mode, text, pii::Context::default())?
-        .unwrap_or_else(|| CENSORED_LABEL.to_string()))
-}
-
-/// URLs are checked after percent-decoding and replaced whole when flagged.
-pub(crate) fn filter_url(
-    filter: &SensitiveFilterState,
-    mode: FilterMode,
-    url: &str,
-) -> Result<String, Rejected> {
-    let findings = filter.inspect(&decode_url_for_filter(url), pii::Context::default());
-    match (findings.is_flagged(), mode) {
-        (false, _) => Ok(url.to_string()),
-        (true, FilterMode::Reject) => Err(Rejected),
-        (true, _) => Ok(CENSORED_LABEL.to_string()),
-    }
-}
+pub(crate) use crate::sensitive_filter::{
+    filter_identity, filter_joined_text, filter_segment, filter_url, Rejected,
+};
 
 /// The OCR blocks of one screenshot. Each block is checked with the labels of
 /// its neighbours, because forms put "身份证号" and the number in separate
@@ -546,11 +500,6 @@ fn masked(filter: &SensitiveFilterState, text: &str) -> String {
 // ==================== Tool implementations ====================
 
 const CENSORED_LABEL: &str = "[censored]";
-
-/// Decode percent-encoded URL to UTF-8 for sensitive content checking.
-fn decode_url_for_filter(url: &str) -> String {
-    percent_decode_str(url).decode_utf8_lossy().into_owned()
-}
 
 fn value_flagged(filter: &SensitiveFilterState, value: &Value) -> bool {
     match value {
@@ -1480,6 +1429,7 @@ pub async fn start_server(
         *guard = Some(shutdown_tx);
     }
     mcp_runtime.set_active_port(port);
+    *mcp_runtime.mode.lock().unwrap_or_else(|e| e.into_inner()) = "interactive";
     mcp_runtime.bump_generation();
 
     Ok(())
@@ -1491,6 +1441,7 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
     // Clear this before tearing down the task so no status or probe can mistake
     // a listener that is in the process of stopping for an active endpoint.
     mcp_runtime.clear_active_port();
+    *mcp_runtime.mode.lock().unwrap_or_else(|e| e.into_inner()) = "interactive";
     mcp_runtime.bump_generation();
 
     // Send shutdown signal — select! in the server task will drop the
@@ -1513,9 +1464,14 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
             .unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
-    if let Some(handle) = handle {
-        handle.abort();
-        let _ = handle.await;
+    if let Some(mut handle) = handle {
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
         tracing::info!("MCP server task joined");
     }
 }
@@ -1533,15 +1489,18 @@ pub async fn auto_start(
     mcp_runtime: &McpRuntimeState,
 ) -> Result<(), String> {
     let _lifecycle_guard = mcp_runtime.lock_lifecycle().await;
-    auto_start_locked(app_handle, credential_state, storage_state, mcp_runtime).await
+    auto_start_under_lifecycle(app_handle, credential_state, storage_state, mcp_runtime).await
 }
 
-async fn auto_start_locked(
+pub(crate) async fn auto_start_under_lifecycle(
     app_handle: tauri::AppHandle,
     credential_state: &CredentialManagerState,
     storage_state: &StorageState,
     mcp_runtime: &McpRuntimeState,
 ) -> Result<(), String> {
+    if storage_state.agent_access_enabled() {
+        return crate::agent_access::start_reader(app_handle, storage_state, mcp_runtime).await;
+    }
     let policy = storage_state.load_policy()?;
 
     let port = port_from_policy(&policy);
@@ -1601,7 +1560,7 @@ pub async fn restore_if_enabled(
         return Ok(false);
     }
 
-    match auto_start_locked(
+    match auto_start_under_lifecycle(
         app_handle.clone(),
         credential_state,
         storage_state,

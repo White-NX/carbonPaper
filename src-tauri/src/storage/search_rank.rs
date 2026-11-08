@@ -376,8 +376,8 @@ pub(crate) fn fuzzy_prior(hits: u32, total: u32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::search_plan::fold;
     use super::*;
-    use crate::storage::search_plan::fold;
 
     fn needle(text: &str) -> Vec<char> {
         fold(text)

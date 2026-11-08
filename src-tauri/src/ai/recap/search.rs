@@ -21,6 +21,7 @@ use crate::minilm_contract::{
     validate_minilm_vector, MINILM_DIMENSIONS, MINILM_MODEL_ID, MINILM_VECTOR_SPACE_REVISION,
 };
 use crate::ml_protocol::{MlErrorKind, MlSemanticModel};
+use crate::recap_text_contract::{Chunk, INDEX_VERSION};
 use crate::semantic_runtime::{
     SemanticEmbeddingResult, SemanticRuntimeState, SemanticRuntimeStatus, SemanticTimeouts,
 };
@@ -28,7 +29,6 @@ use crate::sensitive_filter::SensitiveFilterState;
 use crate::storage::{search_plan::QueryPlan, search_rank, SearchMatchEvidence, StorageState};
 use crate::task_error::TaskError;
 
-const INDEX_VERSION: u32 = 2;
 const ENCODE_BATCH: usize = 4;
 const SAVE_SHARD: usize = 64;
 const QUERY_EMBED_TIMEOUT: SemanticTimeouts = SemanticTimeouts {
@@ -595,11 +595,6 @@ impl Identity {
     }
 }
 
-struct Chunk {
-    key: String,
-    text: String,
-    detail: bool,
-}
 struct Document {
     date: String,
     revision: i64,
@@ -850,53 +845,12 @@ fn worker_failure(stage: &str, error: tokio::task::JoinError) -> String {
 /// Byte-bounded windows are conservative for this multilingual tokenizer's
 /// 256-token limit, including title context and special tokens. Overlap keeps
 /// phrases at boundaries retrievable; every source character is retained.
-fn windows(text: &str, bytes: usize) -> Vec<String> {
-    let chars: Vec<char> = text.trim().chars().collect();
-    let mut out = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let mut end = start;
-        let mut size = 0;
-        while end < chars.len() && size + chars[end].len_utf8() <= bytes {
-            size += chars[end].len_utf8();
-            end += 1;
-        }
-        if end == start {
-            end += 1;
-        }
-        out.push(chars[start..end].iter().collect());
-        if end == chars.len() {
-            break;
-        }
-        start = end.saturating_sub(12).max(start + 1);
-    }
-    out
-}
-
 fn chunks(activity: &RecapActivity) -> Vec<Chunk> {
-    let title = windows(&activity.task_title, 72)
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    [
-        (activity.task_title.as_str(), false),
-        (activity.text.as_str(), false),
-    ]
-    .into_iter()
-    .chain(activity.details.iter().map(|d| (d.text.as_str(), true)))
-    .flat_map(|(text, detail)| {
-        windows(text, 160)
-            .into_iter()
-            .map(move |text| (text, detail))
-    })
-    .map(|(text, detail)| {
-        let text = format!("{title}\n{text}");
-        let key = digest(&format!(
-            "recap-search-{INDEX_VERSION}:{MINILM_VECTOR_SPACE_REVISION}:{text}"
-        ));
-        Chunk { key, text, detail }
-    })
-    .collect()
+    crate::recap_text_contract::chunks(
+        &activity.task_title,
+        &activity.text,
+        activity.details.iter().map(|d| d.text.as_str()),
+    )
 }
 
 /// Refilter generated text, user corrections and identities before either UI

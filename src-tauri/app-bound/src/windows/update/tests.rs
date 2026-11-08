@@ -83,6 +83,7 @@ fn fixture() -> Fixture {
         "carbonpaper-ml.exe",
         "carbonpaper-office.exe",
         "carbonpaper-nmh.exe",
+        "carbonpaper-mcp-reader.exe",
     ] {
         fs::write(source.join(name), format!("new {name}")).unwrap();
         fs::write(destination.join(name), format!("old {name}")).unwrap();

@@ -68,10 +68,18 @@ export function prepareNativeComponents(configuration) {
   delete environment.CARGO_ENCODED_RUSTFLAGS;
   const buildArgs = nativeCargoArguments('build', configuration.workspace,
     ['--bin', 'carbonpaper-key-service', '--bin', 'carbonpaper-protected-setup']);
+  const agentCrate = path.join(configuration.workspace, 'src-tauri', 'agent-access');
+  const readerBuildArgs = ['build', '--locked', '--manifest-path', path.join(agentCrate, 'Cargo.toml'),
+    '--profile', DEVELOPMENT_NATIVE_PROFILE, '--features', 'development-runtime', '--bin', 'carbonpaper-mcp-reader'];
   const hash = createHash('sha256').update(configuration.instance).update(configuration.publicKey)
     .update(environment.RUSTFLAGS).update(JSON.stringify(buildArgs))
     .update(run('rustc', ['-vV'], environment, true));
-  for (const file of [...rustFiles(path.join(crate, 'src')), path.join(crate, 'Cargo.toml'),
+  for (const file of [...rustFiles(path.join(crate, 'src')), ...rustFiles(path.join(agentCrate, 'src')),
+    ...rustFiles(path.join(configuration.workspace, 'src-tauri', 'src', 'pii')),
+    ...['mcp_contract.rs', 'sensitive_filter.rs', 'semantic_models.rs', 'ml_protocol.rs', 'mcp_server/page.rs',
+      'recap_text_contract.rs', 'storage/search_plan.rs', 'storage/search_rank.rs']
+      .map(name => path.join(configuration.workspace, 'src-tauri', 'src', name)),
+    path.join(agentCrate, 'Cargo.toml'), path.join(agentCrate, 'Cargo.lock'), path.join(agentCrate, 'build.rs'), path.join(crate, 'Cargo.toml'),
     path.join(crate, 'Cargo.lock'), path.join(crate, 'build.rs')].sort()) {
     hash.update(file).update(readFileSync(file));
   }
@@ -80,17 +88,18 @@ export function prepareNativeComponents(configuration) {
   const statePath = path.join(components, 'build-state.json');
   let previous;
   try { previous = JSON.parse(readFileSync(statePath, 'utf8')); } catch { previous = null; }
-  const names = ['carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe'];
+  const names = ['carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe', 'carbonpaper-mcp-reader.exe'];
   const outputDirectory = path.join(target, DEVELOPMENT_NATIVE_PROFILE);
   if (previous?.fingerprint !== fingerprint || names.some(name => !existsSync(path.join(components, name))
     || sha256(path.join(components, name)) !== previous.files?.[name])) {
     console.log('[app-bound dev] Building isolated service and setup helper...');
     run('cargo', buildArgs, environment);
+    run('cargo', readerBuildArgs, environment);
     mkdirSync(components, { recursive: true });
     const files = {};
     for (const name of names) {
       const binary = path.join(outputDirectory, name);
-      verifyPrivilegedImports(binary);
+      if (name !== 'carbonpaper-mcp-reader.exe') verifyPrivilegedImports(binary);
       files[name] = sha256(binary);
       if (!existsSync(path.join(components, name)) || sha256(path.join(components, name)) !== files[name]) {
         copyFileSync(binary, path.join(components, name));

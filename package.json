@@ -37,6 +37,7 @@
     "build:dev-workers": "node scripts/build-dev-workers.mjs",
     "build:protected:release": "node scripts/build-protected-runtime.mjs --release",
     "test:app-bound": "cargo test --manifest-path src-tauri/app-bound/Cargo.toml && node --test scripts/protected-runtime.test.mjs",
+    "test:agent-access": "cargo test --manifest-path src-tauri/agent-access/Cargo.toml --lib",
     "test:app-bound:fast": "node scripts/check-app-bound.mjs",
     "test:office-nativeom": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-office-nativeom.ps1",
     "build:semantic-ml": "node scripts/build-semantic-ml.mjs",

@@ -130,7 +130,17 @@ impl StorageState {
 
         let s =
             serde_json::to_string_pretty(policy).map_err(|e| format!("serde json error: {}", e))?;
-        std::fs::write(&policy_path, s).map_err(|e| format!("failed to write policy file: {}", e))
+        let privacy = policy.get("sensitive_filter").cloned().unwrap_or_else(|| {
+            serde_json::json!(crate::sensitive_filter::SensitiveFilterConfig::default())
+        });
+        if self.agent_access_enabled()
+            && self.load_policy()?.get("sensitive_filter") != policy.get("sensitive_filter")
+        {
+            self.write_agent_policy(&policy_path, s.as_bytes(), privacy)
+        } else {
+            std::fs::write(&policy_path, s)
+                .map_err(|e| format!("failed to write policy file: {}", e))
+        }
     }
 
     /// Load storage policy from storage_policy.json. Returns empty object if file doesn't exist.

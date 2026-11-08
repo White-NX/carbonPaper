@@ -176,6 +176,7 @@ pub fn inspect_process(pid: u32) -> Result<ProcessIdentity> {
                 sid,
                 runtime_id: String::new(),
                 process_identity: format!("{pid}:{stamp}"),
+                role: RuntimeRole::Desktop,
             },
             image,
             handle,
@@ -399,22 +400,34 @@ pub struct VerifiedCaller {
 
 pub fn verify_main(process: ProcessIdentity) -> Result<VerifiedCaller> {
     #[cfg(feature = "development-runtime")]
-    return crate::development::verify_client(process);
+    {
+        if process
+            .image
+            .file_name()
+            .is_some_and(|v| v.to_string_lossy().eq_ignore_ascii_case("carbonpaper.exe"))
+        {
+            return crate::development::verify_client(process);
+        }
+        return verify_protected_main(process);
+    }
     #[cfg(not(feature = "development-runtime"))]
     verify_protected_main(process)
 }
 
-#[cfg(not(feature = "development-runtime"))]
 fn verify_protected_main(mut process: ProcessIdentity) -> Result<VerifiedCaller> {
     let root = protected_root()?;
     let directory = process.image.parent().ok_or(BrokerError::AccessDenied)?;
-    if process
+    let name = process
         .image
         .file_name()
-        .is_none_or(|v| !v.to_string_lossy().eq_ignore_ascii_case("carbonpaper.exe"))
-    {
-        return Err(BrokerError::AccessDenied);
-    }
+        .ok_or(BrokerError::AccessDenied)?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    process.principal.role = match name.as_str() {
+        "carbonpaper.exe" if !cfg!(feature = "development-runtime") => RuntimeRole::Desktop,
+        "carbonpaper-mcp-reader.exe" => RuntimeRole::McpReader,
+        _ => return Err(BrokerError::AccessDenied),
+    };
     let id = directory
         .file_name()
         .ok_or(BrokerError::AccessDenied)?
@@ -440,10 +453,7 @@ fn verify_protected_main(mut process: ProcessIdentity) -> Result<VerifiedCaller>
     let mut file = locked_file(&process.image)?;
     verify_file(
         &mut file,
-        manifest
-            .files
-            .get("carbonpaper.exe")
-            .ok_or(BrokerError::Integrity)?,
+        manifest.files.get(&name).ok_or(BrokerError::Integrity)?,
     )?;
     process.principal.runtime_id = manifest_id;
     Ok(VerifiedCaller {

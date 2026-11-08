@@ -65,6 +65,7 @@ const requiredPortableEntries = [
   'carbonpaper-office.exe',
   'carbonpaper-nmh.exe',
   'carbonpaper-semantic-worker.exe',
+  'carbonpaper-mcp-reader.exe',
   'onnxruntime/1.24.2/onnxruntime.dll',
   'onnxruntime/1.24.2/onnxruntime_providers_shared.dll',
   'onnxruntime/1.24.2/DirectML.dll',

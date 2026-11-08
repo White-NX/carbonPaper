@@ -120,6 +120,7 @@ fn fixture() -> Fixture {
         sid: "test-user".into(),
         runtime_id: "test-release".into(),
         process_identity: "10:100".into(),
+        role: carbonpaper_app_bound::protocol::RuntimeRole::Desktop,
     };
     let mut ledger = Ledger::open(&dir.path().join("test-service.db")).unwrap();
     ledger

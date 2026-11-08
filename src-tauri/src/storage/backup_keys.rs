@@ -460,6 +460,9 @@ pub(super) fn reset_processing_authority(conn: &Connection) -> Result<(), String
         "ann_build_checkpoints",
         "derived_ann_generations",
         "derived_index_generations",
+        "agent_access_state",
+        "agent_outbox",
+        "agent_projection_gaps",
     ] {
         if !columns(conn, table)?.is_empty() {
             conn.execute(&format!("DELETE FROM {table}"), [])

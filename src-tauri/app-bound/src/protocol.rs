@@ -211,6 +211,66 @@ pub struct BrokerStatus {
     pub supported_consumers: u8,
     #[serde(default)]
     pub supported_storage_keys: bool,
+    #[serde(default)]
+    pub supported_agent_access: bool,
+}
+
+/// The reader is a separately verified executable, never a role supplied over IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRole {
+    Desktop,
+    McpReader,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentViewBinding {
+    pub dataset_id: String,
+    pub generation: String,
+    pub view_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentGrant {
+    pub id: String,
+    pub label: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    pub last_used_at_ms: Option<i64>,
+    pub revoked: bool,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAccessStatus {
+    pub enabled: bool,
+    pub binding: Option<AgentViewBinding>,
+    pub phase: String,
+    pub source_revision: i64,
+    pub applied_revision: i64,
+    pub grants: Vec<AgentGrant>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AgentViewKeys {
+    pub binding: AgentViewBinding,
+    pub content_key: TaskKey,
+    /// Only the desktop exporter receives outbox write material.
+    pub outbox_key: Option<TaskKey>,
+}
+
+/// Constructed by the protected ledger after secret validation. It is never
+/// accepted as a tool argument and fences both revocation and source changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRequestContext {
+    pub grant_id: String,
+    pub owner: String,
+    pub dataset_id: String,
+    pub generation: String,
+    pub authorization_revision: i64,
+    pub grant_revision: i64,
+    pub source_revision: i64,
 }
 
 fn legacy_consumers() -> u8 {
@@ -268,6 +328,41 @@ pub struct RecapObjectKey {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    AgentStatus {},
+    AgentPrepare {
+        dataset_id: String,
+        view_path: String,
+    },
+    AgentWriterKeys {
+        generation: String,
+    },
+    AgentReaderKeys {
+        generation: String,
+    },
+    AgentFence {
+        generation: String,
+    },
+    AgentPublish {
+        generation: String,
+        revision: i64,
+        complete: bool,
+    },
+    AgentIssue {
+        generation: String,
+        label: String,
+        token_hash: String,
+        expires_at_ms: Option<i64>,
+    },
+    AgentRevoke {
+        grant_id: String,
+    },
+    AgentDisable {},
+    AgentAuthorize {
+        token_hash: String,
+    },
+    AgentCheck {
+        context: AgentRequestContext,
+    },
     RegisterStorageKey {
         binding: StorageKeyBinding,
         key: TaskKey,
@@ -363,6 +458,17 @@ pub enum Request {
 impl Request {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::AgentStatus { .. } => "agent_status",
+            Self::AgentPrepare { .. } => "agent_prepare",
+            Self::AgentWriterKeys { .. } => "agent_writer_keys",
+            Self::AgentReaderKeys { .. } => "agent_reader_keys",
+            Self::AgentFence { .. } => "agent_fence",
+            Self::AgentPublish { .. } => "agent_publish",
+            Self::AgentIssue { .. } => "agent_issue",
+            Self::AgentRevoke { .. } => "agent_revoke",
+            Self::AgentDisable { .. } => "agent_disable",
+            Self::AgentAuthorize { .. } => "agent_authorize",
+            Self::AgentCheck { .. } => "agent_check",
             Self::RegisterStorageKey { .. } => "register_storage_key",
             Self::AcquireStorageKey { .. } => "acquire_storage_key",
             Self::PrepareRecapObject { .. } => "prepare_recap_object",
@@ -394,6 +500,13 @@ impl Request {
         !matches!(
             self,
             Self::Status { .. }
+                | Self::AgentStatus { .. }
+                | Self::AgentWriterKeys { .. }
+                | Self::AgentReaderKeys { .. }
+                | Self::AgentAuthorize { .. }
+                | Self::AgentCheck { .. }
+                | Self::AgentFence { .. }
+                | Self::AgentPublish { .. }
                 | Self::InspectTask { .. }
                 | Self::RenewLease { .. }
                 | Self::ReleaseLease { .. }
@@ -407,6 +520,11 @@ impl Request {
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum Response {
     Ok,
+    AgentStatus(AgentAccessStatus),
+    AgentKeys(AgentViewKeys),
+    AgentGrant(AgentGrant),
+    AgentContext(AgentRequestContext),
+    AgentRevision(i64),
     Status(BrokerStatus),
     TaskState(TaskState),
     Prepared(PreparedTask),

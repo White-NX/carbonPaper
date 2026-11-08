@@ -127,6 +127,161 @@ impl NativeBrokerFixture {
             Ledger::open(&self.directory.path().join("keys.db")).expect("reopen durable ledger"),
         )));
     }
+    fn set_role(&mut self, role: RuntimeRole) {
+        self.principal.role = role;
+        let process = identity::inspect_process(std::process::id()).unwrap();
+        let caller = VerifiedCaller {
+            principal: self.principal.clone(),
+            image_lock: identity::locked_file(&process.image).unwrap(),
+        };
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(self.principal.process_identity.clone(), Arc::new(caller));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_agent_grants_and_independent_dpapi_keys_survive_reopen_and_revoke() {
+    let mut fixture = NativeBrokerFixture::new(false);
+    let Response::AgentKeys(keys) = fixture
+        .request(Request::AgentPrepare {
+            dataset_id: fixture.dataset.clone(),
+            view_path: fixture
+                .directory
+                .path()
+                .join("agent-memory.db")
+                .to_string_lossy()
+                .into_owned(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Response::AgentStatus(status) = fixture.request(Request::AgentStatus {}).await.unwrap()
+    else {
+        panic!()
+    };
+    fixture
+        .request(Request::AgentPublish {
+            generation: keys.binding.generation.clone(),
+            revision: status.source_revision,
+            complete: true,
+        })
+        .await
+        .unwrap();
+    let token_hash = "a".repeat(64);
+    let Response::AgentGrant(grant) = fixture
+        .request(Request::AgentIssue {
+            generation: keys.binding.generation.clone(),
+            label: "synthetic reader".into(),
+            token_hash: token_hash.clone(),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    fixture.reopen_ledger();
+    fixture.set_role(RuntimeRole::McpReader);
+    assert_eq!(
+        fixture
+            .request(Request::AgentAuthorize {
+                token_hash: token_hash.clone()
+            })
+            .await
+            .unwrap_err(),
+        BrokerError::Busy
+    );
+    assert_eq!(
+        fixture
+            .request(Request::AgentWriterKeys {
+                generation: keys.binding.generation.clone()
+            })
+            .await
+            .unwrap_err(),
+        BrokerError::AccessDenied
+    );
+    fixture.set_role(RuntimeRole::Desktop);
+    let Response::AgentKeys(restored) = fixture
+        .request(Request::AgentWriterKeys {
+            generation: keys.binding.generation.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(restored.content_key.0, keys.content_key.0);
+    assert_eq!(
+        restored.outbox_key.as_ref().unwrap().0,
+        keys.outbox_key.as_ref().unwrap().0
+    );
+    let Response::AgentStatus(status) = fixture.request(Request::AgentStatus {}).await.unwrap()
+    else {
+        panic!()
+    };
+    fixture
+        .request(Request::AgentPublish {
+            generation: keys.binding.generation.clone(),
+            revision: status.source_revision,
+            complete: true,
+        })
+        .await
+        .unwrap();
+    fixture.set_role(RuntimeRole::McpReader);
+    let Response::AgentKeys(reader_keys) = fixture
+        .request(Request::AgentReaderKeys {
+            generation: keys.binding.generation,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(reader_keys.content_key.0, keys.content_key.0);
+    assert!(reader_keys.outbox_key.is_none());
+    let Response::AgentContext(context) = fixture
+        .request(Request::AgentAuthorize {
+            token_hash: token_hash.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    fixture
+        .request(Request::AgentCheck {
+            context: context.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.request(Request::Status {}).await.unwrap_err(),
+        BrokerError::AccessDenied
+    );
+    fixture.set_role(RuntimeRole::Desktop);
+    fixture
+        .request(Request::AgentRevoke { grant_id: grant.id })
+        .await
+        .unwrap();
+    fixture.set_role(RuntimeRole::McpReader);
+    assert_eq!(
+        fixture
+            .request(Request::AgentCheck { context })
+            .await
+            .unwrap_err(),
+        BrokerError::AccessDenied
+    );
+    assert_eq!(
+        fixture
+            .request(Request::AgentAuthorize { token_hash })
+            .await
+            .unwrap_err(),
+        BrokerError::AccessDenied
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -489,6 +489,7 @@ fn install_prepared_inner(
     state.backup.begin_commit()?;
     let credential_snapshot = state.credential_state.snapshot_import_state();
     let result = (|| {
+        state.retire_agent_access_for_dataset_change()?;
         state.processing_stage.retire_dataset()?;
         state.shutdown_under_maintenance()?;
         let mut transaction = database_snapshot::RestoreFileTransaction::install(

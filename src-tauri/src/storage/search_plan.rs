@@ -8,8 +8,6 @@
 
 use std::collections::HashSet;
 
-use super::StorageState;
-
 /// Case forms tried per character.
 ///
 /// The bitmap index stores bigrams exactly as they were captured, so text
@@ -23,12 +21,19 @@ const MAX_CASE_FORMS_PER_CHAR: usize = 2;
 /// Characters the index keeps.
 ///
 /// Deliberately identical to the filter in
-/// [`StorageState::bigram_tokenize`]: whitespace and punctuation are dropped
+/// `StorageState::bigram_tokenize`: whitespace and punctuation are dropped
 /// before bigrams are cut, on the write path as much as here. That is why the
 /// index holds cross-word bigrams — `Six Degrees` contributes `xD` — and why a
 /// phrase query is allowed to ask for them.
 pub(crate) fn is_indexable(ch: char) -> bool {
-    ch.is_alphanumeric() || StorageState::is_cjk(ch)
+    ch.is_alphanumeric() || is_cjk(ch)
+}
+
+pub(crate) fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF |
+        0x2A700..=0x2B73F | 0x2B740..=0x2B81F | 0x2B820..=0x2CEAF |
+        0xF900..=0xFAFF | 0x2F800..=0x2FA1F)
 }
 
 /// The case spellings of one character, as typed first.

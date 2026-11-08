@@ -6,6 +6,7 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+mod agent_access;
 mod recap;
 mod storage_keys;
 
@@ -15,6 +16,7 @@ pub struct Principal {
     pub runtime_id: String,
     /// Kernel PID plus process creation time, not a request-supplied PID.
     pub process_identity: String,
+    pub role: RuntimeRole,
 }
 
 pub struct Ledger {
@@ -76,6 +78,7 @@ impl Ledger {
         }
         Self::init_recap(&conn)?;
         Self::init_storage_keys(&conn)?;
+        Self::init_agent_access(&conn)?;
         Ok(Self { conn })
     }
 
@@ -108,6 +111,8 @@ impl Ledger {
         db(tx.execute("DELETE FROM tasks WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_keys WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_public_keys WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM agent_grants WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM agent_views WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM owners WHERE sid=?1", [sid]))?;
         db(tx.commit())
     }
@@ -211,6 +216,12 @@ impl Ledger {
         dataset: Option<String>,
         protector: &dyn KeyProtector,
     ) -> Result<Response> {
+        if let Some(response) = Self::dispatch_agent_access(conn, who, &request, now, protector)? {
+            return Ok(response);
+        }
+        if who.role != RuntimeRole::Desktop {
+            return Err(BrokerError::AccessDenied);
+        }
         if let Some(response) = Self::dispatch_storage_keys(
             conn,
             who,
@@ -273,6 +284,7 @@ impl Ledger {
                     return Err(BrokerError::InvalidRequest);
                 }
                 Self::retire_where(conn, &who.sid, Some(&dataset_id))?;
+                Self::retire_agent_access(conn, &who.sid)?;
                 db(conn.execute(
                     "UPDATE owners SET dataset_id=NULL WHERE sid=?1 AND dataset_id=?2",
                     params![who.sid, dataset_id],
@@ -620,6 +632,7 @@ impl Ledger {
             runtime_id: who.runtime_id.clone(),
             supported_consumers: Consumer::ALL_MASK,
             supported_storage_keys: true,
+            supported_agent_access: true,
         })
     }
 
@@ -748,6 +761,7 @@ mod tests {
             sid: "user-a".into(),
             runtime_id: "release-a".into(),
             process_identity: "10:100".into(),
+            role: RuntimeRole::Desktop,
         };
         ledger
             .register_owner(&who.sid, &who.runtime_id, true)

@@ -34,7 +34,10 @@ impl Drop for GlobalMemGuard {
 }
 
 #[cfg(windows)]
-fn copy_mcp_token_to_clipboard(window: &tauri::Window, token: &str) -> Result<(), String> {
+pub(crate) fn copy_mcp_token_to_clipboard(
+    window: &tauri::Window,
+    token: &str,
+) -> Result<(), String> {
     use std::mem::size_of;
     use std::ptr;
     use windows::Win32::Foundation::{HANDLE, HWND};
@@ -43,7 +46,7 @@ fn copy_mcp_token_to_clipboard(window: &tauri::Window, token: &str) -> Result<()
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
-    let mut wide: Vec<u16> = token.encode_utf16().collect();
+    let mut wide = zeroize::Zeroizing::new(token.encode_utf16().collect::<Vec<u16>>());
     wide.push(0);
     let byte_len = wide.len() * size_of::<u16>();
 
@@ -104,7 +107,10 @@ impl Drop for ClipboardGuard {
 }
 
 #[cfg(not(windows))]
-fn copy_mcp_token_to_clipboard(_window: &tauri::Window, _token: &str) -> Result<(), String> {
+pub(crate) fn copy_mcp_token_to_clipboard(
+    _window: &tauri::Window,
+    _token: &str,
+) -> Result<(), String> {
     Err("MCP token clipboard delivery is only available on Windows".to_string())
 }
 
@@ -150,6 +156,22 @@ pub async fn mcp_set_enabled(
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
     let _lifecycle_guard = mcp_state.lock_lifecycle().await;
+
+    if storage_state.agent_access_enabled() {
+        let mut policy = storage_state.load_policy()?;
+        policy_as_object_mut(&mut policy)?.insert("mcp_enabled".into(), serde_json::json!(enabled));
+        storage_state.save_policy(&policy)?;
+        if enabled && storage_state.agent_preparation().phase == "ready" {
+            crate::agent_access::start_reader(app.clone(), &storage_state, &mcp_state).await?;
+        } else {
+            mcp_server::stop_server(&mcp_state).await;
+        }
+        let _ = app.emit(
+            "mcp-status-changed",
+            serde_json::json!({"state":if enabled{"running"}else{"disabled"},"mode":"unattended"}),
+        );
+        return Ok(serde_json::json!({"status":"ok","mode":"unattended"}));
+    }
 
     if enabled {
         let mut policy = storage_state.load_policy()?;
@@ -294,12 +316,22 @@ pub async fn mcp_get_status(
         last_error
     };
     let ml_status = ml_state.status(failed_ocr);
+    let unattended = storage_state.agent_access_enabled();
+    let agent_preparation = storage_state.agent_preparation();
     let state = if !enabled {
         "disabled"
     } else if running && !port_consistent {
         "error"
     } else if running {
         "running"
+    } else if unattended {
+        match agent_preparation.phase.as_str() {
+            "preparing" | "syncing" => "preparing",
+            "waiting_for_unlock" => "waiting_for_unlock",
+            "error" => "error",
+            _ if status_error.is_some() => "error",
+            _ => "stopped",
+        }
     } else if !credential_state.is_session_valid()
         || status_error
             .as_deref()
@@ -315,6 +347,8 @@ pub async fn mcp_get_status(
 
     Ok(serde_json::json!({
         "enabled": enabled,
+        "mode": if unattended { "unattended" } else { "interactive" },
+        "agent_preparation": agent_preparation,
         "port": port,
         "active_port": active_port,
         "port_consistent": port_consistent,
@@ -361,6 +395,7 @@ pub async fn mcp_run_smoke_test(
 ) -> Result<McpSmokeReport, String> {
     super::check_auth_required(&credential_state)?;
     let _lifecycle_guard = mcp_state.lock_lifecycle().await;
+    require_interactive_credentials(&storage_state, &mcp_state)?;
 
     let runtime_generation = mcp_state.generation();
     let active_port = mcp_state.active_port();
@@ -423,6 +458,7 @@ pub async fn mcp_reset_token(
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
     let _lifecycle_guard = mcp_state.lock_lifecycle().await;
+    require_interactive_credentials(&storage_state, &mcp_state)?;
 
     let policy = storage_state.load_policy()?;
     let configured_port = mcp_server::port_from_policy(&policy);
@@ -544,6 +580,7 @@ pub async fn mcp_copy_token_to_clipboard(
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
     let _lifecycle_guard = mcp_state.lock_lifecycle().await;
+    require_interactive_credentials(&storage_state, &mcp_state)?;
 
     let policy = storage_state.load_policy()?;
     let encrypted_token = policy
@@ -589,13 +626,27 @@ pub async fn mcp_set_sensitive_filter_config(
     super::check_auth_required(&credential_state)?;
 
     let config = config.normalized();
-    filter_state.update_config(config.clone());
 
     let mut policy = storage_state.load_policy()?;
     let config_value =
         serde_json::to_value(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
     policy_as_object_mut(&mut policy)?.insert("sensitive_filter".into(), config_value);
-    storage_state.save_policy(&policy)
+    storage_state.save_policy(&policy)?;
+    filter_state.update_config(config);
+    Ok(())
+}
+
+fn require_interactive_credentials(
+    storage: &StorageState,
+    runtime: &mcp_server::McpRuntimeState,
+) -> Result<(), String> {
+    if storage.agent_access_enabled() || runtime.mode() == "unattended" {
+        return Err(
+            "AGENT_MANAGE_CREDENTIALS: Manage unattended credentials in Agent Access settings"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

@@ -11,6 +11,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub const MINILM_MODEL_ID: &str = "paraphrase-multilingual-MiniLM-L12-v2";
+pub const MINILM_VECTOR_SPACE_REVISION: &str = "minilm-l12-vector-space-v1";
+pub const MINILM_DIMENSIONS: usize = 384;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticOperation {
     TextEmbedding,

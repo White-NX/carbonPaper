@@ -404,6 +404,7 @@ mod tests {
             sid: "fixture-user".into(),
             runtime_id: "fixture-runtime".into(),
             process_identity: "1:1".into(),
+            role: RuntimeRole::Desktop,
         };
         let dataset = random_id();
         let binding = binding(&dataset);

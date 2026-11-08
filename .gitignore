@@ -52,6 +52,7 @@ tools/disk-wear-runs/
 /.release-assets/
 /src-tauri/semantic-worker/target/
 /src-tauri/app-bound/target/
+/src-tauri/agent-access/target/
 
 # Artificial Intelligence
 CLAUDE.md

@@ -1,0 +1,166 @@
+# Unattended Agent Access
+
+CarbonPaper provides an opt-in, read-only credential for its complete prepared
+text history through local MCP. The permission is independent of an unlocked
+application session and of the background-organization preference. It includes
+future captures and resumes after Windows sign-in and background application
+startup. Fully exiting the application stops the endpoint.
+
+The permission reduces the protection supplied by application locking: anyone
+holding a credential can retrieve the authorized text while the UI is locked.
+Use a normal interactive session with automatic locking disabled when unattended
+Agent access is unnecessary. Revocation prevents further authorized responses;
+it cannot recover text already returned.
+
+## Scope and behavior
+
+| Operation or event | Behavior |
+| --- | --- |
+| Read capture times, application names, window titles, categories, recorded URLs and links | Available across the prepared active dataset |
+| Read OCR, saved recap activities, corrections, cluster membership and summaries | Available when recorded; ordinary content and PII filters still apply |
+| Enumerate dates and captures | All prepared history, using existing pagination and explicit Unix millisecond timestamps |
+| Search visible words | Shared keyword and fuzzy matching rules; explanations describe the representative OCR row |
+| Search screen appearance | Copied Chinese-CLIP vectors and a text-only query embedding; missing vectors are reported |
+| Search recaps | Corrected keyword results, copied MiniLM vectors, saved calendars, coverage and ranking revisions |
+| Read screenshots, thumbnails, crops, binary attachments, image paths or archive keys | Outside the permission |
+| Edit summaries, delete data, change settings or issue credentials | Outside the read-only catalog |
+| Lock or expire the UI session | Credential remains active; ordinary UI access retains its authentication requirements |
+| Restart Windows or the application | Access resumes after sign-in and background startup once reconciliation completes |
+| Revoke one credential | Other credentials remain active; requests admitted under the revoked revision are rejected before response delivery |
+| Disable unattended access | All grants and service key authority are retired, and the reader stops |
+| Import a backup or change the data directory | Old grants are retired; the active dataset requires a new explicit authorization |
+
+All ten existing read tools are available. The two summary-write tools are
+omitted from the catalog and rejected if called directly. In-process AI tools
+continue to use the authenticated interactive dispatcher.
+
+## Application commands
+
+The native settings/main-window commands are:
+
+- `agent_access_get_status`: availability, preparation progress and credential
+  metadata. It returns no archive text, paths, keys or bearer secrets. Labels
+  are omitted while the UI is locked.
+- `agent_access_set_enabled`: enable or disable persistent permission. Enabling
+  performs fresh Windows verification even with a valid application session.
+- `agent_access_resume`: continue interrupted preparation using an ordinary
+  authenticated session.
+- `agent_access_issue_credential`: issue a labeled credential, optionally with
+  an expiry, or replace an existing one. Fresh Windows verification is required.
+- `agent_access_revoke_credential`: independently revoke a credential.
+
+A random credential is delivered once through the native Windows clipboard.
+Neither the plaintext credential nor content keys cross frontend IPC. Failed
+clipboard delivery revokes the newly issued grant. Replacement delivers the new
+credential before revoking the old one. Lost credentials are replaced, because
+the service stores a hash rather than a recoverable plaintext secret.
+
+Exactly one listener owns the configured loopback MCP port. Interactive mode
+uses the desktop listener and its ordinary token; unattended mode uses the
+protected reader and independently issued credentials. Listener transitions
+share the existing lifecycle lock. Existing interactive token-copy, rotation
+and smoke-test commands are unavailable in unattended mode.
+
+## Independent text repository
+
+[`carbonpaper-agent-access`](../src-tauri/agent-access/) is a separate Rust
+crate containing typed projections, encrypted storage, filters, pagination and
+the unattended dispatcher. It does not link the archive repository, CNG private
+key context, screenshot loader or an arbitrary file-read API.
+
+Its SQLCipher-encrypted `agent-memory.db` uses an independently random content
+key. The transactional outbox uses a second independently random key and
+authenticates the dataset and generation. Keys are unrelated to the bearer
+credential and archive master key.
+
+The allowlist covers text, identifiers, revisions, timestamps, recorded
+relationships, numeric geometry and existing search vectors. It excludes
+arbitrary screenshot metadata, icons, image locations, image bytes, key
+envelopes, prompts, reasoning and provider diagnostics. Recap summaries and
+evidence are decoded into explicit fields.
+
+```mermaid
+flowchart LR
+    Capture[Capture and OCR] --> Archive[Protected archive and images]
+    Capture --> Writer[Typed text exporter]
+    History[Authenticated history preparation] --> Writer
+    Writer --> View[Encrypted Agent text view]
+    Service[Protected key service] --> Reader[Protected MCP reader]
+    View --> Reader
+    Reader --> Agent[Agent with read credential]
+```
+
+The desktop exporter reads historical metadata, OCR, links and saved text
+payloads while authenticated. It never opens source screenshots or thumbnails.
+Capture and processing stage already available plaintext as bounded,
+short-lived Agent-key-encrypted material. Source triggers return independently
+encrypted typed events, or identifier-only synchronization gaps when that
+material is unavailable. Plaintext SQL decryption functions retain their
+`DIRECTONLY` restriction.
+
+Events commit alongside source changes. Revision fencing, tombstones and
+content-index removal prevent older callbacks from overwriting newer records or
+reviving deleted children. Historical preparation uses a persistent checkpoint
+and drains concurrent updates between pages. It pauses on lock or cancellation.
+
+## Protected reader and authority
+
+[`carbonpaper-mcp-reader`](../src-tauri/agent-access/src/bin/reader.rs) owns
+the unattended HTTP endpoint and receives configuration through stdin. Keys and
+credentials are never command-line arguments. A Windows Job stops the reader
+and its query worker descendants when the desktop exits.
+
+The existing app-bound ledger stores independent Agent policy, protected view
+keys, credential hashes, labels, expiry and last-use timestamps. Grants bind the
+owning SID, dataset and view generation. The reader role is derived from the
+kernel-observed process identity, protected executable location and signed
+runtime manifest. It can acquire only Agent content keys and validate Agent
+requests; archive and background-processing operations remain restricted to the
+desktop role. The reader never receives outbox write material.
+
+Query embeddings use the existing protected Rust semantic worker. The reader
+can request only `EmbedText`; an Agent request cannot create a historical
+image embedding or select a source image/file. Executable, runtime-library and
+dictionary bytes remain pinned while the reader serves requests. Model weights
+retain the existing descriptor verification.
+
+Each request obtains a service-issued context after bearer-hash validation.
+Before returning a response, it rechecks grant, expiry, dataset, generation and
+source revisions. Source mutations fence reads before commit. A service restart
+places enabled views in reconciliation, and desktop synchronization must publish
+readiness before requests resume. Service failure, mismatched bindings or
+unresolved gaps deny reads.
+
+Healthy locked startup restores only Agent-view write material and applies
+captured outbox events. Repairing a gap that requires archive plaintext waits
+for an ordinary unlock. No plaintext fallback is persisted and incomplete
+preparation is never presented as complete history.
+
+## Lifecycle and packaging
+
+Disabling access clears desktop write material and retires service authority
+before reader shutdown and encrypted-file cleanup. Re-enabling creates a new
+generation and requires new authorization and preparation. Original archive
+data and background organization remain intact.
+
+Backup export includes neither the Agent text database nor service authority.
+Import strips Agent state, outbox and gap tables from the imported archive and
+retires previous grants. Data-directory changes also require reauthorization.
+
+Protected release and development manifests include the reader. Build,
+development-cache, portable-package and release-verification scripts include
+the new binary and shared query contracts. Older installed services report the
+capability as unavailable; enable or repair the protected runtime before setup.
+
+## Operational verification
+
+`npm run test:agent-access` exercises the independent reader repository and
+contracts. The app-bound library suite includes isolated native pipe/DPAPI
+coverage for key restoration, role restrictions and credential revocation.
+The desktop library tests exercise authenticated backfill, locked future
+capture, gaps, transactional rollback and saved recap projection.
+
+Release acceptance also requires an installed protected runtime, real Windows
+verification, foreground/settings window ownership, locked reads, application
+restart, Windows sign-in/startup, dataset replacement and packaged query models.
+Isolated tests and compilation do not establish those full application flows.

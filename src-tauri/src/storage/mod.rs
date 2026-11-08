@@ -5,6 +5,7 @@
 //! 2. Screenshot metadata and OCR results
 //! 3. OCR data storage and search
 
+mod agent_access;
 mod ann_build;
 mod background_scheduler;
 pub(crate) mod backup;
@@ -98,6 +99,7 @@ pub struct StorageState {
     pub(crate) backup: backup::Control,
     pub(crate) processing_stage: Arc<crate::processing_stage::ProcessingStaging>,
     protected: Arc<protected::ProtectedStorage>,
+    pub(crate) agent_writer: Arc<agent_access::AgentWriter>,
     /// Database connection
     db: Mutex<Option<Connection>>,
     /// Data directory (contains database, screenshots, logs, etc.)
@@ -231,15 +233,18 @@ impl StorageState {
     ) -> Self {
         let screenshot_dir = data_dir.join("screenshots");
         let processing_stage = Arc::new(crate::processing_stage::ProcessingStaging::new());
+        let agent_writer = Arc::new(agent_access::AgentWriter::default());
         let protected = Arc::new(protected::ProtectedStorage::new(
             credential_state.clone(),
             processing_stage.clone(),
+            agent_writer.clone(),
         ));
 
         Self {
             backup: backup::Control::default(),
             processing_stage,
             protected,
+            agent_writer,
             db: Mutex::new(None),
             data_dir: Mutex::new(data_dir),
             screenshot_dir: Mutex::new(screenshot_dir),

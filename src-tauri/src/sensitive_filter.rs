@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tauri::Manager;
 
 const DICT_KEY_MATERIAL: &[u8] = b"CarbonPaper-SensitiveDict-v1";
 
@@ -239,34 +238,17 @@ impl SensitiveFilterState {
         state
     }
 
-    /// Load encrypted dictionary files from Tauri resources and build automata.
-    pub fn load_dicts(&self, app_handle: &tauri::AppHandle) {
+    /// Load the same encrypted dictionaries in the desktop and isolated reader.
+    pub fn load_dicts(&self, resource_dir: &std::path::Path) -> Result<(), String> {
         let key: [u8; 32] = Sha256::digest(DICT_KEY_MATERIAL).into();
         let mut wl = self.word_lists.write().unwrap();
 
         for &(cat_id, dict_file) in DICT_FILES {
             let filename = format!("compliance_process/dicts/{}", dict_file);
 
-            let resource_path = match app_handle.path().resource_dir() {
-                Ok(dir) => dir.join(&filename),
-                Err(e) => {
-                    tracing::warn!("Cannot resolve resource dir for {}: {}", cat_id, e);
-                    continue;
-                }
-            };
-
-            if !resource_path.exists() {
-                tracing::warn!("Dict file not found: {}", resource_path.display());
-                continue;
-            }
-
-            let encrypted = match std::fs::read(&resource_path) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!("Failed to read {}: {}", resource_path.display(), e);
-                    continue;
-                }
-            };
+            let resource_path = resource_dir.join(&filename);
+            let encrypted = std::fs::read(&resource_path)
+                .map_err(|e| format!("Cannot load privacy dictionary: {e}"))?;
 
             match decrypt_dict(&key, &encrypted) {
                 Ok(words) => {
@@ -274,7 +256,7 @@ impl SensitiveFilterState {
                     wl.insert(cat_id.to_string(), words);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to decrypt dict for '{}': {}", cat_id, e);
+                    return Err(format!("Cannot decode privacy dictionary: {e}"));
                 }
             }
         }
@@ -283,6 +265,7 @@ impl SensitiveFilterState {
         // Build initial composite automaton from config
         let config = self.config.read().unwrap().clone();
         self.rebuild_automaton(&config);
+        Ok(())
     }
 
     /// Check if the filter is enabled.
@@ -503,6 +486,79 @@ fn decrypt_dict(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<String>, String>
     Ok(words)
 }
 
+/// A record withheld because the filter mode is [`FilterMode::Reject`].
+#[derive(Debug)]
+pub struct Rejected;
+
+/// One-line identity fields such as window titles: replaced, never removed.
+pub fn filter_identity(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+) -> Result<String, Rejected> {
+    let findings = filter.inspect(text, pii::Context::default());
+    if !findings.is_flagged() {
+        return Ok(filter.kept_text(text, &findings));
+    }
+    match mode {
+        FilterMode::Reject => Err(Rejected),
+        FilterMode::RemoveParagraph => Ok("[censored]".to_string()),
+        FilterMode::Mask => Ok(filter.masked_text(text, &findings)),
+    }
+}
+
+/// An OCR segment or link text. `Ok(None)` drops it, which is what the
+/// default mode does with every segment that has a sensitive word or
+/// personal information.
+pub fn filter_segment(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+    context: pii::Context,
+) -> Result<Option<String>, Rejected> {
+    let findings = filter.inspect(text, context);
+    if !findings.is_flagged() {
+        return Ok(Some(filter.kept_text(text, &findings)));
+    }
+    match mode {
+        FilterMode::Reject => Err(Rejected),
+        FilterMode::RemoveParagraph => Ok(None),
+        FilterMode::Mask => Ok(Some(filter.masked_text(text, &findings))),
+    }
+}
+
+/// Text joined from several OCR segments, such as a search snippet. The
+/// segments can no longer be told apart, so the default mode replaces the
+/// whole text and keeps the hit; the snapshot details still return the
+/// clean segments.
+pub fn filter_joined_text(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+) -> Result<String, Rejected> {
+    Ok(filter_segment(filter, mode, text, pii::Context::default())?
+        .unwrap_or_else(|| "[censored]".to_string()))
+}
+
+/// URLs are checked after percent-decoding and replaced whole when flagged.
+pub fn filter_url(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    url: &str,
+) -> Result<String, Rejected> {
+    let findings = filter.inspect(
+        &percent_encoding::percent_decode_str(url)
+            .decode_utf8_lossy()
+            .as_ref(),
+        pii::Context::default(),
+    );
+    match (findings.is_flagged(), mode) {
+        (false, _) => Ok(url.to_string()),
+        (true, FilterMode::Reject) => Err(Rejected),
+        (true, _) => Ok("[censored]".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,7 +621,7 @@ mod tests {
                 FilterMode::RemoveParagraph,
                 FilterMode::Mask,
             ] {
-                let result = crate::mcp_server::filter_identity(&new, mode, text);
+                let result = filter_identity(&new, mode, text);
                 let valid = match (hit, mode, result) {
                     (true, FilterMode::Reject, Err(_)) => true,
                     (true, FilterMode::RemoveParagraph, Ok(value)) => value == "[censored]",

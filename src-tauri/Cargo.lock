@@ -684,6 +684,7 @@ dependencies = [
  "argon2",
  "axum",
  "base64 0.22.1",
+ "carbonpaper-agent-access",
  "carbonpaper-app-bound",
  "chrono",
  "chrono-tz",
@@ -736,6 +737,30 @@ dependencies = [
  "winreg 0.52.0",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "carbonpaper-agent-access"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "aho-corasick",
+ "axum",
+ "base64 0.22.1",
+ "carbonpaper-app-bound",
+ "chrono",
+ "hex",
+ "once_cell",
+ "percent-encoding",
+ "rand 0.8.5",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

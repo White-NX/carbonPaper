@@ -45,6 +45,7 @@ pub(super) struct ProtectedStorage {
     credentials: Arc<CredentialManagerState>,
     staging: RwLock<Arc<crate::processing_stage::ProcessingStaging>>,
     state: Mutex<State>,
+    agent_writer: Arc<super::agent_access::AgentWriter>,
     #[cfg(test)]
     allow_plaintext: std::sync::atomic::AtomicBool,
 }
@@ -53,11 +54,13 @@ impl ProtectedStorage {
     pub(super) fn new(
         credentials: Arc<CredentialManagerState>,
         staging: Arc<crate::processing_stage::ProcessingStaging>,
+        agent_writer: Arc<super::agent_access::AgentWriter>,
     ) -> Self {
         Self {
             credentials,
             staging: RwLock::new(staging),
             state: Mutex::new(State::default()),
+            agent_writer,
             #[cfg(test)]
             allow_plaintext: std::sync::atomic::AtomicBool::new(false),
         }
@@ -452,7 +455,11 @@ impl ProtectedStorage {
         identity: &str,
         bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        self.write_key(purpose)?.seal(identity, bytes)
+        let sealed = self.write_key(purpose)?.seal(identity, bytes)?;
+        if matches!(purpose, "metadata" | "vectors") {
+            self.agent_writer.stage_payload(&sealed, bytes);
+        }
+        Ok(sealed)
     }
 
     fn resume_ann_key(&self, id: &str) -> Result<Arc<CipherKey>, String> {

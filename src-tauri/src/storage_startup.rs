@@ -236,7 +236,11 @@ fn start_storage_services(app: &tauri::AppHandle, storage: &Arc<StorageState>) {
         },
     );
     let filters = app.state::<Arc<crate::sensitive_filter::SensitiveFilterState>>();
-    filters.load_dicts(app);
+    if let Ok(directory) = app.path().resource_dir() {
+        if let Err(error) = filters.load_dicts(&directory) {
+            tracing::error!("Cannot load privacy dictionaries: {error}");
+        }
+    }
     if let Ok(policy) = storage.load_policy() {
         if let Some(config) = policy.get("sensitive_filter") {
             if let Ok(config) = serde_json::from_value::<
@@ -253,6 +257,7 @@ fn start_storage_services(app: &tauri::AppHandle, storage: &Arc<StorageState>) {
         crate::monitor::start_game_mode_monitor(app.clone());
     }
     let mcp_app = app.clone();
+    crate::agent_access::spawn(app.clone());
     tauri::async_runtime::spawn(async move {
         let storage = mcp_app.state::<Arc<StorageState>>();
         let credentials = mcp_app.state::<Arc<CredentialManagerState>>();

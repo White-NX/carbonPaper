@@ -100,6 +100,11 @@ const COMMAND_TIERS = {
   'commands::migration::storage_backup_cancel': 'session_required',
   'analysis::get_analysis_overview': 'session_required',
   'commands::mcp::mcp_set_enabled': 'session_required',
+  'commands::agent_access::agent_access_get_status': 'public',
+  'commands::agent_access::agent_access_set_enabled': 'session_required',
+  'commands::agent_access::agent_access_resume': 'session_required',
+  'commands::agent_access::agent_access_issue_credential': 'session_required',
+  'commands::agent_access::agent_access_revoke_credential': 'session_required',
   'commands::mcp::mcp_get_status': 'public',
   'commands::mcp::mcp_run_smoke_test': 'session_required',
   'commands::mcp::mcp_ack_privacy_warning': 'public',
@@ -298,6 +303,11 @@ function checkCommandGuardImplementations() {
     throw new Error(`High-impact commands missing main-window guard:\n${missingWindowGuard.join('\n')}`);
   }
   const settingsCommands = [
+  'commands::agent_access::agent_access_get_status',
+  'commands::agent_access::agent_access_set_enabled',
+  'commands::agent_access::agent_access_resume',
+  'commands::agent_access::agent_access_issue_credential',
+  'commands::agent_access::agent_access_revoke_credential',
   'commands::utility::set_app_theme',
   'monitor::monitor_get_filters',
   'settings_window::settings_monitor_action',

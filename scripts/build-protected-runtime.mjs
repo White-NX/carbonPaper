@@ -22,3 +22,7 @@ for (const binary of ['carbonpaper-key-service.exe', 'carbonpaper-protected-setu
   copyFileSync(built, path.join(bundle, binary));
 }
 console.log(`Protected runtime components built (${profile}).`);
+execFileSync('cargo', ['build', '--locked', '--manifest-path', path.join(tauri, 'agent-access', 'Cargo.toml'), '--bin', 'carbonpaper-mcp-reader', ...flags], {
+  stdio: 'inherit', windowsHide: true,
+});
+copyFileSync(path.join(tauri, 'agent-access', 'target', profile, 'carbonpaper-mcp-reader.exe'), path.join(bundle, 'carbonpaper-mcp-reader.exe'));

@@ -43,7 +43,7 @@ async function fixture(t) {
   writeFileSync(path.join(tauri, 'tauri.conf.json'), JSON.stringify({ version: '0.8.5-test.1+build.2' }));
   writeFileSync(path.join(tauri, 'update-public-key.txt'), trustedKey);
   for (const name of binaries) writeFileSync(path.join(release, name), `synthetic test binary: ${name}`);
-  for (const name of ['carbonpaper-semantic-worker.exe', 'carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe']) {
+  for (const name of ['carbonpaper-semantic-worker.exe', 'carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe', 'carbonpaper-mcp-reader.exe']) {
     writeFileSync(path.join(prebundle, name), name === 'carbonpaper-key-service.exe' || name === 'carbonpaper-protected-setup.exe'
       ? testPe() : `synthetic resource: ${name}`);
   }

@@ -3,6 +3,7 @@
 //! This crate wires native capture, encrypted storage, monitor/ML processes, IPC,
 //! commands, tray behavior, and application lifecycle into the desktop runtime.
 
+mod agent_access;
 mod ai;
 mod analysis;
 mod ann_format;
@@ -65,6 +66,7 @@ mod power;
 mod processing_stage;
 mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
+mod recap_text_contract;
 mod registry_config;
 mod rerank;
 mod resource_utils;
@@ -1091,6 +1093,11 @@ pub fn run() {
             commands::recap::recap_get_progress,
             commands::recap::recap_correct,
             commands::mcp::mcp_set_enabled,
+            commands::agent_access::agent_access_get_status,
+            commands::agent_access::agent_access_set_enabled,
+            commands::agent_access::agent_access_resume,
+            commands::agent_access::agent_access_issue_credential,
+            commands::agent_access::agent_access_revoke_credential,
             commands::mcp::mcp_get_status,
             commands::mcp::mcp_run_smoke_test,
             commands::mcp::mcp_ack_privacy_warning,
@@ -1210,6 +1217,7 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                agent_access::stop();
                 tray_panel::destroy(app_handle);
                 if let Some(scheduler) =
                     app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()

@@ -562,6 +562,7 @@ impl StorageState {
         &self,
         request: &SaveScreenshotRequest,
     ) -> Result<SaveScreenshotResponse, String> {
+        let _agent_text = self.agent_writer.stage_capture(request);
         // Check for duplicates
         if self.screenshot_exists(&request.image_hash)? {
             return Ok(SaveScreenshotResponse {
@@ -776,6 +777,7 @@ impl StorageState {
         request: &SaveScreenshotRequest,
         image_data: &[u8],
     ) -> Result<SaveScreenshotResponse, String> {
+        let _agent_text = self.agent_writer.stage_capture(request);
         let fn_start = std::time::Instant::now();
 
         // Return duplicate if already exists

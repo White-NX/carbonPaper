@@ -8,7 +8,7 @@ export const signatureName = 'protected-runtime.sig';
 export const signingContext = Buffer.from('CarbonPaper protected runtime v1\n');
 const required = ['carbonpaper.exe', 'carbonpaper-key-service.exe',
   'carbonpaper-protected-setup.exe', 'carbonpaper-semantic-worker.exe', 'carbonpaper-ml.exe',
-  'carbonpaper-office.exe', 'carbonpaper-nmh.exe'];
+  'carbonpaper-office.exe', 'carbonpaper-nmh.exe', 'carbonpaper-mcp-reader.exe'];
 const maxFileBytes = 2 * 1024 ** 3;
 const releaseVersion = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
 

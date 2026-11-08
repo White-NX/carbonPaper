@@ -24,9 +24,10 @@ pub const USER_DIRECTORY_NAME: &str = concat!(
     env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE")
 );
 pub const CLIENT_FILE: &str = "development-client.json";
-const HELPERS: [&str; 2] = [
+const HELPERS: [&str; 3] = [
     "carbonpaper-key-service.exe",
     "carbonpaper-protected-setup.exe",
+    "carbonpaper-mcp-reader.exe",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -190,6 +191,38 @@ pub fn prepare_package(version: &str) -> std::result::Result<PathBuf, String> {
             CLIENT_FILE.into(),
             crate::crypto::digest(&registration_bytes),
         );
+        // The reader executes only signed protected code, even in development.
+        // The desktop keeps its existing debug registration outside this folder.
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(BrokerError::Integrity)?
+            .join("pre-bundle");
+        for relative in [
+            "carbonpaper-semantic-worker.exe",
+            "onnxruntime/1.24.2/onnxruntime.dll",
+            "onnxruntime/1.24.2/onnxruntime_providers_shared.dll",
+            "onnxruntime/1.24.2/DirectML.dll",
+            "compliance_process/dicts/dict_01.dict.enc",
+            "compliance_process/dicts/dict_02.dict.enc",
+            "compliance_process/dicts/dict_03.dict.enc",
+            "compliance_process/dicts/dict_04.dict.enc",
+            "compliance_process/dicts/dict_05.dict.enc",
+        ] {
+            let source = resources.join(relative);
+            if !source.exists() {
+                continue;
+            }
+            let target = package.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|_| BrokerError::Storage)?;
+            }
+            let hash = checksum(&source)?;
+            fs::copy(&source, &target).map_err(|_| BrokerError::Storage)?;
+            if checksum(&target)? != hash {
+                return Err(BrokerError::Integrity);
+            }
+            files.insert(relative.into(), hash);
+        }
         let release = ReleaseManifest {
             format: 1,
             product: manifest::PRODUCT.into(),

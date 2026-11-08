@@ -225,6 +225,7 @@ impl StorageState {
         }
 
         let previous_registry = crate::registry_config::get_string("data_dir");
+        self.retire_agent_access_for_dataset_change()?;
         if !migrate_data_files {
             self.processing_stage.retire_dataset()?;
         }
