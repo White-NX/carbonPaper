@@ -760,12 +760,16 @@ pub async fn storage_get_screenshot_details(
 /// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_delete_screenshot(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     screenshot_id: i64,
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
     let deleted = state.delete_screenshot(screenshot_id)?;
+    if deleted {
+        crate::tray_panel::invalidate_records(&app);
+    }
     Ok(serde_json::json!({
         "status": "success",
         "deleted": deleted,
@@ -779,6 +783,7 @@ pub async fn storage_delete_screenshot(
 /// "vector_deleted": number | null }`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_delete_by_time_range(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     start_time: f64,
@@ -786,6 +791,9 @@ pub async fn storage_delete_by_time_range(
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
     let deleted_count = state.delete_screenshots_by_time_range(start_time, end_time)?;
+    if deleted_count > 0 {
+        crate::tray_panel::invalidate_records(&app);
+    }
     Ok(serde_json::json!({
         "status": "success",
         "deleted_count": deleted_count,
@@ -869,6 +877,7 @@ pub async fn storage_get_process_monthly_thumbnails(
 /// Authentication: required. Returns `SoftDeleteResult`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_soft_delete(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     process_name: String,
@@ -878,11 +887,13 @@ pub async fn storage_soft_delete(
     check_auth_required(&credential_state)?;
 
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         state.soft_delete_process_month(&process_name, month.as_deref(), time_zone.as_deref())
     })
     .await
-    .map_err(|e| format!("Task join error: {:?}", e))?
+    .map_err(|e| format!("Task join error: {:?}", e))??;
+    crate::tray_panel::invalidate_records(&app);
+    Ok(result)
 }
 
 /// Queues soft deletion for the supplied screenshot IDs.
@@ -891,6 +902,7 @@ pub async fn storage_soft_delete(
 /// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_soft_delete_screenshots(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     screenshot_ids: Vec<i64>,
@@ -898,9 +910,12 @@ pub async fn storage_soft_delete_screenshots(
     check_auth_required(&credential_state)?;
 
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || state.soft_delete_screenshots(&screenshot_ids))
-        .await
-        .map_err(|e| format!("Task join error: {:?}", e))?
+    let result =
+        tokio::task::spawn_blocking(move || state.soft_delete_screenshots(&screenshot_ids))
+            .await
+            .map_err(|e| format!("Task join error: {:?}", e))??;
+    crate::tray_panel::invalidate_records(&app);
+    Ok(result)
 }
 
 /// Returns pending and completed soft-delete queue counts.

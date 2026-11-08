@@ -4,15 +4,19 @@ import { invoke } from '@tauri-apps/api/core';
 import { getIndexHealth } from '../../../lib/monitor_api';
 import { useSavedCaptureFilters } from './useSavedCaptureFilters';
 
-vi.mock('./useCaptureFilterSettings', () => ({ readSavedCaptureFilters: () => ({ processes: [], titles: [], ignoreProtected: true }) }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => vi.fn()) }));
+vi.mock('./useCaptureFilterSettings', () => ({
+  readSavedCaptureFilters: () => ({ processes: [], titles: [], ignoreProtected: true }),
+  filtersFromBackend: (filters) => filters,
+}));
 beforeEach(() => { invoke.mockReset(); });
 
 describe('background settings authentication', () => {
-  it('does not launch Hello when applying saved capture filters loses the session', async () => {
+  it('does not launch Hello when reading committed capture filters loses the session', async () => {
     invoke.mockRejectedValue(new Error('AUTH_REQUIRED'));
     renderHook(() => useSavedCaptureFilters({ monitorStatus: 'running' }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith('monitor_update_filters', expect.anything()));
-    expect(invoke.mock.calls.map(([command]) => command)).toEqual(['monitor_update_filters']);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('monitor_get_filters'));
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual(['monitor_get_filters']);
   });
 
   it('reports locked index health without requesting an authentication prompt', async () => {

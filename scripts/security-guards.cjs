@@ -39,6 +39,9 @@ const COMMAND_TIERS = {
   'app_bound::app_bound_install': 'session_required',
   'app_bound::app_bound_uninstall': 'session_required',
   'commands::utility::set_app_language': 'public',
+  'commands::utility::set_app_theme': 'public',
+  'commands::utility::tray_take_navigation': 'session_required',
+  'monitor::monitor_get_filters': 'session_required',
   'monitor::start_monitor': 'runtime_public',
   'monitor::get_monitor_autostart': 'public',
   'monitor::set_monitor_autostart': 'session_required',
@@ -274,6 +277,7 @@ function checkCommandGuardImplementations() {
   }
 
   const mainWindowCommands = [
+    'commands::utility::tray_take_navigation',
     'storage_startup::storage_retry_initialization',
     'settings_window::open_settings_window',
     'ml_runtime::debug_trigger_ocr_model_repair_notification',
@@ -294,6 +298,8 @@ function checkCommandGuardImplementations() {
     throw new Error(`High-impact commands missing main-window guard:\n${missingWindowGuard.join('\n')}`);
   }
   const settingsCommands = [
+  'commands::utility::set_app_theme',
+  'monitor::monitor_get_filters',
   'settings_window::settings_monitor_action',
   "minilm_index::semantic_index_run_now",
   "minilm_index::semantic_index_stop_now",

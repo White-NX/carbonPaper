@@ -161,6 +161,8 @@ pub struct CaptureState {
     pub stopped: AtomicBool,
     pub config: Mutex<CaptureConfig>,
     pub exclusion_settings: Mutex<ExclusionSettings>,
+    // Serializes filter file loads and writes, including changes from the tray.
+    exclusion_settings_directory: Mutex<Option<std::path::PathBuf>>,
     pub in_flight_ocr_count: AtomicU32,
     pub ocr_timeout_secs: AtomicU32,
     pub ocr_cold_start_pending: AtomicBool,
@@ -232,6 +234,7 @@ impl CaptureState {
             stopped: AtomicBool::new(false),
             config: Mutex::new(CaptureConfig::default()),
             exclusion_settings: Mutex::new(ExclusionSettings::default()),
+            exclusion_settings_directory: Mutex::new(None),
             in_flight_ocr_count: AtomicU32::new(0),
             ocr_timeout_secs: AtomicU32::new(120),
             ocr_cold_start_pending: AtomicBool::new(true),
@@ -272,74 +275,203 @@ impl CaptureState {
 
     /// Loads user-defined exclusion settings (processes and titles) from the `monitor_filters.json` file.
     pub fn load_exclusion_settings(&self, data_dir: &std::path::Path) {
-        let path = data_dir.join("monitor_filters.json");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-                let mut settings = self
-                    .exclusion_settings
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if let Some(processes) = data.get("processes").and_then(|v| v.as_array()) {
-                    settings.user_excluded_processes = processes
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_lowercase())
-                        .collect();
-                }
-                if let Some(titles) = data.get("titles").and_then(|v| v.as_array()) {
-                    settings.user_excluded_titles = titles
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_lowercase())
-                        .collect();
-                }
-                if let Some(ignore_protected) =
-                    data.get("ignore_protected").and_then(|v| v.as_bool())
-                {
-                    settings.ignore_protected_windows = ignore_protected;
-                }
-                tracing::info!(
-                    "Loaded exclusion settings: {} processes, {} titles",
-                    settings.user_excluded_processes.len(),
-                    settings.user_excluded_titles.len()
-                );
-            }
+        if let Err(error) = self.ensure_exclusion_settings_loaded(data_dir) {
+            tracing::warn!("Could not load capture filters: {error}");
         }
     }
 
-    /// Saves the current exclusion settings to the `monitor_filters.json` file, using a safe temporary file renaming approach.
-    pub fn save_exclusion_settings(&self, data_dir: &std::path::Path) {
+    pub(crate) fn ensure_exclusion_settings_loaded(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> Result<(), String> {
+        self.refresh_exclusion_settings(data_dir, || true)
+    }
+
+    pub(crate) fn refresh_exclusion_settings(
+        &self,
+        data_dir: &std::path::Path,
+        admitted: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut directory = self
+            .exclusion_settings_directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !admitted() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        self.load_filters_locked(data_dir, &mut directory, admitted)
+    }
+
+    fn load_filters_locked(
+        &self,
+        data_dir: &std::path::Path,
+        directory: &mut Option<std::path::PathBuf>,
+        admitted: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut next = ExclusionSettings::default();
+        match std::fs::read_to_string(data_dir.join("monitor_filters.json")) {
+            Ok(content) => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&content).map_err(|e| e.to_string())?;
+                Self::patch_filters(
+                    &mut next,
+                    payload
+                        .get("processes")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    payload
+                        .get("titles")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    payload.get("ignore_protected").and_then(|v| v.as_bool()),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if !admitted() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        *self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next;
+        *directory = Some(data_dir.to_path_buf());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn saved_exclusion_settings(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.saved_exclusion_settings_guarded(data_dir, || true)
+    }
+
+    pub(crate) fn saved_exclusion_settings_guarded(
+        &self,
+        data_dir: &std::path::Path,
+        admitted: impl Fn() -> bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let mut directory = self
+            .exclusion_settings_directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !admitted() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        self.load_filters_locked(data_dir, &mut directory, &admitted)?;
+        if !data_dir
+            .join("monitor_filters.json")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(None);
+        }
         let settings = self
             .exclusion_settings
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let payload = serde_json::json!({
-            "processes": settings.user_excluded_processes.iter().cloned().collect::<Vec<_>>(),
-            "titles": settings.user_excluded_titles.iter().cloned().collect::<Vec<_>>(),
-            "ignore_protected": settings.ignore_protected_windows,
-        });
-        let path = data_dir.join("monitor_filters.json");
-        if let Ok(content) = serde_json::to_string_pretty(&payload) {
-            let tmp_path = path.with_extension("json.tmp");
-            if std::fs::write(&tmp_path, &content).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &path);
-            }
-        }
+        Ok(Some(Self::filter_payload(&settings)))
     }
 
-    /// Updates the exclusion filters in memory with new process names, window titles, or the protected window ignore flag.
+    fn filter_payload(settings: &ExclusionSettings) -> serde_json::Value {
+        let mut processes: Vec<_> = settings.user_excluded_processes.iter().cloned().collect();
+        let mut titles: Vec<_> = settings.user_excluded_titles.iter().cloned().collect();
+        processes.sort();
+        titles.sort();
+        serde_json::json!({ "processes": processes, "titles": titles, "ignore_protected": settings.ignore_protected_windows })
+    }
+
+    fn persist_filters(
+        data_dir: &std::path::Path,
+        settings: &ExclusionSettings,
+    ) -> Result<(), String> {
+        let path = data_dir.join("monitor_filters.json");
+        let temporary = path.with_extension("json.tmp");
+        let content = serde_json::to_vec_pretty(&Self::filter_payload(settings))
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&temporary, content).map_err(|e| e.to_string())?;
+        std::fs::rename(&temporary, &path).map_err(|e| e.to_string())
+    }
+
+    /// Publish the in-memory patch only after the complete filter file is saved.
     pub fn update_exclusion_settings(
         &self,
+        data_dir: &std::path::Path,
+        processes: Option<Vec<String>>,
+        titles: Option<Vec<String>>,
+        ignore_protected: Option<bool>,
+    ) -> Result<(), String> {
+        let mut directory = self
+            .exclusion_settings_directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.load_filters_locked(data_dir, &mut directory, || true)?;
+        let mut next = self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Self::patch_filters(&mut next, processes, titles, ignore_protected);
+        Self::persist_filters(data_dir, &next)?;
+        *self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn toggle_process_exclusion(
+        &self,
+        data_dir: &std::path::Path,
+        process: &str,
+    ) -> Result<(), String> {
+        self.toggle_process_exclusion_guarded(data_dir, process, || true)
+    }
+
+    pub(crate) fn toggle_process_exclusion_guarded(
+        &self,
+        data_dir: &std::path::Path,
+        process: &str,
+        admitted: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let process = process.trim().to_lowercase();
+        if process.is_empty() {
+            return Err("Missing process".into());
+        }
+        let mut directory = self
+            .exclusion_settings_directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !admitted() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        self.load_filters_locked(data_dir, &mut directory, &admitted)?;
+        let mut next = self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !next.user_excluded_processes.remove(&process) {
+            next.user_excluded_processes.insert(process);
+        }
+        Self::persist_filters(data_dir, &next)?;
+        if !admitted() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        *self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
+    }
+
+    fn patch_filters(
+        settings: &mut ExclusionSettings,
         processes: Option<Vec<String>>,
         titles: Option<Vec<String>>,
         ignore_protected: Option<bool>,
     ) {
-        let mut settings = self
-            .exclusion_settings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         if let Some(procs) = processes {
             settings.user_excluded_processes = procs
                 .into_iter()
@@ -1438,6 +1570,12 @@ pub async fn run_capture_loop(
         };
         let base_window_fingerprint = ActiveWindowFingerprint::new(&window_info, None);
 
+        // Recording the resident panel would replace its preview with itself.
+        if crate::tray_panel::is_panel_window(&app, window_info.hwnd_raw) {
+            last_window_fingerprint = Some(base_window_fingerprint);
+            continue;
+        }
+
         // Exclusion check
         {
             let settings = capture_state
@@ -1734,6 +1872,7 @@ pub async fn run_capture_loop(
                     continue;
                 }
             };
+        crate::tray_panel::records_changed(&app);
         if let Some(context) = office_context {
             office_runtime.associate_screenshot(
                 app.clone(),
@@ -2262,6 +2401,120 @@ pub(crate) fn md5_hash(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_filter_files_are_reloaded_before_capture_and_native_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = CaptureState::new();
+        state
+            .update_exclusion_settings(directory.path(), Some(vec!["code.exe".into()]), None, None)
+            .unwrap();
+        let restored = serde_json::json!({ "processes": ["chrome.exe"], "titles": ["private"], "ignore_protected": false });
+        std::fs::write(
+            directory.path().join("monitor_filters.json"),
+            restored.to_string(),
+        )
+        .unwrap();
+        state.load_exclusion_settings(directory.path());
+        assert!(state
+            .exclusion_settings
+            .lock()
+            .unwrap()
+            .user_excluded_processes
+            .contains("chrome.exe"));
+        assert!(!state
+            .exclusion_settings
+            .lock()
+            .unwrap()
+            .user_excluded_processes
+            .contains("code.exe"));
+        state
+            .toggle_process_exclusion(directory.path(), "obsidian.exe")
+            .unwrap();
+        let saved = state
+            .saved_exclusion_settings(directory.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved["processes"],
+            serde_json::json!(["chrome.exe", "obsidian.exe"])
+        );
+        assert_eq!(saved["titles"], serde_json::json!(["private"]));
+        assert_eq!(saved["ignore_protected"], false);
+        assert!(state
+            .refresh_exclusion_settings(directory.path(), || false)
+            .is_err());
+        assert_eq!(
+            state
+                .saved_exclusion_settings(directory.path())
+                .unwrap()
+                .unwrap(),
+            saved
+        );
+    }
+
+    #[test]
+    fn tray_exclusion_preserves_other_rules_and_survives_a_capture_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = CaptureState::new();
+        state
+            .update_exclusion_settings(
+                directory.path(),
+                Some(vec!["code".into()]),
+                Some(vec!["private".into()]),
+                Some(false),
+            )
+            .unwrap();
+        state
+            .toggle_process_exclusion(directory.path(), " chrome ")
+            .unwrap();
+        state.load_exclusion_settings(directory.path());
+        let reopened = CaptureState::new();
+        let saved = reopened
+            .saved_exclusion_settings(directory.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["processes"], serde_json::json!(["chrome", "code"]));
+        assert_eq!(saved["titles"], serde_json::json!(["private"]));
+        assert_eq!(saved["ignore_protected"], false);
+        reopened
+            .toggle_process_exclusion(directory.path(), "chrome")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .saved_exclusion_settings(directory.path())
+                .unwrap()
+                .unwrap()["processes"],
+            serde_json::json!(["code"])
+        );
+    }
+
+    #[test]
+    fn a_failed_tray_filter_save_keeps_the_previous_memory_and_file_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = CaptureState::new();
+        state
+            .update_exclusion_settings(directory.path(), Some(vec!["code".into()]), None, None)
+            .unwrap();
+        std::fs::create_dir(directory.path().join("monitor_filters.json.tmp")).unwrap();
+        assert!(state
+            .toggle_process_exclusion(directory.path(), "chrome")
+            .is_err());
+        assert!(!state
+            .exclusion_settings
+            .lock()
+            .unwrap()
+            .user_excluded_processes
+            .contains("chrome"));
+        let reopened = CaptureState::new();
+        assert_eq!(
+            reopened
+                .saved_exclusion_settings(directory.path())
+                .unwrap()
+                .unwrap()["processes"],
+            serde_json::json!(["code"])
+        );
+    }
 
     #[test]
     fn capture_and_extension_frames_obey_all_pause_reasons() {

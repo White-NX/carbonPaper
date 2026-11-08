@@ -81,6 +81,7 @@ mod smart_cluster_scoring;
 mod storage;
 mod storage_startup;
 mod task_error;
+mod tray_panel;
 mod updater;
 pub use updater::verify_update_manifest_file;
 
@@ -175,6 +176,7 @@ pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result
     let previous =
         normalize_app_language(&registry_config::get_string("language").unwrap_or_default());
     registry_config::set_string("language", &language)?;
+    tray_panel::refresh_appearance(app);
     refresh_tray_menu(app);
     if language != previous {
         if let Some(recap) = app.try_state::<ai::recap::RecapRuntime>() {
@@ -186,6 +188,7 @@ pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result
 }
 
 pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) {
+    tray_panel::refresh_public(app);
     let Some(menu_state) = app.try_state::<TrayMenuState>() else {
         return;
     };
@@ -508,6 +511,8 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
                 }
             }
             Err(e) => {
+                tray_panel::finish_handoff(&app_handle);
+                settings_window::refresh_ui_foreground(&app_handle);
                 tracing::error!("Failed to create main window: {}", e);
                 let texts = tray_texts();
                 let _ = app_handle
@@ -521,7 +526,7 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
     });
 }
 
-fn open_main_window_from_tray(app: &tauri::AppHandle) {
+pub(crate) fn open_main_window_from_tray(app: &tauri::AppHandle) {
     open_main_window(app, false);
 }
 
@@ -531,6 +536,9 @@ pub(crate) fn open_main_window_for_ocr_model_repair(app: &tauri::AppHandle) {
 
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
+    if let Err(error) = tray_panel::prepare(&app_handle) {
+        tracing::warn!("Native tray panel unavailable; retaining standard menu: {error}");
+    }
     let texts = tray_texts();
 
     let open_item = MenuItemBuilder::with_id(MENU_ID_OPEN, texts.open).build(&app_handle)?;
@@ -553,9 +561,10 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .item(&quit_item)
         .build()?;
 
-    let mut tray_builder = TrayIconBuilder::new()
-        .menu(&menu)
-        .show_menu_on_left_click(false);
+    let mut tray_builder = TrayIconBuilder::new().show_menu_on_left_click(false);
+    if !tray_panel::available(&app_handle) {
+        tray_builder = tray_builder.menu(&menu);
+    }
     if let Some(icon) = app.default_window_icon().cloned() {
         tray_builder = tray_builder.icon(icon);
     }
@@ -564,11 +573,14 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             if let TrayIconEvent::Click {
                 button,
                 button_state,
+                position,
                 ..
             } = event
             {
                 if is_open_tray_click(button, button_state) {
                     open_main_window_from_tray(tray.app_handle());
+                } else if button == MouseButton::Right && button_state == MouseButtonState::Up {
+                    tray_panel::show(tray.app_handle(), (position.x as i32, position.y as i32));
                 }
             }
         })
@@ -605,37 +617,7 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             MENU_ID_QUIT => {
-                let app_handle = app.clone();
-                IS_QUITTING.store(true, Ordering::Relaxed);
-                cancel_auto_lightweight_timer(&app_handle);
-                if let Some(credential_state) =
-                    app_handle.try_state::<Arc<CredentialManagerState>>()
-                {
-                    credential_state.clear_all_cached_keys();
-                }
-                if let Some(scheduler) =
-                    app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
-                {
-                    scheduler.stop();
-                }
-
-                let state = app_handle.state::<MonitorState>();
-                state.stopping.store(true, Ordering::SeqCst);
-
-                let capture_state = app_handle.state::<Arc<CaptureState>>();
-                capture_state.stopped.store(true, Ordering::SeqCst);
-                capture_state.paused.store(false, Ordering::SeqCst);
-                if let Some(handle) = capture_state
-                    .capture_task
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                {
-                    handle.abort();
-                }
-                capture_state.clear_wgc_session("app_quit");
-
-                app_handle.exit(0);
+                quit_from_tray(app);
             }
             _ => {}
         })
@@ -654,6 +636,34 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     refresh_tray_menu(&app_handle);
 
     Ok(())
+}
+
+pub(crate) fn quit_from_tray(app: &tauri::AppHandle) {
+    IS_QUITTING.store(true, Ordering::Relaxed);
+    cancel_auto_lightweight_timer(app);
+    if let Some(credentials) = app.try_state::<Arc<CredentialManagerState>>() {
+        credentials.clear_all_cached_keys();
+    }
+    if let Some(scheduler) = app.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.stop();
+    }
+    app.state::<MonitorState>()
+        .stopping
+        .store(true, Ordering::SeqCst);
+    let capture = app.state::<Arc<CaptureState>>();
+    capture.stopped.store(true, Ordering::SeqCst);
+    capture.paused.store(false, Ordering::SeqCst);
+    if let Some(handle) = capture
+        .capture_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        handle.abort();
+    }
+    capture.clear_wgc_session("app_quit");
+    app.exit(0);
 }
 
 pub fn get_data_dir() -> std::path::PathBuf {
@@ -972,6 +982,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::utility::set_app_language,
+            commands::utility::set_app_theme,
+            commands::utility::tray_take_navigation,
             monitor::start_monitor,
             monitor::get_monitor_autostart,
             monitor::set_monitor_autostart,
@@ -981,6 +993,7 @@ pub fn run() {
             monitor::get_monitor_status,
             monitor::monitor_search_nl,
             monitor::monitor_update_filters,
+            monitor::monitor_get_filters,
             monitor::monitor_update_advanced_config,
             monitor::monitor_nl_cluster_query,
             monitor::monitor_nl_cluster_reranker_status,
@@ -1197,6 +1210,7 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                tray_panel::destroy(app_handle);
                 if let Some(scheduler) =
                     app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
                 {

@@ -2,6 +2,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { emitTo } from '@tauri-apps/api/event';
 import { withAuth } from './auth_api';
 
+export function setAppTheme(theme) {
+  return invoke('set_app_theme', { theme });
+}
+
 export function isSettingsWindow() {
   return typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('window') === 'settings';
 }

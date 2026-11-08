@@ -122,6 +122,35 @@ pub fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), S
     crate::set_app_language(&app, &language)
 }
 
+#[tauri::command]
+pub fn set_app_theme(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    theme: String,
+) -> Result<(), String> {
+    crate::settings_window::check_settings_ui(&window)?;
+    if !matches!(theme.as_str(), "light" | "dark") {
+        return Err("INVALID_THEME".into());
+    }
+    registry_config::set_string("theme", &theme)?;
+    crate::tray_panel::refresh_appearance(&app);
+    Ok(())
+}
+
+/// Only the authenticated main UI can consume protected tray navigation.
+#[tauri::command]
+pub(crate) fn tray_take_navigation(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<Option<crate::tray_panel::Navigation>, String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+    let intent = crate::tray_panel::take_navigation(&app);
+    crate::commands::check_auth_required(&credential_state)?;
+    Ok(intent)
+}
+
 /// Returns advanced runtime configuration as a JSON object.
 ///
 /// Authentication: not required; the object contains preferences but no secrets.
@@ -398,14 +427,8 @@ pub async fn switch_to_lightweight_mode(
         tracing::info!("Main window destroyed");
     }
 
-    // Destroying the UI is a foreground transition. It expires the ordinary
-    // session while deliberately retaining any process-scoped background
-    // lease that was granted by a prior Hello unlock.
-    if let Some(credential_state) =
-        app.try_state::<Arc<crate::credential_manager::CredentialManagerState>>()
-    {
-        credential_state.set_foreground_state(false);
-    }
+    // A visible native panel remains a foreground UI after the WebView closes.
+    crate::settings_window::refresh_ui_foreground(&app);
 
     // Publish the new mode to shared state.
     *lightweight_state.is_lightweight.lock().unwrap() = true;

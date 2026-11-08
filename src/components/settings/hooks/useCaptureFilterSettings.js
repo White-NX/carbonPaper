@@ -1,9 +1,26 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { deleteRecordsByTimeRange, updateMonitorFilters } from '../../../lib/monitor_api';
 import { defaultFilterSettings, normalizeList } from '../filterUtils';
 import { useSettingsActivity } from '../SettingsActivityContext';
 import { notifySettingsChanged } from '../../../lib/settings_api';
-import { setPreference } from '../../../lib/preference_store';
+import { setPreference, subscribePreference } from '../../../lib/preference_store';
+
+export function filtersFromBackend(filters) {
+  return { processes: filters.processes || [], titles: filters.titles || [], ignoreProtected: filters.ignore_protected ?? true };
+}
+
+// Keep the user's additions/removals when committed rules change in the tray.
+function rebaseDraft(draft, before, after) {
+  const rebaseList = (key) => {
+    const removed = new Set(before[key].filter((item) => !draft[key].includes(item)));
+    const added = draft[key].filter((item) => !before[key].includes(item));
+    return [...new Set([...after[key].filter((item) => !removed.has(item)), ...added])];
+  };
+  return {
+    processes: rebaseList('processes'), titles: rebaseList('titles'),
+    ignoreProtected: draft.ignoreProtected === before.ignoreProtected ? after.ignoreProtected : draft.ignoreProtected,
+  };
+}
 
 export function readSavedCaptureFilters() {
   try {
@@ -40,7 +57,17 @@ export function useCaptureFilterSettings({
   const [pendingApply, setPendingApply] = useState(false);
   const filterSettingsRef = useRef(filterSettings);
   const hasDraft = filtersDirty || Boolean(processInput.trim() || titleInput.trim());
+  const hasDraftRef = useRef(hasDraft);
+  hasDraftRef.current = hasDraft || savingFilters || pendingApply;
+  const committed = useRef(filterSettings);
   useSettingsActivity('capture-filters', { dirty: hasDraft, busy: savingFilters });
+
+  useEffect(() => subscribePreference('monitorFilters', () => {
+    const next = readSavedCaptureFilters();
+    const previousCommitted = committed.current;
+    committed.current = next;
+    setFilterSettings((previous) => hasDraftRef.current ? rebaseDraft(previous, previousCommitted, next) : next);
+  }), []);
 
   const addProcessTags = () => {
     const items = normalizeList(processInput);
@@ -91,9 +118,6 @@ export function useCaptureFilterSettings({
   };
 
   const syncFiltersToMonitor = useCallback(async (filtersPayload = filterSettingsRef.current) => {
-    if (monitorStatus !== 'running') {
-      return { ok: false, reason: 'not_running' };
-    }
     try {
       await updateMonitorFilters({
         processes: filtersPayload.processes,
@@ -107,7 +131,7 @@ export function useCaptureFilterSettings({
       }
       return { ok: false, reason: 'error', error: e };
     }
-  }, [monitorStatus]);
+  }, []);
 
   const handleQuickDelete = async (minutes) => {
     setIsDeleting(true);
@@ -141,6 +165,8 @@ export function useCaptureFilterSettings({
       processes: Array.from(new Set([...filterSettings.processes, ...normalizeList(processInput)])),
       titles: Array.from(new Set([...filterSettings.titles, ...normalizeList(titleInput)])),
     };
+    const previousPreference = localStorage.getItem('monitorFilters');
+    const previousCommitted = committed.current;
     try {
       setPreference('monitorFilters', JSON.stringify(nextFilters));
       filterSettingsRef.current = nextFilters;
@@ -150,10 +176,19 @@ export function useCaptureFilterSettings({
       setFiltersDirty(false);
       const result = await syncFiltersToMonitor(nextFilters);
       setPendingApply(!result.ok && result.reason !== 'not_running');
-      if (result.ok) setSaveFiltersMessage(t('settings.save_filters.synced'));
-      else if (result.reason === 'not_running') setSaveFiltersMessage(t('settings.save_filters.saved_local_not_running'));
-      else setSaveFiltersMessage(t('settings.save_filters.saved_local_sync_failed', { error: result.error?.message || result.error || '' }));
-      await notifySettingsChanged(['filters']);
+      if (result.ok) {
+        setSaveFiltersMessage(t(monitorStatus === 'running' ? 'settings.save_filters.synced' : 'settings.save_filters.saved_local_not_running'));
+        await notifySettingsChanged(['filters']);
+      } else {
+        // The native file remains authoritative after a failed save. Keep the
+        // user's changes as a visible draft instead of a stale committed cache.
+        committed.current = previousCommitted;
+        hasDraftRef.current = true;
+        setFiltersDirty(true);
+        setPreference('monitorFilters', previousPreference);
+        setFilterSettings(nextFilters);
+        setSaveFiltersMessage(t('settings.feedback.saveFailed', { error: result.error?.message || result.error || '' }));
+      }
     } catch (error) {
       setSaveFiltersMessage(t('settings.feedback.saveFailed', { error: String(error) }));
     } finally {

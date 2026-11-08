@@ -30,8 +30,15 @@ pub(super) struct AutomationState {
 pub(super) struct Policy {
     pub manual_stop: bool,
     pub manual_pause: bool,
+    pub timed_pause: Option<TimedPause>,
     pub error: Option<String>,
     unexpected_stops: VecDeque<Instant>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TimedPause {
+    deadline: Instant,
+    pub until_ms: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -54,10 +61,16 @@ impl Policy {
             if conditions.power_blocked {
                 return Some(MonitorAction::Stop);
             }
+            if self.timed_pause_expired(Instant::now()) {
+                return Some(MonitorAction::ExpireTimedPause);
+            }
             if conditions.maintenance_resume_pending {
                 return Some(MonitorAction::ResumeAfterPowerSaving);
             }
             return None;
+        }
+        if self.timed_pause_expired(Instant::now()) {
+            return Some(MonitorAction::ExpireTimedPause);
         }
         if conditions.storage_ready
             && !conditions.onboarding_held
@@ -73,6 +86,7 @@ impl Policy {
     }
 
     pub fn user_action(&mut self, action: MonitorAction, paused: bool) {
+        self.timed_pause = None;
         match action {
             MonitorAction::Start | MonitorAction::Restart => self.request_start(),
             MonitorAction::Stop => {
@@ -81,15 +95,44 @@ impl Policy {
                 self.error = None;
             }
             MonitorAction::Pause => self.manual_pause = true,
+            MonitorAction::PauseFor(minutes) => {
+                let duration = Duration::from_secs(u64::from(minutes) * 60);
+                self.manual_pause = true;
+                self.timed_pause = Some(TimedPause {
+                    deadline: Instant::now() + duration,
+                    until_ms: chrono::Utc::now().timestamp_millis() + duration.as_millis() as i64,
+                });
+            }
             MonitorAction::Resume => self.manual_pause = false,
             MonitorAction::TogglePause => self.manual_pause = !paused,
-            MonitorAction::ResumeAfterPowerSaving => {}
+            MonitorAction::ResumeAfterPowerSaving | MonitorAction::ExpireTimedPause => {}
         }
+    }
+
+    fn timed_pause_expired(&self, now: Instant) -> bool {
+        self.timed_pause.is_some_and(|pause| now >= pause.deadline)
+    }
+
+    pub fn expire_timed_pause(&mut self) {
+        self.timed_pause = None;
+        self.manual_pause = false;
+    }
+
+    fn next_check_delay(&self, fallback: Duration) -> Duration {
+        self.timed_pause
+            .map(|pause| {
+                pause
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(fallback)
+            })
+            .unwrap_or(fallback)
     }
 
     pub fn request_start(&mut self) {
         self.manual_stop = false;
         self.manual_pause = false;
+        self.timed_pause = None;
         self.error = None;
         self.unexpected_stops.clear();
     }
@@ -179,7 +222,12 @@ pub(crate) fn start(app: AppHandle) {
             let delay = if maintenance_blocked || crate::maintenance::is_active() {
                 MAINTENANCE_RECHECK_INTERVAL
             } else {
-                RECHECK_INTERVAL
+                monitor
+                    .automation
+                    .policy
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .next_check_delay(RECHECK_INTERVAL)
             };
             tokio::select! {
                 _ = monitor.automation.wake.notified() => {},
@@ -204,6 +252,89 @@ mod tests {
             maintenance_active: false,
             maintenance_resume_pending: false,
         }
+    }
+
+    #[test]
+    fn timed_pause_expires_without_starting_a_stopped_or_power_blocked_monitor() {
+        let mut policy = Policy::default();
+        policy.user_action(MonitorAction::PauseFor(15), false);
+        assert!(policy.manual_pause);
+        assert!(policy.timed_pause.unwrap().until_ms > chrono::Utc::now().timestamp_millis());
+        policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            policy.automatic_action(Conditions {
+                running: true,
+                power_blocked: true,
+                ..ready()
+            }),
+            Some(MonitorAction::Stop)
+        );
+        assert_eq!(
+            policy.automatic_action(Conditions {
+                power_blocked: true,
+                auto_start: false,
+                ..ready()
+            }),
+            Some(MonitorAction::ExpireTimedPause)
+        );
+        policy.expire_timed_pause();
+        assert!(!policy.manual_pause);
+        assert_eq!(
+            policy.automatic_action(Conditions {
+                auto_start: false,
+                ..ready()
+            }),
+            None
+        );
+        assert_eq!(policy.automatic_action(ready()), Some(MonitorAction::Start));
+    }
+
+    #[test]
+    fn explicit_pause_stop_and_resume_supersede_a_due_timed_resume() {
+        for action in [
+            MonitorAction::Pause,
+            MonitorAction::Stop,
+            MonitorAction::Resume,
+            MonitorAction::Restart,
+        ] {
+            let mut policy = Policy::default();
+            policy.user_action(MonitorAction::PauseFor(15), false);
+            policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+            policy.user_action(action, true);
+            assert!(policy.timed_pause.is_none());
+            assert_ne!(
+                policy.automatic_action(Conditions {
+                    running: true,
+                    ..ready()
+                }),
+                Some(MonitorAction::ExpireTimedPause)
+            );
+            assert_eq!(policy.manual_pause, action == MonitorAction::Pause);
+        }
+    }
+
+    #[test]
+    fn timed_resume_waits_for_maintenance_and_wakes_at_its_deadline() {
+        let mut policy = Policy::default();
+        policy.user_action(MonitorAction::PauseFor(15), false);
+        policy.timed_pause.as_mut().unwrap().deadline = Instant::now() + Duration::from_secs(2);
+        assert!(policy.next_check_delay(RECHECK_INTERVAL) <= Duration::from_secs(2));
+        policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            policy.automatic_action(Conditions {
+                running: true,
+                maintenance_active: true,
+                ..ready()
+            }),
+            None
+        );
+        assert_eq!(
+            policy.automatic_action(Conditions {
+                running: true,
+                ..ready()
+            }),
+            Some(MonitorAction::ExpireTimedPause)
+        );
     }
 
     #[test]
