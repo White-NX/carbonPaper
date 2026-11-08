@@ -3,12 +3,12 @@ import { useTranslation } from 'react-i18next';
 import { CheckCircle2, ChevronRight, Circle, CircleAlert, Loader2, PauseCircle, Square } from 'lucide-react';
 import { recapErrorKey } from '../../lib/recap_api';
 import { calendarTimeFormatter } from '../../lib/calendar_time';
-import { recapAttemptStatus, recapDiagnosticOutcome, recapDiagnosticPeriods, recapRequestDuration } from '../../lib/recap_diagnostics';
+import { recapAttemptStatus, recapDiagnosticMainlines, recapDiagnosticOutcome, recapDiagnosticPeriods, recapRequestDuration } from '../../lib/recap_diagnostics';
 import { ProgressBlock } from '../overlay/ProgressBlock';
 import { Button } from '../ui/Button';
 import { Banner } from '../ui/Banner';
 
-const ACTIVE = new Set(['preparing', 'collecting', 'screening', 'waiting', 'thinking', 'writing', 'validating', 'summarizing', 'saving', 'running', 'updating']);
+const ACTIVE = new Set(['preparing', 'collecting', 'screening', 'waiting', 'thinking', 'writing', 'validating', 'summarizing', 'integrating', 'saving', 'running', 'updating']);
 const PROBLEMS = new Set(['failed', 'partial', 'summaryFailed', 'summaryPending', 'cancelled', 'paused', 'interrupted']);
 const TABS = ['reply', 'reasoning', 'requestDetails'];
 const EXTRA_STATES = new Set(['empty', 'pending', 'summaryFailed', 'summaryPending', 'updating', 'interrupted', 'noHistory']);
@@ -68,7 +68,7 @@ function AttemptDetails({ attempt, progress, now }) {
         }}>{t(`recap.diagnostics.tabs.${name}`)}</Button>)}
     </div>
     <div role="tabpanel" id={`${id}-panel`} aria-labelledby={`${id}-${tab}`} className="min-w-0 text-xs">
-      {tab === 'requestDetails' ? <dl className="recap-request-fields grid gap-x-5 gap-y-2 tabular-nums [&>dt]:text-ide-muted [&>dd]:min-w-0 [&>dd]:break-words">
+      {tab === 'requestDetails' ? <><dl className="recap-request-fields grid gap-x-5 gap-y-2 tabular-nums [&>dt]:text-ide-muted [&>dd]:min-w-0 [&>dd]:break-words">
         <dt>{t('recap.diagnostics.model')}</dt><dd>{attempt.model}</dd>
         <dt>{t('recap.diagnostics.requestDuration')}</dt><dd>{duration(recapRequestDuration(attempt, now, progress), t)}</dd>
         <dt>{t('recap.progress.outputLimit')}</dt><dd>{value(attempt.max_output_tokens)}</dd>
@@ -78,7 +78,16 @@ function AttemptDetails({ attempt, progress, now }) {
         <dt>{t('recap.progress.received')}</dt><dd>{t('recap.progress.receivedCounts', { reasoning: attempt.reasoning_chars ?? 0, text: attempt.text_chars ?? 0 })}</dd>
         <dt>{t('recap.progress.requestId')}</dt><dd className="[overflow-wrap:anywhere] font-mono">{attempt.id}</dd>
         {attempt.error && <><dt>{t('recap.diagnostics.rawError')}</dt><dd className="whitespace-pre-wrap [overflow-wrap:anywhere] font-mono">{attempt.error}</dd></>}
-      </dl> : <>
+      </dl>
+        {attempt.evidence_calls?.length > 0 && <div className="mt-4 border-t border-ide-border pt-3">
+          <h3 className="mb-2 font-medium">{t('recap.diagnostics.evidenceCalls')}</h3>
+          <ul className="space-y-3">{attempt.evidence_calls.map((call, index) => <li key={index}>
+            <p className="text-ide-muted">{t(`recap.progress.tools.${call.tool}`)}</p>
+            <pre className="mt-1 whitespace-pre-wrap break-all font-mono leading-relaxed">{call.arguments}</pre>
+            <p className={`mt-1 ${call.error ? 'text-ide-warning' : 'text-ide-muted'}`}>{call.error ? t(recapErrorKey(call.error)) : t('recap.diagnostics.evidenceResults', { records: call.source_ids?.length || 0, activities: call.activity_ids?.length || 0 })}</p>
+          </li>)}</ul>
+        </div>}
+      </> : <>
         {text ? <>
           <p className="mb-2 text-ide-muted">{t(running ? 'recap.diagnostics.receivingPreview' : 'recap.diagnostics.savedPreview')}{chars > [...text].length && ` · ${t('recap.progress.previewLimited')}`}</p>
           <pre className="whitespace-pre-wrap [overflow-wrap:anywhere] font-mono leading-relaxed">{text}</pre>
@@ -113,7 +122,7 @@ function Period({ period, progress, now, automaticOpen, time }) {
   const [chosenOpen, setChosenOpen] = useState(null);
   const id = useId();
   const open = chosenOpen ?? automaticOpen;
-  const range = Number.isFinite(period.end_ms) ? `${time(period.start_ms)}–${time(period.end_ms)}` : t('recap.diagnostics.periodFrom', { start: time(period.start_ms) });
+  const range = period.daily ? t('recap.mainlines.title') : Number.isFinite(period.end_ms) ? `${time(period.start_ms)}–${time(period.end_ms)}` : t('recap.diagnostics.periodFrom', { start: time(period.start_ms) });
   const attemptProgress = attempt => period.live.some(live => live.id === attempt.id) ? progress : null;
   const durations = period.attempts.map(attempt => recapRequestDuration(attempt, now, attemptProgress(attempt)));
   const total = durations.length && durations.every(value => value != null) ? durations.reduce((sum, value) => sum + value, 0) : null;
@@ -129,7 +138,7 @@ function Period({ period, progress, now, automaticOpen, time }) {
       <span className="recap-period-status flex max-w-[42%] items-center justify-end gap-1.5 text-xs font-normal"><StatusIcon status={period.status} />{statusLabel(period.active ? 'running' : period.status, t)}</span>
     </Button>
     {open && <div id={id} className="min-w-0 pb-4 pl-2 sm:pl-7">
-      {!period.active && ['summaryFailed', 'summaryPending'].includes(period.status) && <div className="mb-2"><Banner tone={period.summary_error ? 'warning' : 'info'}>{t(period.summary_error ? 'recap.summaryUnavailable' : 'recap.summaryPending')}</Banner></div>}
+      {!period.active && ['summaryFailed', 'summaryPending'].includes(period.status) && <div className="mb-2"><Banner tone={period.error || period.summary_error ? 'warning' : 'info'}>{t(period.daily ? period.error ? 'recap.mainlines.unavailable' : 'recap.mainlines.pending' : period.summary_error ? 'recap.summaryUnavailable' : 'recap.summaryPending')}</Banner></div>}
       {visibleError && !errorInAttempt && <div className="mb-2"><DiagnosticError error={visibleError} tone={period.status === 'failed' ? 'error' : 'warning'} /></div>}
       {period.attempts.length ? <ol aria-label={t('recap.diagnostics.steps')}>
         {period.attempts.map(attempt => <Attempt key={attempt.id} attempt={attempt} progress={attemptProgress(attempt)} now={now} onInspect={() => setChosenOpen(true)} />)}
@@ -138,7 +147,7 @@ function Period({ period, progress, now, automaticOpen, time }) {
   </li>;
 }
 
-export default function RecapProgress({ progress, batches = [], error, calendar }) {
+export default function RecapProgress({ progress, batches = [], error, calendar, day }) {
   const { t, i18n } = useTranslation();
   const time = useMemo(() => calendarTimeFormatter(i18n.language, calendar), [i18n.language, calendar]);
   const [now, setNow] = useState(Date.now);
@@ -150,8 +159,9 @@ export default function RecapProgress({ progress, batches = [], error, calendar 
     return () => clearInterval(timer);
   }, [running]);
   const periods = useMemo(() => recapDiagnosticPeriods(batches, progress), [batches, progress]);
+  const mainlines = useMemo(() => recapDiagnosticMainlines(day, progress), [day, progress]);
   const runError = progress ? progress.error : error;
-  const status = progress && progress.stage !== 'ready' ? progress.stage : runError ? 'failed' : recapDiagnosticOutcome(periods);
+  const status = progress && progress.stage !== 'ready' ? progress.stage : runError ? 'failed' : recapDiagnosticOutcome([...periods, ...(mainlines ? [mainlines] : [])]);
   const completed = periods.filter(period => ['ready', 'empty'].includes(period.status)).length;
   const current = periods.find(period => period.active) || periods.find(period => PROBLEMS.has(period.status));
   return <section aria-label={t('recap.progress.title')} className="text-sm text-ide-text">
@@ -168,6 +178,7 @@ export default function RecapProgress({ progress, batches = [], error, calendar 
     </div>
     <ol aria-label={t('recap.diagnostics.periods')}>
       {periods.map(period => <Period key={period.start_ms} period={period} progress={progress} now={now} automaticOpen={current?.start_ms === period.start_ms} time={time} />)}
+      {mainlines && <Period period={mainlines} progress={progress} now={now} automaticOpen={mainlines.active || PROBLEMS.has(mainlines.status)} time={time} />}
     </ol>
   </section>;
 }

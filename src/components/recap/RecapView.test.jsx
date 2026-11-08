@@ -35,6 +35,52 @@ beforeEach(() => {
 });
 
 describe('daily recap page', () => {
+  it('shows daily mainlines above period recaps and returns to the same branch with focus', async () => {
+    const original = day.batches[0].activities[0];
+    day.batches[0].activities.push({ ...original, id: 'workflow', task_id: 'workflow', task_title: 'Configure workflow', text: 'Connected the notification workflow.' });
+    day.batches.push({ ...day.batches[0], start_ms: original.start_ms + 14400000, end_ms: original.start_ms + 28800000,
+      activities: [{ ...original, id: 'later', start_ms: original.start_ms + 14400000, text: 'Returned to check the login flow.' }] });
+    day.threads.push({ id: 'workflow', title: 'Configure workflow', activity_ids: ['workflow'] });
+    day.mainlines = { items: [{ id: 'project', title: 'Improve the project flow', text: 'Reviewed login handling and configured notifications.', task_ids: ['task', 'workflow'], activity_ids: ['a1', 'workflow'], sources: original.sources }] };
+    render(<RecapView active isAuthenticated />);
+    const mainlines = await screen.findByRole('region', { name: 'recap.mainlines.title' });
+    expect(mainlines.compareDocumentPosition(screen.getByRole('heading', { name: 'recap.periodRecaps' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    expect(within(mainlines).getByRole('heading', { name: 'Improve the project flow' })).toBeVisible();
+    const task = within(mainlines).getByRole('button', { name: /Review login flow/ });
+    fireEvent.click(task);
+    expect(screen.getByText('Returned to check the login flow.')).toBeVisible();
+    expect(screen.queryByRole('region', { name: 'recap.mainlines.title' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.back' }));
+    const restored = within(screen.getByRole('region', { name: 'recap.mainlines.title' })).getByRole('button', { name: /Review login flow/ });
+    expect(restored).toHaveFocus();
+    expect(screen.getByRole('heading', { name: 'Improve the project flow' })).toBeVisible();
+    fireEvent.click(screen.getByRole('tab', { name: 'recap.records' }));
+    expect(screen.queryByRole('region', { name: 'recap.mainlines.title' })).not.toBeInTheDocument();
+  });
+
+  it('returns to another mainline branch and hides invalidated relationships on refresh', async () => {
+    const original = day.batches[0].activities[0];
+    day.batches[0].activities.push({ ...original, id: 'other', task_id: 'other', task_title: 'Compare workflow plans', text: 'Compared plans for another project.' });
+    day.threads.push({ id: 'other', title: 'Compare workflow plans', activity_ids: ['other'] });
+    day.mainlines = { items: [
+      { id: 'first', title: 'Review project login', text: 'Reviewed the login flow.', task_ids: ['task'], sources: [] },
+      { id: 'second', title: 'Plan the notification workflow', text: 'Compared available plans.', task_ids: ['other'], sources: [] },
+    ] };
+    render(<RecapView active isAuthenticated />);
+    await screen.findByRole('heading', { name: 'Plan the notification workflow' });
+    fireEvent.click(within(screen.getByRole('region', { name: 'recap.mainlines.title' })).getByRole('button', { name: /Compare workflow plans/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'recap.back' }));
+    expect(screen.getByRole('heading', { name: 'Plan the notification workflow' })).toBeVisible();
+    expect(within(screen.getByRole('region', { name: 'recap.mainlines.title' })).getByRole('button', { name: /Compare workflow plans/ })).toHaveFocus();
+    api.getRecapDay.mockResolvedValue({ ...day, mainlines: null });
+    const changed = listen.mock.calls.filter(([event]) => event === 'recap-changed').at(-1)[1];
+    await act(async () => { changed(); });
+    expect(await screen.findByText('recap.mainlines.pending')).toBeVisible();
+    expect(screen.queryByText('Plan the notification workflow')).not.toBeInTheDocument();
+    expect(screen.getByText('Compared plans for another project.')).toBeVisible();
+  });
+
   it('opens a snapshot deep link on a different date and scrolls to that occurrence', async () => {
     const original = day.batches[0].activities[0];
     day.batches[0].activities.push({ ...original, id: 'a2', start_ms: original.start_ms + 60000,

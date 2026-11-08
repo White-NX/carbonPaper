@@ -1,11 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { recapAttemptStatus, recapDiagnosticOutcome, recapDiagnosticPeriods, recapRequestDuration } from './recap_diagnostics';
+import { recapAttemptStatus, recapDiagnosticMainlines, recapDiagnosticOutcome, recapDiagnosticPeriods, recapRequestDuration } from './recap_diagnostics';
 
 const initial = { id: 'initial', batch_start_ms: 1000, kind: 'initial', started_at_ms: 10, finished_at_ms: 20, status: 'ready' };
 const summary = { ...initial, id: 'summary', kind: 'summary', started_at_ms: 30, finished_at_ms: 40 };
 const batch = { start_ms: 1000, end_ms: 2000, status: 'ready', activities: [{ id: 'a' }], summary: { overview: 'Ready' }, attempts: [initial, summary] };
 
 describe('recap diagnostics state', () => {
+  it('keeps daily evidence requests out of period counts and preserves extraction history', () => {
+    const daily = { ...initial, id: 'mainline', kind: 'mainlines', started_at_ms: 50 };
+    const progress = { stage: 'thinking', batch_start_ms: 1000, attempts: [daily], finished_at_ms: null };
+    const periods = recapDiagnosticPeriods([batch], progress);
+    expect(periods).toHaveLength(1);
+    expect(periods[0].attempts.map(attempt => attempt.id)).toEqual(['initial', 'summary']);
+    expect(periods[0].active).toBe(false);
+    const mainline = recapDiagnosticMainlines({ batches: [batch] }, progress);
+    expect(mainline).toMatchObject({ daily: true, active: true, attempts: [daily] });
+    const stale = recapDiagnosticMainlines({ batches: [batch], mainlines: null, mainlines_attempts: [daily] }, { ...progress, stage: 'ready', finished_at_ms: 100 });
+    expect(stale.status).toBe('summaryPending');
+    expect(recapDiagnosticOutcome([...periods, stale])).toBe('partial');
+  });
+
   it('retains activity requests when only the summary is retried', () => {
     const retry = { ...summary, id: 'retry', status: 'running' };
     const [period] = recapDiagnosticPeriods([batch], { stage: 'summarizing', batch_start_ms: 1000, attempts: [retry] });

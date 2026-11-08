@@ -37,11 +37,11 @@ impl Default for RecapSettings {
             language: "zh-CN".into(),
             include_key_details: true,
             semantic_search_enabled: true,
-            batch_input_tokens: 36_000,
+            batch_input_tokens: 128_000,
             batch_output_tokens: 64_000,
             request_output_tokens: 32_000,
             answer_tokens: 4_000,
-            budget_version: 1,
+            budget_version: 2,
             daily_input_tokens: 432_000,
             daily_output_tokens: 384_000,
             screening_input_tokens: 2_000_000,
@@ -103,20 +103,23 @@ impl RecapSettings {
         // Key details are part of the searchable recap contract now. Older
         // payloads may contain false, but reads and saves always normalize it.
         self.include_key_details = true;
-        if self.budget_version == 0 {
-            if (
+        if self.budget_version < 2 {
+            let tuple = (
                 self.batch_input_tokens,
                 self.batch_output_tokens,
                 self.daily_input_tokens,
                 self.daily_output_tokens,
-            ) == (36_000, 6_000, 216_000, 36_000)
-            {
+            );
+            if self.budget_version == 0 && tuple == (36_000, 6_000, 216_000, 36_000) {
                 let defaults = Self::default();
+                self.batch_input_tokens = defaults.batch_input_tokens;
                 self.batch_output_tokens = defaults.batch_output_tokens;
                 self.daily_input_tokens = defaults.daily_input_tokens;
                 self.daily_output_tokens = defaults.daily_output_tokens;
+            } else if tuple == (36_000, 64_000, 432_000, 384_000) {
+                self.batch_input_tokens = Self::default().batch_input_tokens;
             }
-            self.budget_version = 1;
+            self.budget_version = 2;
         }
         self
     }
@@ -262,6 +265,27 @@ pub struct RecapTopic {
     pub activity_ids: Vec<String>,
 }
 
+/// A derived relationship between concrete tasks, without changing their IDs,
+/// occurrences or user corrections. An empty list is a valid scattered day.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RecapMainlines {
+    pub items: Vec<RecapMainline>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecapMainline {
+    #[serde(default)]
+    pub id: String,
+    pub title: String,
+    pub text: String,
+    pub task_ids: Vec<String>,
+    pub activity_ids: Vec<String>,
+    pub evidence_ids: Vec<i64>,
+    /// Resolved locally; models cannot supply source metadata.
+    #[serde(default)]
+    pub sources: Vec<SourceRef>,
+}
+
 /// Bounded previews are private recap data and are persisted only inside the
 /// encrypted batch payload. Progress notifications never carry this content.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -283,6 +307,17 @@ pub struct RecapAttempt {
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub truncated: bool,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_calls: Vec<RecapEvidenceCall>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecapEvidenceCall {
+    pub tool: String,
+    pub arguments: String,
+    pub source_ids: Vec<i64>,
+    pub activity_ids: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -356,6 +391,10 @@ pub struct RecapDay {
     pub calendar: CalendarDay,
     pub batches: Vec<RecapBatch>,
     pub threads: Vec<TaskThread>,
+    pub mainlines: Option<RecapMainlines>,
+    pub mainlines_error: Option<String>,
+    pub mainlines_updated_at_ms: i64,
+    pub mainlines_attempts: Vec<RecapAttempt>,
     pub usage: RecapUsage,
     pub can_undo: bool,
     pub running: bool,
@@ -629,6 +668,7 @@ mod tests {
         assert_eq!(settings.budget_version, 0);
         let upgraded = settings.current_defaults();
         assert!(upgraded.enabled);
+        assert_eq!(upgraded.batch_input_tokens, 128_000);
         assert_eq!(upgraded.batch_output_tokens, 64000);
         assert_eq!(upgraded.request_output_tokens, 32000);
         assert_eq!(
@@ -646,6 +686,18 @@ mod tests {
         intentional["budget_version"] = serde_json::json!(1);
         let intentional: RecapSettings = serde_json::from_value(intentional).unwrap();
         assert_eq!(intentional.current_defaults().batch_output_tokens, 6000);
+        let previous = RecapSettings {
+            batch_input_tokens: 36_000,
+            budget_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(previous.current_defaults().batch_input_tokens, 128_000);
+        let custom = RecapSettings {
+            batch_input_tokens: 60_000,
+            budget_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(custom.current_defaults().batch_input_tokens, 60_000);
     }
     #[test]
     fn four_hour_windows_are_half_open_and_only_closed_windows_are_returned() {

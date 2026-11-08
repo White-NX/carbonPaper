@@ -60,7 +60,12 @@ fn day_view(
             counts
         })
         .collect::<Vec<_>>();
+    let mainlines_attempt_count = day.mainlines_attempts.len();
+    if !attempts {
+        day.mainlines_attempts.clear();
+    }
     let mut value = serde_json::to_value(day).map_err(|_| "RECAP_INVALID_CACHE")?;
+    value["mainlines_attempt_count"] = mainlines_attempt_count.into();
     if let Some(batches) = value["batches"].as_array_mut() {
         for (batch, (records, attempts, apps)) in batches.iter_mut().zip(counts) {
             batch["record_count"] = records.into();
@@ -289,6 +294,10 @@ mod tests {
             calendar: CalendarDay::in_zone("2026-10-01", chrono_tz::UTC).unwrap(),
             batches: vec![batch],
             threads: vec![],
+            mainlines: None,
+            mainlines_error: None,
+            mainlines_updated_at_ms: 0,
+            mainlines_attempts: vec![],
             usage: RecapUsage::default(),
             can_undo: false,
             running: false,
@@ -321,6 +330,10 @@ mod tests {
             date: "2026-10-01".into(),
             calendar: CalendarDay::in_zone("2026-10-01", chrono_tz::UTC).unwrap(),
             threads: vec![],
+            mainlines: None,
+            mainlines_error: None,
+            mainlines_updated_at_ms: 0,
+            mainlines_attempts: vec![],
             usage: RecapUsage::default(),
             can_undo: false,
             running: false,

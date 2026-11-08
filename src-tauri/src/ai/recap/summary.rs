@@ -256,13 +256,10 @@ pub(super) async fn generate(
         let mut input = batch.clone();
         let filter = ctx.app.state::<std::sync::Arc<SensitiveFilterState>>();
         for activity in &mut input.activities {
-            for text in [&mut activity.task_title, &mut activity.text] {
-                *text = crate::mcp_server::filter_identity(&filter, filter.mode(), text)
-                    .unwrap_or_else(|_| "[censored]".into());
-            }
+            super::privacy::filter_activity(&filter, activity);
         }
         // A separate bounded generation run shares the daily generation budget.
-        // Extraction retains its two attempts; summarization gets one attempt.
+        // Extraction can verify evidence; this paraphrase gets one attempt.
         let run = format!("summary-{}", hex::encode(rand::random::<[u8; 16]>()));
         let result = async {
             if let Some(summary) = single_activity_summary(&input) {

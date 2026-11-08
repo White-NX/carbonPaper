@@ -330,6 +330,10 @@ mod tests {
             )
             .unwrap(),
             threads: vec![],
+            mainlines: None,
+            mainlines_error: None,
+            mainlines_updated_at_ms: 0,
+            mainlines_attempts: vec![],
             usage: Default::default(),
             can_undo: false,
             running: false,
