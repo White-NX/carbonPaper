@@ -591,6 +591,51 @@ fn invalid_classification_scores_do_not_commit_or_consume_the_lease() {
 }
 
 #[test]
+fn reconciliation_reclaims_the_full_staging_vacuum_budget_and_preserves_active_inputs() {
+    let mut fixture = fixture();
+    let (dir, storage, _broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::MiniLm.bit());
+    let path = dir.join(STAGING_FILE);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "WITH RECURSIVE entries(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM entries WHERE n<128)
+             INSERT INTO staged_inputs(task_id,dataset_id,screenshot_id,binding,payload,digest,expires,state,created)
+             SELECT printf('%064x',n+1000000),'vacuum-fixture',-n,'{}',zeroblob(16384),'',unixepoch()+86400,'retired',unixepoch() FROM entries;
+             UPDATE staged_inputs SET payload=NULL WHERE screenshot_id<0;",
+        )
+        .unwrap();
+    let free_pages = || {
+        connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = free_pages();
+    assert!(before > 256);
+    let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+    storage.processing_stage.reconcile(storage).unwrap();
+
+    let reclaimed = before - free_pages();
+    // SQLite may also retire one pointer-map page while freeing 256 data pages.
+    assert!(
+        (256..=257).contains(&reclaimed),
+        "reclaimed {reclaimed} pages"
+    );
+    assert!(std::fs::metadata(&path).unwrap().len() < bytes_before);
+    assert_eq!(
+        storage
+            .processing_stage
+            .claim(storage, Consumer::MiniLm)
+            .unwrap()
+            .unwrap()
+            .receipt
+            .screenshot_id,
+        1,
+    );
+}
+
+#[test]
 fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
