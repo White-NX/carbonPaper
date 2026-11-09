@@ -269,9 +269,10 @@ impl Ledger {
                 expires_at_ms,
                 ..
             } => {
-                if view.phase != "ready" || view.source != view.applied {
-                    return Err(BrokerError::Busy);
-                }
+                // Issuance records authority for this enabled generation.
+                // Reader key acquisition and request authorization separately
+                // require a complete, synchronized view; a concurrent capture
+                // must not invalidate the user's freshly verified issuance.
                 if label.trim().is_empty()
                     || label.chars().count() > 80
                     || label.chars().any(char::is_control)
@@ -395,6 +396,74 @@ mod tests {
         .unwrap();
         keys
     }
+    #[test]
+    fn credentials_issue_during_sync_but_reader_keys_and_requests_wait_for_readiness() {
+        let (mut ledger, who, dataset) = fixture();
+        let keys = ready(&mut ledger, &who, &dataset);
+        let Response::AgentRevision(revision) = call(
+            &mut ledger,
+            &who,
+            Request::AgentFence {
+                generation: keys.binding.generation.clone(),
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let token_hash = "a".repeat(64);
+        assert!(matches!(
+            call(
+                &mut ledger,
+                &who,
+                Request::AgentIssue {
+                    generation: keys.binding.generation.clone(),
+                    label: "during capture".into(),
+                    token_hash: token_hash.clone(),
+                    expires_at_ms: None,
+                },
+            )
+            .unwrap(),
+            Response::AgentGrant(_)
+        ));
+        let mut reader = who.clone();
+        reader.role = RuntimeRole::McpReader;
+        assert_eq!(
+            call(
+                &mut ledger,
+                &reader,
+                Request::AgentReaderKeys {
+                    generation: keys.binding.generation.clone(),
+                },
+            )
+            .unwrap_err(),
+            BrokerError::Busy
+        );
+        for complete in [false, true] {
+            let authorization = call(
+                &mut ledger,
+                &reader,
+                Request::AgentAuthorize {
+                    token_hash: token_hash.clone(),
+                },
+            );
+            assert_eq!(authorization.unwrap_err(), BrokerError::Busy);
+            call(
+                &mut ledger,
+                &who,
+                Request::AgentPublish {
+                    generation: keys.binding.generation.clone(),
+                    revision,
+                    complete,
+                },
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            call(&mut ledger, &reader, Request::AgentAuthorize { token_hash }).unwrap(),
+            Response::AgentContext(_)
+        ));
+    }
+
     #[test]
     fn read_grants_fence_source_changes_and_independent_revocation() {
         let (mut ledger, who, dataset) = fixture();

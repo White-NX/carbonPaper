@@ -73,6 +73,8 @@ permissions; **Feature guide** in Privacy settings reopens it.
 **AI → Agent access** retains connection and privacy-filter controls and manages
 unattended credentials. Text preparation must finish before creating a labeled
 credential; interrupted preparation offers an explicit continuation action.
+Once issuance starts, concurrent capture synchronization does not cancel it.
+Reader key acquisition and requests still require a complete, synchronized view.
 Each credential has an optional expiry, last-use information, replacement and
 independent revocation. Interactive token-copy, token-rotation and smoke-test
 controls are shown only in interactive mode. Setup instructions use the active
