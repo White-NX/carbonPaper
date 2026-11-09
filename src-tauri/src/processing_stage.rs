@@ -1294,7 +1294,12 @@ impl ProcessingStaging {
         self.with_store(|s| {
             s.connection.execute("UPDATE staged_work SET state='pending',lease_id=NULL WHERE state='processing' AND deadline<=?1",[protocol::now_secs()]).map_err(|e|e.to_string())?;
             s.connection.execute("DELETE FROM staged_inputs WHERE state='retired' AND expires<?1",[protocol::now_secs()-60*protocol::DAY_SECS]).map_err(|e|e.to_string())?;
-            s.connection.execute_batch("PRAGMA incremental_vacuum(256);").map_err(|e|e.to_string())
+            // Each incremental-vacuum result advances one page. execute_batch
+            // steps only once, so drain the results to honor the page budget.
+            let mut vacuum = s.connection.prepare("PRAGMA incremental_vacuum(256)").map_err(|e|e.to_string())?;
+            let mut rows = vacuum.query([]).map_err(|e|e.to_string())?;
+            while rows.next().map_err(|e|e.to_string())?.is_some() {}
+            Ok(())
         })?;
         Ok(processed)
     }
