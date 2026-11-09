@@ -104,13 +104,93 @@ fn seed_history(storage: &StorageState) -> i64 {
     let guard = storage.get_connection_named("agent_test_seed").unwrap();
     let conn = guard.as_ref().unwrap();
     conn.execute("INSERT INTO screenshots(id,image_path,image_hash,window_title_enc,content_key_encrypted,created_at,status) VALUES(42,'screenshots/file-must-not-be-opened.png.enc','history',?1,?2,'2026-11-08 00:00:00','committed')",params![title,wrapping]).unwrap();
-    conn.execute("INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4) VALUES(43,42,'synthetic-ocr',?1,?2,1,0,0,1,0,1,1,0,1)",params![ocr,ocr_key]).unwrap();
+    conn.execute("INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4) VALUES(43,42,'',?1,?2,1,0,0,1,0,1,1,0,1)",params![ocr,ocr_key]).unwrap();
     42
 }
 fn view(storage: &StorageState) -> AgentRepository {
     let binding = storage.agent_binding().unwrap();
     AgentRepository::open(Path::new(&binding.view_path), &[7; 32], &binding, true).unwrap()
 }
+#[test]
+fn database_maintenance_fences_ready_access_and_reconciles_after_locked_reopen() {
+    let (_directory, storage, authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    let revision = authority.lock().unwrap().source;
+    storage.credential_state.invalidate_session();
+    storage.credential_state.clear_all_cached_keys();
+
+    let maintenance = storage.database_maintenance("agent_test_backup_export");
+    assert_eq!(storage.agent_preparation().phase, "syncing");
+    {
+        let status = authority.lock().unwrap();
+        assert_eq!(status.phase, "syncing");
+        assert_eq!(status.source, revision + 1);
+        assert_eq!(status.applied, revision);
+    }
+    assert!(storage
+        .try_foreground_db_read("agent_test_reader_start")
+        .is_none());
+    storage.shutdown_under_maintenance().unwrap();
+    storage.initialize_under_maintenance().unwrap();
+    assert_eq!(storage.agent_preparation().phase, "syncing");
+    drop(maintenance);
+
+    storage.sync_agent_access().unwrap();
+    assert_eq!(storage.agent_preparation().phase, "ready");
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    assert!(!storage.is_session_valid());
+    assert_eq!(view(&storage).ocr(42).unwrap()[0].text, "historical OCR");
+}
+
+#[test]
+fn idle_vacuum_probe_keeps_unattended_access_ready() {
+    let (_directory, storage, authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    let revision = authority.lock().unwrap().source;
+    storage.credential_state.invalidate_session();
+
+    storage
+        .run_incremental_vacuum_if_idle(i64::MAX, 500)
+        .unwrap();
+    assert_eq!(storage.agent_preparation().phase, "ready");
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    assert_eq!(authority.lock().unwrap().source, revision);
+}
+
+#[test]
+fn unsuccessful_try_maintenance_keeps_agent_revision_and_readiness() {
+    let (_directory, storage, authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    let revision = authority.lock().unwrap().source;
+
+    for reader in [
+        storage.foreground_db_activity.read("agent_test_foreground"),
+        storage
+            .independent_db_activity
+            .read("agent_test_independent"),
+    ] {
+        assert!(storage
+            .try_database_maintenance("agent_test_busy")
+            .is_none());
+        assert!(!storage.is_database_maintenance_pending());
+        assert_eq!(storage.agent_preparation().phase, "ready");
+        assert_eq!(authority.lock().unwrap().source, revision);
+        drop(reader);
+    }
+    let maintenance = storage.try_database_maintenance("agent_test_idle").unwrap();
+    assert_eq!(storage.agent_preparation().phase, "syncing");
+    assert_eq!(authority.lock().unwrap().source, revision + 1);
+    drop(maintenance);
+    storage.sync_agent_access().unwrap();
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+}
+
 #[test]
 fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full_text() {
     let (_directory, storage, authority) = fixture();
@@ -179,6 +259,15 @@ fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full
         Some("future window")
     );
     assert_eq!(text.ocr(future).unwrap()[0].text, "future OCR");
+    let result = carbonpaper_agent_access::dispatcher::call(
+        &text,
+        &carbonpaper_agent_access::sensitive_filter::SensitiveFilterState::default(),
+        "search_ocr_text",
+        json!({"query":"future OCR","fuzzy":false}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(result["items"][0]["screenshot_id"], future);
     let data = serde_json::to_value(text.snapshot(future).unwrap().unwrap()).unwrap();
     assert!(data.get("metadata").is_none());
     assert!(data.get("image_path").is_none());
@@ -236,6 +325,35 @@ fn missing_write_material_records_a_transactional_gap_and_deletion_fences_cached
     storage.sync_agent_access().unwrap();
     assert!(view(&storage).snapshot(42).unwrap().is_none());
     assert!(view(&storage).ocr(42).unwrap().is_empty());
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+}
+
+#[test]
+fn locked_restart_restores_scoped_reads_without_an_archive_master_key() {
+    let (directory, storage, authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    storage.credential_state.invalidate_session();
+    storage.credential_state.clear_all_cached_keys();
+    assert!(storage.credential_state.get_hmac_key().is_err());
+    let mut restarted =
+        StorageState::new(directory.path().into(), storage.credential_state.clone());
+    restarted.replace_processing_stage_for_tests(
+        crate::processing_stage::ProcessingStaging::with_test_broker(Arc::new(OfflineProcessing)),
+    );
+    *restarted.agent_writer.authority.lock().unwrap() =
+        storage.agent_writer.authority.lock().unwrap().clone();
+    {
+        let mut state = authority.lock().unwrap();
+        state.source += 1;
+        state.phase = "syncing".into();
+    }
+    restarted.initialize().unwrap();
+    restarted.sync_agent_access().unwrap();
+    assert!(!restarted.is_session_valid());
+    assert!(restarted.credential_state.get_hmac_key().is_err());
+    assert_eq!(view(&restarted).ocr(42).unwrap()[0].text, "historical OCR");
     assert_eq!(authority.lock().unwrap().phase, "ready");
 }
 #[test]
@@ -310,4 +428,258 @@ fn backfill_unwraps_summary_text_and_keeps_independent_corrections_without_diagn
     let serialized = serde_json::to_string(&summary).unwrap();
     assert!(!serialized.contains("diagnostics"));
     assert!(!serialized.contains("reasoning"));
+}
+
+fn seed_pagination_history(conn: &Connection, count: i64) {
+    conn.execute(
+        "WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<?1)
+         INSERT INTO screenshots(id,image_path,image_hash,created_at,status)
+         SELECT id,'synthetic.enc','image-'||id,'2026-11-08 00:00:00','committed' FROM ids",
+        [count],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO ocr_results(id,screenshot_id,text_hash,text,confidence,
+            box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
+         SELECT id,id,'text-'||id,'synthetic text',1,0,0,1,0,1,1,0,1 FROM screenshots",
+    )
+    .unwrap();
+}
+
+fn source_query_keys(
+    conn: &Connection,
+    kind: &str,
+    cursor: &str,
+    key: Option<&str>,
+) -> (Vec<String>, i32) {
+    let source = SOURCES.iter().find(|source| source.kind == kind).unwrap();
+    let (sql, parameters) = source.query(cursor, key).unwrap();
+    let mut query = conn.prepare(&sql).unwrap();
+    let rows: Vec<(String, String)> = query
+        .query_map(rusqlite::params_from_iter(parameters), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let steps = query.get_status(rusqlite::StatementStatus::VmStep);
+    let keys = rows
+        .into_iter()
+        .map(|(key, payload)| {
+            serde_json::from_str::<Value>(&payload).unwrap();
+            key
+        })
+        .collect();
+    (keys, steps)
+}
+
+#[test]
+fn source_pages_seek_native_ids_and_project_only_the_selected_history() {
+    use std::sync::atomic::AtomicUsize;
+    let (_directory, storage, _authority) = fixture();
+    let guard = storage
+        .get_connection_named("agent_test_pagination")
+        .unwrap();
+    let conn = guard.as_ref().unwrap();
+    seed_pagination_history(conn, 30_000);
+    let projected = Arc::new(AtomicUsize::new(0));
+    let calls = projected.clone();
+    conn.create_scalar_function(
+        "cp_process",
+        1,
+        FunctionFlags::SQLITE_DIRECTONLY,
+        move |args| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            args.get::<Option<String>>(0)
+        },
+    )
+    .unwrap();
+    for kind in ["snapshot", "ocr"] {
+        let (keys, steps) = source_query_keys(conn, kind, "29870", None);
+        assert_eq!(
+            keys,
+            (29_871..=29_998)
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        );
+        // A late 128-row page must not scan/sort the 30,000-row history.
+        assert!(steps < 50_000, "{kind} page executed {steps} VM steps");
+        let (keys, steps) = source_query_keys(conn, kind, "30000", Some("9"));
+        assert_eq!(keys, ["9"]);
+        assert!(steps < 1_000, "{kind} lookup executed {steps} VM steps");
+        let (keys, _) = source_query_keys(conn, kind, "8", None);
+        assert_eq!(&keys[..3], ["9", "10", "11"]);
+    }
+    assert_eq!(projected.load(Ordering::Relaxed), 128 + 1 + 128);
+
+    conn.execute_batch(
+        "INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,
+            model_id,model_revision,embedding_version,source_fingerprint)
+         SELECT 'clip_image',image_hash,1,x'0000803f','synthetic','fixture',1,'fixture' FROM screenshots;",
+    ).unwrap();
+    conn.create_scalar_function("cp_unseal", 3, FunctionFlags::SQLITE_DIRECTONLY, |args| {
+        args.get::<Vec<u8>>(0)
+    })
+    .unwrap();
+    let expected: Vec<String> = conn
+        .prepare(
+            "SELECT key_id FROM protected_storage_keys WHERE purpose='vectors' ORDER BY key_id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let (keys, steps) = source_query_keys(conn, "vector_key", "", None);
+    assert_eq!(keys, expected);
+    assert!(
+        steps < 2_000,
+        "vector key preparation executed {steps} VM steps for 30,000 vectors"
+    );
+}
+
+#[test]
+fn source_pages_finish_while_the_primary_database_mutex_is_held() {
+    use std::{sync::mpsc, thread, time::Duration};
+    let (_directory, storage, _authority) = fixture();
+    seed_history(&storage);
+    let storage = Arc::new(storage);
+    let primary = storage
+        .get_connection_named("agent_test_held_writer")
+        .unwrap();
+    let reader_storage = storage.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let result = reader_storage.agent_source_page(&SOURCES[0], "", None);
+        finished_tx.send(result).unwrap();
+    });
+    let finished = finished_rx.recv_timeout(Duration::from_secs(5));
+    // Release the mutex before reporting a regression, so the reader can exit.
+    drop(primary);
+    reader.join().unwrap();
+    let rows = finished
+        .expect("Agent history reads must not wait for the primary mutex")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "42");
+}
+
+#[test]
+fn composite_source_pages_keep_relationships_vector_keys_and_recap_visibility() {
+    use std::sync::atomic::AtomicUsize;
+    let (_directory, storage, _authority) = fixture();
+    let guard = storage
+        .get_connection_named("agent_test_composite_pages")
+        .unwrap();
+    let conn = guard.as_ref().unwrap();
+    seed_pagination_history(conn, 350);
+    conn.execute_batch(
+        "INSERT INTO smart_clusters(id,anchor_text) VALUES(2,'two'),(10,'ten');
+         INSERT INTO smart_cluster_summaries(smart_cluster_id) VALUES(2),(10);
+         INSERT INTO smart_cluster_assignments(smart_cluster_id,screenshot_id)
+            SELECT c.id,s.id FROM smart_clusters c CROSS JOIN screenshots s;
+         INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,
+            model_id,model_revision,embedding_version,source_fingerprint)
+            SELECT 'clip_image',image_hash,1,x'0000803f','synthetic','fixture',1,'fixture' FROM screenshots;
+         INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,
+            model_id,model_revision,embedding_version,source_fingerprint)
+            SELECT 'semantic_text',CAST(id AS TEXT),1,x'0000803f','synthetic','fixture',1,'fixture' FROM screenshots;
+         UPDATE screenshots SET is_deleted=1 WHERE id=9;
+         UPDATE ocr_results SET is_deleted=1 WHERE id=8;
+         INSERT INTO recap_days(day,start_ms,end_ms,revision,privacy_hash)
+            VALUES('2026-11-07',0,1,7,'fixture'),('2026-11-08',1,2,7,'fixture');
+         INSERT INTO recap_deleted_days(day) VALUES('2026-11-07');
+         INSERT INTO recap_payloads(kind,key,day,revision,data,row_key) VALUES
+            ('batch','2026-11-08:0','2026-11-08',7,x'01',x'02'),
+            ('batch','2026-11-08:old','2026-11-08',6,x'01',x'02'),
+            ('batch','2026-11-07:0','2026-11-07',7,x'01',x'02'),
+            ('corrections','2026-11-08:0','2026-11-08',-1,x'01',x'02'),
+            ('summary','2026-11-08:0','2026-11-08',7,x'01',x'02'),
+            ('prompt','2026-11-08:0','2026-11-08',7,x'01',x'02');",
+    ).unwrap();
+    // Test only key selection/projection here; the encrypted plaintext contract
+    // is covered by the authenticated backfill tests above.
+    conn.create_scalar_function("cp_text", 2, FunctionFlags::SQLITE_DIRECTONLY, |args| {
+        args.get::<Option<String>>(0)
+    })
+    .unwrap();
+    let projected = Arc::new(AtomicUsize::new(0));
+    let calls = projected.clone();
+    conn.create_scalar_function(
+        "cp_unseal",
+        3,
+        FunctionFlags::SQLITE_DIRECTONLY,
+        move |args| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            args.get::<Vec<u8>>(0)
+        },
+    )
+    .unwrap();
+    let live_ids: Vec<i64> = (1..=350).filter(|id| *id != 9).collect();
+    let expectations = [
+        (
+            "snapshot",
+            live_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ),
+        (
+            "ocr",
+            live_ids
+                .iter()
+                .filter(|id| **id != 8)
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        ("cluster", vec!["2".into(), "10".into()]),
+        ("summary", vec!["2".into(), "10".into()]),
+        (
+            "assignment",
+            [2, 10]
+                .into_iter()
+                .flat_map(|cluster| live_ids.iter().map(move |id| format!("{cluster}:{id}")))
+                .collect(),
+        ),
+        ("calendar", vec!["2026-11-08".into()]),
+        (
+            "recap",
+            vec![
+                "batch:2026-11-08:0".into(),
+                "corrections:2026-11-08:0".into(),
+                "summary:2026-11-08:0".into(),
+            ],
+        ),
+        (
+            "vector_key",
+            conn.prepare(
+                "SELECT key_id FROM protected_storage_keys WHERE purpose='vectors' ORDER BY key_id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap(),
+        ),
+    ];
+    for (kind, expected) in expectations {
+        let mut cursor = String::new();
+        let mut actual = Vec::new();
+        loop {
+            let (keys, _) = source_query_keys(conn, kind, &cursor, None);
+            if keys.is_empty() {
+                break;
+            }
+            cursor = keys.last().unwrap().clone();
+            actual.extend(keys);
+            assert!(
+                actual.len() <= expected.len(),
+                "{kind} must advance without repeating keys"
+            );
+        }
+        assert_eq!(actual, expected, "{kind}");
+        let key = expected.last().unwrap();
+        assert_eq!(
+            source_query_keys(conn, kind, "", Some(key)).0,
+            [key.clone()]
+        );
+    }
+    assert_eq!(projected.load(Ordering::Relaxed), 0);
 }

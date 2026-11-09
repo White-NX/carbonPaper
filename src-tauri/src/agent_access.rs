@@ -34,9 +34,14 @@ pub(crate) fn spawn(app: tauri::AppHandle) {
     storage.start_agent_exporter();
     tauri::async_runtime::spawn(async move {
         while !STOPPED.load(Ordering::Acquire) {
-            if storage.agent_access_enabled() && storage.agent_preparation().phase == "ready" {
-                let state = app.state::<McpRuntimeState>();
-                let _guard = state.lock_lifecycle().await;
+            let state = app.state::<McpRuntimeState>();
+            let guard = state.lock_lifecycle().await;
+            if crate::maintenance::is_active() || storage.is_database_maintenance_pending() {
+                if state.mode() == "unattended" {
+                    crate::mcp_server::stop_server(&state).await;
+                }
+            } else if storage.agent_access_enabled() && storage.agent_preparation().phase == "ready"
+            {
                 if !state.is_running() || state.mode() != "unattended" {
                     if storage
                         .load_policy()
@@ -45,14 +50,14 @@ pub(crate) fn spawn(app: tauri::AppHandle) {
                         .unwrap_or(false)
                     {
                         if let Err(error) = start_reader(app.clone(), &storage, &state).await {
-                            state.set_last_error(error.clone());
-                            let _=app.emit("mcp-status-changed",serde_json::json!({"state":"error","mode":"unattended","error":error}));
+                            if error != crate::maintenance::MAINTENANCE_IN_PROGRESS {
+                                state.set_last_error(error.clone());
+                                let _=app.emit("mcp-status-changed",serde_json::json!({"state":"error","mode":"unattended","error":error}));
+                            }
                         }
                     }
                 }
             } else if !storage.agent_access_enabled() {
-                let state = app.state::<McpRuntimeState>();
-                let _guard = state.lock_lifecycle().await;
                 if state.mode() == "unattended" {
                     crate::mcp_server::stop_server(&state).await;
                     let credentials =
@@ -74,6 +79,7 @@ pub(crate) fn spawn(app: tauri::AppHandle) {
                     }
                 }
             }
+            drop(guard);
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     });
@@ -117,11 +123,20 @@ fn assign_job(child: &tokio::process::Child) -> Result<ReaderJob, String> {
     }
 }
 
+/// The caller holds the MCP lifecycle lock. Startup also owns a foreground
+/// database permit so maintenance cannot close the source beneath the child.
 pub(crate) async fn start_reader(
     app: tauri::AppHandle,
     storage: &StorageState,
     state: &McpRuntimeState,
 ) -> Result<(), String> {
+    let _admission = crate::maintenance::runtime_control_guard()?;
+    let _activity = storage
+        .try_foreground_db_read("agent_reader_start")
+        .ok_or(crate::maintenance::MAINTENANCE_IN_PROGRESS)?;
+    if storage.is_database_maintenance_pending() {
+        return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+    }
     if storage.agent_preparation().phase != "ready" {
         return Err("AGENT_SYNC_INCOMPLETE".into());
     }

@@ -38,6 +38,7 @@ impl StorageState {
             .map_err(|e| format!("Failed to encrypt payload: {}", e))?;
 
         let encrypted_key = self.wrap_row_key_for_storage(&row_key)?;
+        self.agent_writer.stage_row_key(&encrypted_data, &row_key);
         self.agent_writer.stage_payload(&encrypted_data, plaintext);
 
         Self::zeroize_bytes(&mut row_key);

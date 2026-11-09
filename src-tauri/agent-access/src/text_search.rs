@@ -1,6 +1,6 @@
 //! Indexed OCR candidates, verified with the desktop's plaintext ranker.
 use crate::{
-    dispatcher::{clean_snapshot, query_page},
+    dispatcher::clean_snapshot,
     mcp_contract::TimeRange,
     page::Page,
     pii,
@@ -8,9 +8,7 @@ use crate::{
     search_plan::QueryPlan,
     search_rank,
     sensitive_filter::{filter_segment, SensitiveFilterState},
-    types::OcrText,
 };
-use rusqlite::params;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -33,36 +31,61 @@ pub(crate) fn ocr(
         ));
     }
     let plan = QueryPlan::build(query);
-    let terms: HashSet<String> = plan
-        .phrase_groups
-        .iter()
-        .map(|g| crate::search_plan::fold(&g.bigram).iter().collect())
-        .collect();
     let short = plan.keywords.iter().any(|word| word.len() < 2);
     let range = TimeRange::from_args(args, false)?;
-    let list = |key: &str| {
-        args.get(key)
-            .and_then(Value::as_array)
-            .filter(|v| !v.is_empty())
-            .map(|v| json!(v).to_string())
-    };
-    let rows: Vec<OcrText> = query_page(repo,
-        "SELECT o.body FROM records o JOIN records s ON s.kind='snapshot' AND s.key=CAST(o.screenshot_id AS TEXT)
-        WHERE o.kind='ocr' AND o.body IS NOT NULL AND s.body IS NOT NULL
-        AND (?1=1 OR o.key IN (SELECT key FROM text_terms WHERE kind='ocr' AND term IN (SELECT value FROM json_each(?2))))
-        AND (?3 IS NULL OR s.captured_at_ms>=?3) AND (?4 IS NULL OR s.captured_at_ms<?4)
-        AND (?5 IS NULL OR json_extract(s.body,'$.process_name') IN (SELECT value FROM json_each(?5)))
-        AND (?6 IS NULL OR json_extract(s.body,'$.category') IN (SELECT value FROM json_each(?6)))",
-        params![short,json!(terms).to_string(),range.start_ms,range.end_ms,list("process_names"),list("categories")])?;
+    let processes: Vec<String> =
+        serde_json::from_value(args["process_names"].clone()).unwrap_or_default();
+    let categories: Vec<String> =
+        serde_json::from_value(args["categories"].clone()).unwrap_or_default();
     let fuzzy = args["fuzzy"].as_bool().unwrap_or(true);
     let mut ranked = Vec::new();
-    for row in rows {
-        let rank = search_rank::score_text(&plan, &row.text);
-        if rank.matched && (fuzzy || rank.literal) {
-            let snapshot = repo
-                .snapshot(row.screenshot_id)?
-                .ok_or("AGENT_INVALID_RECORD")?;
-            ranked.push((row, snapshot, rank));
+    let source = repo.source()?;
+    let candidates = if short {
+        None
+    } else {
+        Some(source.candidates(&plan)?)
+    };
+    let mut indexed = candidates.as_ref().map(|v| v.iter());
+    let mut cursor = 0;
+    loop {
+        // Each source query releases its SQLite read lock before text ranking.
+        let ids: Vec<i64> = match indexed.as_mut() {
+            Some(ids) => ids.take(256).map(i64::from).collect(),
+            None => source.all_ocr_ids(cursor, 256)?,
+        };
+        let Some(last) = ids.last() else {
+            break;
+        };
+        cursor = *last;
+        let mut scoped = Vec::new();
+        let mut snapshots = std::collections::HashMap::new();
+        for id in ids {
+            let Some(snapshot) = repo.ocr_snapshot(id)? else {
+                continue;
+            };
+            if !range.contains(snapshot.captured_at_ms)
+                || !processes.is_empty()
+                    && !snapshot
+                        .process_name
+                        .as_ref()
+                        .is_some_and(|v| processes.contains(v))
+                || !categories.is_empty()
+                    && !snapshot
+                        .category
+                        .as_ref()
+                        .is_some_and(|v| categories.contains(v))
+            {
+                continue;
+            }
+            snapshots.insert(snapshot.screenshot_id, snapshot);
+            scoped.push(id);
+        }
+        for row in repo.ocr_ids(&scoped)? {
+            let rank = search_rank::score_text(&plan, &row.text);
+            if rank.matched && (fuzzy || rank.literal) {
+                let snapshot = snapshots[&row.screenshot_id].clone();
+                ranked.push((row, snapshot, rank));
+            }
         }
     }
     ranked.sort_by(|a, b| {

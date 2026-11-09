@@ -24,7 +24,7 @@ pub fn tools_list() -> Value {
     });
     for tool in tools.as_array_mut().unwrap() {
         if tool["name"] == "search_recaps" {
-            tool["description"] = json!("Search all prepared, corrected recap activities by keyword, semantic meaning, or hybrid. Keywords are verified against the independent encrypted text index. Semantic search uses copied MiniLM vectors and never generates embeddings for history. Date filters are inclusive and use saved calendars. coverage reports global, scoped and per-date chunk coverage; keyword-only coverage is null. execution reports branch availability and the semantic top-200 cap. Pass ranking_revision when continuing a page. Sources use screenshot_id and captured_at_ms in Unix milliseconds.");
+            tool["description"] = json!("Search all prepared, corrected recap activities by keyword, semantic meaning, or hybrid. Keywords are verified against saved corrected text. Semantic search reads existing stored MiniLM vectors and never generates embeddings for history. Date filters are inclusive and use saved calendars. coverage reports global, scoped and per-date chunk coverage; keyword-only coverage is null. execution reports branch availability and the semantic top-200 cap. Pass ranking_revision when continuing a page. Sources use screenshot_id and captured_at_ms in Unix milliseconds.");
         } else if tool["name"] == "get_recap_days" {
             tool["description"] = json!("List all prepared non-deleted daily recap dates, newest first, with offset/limit and saved calendars[date]. A listed date may have pending periods. Does not generate recaps.");
         }
@@ -192,40 +192,45 @@ pub fn call(
             let processes: Vec<String> =
                 serde_json::from_value(args["process_names"].clone()).unwrap_or_default();
             let mut scores = Vec::new();
-            let vectors: Vec<VectorText> = repo.all("vector")?;
-            let matching: Vec<_> = vectors
-                .into_iter()
-                .filter(|v| {
-                    v.kind == "clip_image"
-                        && v.model_id == model
-                        && v.model_revision == revision
-                        && cosine(query, &v.vector).is_some()
-                })
-                .collect();
-            if matching.is_empty() {
+            let mut indexed = 0;
+            let mut cursor = 0;
+            let total = repo.snapshot_count()?;
+            loop {
+                let vectors = repo.vector_page("clip_image", cursor, 256)?;
+                let Some(last) = vectors.last() else {
+                    break;
+                };
+                cursor = last.screenshot_id;
+                for v in vectors {
+                    if v.model_id != model
+                        || v.model_revision != revision
+                        || cosine(query, &v.vector).is_none()
+                    {
+                        continue;
+                    }
+                    indexed += 1;
+                    let Some(snapshot) = repo.snapshot(v.screenshot_id)? else {
+                        continue;
+                    };
+                    if !range.contains(snapshot.captured_at_ms)
+                        || !processes.is_empty()
+                            && !snapshot
+                                .process_name
+                                .as_ref()
+                                .is_some_and(|p| processes.contains(p))
+                    {
+                        continue;
+                    }
+                    if let Some(score) = cosine(query, &v.vector) {
+                        scores.push((score, snapshot));
+                    }
+                }
+            }
+            if indexed == 0 {
                 return Err(
                     "AGENT_INDEX_UNAVAILABLE: No matching visual embeddings have been prepared"
                         .into(),
                 );
-            }
-            let indexed = matching.len();
-            let total = repo.snapshot_count()?;
-            for v in matching {
-                let Some(snapshot) = repo.snapshot(v.screenshot_id)? else {
-                    continue;
-                };
-                if !range.contains(snapshot.captured_at_ms)
-                    || !processes.is_empty()
-                        && !snapshot
-                            .process_name
-                            .as_ref()
-                            .is_some_and(|p| processes.contains(p))
-                {
-                    continue;
-                }
-                if let Some(score) = cosine(query, &v.vector) {
-                    scores.push((score, snapshot));
-                }
             }
             scores.sort_by(|a, b| {
                 b.0.total_cmp(&a.0)

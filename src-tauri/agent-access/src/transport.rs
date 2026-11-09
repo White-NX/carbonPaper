@@ -46,7 +46,7 @@ async fn broker(request: BrokerRequest) -> Result<BrokerResponse, BrokerError> {
 }
 
 async fn authorize(
-    State(_state): State<Arc<ReaderState>>,
+    State(state): State<Arc<ReaderState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -61,7 +61,7 @@ async fn authorize(
     };
     let token_hash = hex::encode(Sha256::digest(secret.as_bytes()));
     match broker(BrokerRequest::AgentAuthorize{token_hash}).await {
-        Ok(BrokerResponse::AgentContext(context))=>{request.extensions_mut().insert(context);next.run(request).await},
+        Ok(BrokerResponse::AgentContext(context)) if context.dataset_id==state.binding.dataset_id && context.generation==state.binding.generation=>{request.extensions_mut().insert(context);next.run(request).await},
         Err(BrokerError::Busy)=>(StatusCode::SERVICE_UNAVAILABLE,Json(json!({"error":{"code":"AGENT_SYNC_INCOMPLETE","message":"CarbonPaper text preparation or synchronization is incomplete"}}))).into_response(),
         Err(BrokerError::Unavailable)=>(StatusCode::SERVICE_UNAVAILABLE,"Agent authorization service unavailable").into_response(),
         _=>(StatusCode::UNAUTHORIZED,"Credential is invalid, expired or revoked").into_response(),
@@ -234,12 +234,6 @@ pub async fn serve(configuration: ReaderConfiguration) -> Result<(), String> {
     };
     let key = Zeroizing::new(keys.content_key.0.clone());
     let binding = keys.binding;
-    AgentRepository::open(
-        std::path::Path::new(&binding.view_path),
-        &key,
-        &binding,
-        true,
-    )?;
     let filters = SensitiveFilterState::default();
     filters.load_dicts(&runtime_root)?;
     // The desktop synchronizes privacy configuration as encrypted typed data.
@@ -249,6 +243,7 @@ pub async fn serve(configuration: ReaderConfiguration) -> Result<(), String> {
         &binding,
         true,
     )?;
+    repo.source()?;
     if let Some(config) = repo.get("privacy", "settings")? {
         filters.update_config(config);
     } else {

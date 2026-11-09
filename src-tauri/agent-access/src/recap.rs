@@ -283,23 +283,20 @@ pub(crate) fn search(
             );
             documents.push(Document { item, chunks });
         }
-        let saved: Vec<RecapText> = query_page(
-            repo,
-            "SELECT body FROM records WHERE kind='recap' AND date=?1 AND body IS NOT NULL",
-            [&calendar.date],
-        )?;
-        for part in saved.into_iter().filter(|p| {
-            p.part == "search"
-                && p.revision == calendar.source_revision
-                && p.content.version == recap_text_contract::INDEX_VERSION
-                && p.content.model_revision == MINILM_VECTOR_SPACE_REVISION
-        }) {
-            vectors.extend(
-                part.content
-                    .vectors
-                    .into_iter()
-                    .filter(|(_, v)| v.len() == MINILM_DIMENSIONS && cosine(v, v).is_some()),
-            );
+        for content in repo
+            .recap_vectors(&calendar.date, calendar.source_revision)?
+            .into_iter()
+            .filter(|p| {
+                p.version == recap_text_contract::INDEX_VERSION
+                    && p.model_revision == MINILM_VECTOR_SPACE_REVISION
+            })
+        {
+            vectors.extend(content.vectors.into_iter().filter(|(key, v)| {
+                carbonpaper_app_bound::protocol::valid_id(key)
+                    && v.len() == MINILM_DIMENSIONS
+                    && cosine(v, v).is_some()
+                    && v.iter().map(|x| x * x).sum::<f32>() > 1e-12
+            }));
         }
         calendars.insert(calendar.date.clone(), json!(calendar));
     }

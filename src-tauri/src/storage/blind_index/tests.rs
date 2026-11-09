@@ -352,7 +352,11 @@ fn encrypted_snapshot_reopens_with_equivalent_postings() {
     let original = large();
     {
         let conn = Connection::open(&path).unwrap();
-        crate::storage::connection::configure_sqlcipher_connection(&conn, &key).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA key=\"x'{}'\"; PRAGMA temp_store=MEMORY;",
+            hex::encode(key)
+        ))
+        .unwrap();
         legacy(&conn);
         ensure_schema(&conn).unwrap();
         write(&conn, "large", &original);
@@ -360,7 +364,12 @@ fn encrypted_snapshot_reopens_with_equivalent_postings() {
             .unwrap();
     }
     let restored = Connection::open(copy).unwrap();
-    crate::storage::connection::configure_sqlcipher_connection(&restored, &key).unwrap();
+    restored
+        .execute_batch(&format!(
+            "PRAGMA key=\"x'{}'\"; PRAGMA temp_store=MEMORY;",
+            hex::encode(key)
+        ))
+        .unwrap();
     ensure_schema(&restored).unwrap();
     assert_posting(&restored, "large", &original, true);
     assert!(restored
@@ -389,11 +398,11 @@ fn crash_recovery_preserves_format_and_posting_transaction_boundaries() {
                 }
             }
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "storage::blind_index::tests::crash_child",
-                ])
+                .args(["--ignored", "--exact"])
+                .arg(format!(
+                    "{}::crash_child",
+                    module_path!().split_once("::").unwrap().1
+                ))
                 .env("CARBONPAPER_BLIND_CRASH_DB", &path)
                 .env("CARBONPAPER_BLIND_CRASH_OP", operation)
                 .env(

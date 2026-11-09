@@ -59,11 +59,17 @@ pub fn storage_is_startup_vacuum_in_progress(state: tauri::State<'_, Arc<Storage
 /// Frontend: `components/settings/useAdvancedSectionController.js`.
 #[tauri::command]
 pub async fn storage_run_manual_vacuum(
+    app_handle: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
 
+    let mcp = app_handle.state::<crate::mcp_server::McpRuntimeState>();
+    let _mcp_lifecycle = mcp.lock_lifecycle().await;
+    if mcp.mode() == "unattended" {
+        crate::mcp_server::stop_server(&mcp).await;
+    }
     let state = state.inner().clone();
 
     tokio::task::spawn_blocking(move || match state.run_manual_vacuum() {
@@ -168,6 +174,13 @@ pub async fn storage_migrate_data_dir(
         .quiesce(std::time::Duration::from_secs(5))
         .await;
 
+    // The protected reader owns independent source-file handles in another
+    // process. Join it before closing/copying storage and prevent restarts.
+    let mcp = app_handle.state::<crate::mcp_server::McpRuntimeState>();
+    let mcp_lifecycle = mcp.lock_lifecycle().await;
+    if mcp.mode() == "unattended" {
+        crate::mcp_server::stop_server(&mcp).await;
+    }
     let state = state.inner().clone();
     let state_after_migration = Arc::clone(&state);
     let migration_app_handle = app_handle.clone();
@@ -177,6 +190,8 @@ pub async fn storage_migrate_data_dir(
     .await
     .map_err(|e| format!("Task join error: {:?}", e));
     let storage_ready = state_after_migration.is_initialized();
+    drop(mcp_lifecycle);
+    drop(mcp);
 
     // Resume Office observation only after the selected database is open again.
     if was_active && storage_ready {
@@ -259,6 +274,11 @@ pub async fn storage_export_backup(
     office_runtime
         .quiesce(std::time::Duration::from_secs(5))
         .await;
+    let mcp = app_handle.state::<crate::mcp_server::McpRuntimeState>();
+    let mcp_lifecycle = mcp.lock_lifecycle().await;
+    if mcp.mode() == "unattended" {
+        crate::mcp_server::stop_server(&mcp).await;
+    }
     let worker_state = state.inner().clone();
     let credentials = credential_state.inner().clone();
     let events = app_handle.clone();
@@ -307,6 +327,8 @@ pub async fn storage_export_backup(
             state.initialize(),
         ),
     };
+    drop(mcp_lifecycle);
+    drop(mcp);
     if was_active && initialize.is_ok() {
         office_runtime.resume();
     }
@@ -351,6 +373,11 @@ pub async fn storage_import_backup(
     app_handle
         .state::<Arc<crate::clip_ann::ClipAnnState>>()
         .disarm();
+    let mcp = app_handle.state::<crate::mcp_server::McpRuntimeState>();
+    let mcp_lifecycle = mcp.lock_lifecycle().await;
+    if mcp.mode() == "unattended" {
+        crate::mcp_server::stop_server(&mcp).await;
+    }
     let worker_state = state.inner().clone();
     let credentials = credential_state.inner().clone();
     let events = app_handle.clone();
@@ -401,6 +428,8 @@ pub async fn storage_import_backup(
             )
         }
     };
+    drop(mcp_lifecycle);
+    drop(mcp);
     if was_active && initialize.is_ok() {
         office_runtime.resume();
     }

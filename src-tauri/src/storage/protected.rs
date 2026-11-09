@@ -455,8 +455,11 @@ impl ProtectedStorage {
         identity: &str,
         bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
-        let sealed = self.write_key(purpose)?.seal(identity, bytes)?;
-        if matches!(purpose, "metadata" | "vectors") {
+        let key = self.write_key(purpose)?;
+        let sealed = key.seal(identity, bytes)?;
+        if purpose == "vectors" {
+            self.agent_writer.stage_vector_key(&key);
+        } else if purpose == "metadata" {
             self.agent_writer.stage_payload(&sealed, bytes);
         }
         Ok(sealed)

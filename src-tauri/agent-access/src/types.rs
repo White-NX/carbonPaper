@@ -172,24 +172,66 @@ pub struct VectorText {
     pub vector: Vec<f32>,
 }
 
+/// An authorization for existing OCR ciphertext, not a second OCR record.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrAccess {
+    pub ocr_id: i64,
+    pub screenshot_id: i64,
+    pub payload_digest: Vec<u8>,
+    pub key_envelope: Vec<u8>,
+}
+
+/// Only the vectors domain is shared; metadata, ANN and image keys stay separate.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorAccess {
+    pub key_id: String,
+    pub key_envelope: Vec<u8>,
+}
+
+/// Recap search payloads contain the existing MiniLM vectors.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecapSearchAccess {
+    pub date: String,
+    pub key: String,
+    pub revision: i64,
+    pub payload_digest: Vec<u8>,
+    pub key_envelope: Vec<u8>,
+}
+
+// Key envelopes must not appear in diagnostic output.
+macro_rules! opaque_debug {
+    ($($kind:ty),+ $(,)?) => {$ (
+        impl std::fmt::Debug for $kind {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($kind)).finish_non_exhaustive()
+            }
+        }
+    )+};
+}
+opaque_debug!(OcrAccess, VectorAccess, RecapSearchAccess);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum TextRecord {
     Snapshot(SnapshotText),
-    Ocr(OcrText),
+    OcrAccess(OcrAccess),
     Cluster(ClusterText),
     Summary(SummaryText),
     Assignment(AssignmentText),
     Recap(RecapText),
+    RecapSearchAccess(RecapSearchAccess),
     Calendar(CalendarText),
-    Vector(VectorText),
+    VectorAccess(VectorAccess),
     Privacy(crate::sensitive_filter::SensitiveFilterConfig),
 }
 impl TextRecord {
     pub fn identity(&self) -> (&'static str, String) {
         match self {
             Self::Snapshot(v) => ("snapshot", v.screenshot_id.to_string()),
-            Self::Ocr(v) => ("ocr", v.ocr_id.to_string()),
+            Self::OcrAccess(v) => ("ocr", v.ocr_id.to_string()),
             Self::Cluster(v) => ("cluster", v.cluster_id.to_string()),
             Self::Summary(v) => ("summary", v.cluster_id.to_string()),
             Self::Assignment(v) => (
@@ -197,8 +239,9 @@ impl TextRecord {
                 format!("{}:{}", v.cluster_id, v.screenshot_id),
             ),
             Self::Recap(v) => ("recap", format!("{}:{}", v.part, v.key)),
+            Self::RecapSearchAccess(v) => ("recap", format!("search:{}", v.key)),
             Self::Calendar(v) => ("calendar", v.date.clone()),
-            Self::Vector(v) => ("vector", format!("{}:{}", v.kind, v.screenshot_id)),
+            Self::VectorAccess(v) => ("vector_key", v.key_id.clone()),
             Self::Privacy(_) => ("privacy", "settings".into()),
         }
     }
@@ -227,6 +270,8 @@ pub enum TextChange {
     DeleteDay {
         date: String,
     },
+    /// A source-only mutation, such as deleting an existing vector.
+    SourceChanged,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

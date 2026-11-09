@@ -766,6 +766,7 @@ impl<'a> BlindIndex<'a> {
 }
 
 #[cfg(test)]
+#[path = "blind_index/tests.rs"]
 mod tests;
 
 fn decode(bytes: &[u8]) -> Result<RoaringBitmap, String> {

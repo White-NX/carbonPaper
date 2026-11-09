@@ -20,14 +20,15 @@ it cannot recover text already returned.
 | Read OCR, saved recap activities, corrections, cluster membership and summaries | Available when recorded; ordinary content and PII filters still apply |
 | Enumerate dates and captures | All prepared history, using existing pagination and explicit Unix millisecond timestamps |
 | Search visible words | Shared keyword and fuzzy matching rules; explanations describe the representative OCR row |
-| Search screen appearance | Copied Chinese-CLIP vectors and a text-only query embedding; missing vectors are reported |
-| Search recaps | Corrected keyword results, copied MiniLM vectors, saved calendars, coverage and ranking revisions |
+| Search screen appearance | Existing Chinese-CLIP vectors and a text-only query embedding; missing vectors are reported |
+| Search recaps | Corrected keyword results, existing MiniLM vectors, saved calendars, coverage and ranking revisions |
 | Read screenshots, thumbnails, crops, binary attachments, image paths or archive keys | Outside the permission |
 | Edit summaries, delete data, change settings or issue credentials | Outside the read-only catalog |
 | Lock or expire the UI session | Credential remains active; ordinary UI access retains its authentication requirements |
 | Restart Windows or the application | Access resumes after sign-in and background startup once reconciliation completes |
 | Revoke one credential | Other credentials remain active; requests admitted under the revoked revision are rejected before response delivery |
 | Disable unattended access | All grants and service key authority are retired, and the reader stops |
+| Export a backup, compact the database or repair its search index | Reads pause during maintenance and resume after reconciliation |
 | Import a backup or change the data directory | Old grants are retired; the active dataset requires a new explicit authorization |
 
 All ten existing read tools are available. The two summary-write tools are
@@ -108,47 +109,74 @@ protected reader and independently issued credentials. Listener transitions
 share the existing lifecycle lock. Existing interactive token-copy, rotation
 and smoke-test commands are unavailable in unattended mode.
 
-## Independent text repository
+## Lightweight authorization and source reuse
 
 [`carbonpaper-agent-access`](../src-tauri/agent-access/) is a separate Rust
-crate containing typed projections, encrypted storage, filters, pagination and
-the unattended dispatcher. It does not link the archive repository, CNG private
-key context, screenshot loader or an arbitrary file-read API.
+crate containing typed projections, encrypted authorizations, filters,
+pagination and the unattended dispatcher. Its fixed read-only source connector
+opens `screenshots.db` beside the service-authorized `agent-memory.db`. It does
+not link the desktop archive repository, CNG private key context, screenshot
+loader or an arbitrary file-read API.
 
-Its SQLCipher-encrypted `agent-memory.db` uses an independently random content
-key. The transactional outbox uses a second independently random key and
-authenticates the dataset and generation. Keys are unrelated to the bearer
-credential and archive master key.
+The SQLCipher-encrypted `agent-memory.db` uses an independently random content
+key. It keeps small text projections for capture metadata, links, clusters,
+summaries, recap activities, calendars and privacy settings. OCR rows contain
+identifiers, revisions, ciphertext digests and wrapped OCR keys. Vector access
+wraps each existing vectors-domain key once; recap search access wraps the key
+for its existing saved payload. The reader reuses OCR bodies, vector arrays and
+HMAC posting lists in the main database. The Agent database keeps no full-text
+tables or second OCR/vector copy.
 
-The allowlist covers text, identifiers, revisions, timestamps, recorded
-relationships, numeric geometry and existing search vectors. It excludes
-arbitrary screenshot metadata, icons, image locations, image bytes, key
-envelopes, prompts, reasoning and provider diagnostics. Recap summaries and
-evidence are decoded into explicit fields.
+The source connector receives separately wrapped public-bootstrap SQLCipher
+and HMAC search keys. It receives neither the archive master key nor screenshot
+keys. Key envelopes authenticate the dataset, generation, domain, record
+identity and ciphertext digest. The transactional outbox uses a second
+independently random key and authenticates its dataset and generation. These
+keys are independent of bearer credentials.
+
+Tool responses allow text, identifiers, revisions, timestamps, recorded
+relationships and numeric geometry. They exclude arbitrary screenshot
+metadata, icons, image locations, image bytes, key envelopes, prompts,
+reasoning and provider diagnostics. Recap summaries and evidence are decoded
+into explicit fields.
 
 ```mermaid
 flowchart LR
-    Capture[Capture and OCR] --> Archive[Protected archive and images]
-    Capture --> Writer[Typed text exporter]
+    Capture[Capture and OCR] --> Archive[Main encrypted database]
+    Capture --> Writer[Scoped key and projection writer]
     History[Authenticated history preparation] --> Writer
-    Writer --> View[Encrypted Agent text view]
+    Writer --> View[Encrypted authorizations and small projections]
     Service[Protected key service] --> Reader[Protected MCP reader]
     View --> Reader
+    Archive -->|Read-only OCR and existing vectors| Reader
     Reader --> Agent[Agent with read credential]
 ```
 
-The desktop exporter reads historical metadata, OCR, links and saved text
-payloads while authenticated. It never opens source screenshots or thumbnails.
-Capture and processing stage already available plaintext as bounded,
-short-lived Agent-key-encrypted material. Source triggers return independently
-encrypted typed events, or identifier-only synchronization gaps when that
-material is unavailable. Plaintext SQL decryption functions retain their
-`DIRECTONLY` restriction.
+Historical preparation unwraps OCR, recap-search and vector-domain keys while
+authenticated, then rewraps them for the authorized generation. It decodes only
+the text needed by small projections and never opens screenshots or thumbnails.
+Capture and processing stage freshly generated row/domain keys before clearing
+them, so new OCR and vectors can become available while the UI is locked.
+Other projection text is staged as bounded, short-lived Agent-key-encrypted
+material. Source triggers return encrypted key/projection events, or
+identifier-only gaps when the required material is unavailable. Ciphertext
+digests avoid carrying full OCR or recap-search payloads through those events.
+Plaintext SQL decryption functions retain their `DIRECTONLY` restriction.
+
+OCR search reuses the main database's HMAC bitmap index and shared fuzzy
+matching and ranking rules. The desktop writer fills missing postings from
+authorized OCR even while locked, decrypting and hashing outside the main
+database mutex and committing at most 32 OCR rows per transaction. The reader
+checks OCR and recap-search digests before decrypting their source payloads;
+semantic reads validate the existing vector model, revision and dimensions.
+CLIP scans read vectors in bounded pages.
 
 Events commit alongside source changes. Revision fencing, tombstones and
-content-index removal prevent older callbacks from overwriting newer records or
-reviving deleted children. Historical preparation uses a persistent checkpoint
-and drains concurrent updates between pages. It pauses on lock or cancellation.
+source deletion checks prevent older callbacks from overwriting newer records
+or reviving deleted children. Historical preparation uses a persistent checkpoint
+and drains concurrent updates between pages. It pauses on lock, cancellation or
+maintenance. The main database must remain available; missing files, mismatched
+datasets or changed ciphertext fail the read rather than return a stale copy.
 
 ## Protected reader and authority
 
@@ -178,8 +206,9 @@ places enabled views in reconciliation, and desktop synchronization must publish
 readiness before requests resume. Service failure, mismatched bindings or
 unresolved gaps deny reads.
 
-Healthy locked startup restores only Agent-view write material and applies
-captured outbox events. Repairing a gap that requires archive plaintext waits
+Healthy locked startup restores Agent-view write material, applies captured
+authorization/projection events and updates the existing search index without
+an archive master key. Repairing a gap that requires archive plaintext waits
 for an ordinary unlock. No plaintext fallback is persisted and incomplete
 preparation is never presented as complete history.
 
@@ -190,9 +219,20 @@ before reader shutdown and encrypted-file cleanup. Re-enabling creates a new
 generation and requires new authorization and preparation. Original archive
 data and background organization remain intact.
 
-Backup export includes neither the Agent text database nor service authority.
+Backup export includes neither the Agent authorization database nor service authority.
 Import strips Agent state, outbox and gap tables from the imported archive and
 retires previous grants. Data-directory changes also require reauthorization.
+
+Backup, import, data-directory changes, manual compaction and search-index repair
+stop and join the protected reader before the blocking operation, holding the
+MCP lifecycle lock to prevent a concurrent restart. Database maintenance fences
+the service revision only after both desktop database activity gates have
+drained; unsuccessful idle-maintenance attempts preserve readiness. The
+background supervisor also suspends the reader while maintenance is pending.
+The exporter yields between preparation/index batches and republishes readiness
+after the operation, allowing an unchanged dataset to resume while locked.
+Idle cleanup checks the freelist before entering maintenance so ordinary probes
+that need no compaction preserve active access.
 
 Protected release and development manifests include the reader. Build,
 development-cache, portable-package and release-verification scripts include

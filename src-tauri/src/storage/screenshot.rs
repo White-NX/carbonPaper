@@ -2939,6 +2939,19 @@ impl StorageState {
         freelist_threshold: i64,
         vacuum_pages: i64,
     ) -> Result<IncrementalVacuumResult, String> {
+        // Ordinary idle probes must not fence unattended reads when there is
+        // nothing to compact. Recheck after acquiring maintenance below because
+        // capture or another cleanup may change the freelist in between.
+        if self.agent_access_enabled() {
+            let guard = self.get_connection_named("incremental_vacuum_agent_probe")?;
+            let conn = guard.as_ref().unwrap();
+            let freelist: i64 = conn
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .map_err(|e| format!("Failed to read freelist_count: {}", e))?;
+            if freelist <= freelist_threshold {
+                return Ok(IncrementalVacuumResult::default());
+            }
+        }
         let Some(_maintenance) = self.try_database_maintenance("run_incremental_vacuum_if_idle")
         else {
             return Ok(IncrementalVacuumResult::default());

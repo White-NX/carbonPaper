@@ -144,6 +144,25 @@ pub(crate) struct ActivityGate {
 }
 
 impl ActivityGate {
+    pub(crate) fn try_read(&self, caller: &'static str) -> Option<ActivityReadGuard> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.active_writer || state.waiting_writers > 0 {
+            return None;
+        }
+        state.active_readers += 1;
+        drop(state);
+
+        Some(ActivityReadGuard {
+            inner: Arc::clone(&self.inner),
+            caller,
+            acquired_at: Instant::now(),
+        })
+    }
+
     pub(crate) fn read(&self, caller: &'static str) -> ActivityReadGuard {
         let mut state = self
             .inner

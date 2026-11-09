@@ -165,6 +165,11 @@ async fn run_repair(
     tracing::info!("[BLIND_INDEX_REPAIR] starting stale-posting repair");
 
     let restore = maintenance_support::pause_capture_for_maintenance(&app, &maintenance).await;
+    let mcp = app.state::<crate::mcp_server::McpRuntimeState>();
+    let mcp_lifecycle = mcp.lock_lifecycle().await;
+    if mcp.mode() == "unattended" {
+        crate::mcp_server::stop_server(&mcp).await;
+    }
     let result = match restore.as_ref() {
         Ok(_) => {
             let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -190,6 +195,7 @@ async fn run_repair(
         }
         Err(error) => Err(error.clone()),
     };
+    drop(mcp_lifecycle);
 
     if let Ok(restore) = restore.as_ref() {
         maintenance_support::restore_monitor_after_maintenance(&app, restore, &maintenance).await;

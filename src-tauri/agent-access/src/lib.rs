@@ -1,4 +1,8 @@
-//! Text-only storage and MCP dispatch. This crate has no archive/CNG/image API.
+//! Text-only MCP dispatch with scoped keys and read-only source queries.
+//! This crate has no CNG, screenshot loader or arbitrary file-read API.
+#[allow(dead_code)]
+#[path = "../../src/storage/blind_index.rs"]
+mod blind_index;
 pub mod dispatcher;
 mod embeddings;
 #[path = "../../src/mcp_contract.rs"]
@@ -28,6 +32,9 @@ mod search_rank;
 mod semantic_models;
 #[path = "../../src/sensitive_filter.rs"]
 pub mod sensitive_filter;
+mod source;
+#[cfg(test)]
+mod test_source;
 mod text_search;
 pub mod transport;
 pub mod types;

@@ -336,6 +336,13 @@ impl StorageState {
         self.foreground_db_activity.read("foreground_query")
     }
 
+    pub(crate) fn try_foreground_db_read(
+        &self,
+        caller: &'static str,
+    ) -> Option<connection::ActivityReadGuard> {
+        self.foreground_db_activity.try_read(caller)
+    }
+
     pub(crate) fn database_maintenance(
         &self,
         caller: &'static str,
@@ -349,6 +356,7 @@ impl StorageState {
         // independent-read drain finite.
         self.clear_search_order_cache();
         let independent_reads = self.independent_db_activity.write(caller);
+        self.agent_writer.suspend_for_maintenance();
         connection::DatabaseMaintenanceGuard::from_parts(pending, foreground, independent_reads)
     }
 
@@ -362,6 +370,7 @@ impl StorageState {
         let foreground = self.foreground_db_activity.try_write(caller)?;
         self.clear_search_order_cache();
         let independent_reads = self.independent_db_activity.try_write(caller)?;
+        self.agent_writer.suspend_for_maintenance();
         Some(connection::DatabaseMaintenanceGuard::from_parts(
             pending,
             foreground,

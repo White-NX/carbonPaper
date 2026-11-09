@@ -10,9 +10,16 @@ use std::sync::Arc;
 use tauri::Emitter;
 
 pub(super) async fn service(request: Request) -> Result<Response, String> {
+    let operation = request.operation();
     tokio::task::spawn_blocking(move || {
-        carbonpaper_app_bound::windows::transport::call(request)
-            .map_err(|e| format!("AGENT_SERVICE_UNAVAILABLE: {e}"))
+        carbonpaper_app_bound::windows::transport::call(request).map_err(|error| {
+            tracing::warn!(
+                "[APP_BOUND] agent broker operation={} result=error code={}",
+                operation,
+                error.code()
+            );
+            format!("AGENT_SERVICE_UNAVAILABLE: {error}")
+        })
     })
     .await
     .map_err(|e| e.to_string())?
