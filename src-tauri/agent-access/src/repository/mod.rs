@@ -491,13 +491,55 @@ impl AgentRepository {
     }
 
     pub fn apply(&mut self, event: &ExportEvent) -> Result<(), String> {
-        if event.dataset_id != self.binding.dataset_id
-            || event.generation != self.binding.generation
+        self.apply_batch(std::slice::from_ref(event))
+    }
+
+    pub fn apply_batch(&mut self, events: &[ExportEvent]) -> Result<(), String> {
+        self.apply_batch_with_checkpoint(events, None)
+    }
+
+    /// Publish the durable outbox position in the same transaction as its rows.
+    pub fn apply_outbox_batch(
+        &mut self,
+        events: &[ExportEvent],
+        checkpoint: i64,
+    ) -> Result<(), String> {
+        self.apply_batch_with_checkpoint(events, Some(checkpoint))
+    }
+
+    fn apply_batch_with_checkpoint(
+        &mut self,
+        events: &[ExportEvent],
+        checkpoint: Option<i64>,
+    ) -> Result<(), String> {
+        if events.is_empty() && checkpoint.is_none() {
+            return Ok(());
+        }
+        let tx = db(self.conn.transaction())?;
+        for event in events {
+            Self::apply_event(&tx, &self.key, &self.binding, event)?;
+        }
+        if let Some(revision) = events.iter().map(|event| event.revision).max() {
+            db(tx.execute("INSERT INTO agent_metadata VALUES('revision',?1) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(agent_metadata.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",[revision.to_string()]))?;
+        }
+        if let Some(checkpoint) = checkpoint {
+            db(tx.execute("INSERT INTO agent_metadata VALUES('checkpoint',?1) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(agent_metadata.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",[checkpoint.to_string()]))?;
+        }
+        db(tx.commit())
+    }
+
+    fn apply_event(
+        tx: &Connection,
+        key: &[u8],
+        binding: &AgentViewBinding,
+        event: &ExportEvent,
+    ) -> Result<(), String> {
+        if event.dataset_id != binding.dataset_id
+            || event.generation != binding.generation
             || event.revision <= 0
         {
             return Err("AGENT_DATASET_MISMATCH".into());
         }
-        let tx = db(self.conn.transaction())?;
         let revision = event.revision;
         match &event.change {
             TextChange::Put { record } => {
@@ -508,8 +550,8 @@ impl AgentRepository {
                             return Err("AGENT_INVALID_OCR_ACCESS".into());
                         }
                         source::open_key(
-                            &self.key,
-                            &self.binding,
+                            key,
+                            binding,
                             "ocr",
                             &id,
                             &v.payload_digest,
@@ -525,14 +567,7 @@ impl AgentRepository {
                         if hex::decode(&v.key_id).map_or(true, |v| v.len() != 16) {
                             return Err("AGENT_INVALID_VECTOR_ACCESS".into());
                         }
-                        source::open_key(
-                            &self.key,
-                            &self.binding,
-                            "vectors",
-                            &v.key_id,
-                            &[],
-                            &v.key_envelope,
-                        )?;
+                        source::open_key(key, binding, "vectors", &v.key_id, &[], &v.key_envelope)?;
                         db(tx.execute("INSERT INTO vector_access VALUES(?1,?2,?3) ON CONFLICT(key_id) DO UPDATE SET revision=excluded.revision,key_envelope=excluded.key_envelope WHERE vector_access.revision<excluded.revision",params![v.key_id,revision,v.key_envelope]))?;
                     }
                     TextRecord::RecapSearchAccess(v) => {
@@ -540,8 +575,8 @@ impl AgentRepository {
                             return Err("AGENT_INVALID_RECAP_ACCESS".into());
                         }
                         source::open_key(
-                            &self.key,
-                            &self.binding,
+                            key,
+                            binding,
                             "recap_search",
                             &v.key,
                             &v.payload_digest,
@@ -609,9 +644,9 @@ impl AgentRepository {
                 ))?;
             }
             TextChange::Delete { kind, key } => {
-                if Self::delete(&tx, kind, key, revision)? {
+                if Self::delete(tx, kind, key, revision)? {
                     if kind == "snapshot" {
-                        Self::delete_children(&tx, key, revision)?;
+                        Self::delete_children(tx, key, revision)?;
                     }
                     if kind == "cluster" {
                         db(tx.execute("UPDATE records SET body=NULL,revision=MAX(revision,?2) WHERE cluster_id=CAST(?1 AS INTEGER)",params![key,revision]))?;
@@ -626,15 +661,15 @@ impl AgentRepository {
             } => {
                 let id = screenshot_id.to_string();
                 if *deleted {
-                    if Self::delete(&tx, "snapshot", &id, revision)? {
-                        Self::delete_children(&tx, &id, revision)?;
+                    if Self::delete(tx, "snapshot", &id, revision)? {
+                        Self::delete_children(tx, &id, revision)?;
                     }
                 } else {
                     db(tx.execute("UPDATE records SET body=json_set(body,'$.category',?2,'$.status',?3),revision=?4 WHERE kind='snapshot' AND key=?1 AND body IS NOT NULL AND revision<?4",params![id,category,status,revision]))?;
                 }
             }
             TextChange::Gap { kind, key } => {
-                if Self::record_revision(&tx, kind, key)?.is_none_or(|v| v < revision) {
+                if Self::record_revision(tx, kind, key)?.is_none_or(|v| v < revision) {
                     db(tx.execute("INSERT INTO gaps VALUES(?1,?2,?3) ON CONFLICT(kind,key) DO UPDATE SET revision=MAX(gaps.revision,excluded.revision)",params![kind,key,revision]))?;
                 }
             }
@@ -652,8 +687,7 @@ impl AgentRepository {
             }
             TextChange::SourceChanged => {}
         }
-        db(tx.execute("INSERT INTO agent_metadata VALUES('revision',?1) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(agent_metadata.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",[revision.to_string()]))?;
-        db(tx.commit())
+        Ok(())
     }
 
     fn record_revision(conn: &Connection, kind: &str, key: &str) -> Result<Option<i64>, String> {

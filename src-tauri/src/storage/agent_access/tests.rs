@@ -192,6 +192,48 @@ fn unsuccessful_try_maintenance_keeps_agent_revision_and_readiness() {
 }
 
 #[test]
+fn failed_history_page_does_not_publish_a_prefix_or_advance_past_unprepared_ocr() {
+    let (_directory, storage, authority) = fixture();
+    seed_history(&storage);
+    {
+        let guard = storage
+            .get_connection_named("agent_test_bad_history_key")
+            .unwrap();
+        guard.as_ref().unwrap().execute(
+            "INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
+             SELECT 44,screenshot_id,'',text_enc,X'00',confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4 FROM ocr_results WHERE id=43",
+            [],
+        ).unwrap();
+    }
+    storage.begin_agent_access().unwrap();
+    assert!(storage.sync_agent_access().is_err());
+    let projected = view(&storage);
+    assert!(projected.ocr_payload_digest(43).is_err());
+    assert!(projected.ocr(42).is_err());
+    drop(projected);
+    assert_ne!(authority.lock().unwrap().phase, "ready");
+
+    {
+        let guard = storage
+            .get_connection_named("agent_test_repair_history_key")
+            .unwrap();
+        guard.as_ref().unwrap().execute(
+            "UPDATE ocr_results SET text_key_encrypted=(SELECT text_key_encrypted FROM ocr_results WHERE id=43) WHERE id=44",
+            [],
+        ).unwrap();
+    }
+    storage.sync_agent_access().unwrap();
+    let ids = view(&storage)
+        .ocr(42)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.ocr_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![43, 44]);
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+}
+
+#[test]
 fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full_text() {
     let (_directory, storage, authority) = fixture();
     let historical = seed_history(&storage);

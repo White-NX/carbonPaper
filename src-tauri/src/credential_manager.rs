@@ -1441,9 +1441,8 @@ impl Drop for CngKeyHandle {
     }
 }
 
-/// Runs the size-query + decrypt `NCryptDecrypt` pair against a borrowed key
-/// handle. The caller keeps ownership of the handle and frees it, which lets
-/// the credential state reuse the authenticated handle for all readers.
+/// Decrypts RSA material against a borrowed key handle. The caller retains
+/// ownership, so all readers reuse the authenticated handle.
 #[cfg(windows)]
 fn ncrypt_decrypt_with_key(
     key: windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE,
@@ -1465,16 +1464,13 @@ fn ncrypt_decrypt_with_key(
         }
     };
 
-    // Query plaintext size before allocating the output buffer.
+    // RSA PKCS#1 plaintext fits within the modulus-sized ciphertext buffer.
+    // A separate size query performs the private-key operation again in the
+    // Software KSP, doubling the cost of a large historical row-key backfill.
     let mut out_len: u32 = 0;
-    // SAFETY: key and ciphertext are live; the null output buffer requests only the
-    // plaintext length and `out_len` points to writable stack storage.
-    unsafe { NCryptDecrypt(key, Some(ciphertext), None, None, &mut out_len, flags) }
-        .map_err(|e| map_error("NCryptDecrypt size failed", e))?;
-
-    let mut output = vec![0u8; out_len as usize];
-    // SAFETY: output is uniquely mutable and sized from CNG's query; all handles and
-    // input/output slices remain live until the synchronous call returns.
+    let mut output = vec![0u8; ciphertext.len()];
+    // SAFETY: this handle is RSA, output is uniquely mutable and large enough
+    // for its plaintext, and all slices remain live for the synchronous call.
     unsafe {
         NCryptDecrypt(
             key,
@@ -1485,7 +1481,10 @@ fn ncrypt_decrypt_with_key(
             flags,
         )
     }
-    .map_err(|e| map_error("NCryptDecrypt failed", e))?;
+    .map_err(|e| {
+        output.zeroize();
+        map_error("NCryptDecrypt failed", e)
+    })?;
 
     output.truncate(out_len as usize);
     Ok(output)

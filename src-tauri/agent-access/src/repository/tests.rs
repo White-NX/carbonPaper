@@ -51,6 +51,45 @@ fn projection_is_independently_encrypted_and_tombstones_fence_late_callbacks() {
         .any(|v| v == b"private history fixture"));
 }
 #[test]
+fn outbox_batches_roll_back_together_and_preserve_tombstones_and_checkpoints() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("agent-memory.db");
+    let binding = binding(&path);
+    let mut repo = AgentRepository::open(&path, &[7; 32], &binding, false).unwrap();
+    let put = |revision| ExportEvent {
+        dataset_id: binding.dataset_id.clone(),
+        generation: binding.generation.clone(),
+        revision,
+        change: TextChange::Put {
+            record: TextRecord::Snapshot(SnapshotText {
+                screenshot_id: 42,
+                ..Default::default()
+            }),
+        },
+    };
+    let mut invalid = put(2);
+    invalid.generation = "c".repeat(64);
+    assert!(repo.apply_outbox_batch(&[put(1), invalid], 17).is_err());
+    assert!(repo.snapshot(42).unwrap().is_none());
+    assert_eq!(repo.checkpoint().unwrap(), 0);
+
+    let delete = ExportEvent {
+        change: TextChange::Delete {
+            kind: "snapshot".into(),
+            key: "42".into(),
+        },
+        ..put(3)
+    };
+    repo.apply_outbox_batch(&[put(1), delete, put(2)], 17)
+        .unwrap();
+    assert!(repo.snapshot(42).unwrap().is_none());
+    assert_eq!(repo.checkpoint().unwrap(), 17);
+    repo.apply_outbox_batch(&[put(2)], 16).unwrap();
+    assert!(repo.snapshot(42).unwrap().is_none());
+    assert_eq!(repo.checkpoint().unwrap(), 17);
+}
+
+#[test]
 fn outbox_cannot_cross_dataset_or_generation_and_never_contains_plaintext() {
     let binding = binding(Path::new("fixture"));
     let event = ExportEvent {

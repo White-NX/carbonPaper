@@ -2,7 +2,9 @@
 //! CNG and image keys stay here. Source triggers fence reads before committing
 //! independently encrypted authorization and projection events.
 use super::StorageState;
-use crate::credential_manager::{decrypt_with_master_key, encrypt_with_master_key};
+use crate::credential_manager::{
+    decrypt_with_master_key, encrypt_with_master_key, CredentialError, RowKeyDecryptTimings,
+};
 use carbonpaper_agent_access::{
     repository::{open_event, seal_access_key, seal_event, AgentRepository},
     types::*,
@@ -20,7 +22,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -53,6 +55,70 @@ struct Checkpoint {
     baseline: i64,
     complete: bool,
 }
+
+struct PreparationTimings {
+    kind: &'static str,
+    started: Instant,
+    last_report: Instant,
+    complete: bool,
+    processed: u64,
+    read: Duration,
+    hydrate: Duration,
+    write: Duration,
+    checkpoint: Duration,
+    outbox: Duration,
+    row_keys: RowKeyDecryptTimings,
+}
+
+impl PreparationTimings {
+    fn new(kind: &'static str) -> Self {
+        Self {
+            kind,
+            started: Instant::now(),
+            last_report: Instant::now(),
+            complete: false,
+            processed: 0,
+            read: Duration::ZERO,
+            hydrate: Duration::ZERO,
+            write: Duration::ZERO,
+            checkpoint: Duration::ZERO,
+            outbox: Duration::ZERO,
+            row_keys: RowKeyDecryptTimings::default(),
+        }
+    }
+
+    fn report(&mut self, outcome: &str) {
+        if self.kind.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "[AGENT_ACCESS] preparation phase={} outcome={} processed={} elapsed_ms={} read_ms={} hydrate_ms={} write_ms={} checkpoint_ms={} outbox_ms={} row_key_calls={} row_key_decrypt_ms={} row_key_lock_wait_ms={}",
+            self.kind, outcome, self.processed, self.started.elapsed().as_millis(),
+            self.read.as_millis(), self.hydrate.as_millis(), self.write.as_millis(),
+            self.checkpoint.as_millis(), self.outbox.as_millis(), self.row_keys.calls,
+            self.row_keys.decrypt.as_millis(), self.row_keys.lock_wait.as_millis(),
+        );
+        self.last_report = Instant::now();
+    }
+
+    fn page_finished(&mut self, complete: bool) {
+        if complete {
+            self.complete = true;
+            self.report("complete");
+        } else if self.last_report.elapsed() >= Duration::from_secs(30) {
+            self.report("running");
+        }
+    }
+}
+
+impl Drop for PreparationTimings {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.report("interrupted");
+        }
+    }
+}
+
 struct WriterKeys {
     content: Zeroizing<Vec<u8>>,
     outbox: Zeroizing<Vec<u8>>,
@@ -1039,6 +1105,7 @@ impl StorageState {
                 return Err("AUTH_REQUIRED".into());
             }
             self.agent_writer.progress_phase("preparing", None);
+            let mut timings = PreparationTimings::new("");
             while checkpoint.phase < SOURCES.len() {
                 if self.agent_maintenance_pending() {
                     return Ok(());
@@ -1051,38 +1118,66 @@ impl StorageState {
                 }
                 let source = &SOURCES[checkpoint.phase];
                 let kind = source.kind;
+                if timings.kind != kind {
+                    timings = PreparationTimings::new(kind);
+                }
+                let read_started = Instant::now();
                 let rows = self.agent_source_page(source, &checkpoint.cursor, None)?;
-                if rows.is_empty() {
+                timings.read += read_started.elapsed();
+                let complete = rows.is_empty();
+                if complete {
                     checkpoint.phase += 1;
                     checkpoint.cursor.clear();
                 } else {
-                    for (key, value) in rows {
-                        let records = self.hydrate_agent_record(kind, value)?;
+                    let processed = rows.len() as u64;
+                    let cursor = rows.last().unwrap().0.clone();
+                    let mut events = Vec::with_capacity(rows.len());
+                    let hydrate_started = Instant::now();
+                    for (_, value) in rows {
+                        let records =
+                            self.hydrate_agent_record(kind, value, &mut timings.row_keys)?;
                         for record in records {
-                            repo.apply(&ExportEvent {
+                            events.push(ExportEvent {
                                 dataset_id: binding.dataset_id.clone(),
                                 generation: binding.generation.clone(),
                                 revision: checkpoint.baseline,
                                 change: TextChange::Put { record },
-                            })?;
+                            });
                         }
-                        checkpoint.cursor = key;
-                        self.agent_writer
-                            .progress
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .processed += 1;
                     }
+                    timings.hydrate += hydrate_started.elapsed();
+                    if self.agent_writer.cancelled.load(Ordering::Acquire) {
+                        return Err("AGENT_CANCELLED".into());
+                    }
+                    if !self.is_session_valid() {
+                        return Err("AUTH_REQUIRED".into());
+                    }
+                    let write_started = Instant::now();
+                    repo.apply_batch(&events)?;
+                    timings.write += write_started.elapsed();
+                    timings.processed += processed;
+                    checkpoint.cursor = cursor;
+                    self.agent_writer
+                        .progress
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .processed += processed;
                 }
+                let checkpoint_started = Instant::now();
                 self.save_agent_checkpoint(&checkpoint)?;
+                timings.checkpoint += checkpoint_started.elapsed();
                 // Keep source updates moving between snapshot pages.
+                let outbox_started = Instant::now();
                 self.apply_agent_outbox(&binding, &mut repo)?;
+                timings.outbox += outbox_started.elapsed();
+                timings.page_finished(complete);
             }
             checkpoint.complete = true;
             self.save_agent_checkpoint(&checkpoint)?;
         }
         self.apply_agent_outbox(&binding, &mut repo)?;
         if self.is_session_valid() {
+            let mut row_key_timings = RowKeyDecryptTimings::default();
             for (kind, key, revision) in repo.gaps()? {
                 if self.agent_maintenance_pending() {
                     return Ok(());
@@ -1106,7 +1201,9 @@ impl StorageState {
                     })?;
                 } else {
                     for (_, value) in rows {
-                        for record in self.hydrate_agent_record(&kind, value)? {
+                        for record in
+                            self.hydrate_agent_record(&kind, value, &mut row_key_timings)?
+                        {
                             repo.apply(&ExportEvent {
                                 dataset_id: binding.dataset_id.clone(),
                                 generation: binding.generation.clone(),
@@ -1305,24 +1402,32 @@ impl StorageState {
             if rows.is_empty() {
                 break;
             }
-            let mut last = 0;
-            for (id, bytes) in rows {
+            let last = rows.last().unwrap().0;
+            let outbox_key = {
+                let keys = self
+                    .agent_writer
+                    .keys
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                keys.as_ref()
+                    .ok_or("AGENT_WRITE_KEY_UNAVAILABLE")?
+                    .outbox
+                    .clone()
+            };
+            let mut events = Vec::with_capacity(rows.len());
+            for (_, bytes) in rows {
                 if self.agent_writer.cancelled.load(Ordering::Acquire) {
                     return Err("AGENT_CANCELLED".into());
                 }
-                let event = {
-                    let keys = self
-                        .agent_writer
-                        .keys
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let keys = keys.as_ref().ok_or("AGENT_WRITE_KEY_UNAVAILABLE")?;
-                    open_event(&keys.outbox, binding, &bytes)?
-                };
-                repo.apply(&event)?;
-                repo.set_checkpoint(id)?;
-                last = id;
+                events.push(open_event(&outbox_key, binding, &bytes)?);
             }
+            if self.agent_maintenance_pending() {
+                return Ok(());
+            }
+            if self.agent_writer.cancelled.load(Ordering::Acquire) {
+                return Err("AGENT_CANCELLED".into());
+            }
+            repo.apply_outbox_batch(&events, last)?;
             let guard = self.get_connection_named("agent_ack_outbox")?;
             db(guard
                 .as_ref()
@@ -1371,6 +1476,7 @@ impl StorageState {
         &self,
         kind: &str,
         mut value: Value,
+        timings: &mut RowKeyDecryptTimings,
     ) -> Result<Vec<TextRecord>, String> {
         if kind == "ocr" || kind == "vector_key" || (kind == "recap" && value["part"] == "search") {
             if !self.is_session_valid() {
@@ -1381,20 +1487,15 @@ impl StorageState {
                 .filter(|s| !s.is_empty())
                 .ok_or("AGENT_INVALID_SOURCE")?;
             let wrapped = hex::decode(encoded).map_err(|_| "AGENT_INVALID_SOURCE")?;
-            let raw_key = Zeroizing::new(
-                if kind == "vector_key" {
-                    crate::credential_manager::unwrap_storage_domain_key(
-                        &self.credential_state,
-                        &wrapped,
-                    )
-                } else {
-                    crate::credential_manager::decrypt_row_key_with_cng(
-                        &self.credential_state,
-                        &wrapped,
-                    )
-                }
-                .map_err(|e| e.to_string())?,
-            );
+            let raw_key = Zeroizing::new(if kind == "vector_key" {
+                crate::credential_manager::unwrap_storage_domain_key(
+                    &self.credential_state,
+                    &wrapped,
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                self.unwrap_agent_history_key(&wrapped, timings)?
+            });
             let (domain, id, digest) = if kind == "vector_key" {
                 (
                     "vectors",
@@ -1455,13 +1556,10 @@ impl StorageState {
                     .filter(|s| !s.is_empty());
                 if let Some(encoded) = encoded {
                     if row_key.is_none() {
-                        row_key = Some(Zeroizing::new(
-                            crate::credential_manager::decrypt_row_key_with_cng(
-                                &self.credential_state,
-                                key.as_deref().ok_or("AGENT_INVALID_SOURCE")?,
-                            )
-                            .map_err(|e| e.to_string())?,
-                        ));
+                        row_key = Some(Zeroizing::new(self.unwrap_agent_history_key(
+                            key.as_deref().ok_or("AGENT_INVALID_SOURCE")?,
+                            timings,
+                        )?));
                     }
                     let bytes = hex::decode(encoded).map_err(|_| "AGENT_INVALID_SOURCE")?;
                     let plain = Zeroizing::new(
@@ -1478,10 +1576,11 @@ impl StorageState {
                 value["links_enc"].as_str().filter(|s| !s.is_empty()),
                 value["links_key"].as_str().filter(|s| !s.is_empty()),
             ) {
-                let plain = Zeroizing::new(self.decrypt_payload_with_row_key(
+                let plain = self.decrypt_agent_history_payload(
                     &hex::decode(data).map_err(|_| "AGENT_INVALID_SOURCE")?,
                     &hex::decode(key).map_err(|_| "AGENT_INVALID_SOURCE")?,
-                )?);
+                    timings,
+                )?;
                 let links: Vec<TextLink> =
                     serde_json::from_slice(&plain).map_err(|_| "AGENT_INVALID_SOURCE")?;
                 value["visible_links"] = json!(links);
@@ -1490,10 +1589,11 @@ impl StorageState {
             let data = value["data_enc"].as_str().filter(|s| !s.is_empty());
             let key = value["key_enc"].as_str().filter(|s| !s.is_empty());
             if let (Some(data), Some(key)) = (data, key) {
-                let plain = Zeroizing::new(self.decrypt_payload_with_row_key(
+                let plain = self.decrypt_agent_history_payload(
                     &hex::decode(data).map_err(|_| "AGENT_INVALID_SOURCE")?,
                     &hex::decode(key).map_err(|_| "AGENT_INVALID_SOURCE")?,
-                )?);
+                    timings,
+                )?;
                 value[if kind == "ocr" { "text" } else { "content" }] =
                     json!(String::from_utf8(plain.to_vec()).map_err(|_| "AGENT_INVALID_SOURCE")?);
             }
@@ -1502,6 +1602,36 @@ impl StorageState {
             return Err("AUTH_REQUIRED".into());
         }
         Ok(vec![decode_projection(kind, value)?])
+    }
+
+    fn unwrap_agent_history_key(
+        &self,
+        wrapped: &[u8],
+        timings: &mut RowKeyDecryptTimings,
+    ) -> Result<Vec<u8>, String> {
+        crate::credential_manager::decrypt_row_key_with_cng_measured(
+            &self.credential_state,
+            wrapped,
+            timings,
+            &|| self.agent_writer.cancelled.load(Ordering::Acquire),
+        )
+        .map_err(|error| match error {
+            CredentialError::AuthRequired => "AUTH_REQUIRED".into(),
+            _ => error.to_string(),
+        })?
+        .ok_or_else(|| "AGENT_CANCELLED".into())
+    }
+
+    fn decrypt_agent_history_payload(
+        &self,
+        encrypted: &[u8],
+        wrapped: &[u8],
+        timings: &mut RowKeyDecryptTimings,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        let key = Zeroizing::new(self.unwrap_agent_history_key(wrapped, timings)?);
+        decrypt_with_master_key(&key, encrypted)
+            .map(Zeroizing::new)
+            .map_err(|error| error.to_string())
     }
     pub(super) fn write_agent_policy(
         &self,

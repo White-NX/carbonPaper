@@ -174,7 +174,10 @@ CLIP scans read vectors in bounded pages.
 Events commit alongside source changes. Revision fencing, tombstones and
 source deletion checks prevent older callbacks from overwriting newer records
 or reviving deleted children. Historical preparation uses a persistent checkpoint
-and drains concurrent updates between pages. It pauses on lock, cancellation or
+and commits each bounded source page in one Agent transaction. Outbox batches
+commit their record updates and applied position together. Preparation drains
+concurrent updates between pages and logs cumulative phase, row-key, read and
+write timings at bounded intervals. It pauses on lock, cancellation or
 maintenance. The main database must remain available; missing files, mismatched
 datasets or changed ciphertext fail the read rather than return a stale copy.
 

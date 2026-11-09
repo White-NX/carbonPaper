@@ -164,6 +164,19 @@ pub(crate) fn reopen_storage_credentials(
 }
 
 #[test]
+fn native_rsa_decryption_preserves_plaintext_lengths_and_rejects_truncated_ciphertext() {
+    let key = ephemeral_key();
+    for length in [1, MASTER_KEY_LEN, 96] {
+        let plaintext = vec![7; length];
+        let ciphertext = wrap_for_test(&key, &plaintext);
+        assert_eq!(key.unwrap_row_key(&ciphertext).unwrap(), plaintext);
+        assert!(key
+            .unwrap_row_key(&ciphertext[..ciphertext.len() / 2])
+            .is_err());
+    }
+}
+
+#[test]
 fn public_export_can_open_before_enforcing_silence_on_public_operations() {
     let key = ephemeral_key();
     let expected = public_blob(&key);
