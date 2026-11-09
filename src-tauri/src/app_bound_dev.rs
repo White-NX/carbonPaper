@@ -16,7 +16,10 @@ pub fn initialize() -> Result<(), String> {
         .status()
         .map_err(|e| format!("Cannot prepare development components: {e}"))?;
     if !status.success() {
-        return Err("Development component build failed; see the debug terminal".into());
+        return Err(format!(
+            "Development component build failed: exit_code={}; see the debug terminal",
+            status.code().unwrap_or(-1)
+        ));
     }
     let package = development::prepare_package(env!("CARGO_PKG_VERSION"))?;
     let (_, package_id) = manifest::read_manifest(&package).map_err(|e| e.to_string())?;
@@ -31,7 +34,8 @@ pub fn initialize() -> Result<(), String> {
         eprintln!(
             "[app-bound dev] Registering this debug build with the isolated Windows service..."
         );
-        development::install_package(&package, false)?;
+        development::install_package(&package, false)
+            .map_err(|e| format!("Development component registration failed: {e}"))?;
     }
     windows::call(Request::Status {})
         .map_err(|e| format!("Development service handshake failed: {e}"))?;

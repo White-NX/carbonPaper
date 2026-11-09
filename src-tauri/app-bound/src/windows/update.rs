@@ -606,6 +606,7 @@ pub fn run(args: &[String]) -> Result<()> {
     locks.pin(&source)?;
     let current = read_release(destination, manifest::RELEASE_PUBLIC_KEY)?;
     let release = read_release(&source, manifest::RELEASE_PUBLIC_KEY)?;
+    release.manifest.validate_for_install()?;
     if release.manifest.version != args[5]
         || semver::Version::parse(&release.manifest.version)
             .map_err(|_| BrokerError::VersionMismatch)?

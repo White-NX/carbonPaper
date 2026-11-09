@@ -114,6 +114,43 @@ fn fixture() -> Fixture {
 }
 
 #[test]
+fn signed_update_accepts_a_legacy_v1_installation_and_adds_the_reader() {
+    let fixture = fixture();
+    let mut legacy = fixture.release.manifest.clone();
+    legacy.version = "1.2.2".into();
+    legacy.files.remove("carbonpaper-mcp-reader.exe");
+    for (name, hash) in &mut legacy.files {
+        *hash = hex::encode(Sha256::digest(
+            fs::read(fixture.destination.join(name)).unwrap(),
+        ));
+    }
+    fs::remove_file(fixture.destination.join("carbonpaper-mcp-reader.exe")).unwrap();
+    let current = write_signed_release(&fixture.destination, &legacy);
+    assert!(!current
+        .manifest
+        .files
+        .contains_key("carbonpaper-mcp-reader.exe"));
+    fixture.release.manifest.validate_for_install().unwrap();
+
+    let mut transaction =
+        Transaction::prepare(&fixture.source, &fixture.destination, &fixture.release).unwrap();
+    transaction.commit().unwrap();
+    transaction.finish();
+    drop(transaction);
+
+    let installed = read_release(&fixture.destination, &fixture.key).unwrap();
+    assert_eq!(installed.manifest.version, "1.2.3");
+    assert_eq!(
+        fs::read(fixture.destination.join("carbonpaper-mcp-reader.exe")).unwrap(),
+        b"new carbonpaper-mcp-reader.exe"
+    );
+    assert_eq!(
+        fs::read(fixture.destination.join("user-data.txt")).unwrap(),
+        b"preserve this"
+    );
+}
+
+#[test]
 fn changed_source_is_rejected_before_any_installed_file_changes() {
     let fixture = fixture();
     fs::write(

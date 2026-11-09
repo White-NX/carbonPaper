@@ -82,6 +82,45 @@ impl BrokerError {
             Self::LimitExceeded => "app_bound_limit_exceeded",
         }
     }
+
+    /// Fixed setup-process exit codes preserve the cause across UAC, where
+    /// the desktop cannot capture the elevated helper's stderr.
+    pub const fn setup_exit_code(self) -> i32 {
+        match self {
+            Self::Unavailable => 20,
+            Self::AccessDenied => 21,
+            Self::InvalidRequest => 22,
+            Self::Disabled => 23,
+            Self::DatasetMismatch => 24,
+            Self::Retired => 25,
+            Self::LeaseExpired => 26,
+            Self::Busy => 27,
+            Self::Integrity => 28,
+            Self::Storage => 29,
+            Self::Protection => 30,
+            Self::VersionMismatch => 31,
+            Self::LimitExceeded => 32,
+        }
+    }
+
+    pub const fn from_setup_exit_code(code: i32) -> Option<Self> {
+        match code {
+            20 => Some(Self::Unavailable),
+            21 => Some(Self::AccessDenied),
+            22 => Some(Self::InvalidRequest),
+            23 => Some(Self::Disabled),
+            24 => Some(Self::DatasetMismatch),
+            25 => Some(Self::Retired),
+            26 => Some(Self::LeaseExpired),
+            27 => Some(Self::Busy),
+            28 => Some(Self::Integrity),
+            29 => Some(Self::Storage),
+            30 => Some(Self::Protection),
+            31 => Some(Self::VersionMismatch),
+            32 => Some(Self::LimitExceeded),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, BrokerError>;
@@ -590,6 +629,34 @@ pub fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_exit_codes_preserve_errors_and_do_not_guess_legacy_failures() {
+        for error in [
+            BrokerError::Unavailable,
+            BrokerError::AccessDenied,
+            BrokerError::InvalidRequest,
+            BrokerError::Disabled,
+            BrokerError::DatasetMismatch,
+            BrokerError::Retired,
+            BrokerError::LeaseExpired,
+            BrokerError::Busy,
+            BrokerError::Integrity,
+            BrokerError::Storage,
+            BrokerError::Protection,
+            BrokerError::VersionMismatch,
+            BrokerError::LimitExceeded,
+        ] {
+            assert_eq!(
+                BrokerError::from_setup_exit_code(error.setup_exit_code()),
+                Some(error)
+            );
+        }
+        assert_eq!(BrokerError::from_setup_exit_code(0), None);
+        assert_eq!(BrokerError::from_setup_exit_code(1), None);
+        assert_eq!(BrokerError::from_setup_exit_code(-1), None);
+    }
+
     #[test]
     fn consumer_capabilities_preserve_legacy_v1_status_and_bit_assignments() {
         let legacy = serde_json::json!({

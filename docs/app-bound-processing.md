@@ -442,18 +442,38 @@ checks that creation and repair both restore the restart policy, including the
 `SERVICE_START` access required to configure `SC_ACTION_RESTART` on an existing
 service handle.
 
-The protected runtime now has two complementary logs:
+The protected runtime has three complementary logs:
 
 | Process | Location | Contents |
 | --- | --- | --- |
 | Desktop application | The active data directory under `logs/<date>/carbonpaper.log` | Client-side broker operation, consumer and redacted error code |
 | Key service | `%ProgramData%/CarbonPaperKeyService/State/logs/service.log` | Service lifecycle, fixed request operation, request stage and redacted error code |
+| Elevated setup helper | `%ProgramFiles%/CarbonPaper/Protected/System/logs/setup.log` | Installation stage, rollback and redacted error code; readable by ordinary users |
+
+The development setup log uses
+`%ProgramFiles%/CarbonPaperDev-<instance>/Protected/System/logs/setup.log`.
+The desktop startup entry records the applicable setup-log path and replays
+initialization/delegation failures that occurred before file logging started.
+Setup failures also return fixed exit codes (20–32) through UAC, so the desktop
+records the underlying broker error even when it cannot capture elevated stderr.
+Unknown exit codes from older helpers remain explicitly unknown.
+
+Installed v1 manifests retain their original component requirements, including
+when checking the previous owner or machine-wide service registration during
+upgrade. New installation/update sources additionally require
+`carbonpaper-mcp-reader.exe`. This allows a signed pre-reader release to be
+authenticated and upgraded without treating its missing new component as
+corruption; signature, checksum, path and version checks still apply.
 
 The service log is best-effort and rotates at 4 MiB to `service.log.1`. A logging
 failure never changes broker behavior. It deliberately excludes keys, wrapped-key
 blobs, OCR text, images, complete SIDs, task/dataset/lease identifiers, paths and
 request JSON. Fixed event and stage names are suitable for diagnosis; the log is
 not an audit ledger.
+
+The setup log follows the same fixed-field and size limits, rotating to
+`setup.log.1`. The service ledger and its logs retain their administrator/SYSTEM
+permissions.
 
 Failed requests and connections include `total_ms`, `verify_ms`,
 `ledger_wait_ms`, `worker_wait_ms` and `ledger_exec_ms`. Successful connections

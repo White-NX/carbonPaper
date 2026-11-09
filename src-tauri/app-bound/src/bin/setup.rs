@@ -5,7 +5,7 @@ fn main() {
         let result = run();
         if let Err(error) = result {
             eprintln!("{error}");
-            std::process::exit(1);
+            std::process::exit(error.setup_exit_code());
         }
     }
     #[cfg(not(windows))]

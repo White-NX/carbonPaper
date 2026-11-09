@@ -231,7 +231,7 @@ pub fn prepare_package(version: &str) -> std::result::Result<PathBuf, String> {
             service_protocol: PROTOCOL_VERSION,
             files,
         };
-        release.validate()?;
+        release.validate_for_install()?;
         let bytes = serde_json::to_vec(&release).map_err(|_| BrokerError::Integrity)?;
         let encoded = Zeroizing::new(manifest::read_bounded(&root.join("signing-seed.txt"), 256)?);
         let seed = Zeroizing::new(
@@ -307,7 +307,7 @@ pub fn install_package(source: &Path, enable: bool) -> std::result::Result<PathB
         }
     })?;
     if !status.success() {
-        return Err("APP_BOUND_INSTALL_FAILED".into());
+        return Err(crate::windows::install::setup_failure_message(status));
     }
     identity::active_runtime()
         .map_err(|e| e.to_string())?

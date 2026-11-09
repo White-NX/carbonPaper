@@ -5,6 +5,7 @@ use crate::{
     manifest::{self, ReleaseManifest, MANIFEST_NAME, SIGNATURE_NAME},
     protocol::*,
     windows::{
+        diagnostics,
         identity::*,
         service::{self, ServiceHandle},
     },
@@ -29,6 +30,31 @@ pub struct InstallOptions {
     pub source: PathBuf,
     pub caller_pid: u32,
     pub enable: bool,
+}
+
+pub fn setup_log_path() -> Result<PathBuf> {
+    Ok(protected_root()?.join("System/logs/setup.log"))
+}
+
+pub fn setup_failure_message(status: std::process::ExitStatus) -> String {
+    let error = status.code().and_then(BrokerError::from_setup_exit_code);
+    format!(
+        "APP_BOUND_INSTALL_FAILED: code={} exit_code={}",
+        error.map_or("unknown", BrokerError::code),
+        status.code().unwrap_or(-1)
+    )
+}
+
+fn init_setup_diagnostics() {
+    let Ok(root) = protected_root() else {
+        return;
+    };
+    let system = root.join("System");
+    // Never create logging paths below an unverified or user-writable root.
+    // Initial installation retries this after preparing the protected roots.
+    if assert_protected(&system).is_ok() && ensure_directory(&system.join("logs"), true).is_ok() {
+        diagnostics::init_setup(&system);
+    }
 }
 
 /// Unelevated restart helper. It can only launch this user's registered main
@@ -79,18 +105,36 @@ pub fn launch_after(pid: u32) -> Result<()> {
 }
 
 pub fn install(options: InstallOptions) -> Result<PathBuf> {
+    let mut stage = "authorize_installer";
+    let result = install_at_stage(options, &mut stage);
+    match &result {
+        Ok(_) => diagnostics::event("info", "install_completed", stage, None),
+        Err(error) => diagnostics::event("error", "install_failed", stage, Some(*error)),
+    }
+    result
+}
+
+fn install_at_stage(options: InstallOptions, stage: &mut &'static str) -> Result<PathBuf> {
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
+    init_setup_diagnostics();
+    diagnostics::event("info", "install_started", "authorize_installer", None);
+    *stage = "canonicalize_source";
     let source = options
         .source
         .canonicalize()
         .map_err(|_| BrokerError::Integrity)?;
+    *stage = "read_source_manifest";
     let (manifest, runtime_id) = manifest::read_manifest(&source)?;
+    *stage = "validate_source_components";
+    manifest.validate_for_install()?;
+    *stage = "inspect_caller";
     let caller = inspect_process(options.caller_pid)?;
     let sid = caller.principal.sid.clone();
     // Updates may be requested by a previously verified protected release;
     // initial activation must originate in this exact signed release folder.
+    *stage = "verify_caller";
     if verify_main(inspect_process(options.caller_pid)?).is_err() {
         #[cfg(feature = "development-runtime")]
         crate::development::verify_bootstrap_caller(&caller, &source, &manifest)?;
@@ -111,6 +155,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     }
     let root = protected_root()?;
     let state = state_root()?;
+    *stage = "prepare_runtime_directories";
     for path in [
         root.parent().unwrap().to_path_buf(),
         root.clone(),
@@ -120,9 +165,12 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     ] {
         ensure_directory(&path, true)?;
     }
+    init_setup_diagnostics();
+    *stage = "prepare_state_directories";
     for path in [state.parent().unwrap().to_path_buf(), state.clone()] {
         ensure_directory(&path, false)?;
     }
+    *stage = "lock_setup";
     let _lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -133,6 +181,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         .map_err(|_| BrokerError::Busy)?;
     let destination = root.join("Runtime").join(&runtime_id);
     if !destination.exists() {
+        *stage = "stage_runtime";
         let staging = root
             .join("Runtime")
             .join(format!("installing-{}", &random_id()[..16]));
@@ -149,14 +198,19 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         }
         copied?;
     } else {
+        *stage = "repair_runtime";
         assert_protected(&destination)?;
         repair_runtime(&source, &destination, &manifest, &runtime_id)?;
     }
+    *stage = "open_ledger";
     let mut ledger = Ledger::open(&state.join("keys.db"))?;
+    *stage = "read_owner_registration";
     let previous = ledger.owner_registration(&sid)?;
     if let Some((old_id, _)) = &previous {
         let old_root = root.join("Runtime").join(old_id);
+        *stage = "read_previous_runtime_manifest";
         let (old_manifest, _) = manifest::read_manifest(&old_root)?;
+        *stage = "check_previous_runtime_version";
         if semver::Version::parse(&manifest.version).map_err(|_| BrokerError::VersionMismatch)?
             < semver::Version::parse(&old_manifest.version)
                 .map_err(|_| BrokerError::VersionMismatch)?
@@ -165,10 +219,12 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         }
     }
     let activation_path = root.join("Activations").join(format!("{sid}.json"));
+    *stage = "read_activation";
     let old_activation = read_optional(&activation_path, 1024)?;
     let service_path = root.join("System").join("carbonpaper-key-service.exe");
     let setup_path = root.join("System").join("carbonpaper-protected-setup.exe");
     let service_registration = root.join("System").join("runtime.json");
+    *stage = "read_service_registration";
     let old_service_registration = read_optional(&service_registration, 1024)?;
     let replace_service = if let Some(bytes) = &old_service_registration {
         let installed: Activation =
@@ -178,16 +234,19 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         }
         let installed_dir = root.join("Runtime").join(&installed.runtime_id);
         assert_protected(&installed_dir)?;
+        *stage = "read_service_runtime_manifest";
         let (current, current_id) = manifest::read_manifest(&installed_dir)?;
         if current_id != installed.runtime_id {
             return Err(BrokerError::Integrity);
         }
         // One machine-wide service serves several users. Activating an older
         // portable package must not downgrade another user's service binary.
+        *stage = "check_service_runtime_version";
         semver::Version::parse(&manifest.version).map_err(|_| BrokerError::VersionMismatch)?
             >= semver::Version::parse(&current.version).map_err(|_| BrokerError::VersionMismatch)?
     } else {
         if service_path.exists() {
+            *stage = "verify_unregistered_service";
             // A missing registration can be repaired from the same signed
             // service, but cannot turn a corrupt marker into a downgrade path.
             verify_file(
@@ -205,23 +264,30 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     let old_setup = (replace_service && setup_path.exists())
         .then(|| root.join("System").join("setup.previous"));
     if let Some(backup) = &old_service {
+        *stage = "backup_service";
         copy_trusted(&service_path, backup)?;
     }
     if let Some(backup) = &old_setup {
+        *stage = "backup_setup";
         copy_trusted(&setup_path, backup)?;
     }
+    *stage = "query_service";
     let service_existed = service::try_open_service(SERVICE_QUERY_STATUS)?.is_some();
     let result = (|| {
+        *stage = "stop_service";
         stop_service()?;
         if replace_service {
+            *stage = "replace_service";
             copy_trusted(
                 &destination.join("carbonpaper-key-service.exe"),
                 &service_path,
             )?;
+            *stage = "replace_setup";
             copy_trusted(
                 &destination.join("carbonpaper-protected-setup.exe"),
                 &setup_path,
             )?;
+            *stage = "write_service_registration";
             atomic_write(
                 &service_registration,
                 &serde_json::to_vec(&Activation {
@@ -230,17 +296,22 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
                 .map_err(|_| BrokerError::Storage)?,
             )?;
         }
+        *stage = "configure_service";
         configure_service(&service_path)?;
+        *stage = "register_owner";
         ledger.register_owner(&sid, &runtime_id, options.enable)?;
         let activation = serde_json::to_vec(&Activation {
             runtime_id: runtime_id.clone(),
         })
         .map_err(|_| BrokerError::Storage)?;
+        *stage = "write_activation";
         atomic_write(&activation_path, &activation)?;
+        *stage = "start_service";
         start_service()?;
         Ok(())
     })();
     if let Err(error) = result {
+        diagnostics::event("warn", "install_rollback", stage, Some(error));
         // Restore registration only, never rewind the task/key database.
         let _ = stop_service();
         let _ = ledger.restore_registration(&sid, previous);

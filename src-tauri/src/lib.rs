@@ -814,6 +814,7 @@ pub fn run() {
     }
     let data_dir = get_data_dir();
     let _log_guard = logging::init_logging(&data_dir);
+    app_bound::log_startup_diagnostics();
 
     // Resolve the journal-mode override once. The resulting policy is carried by
     // StorageState so reopens after restore or directory migration cannot

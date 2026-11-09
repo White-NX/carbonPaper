@@ -25,6 +25,9 @@ pub const PRODUCT: &str = "carbonpaper";
 pub const PRODUCT: &str = "carbonpaper-development";
 
 #[cfg(not(feature = "development-runtime"))]
+// These are the original v1 requirements. Installed manifests must remain
+// readable when a newer package adds a component; authenticate the old release
+// before comparing versions or replacing its service.
 const REQUIRED_FILES: &[&str] = &[
     "carbonpaper.exe",
     "carbonpaper-key-service.exe",
@@ -33,14 +36,12 @@ const REQUIRED_FILES: &[&str] = &[
     "carbonpaper-ml.exe",
     "carbonpaper-office.exe",
     "carbonpaper-nmh.exe",
-    "carbonpaper-mcp-reader.exe",
 ];
 #[cfg(feature = "development-runtime")]
 const REQUIRED_FILES: &[&str] = &[
     "carbonpaper-key-service.exe",
     "carbonpaper-protected-setup.exe",
     "development-client.json",
-    "carbonpaper-mcp-reader.exe",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +78,16 @@ impl ReleaseManifest {
             if !valid_id(hash) || !names.insert(path.to_ascii_lowercase()) {
                 return Err(BrokerError::Integrity);
             }
+        }
+        Ok(())
+    }
+
+    /// New install/update sources include the reader. This requirement must
+    /// not be applied while authenticating a previously installed v1 release.
+    pub fn validate_for_install(&self) -> Result<()> {
+        self.validate()?;
+        if !self.files.contains_key("carbonpaper-mcp-reader.exe") {
+            return Err(BrokerError::Integrity);
         }
         Ok(())
     }
@@ -177,6 +188,75 @@ pub fn safe_relative_path(value: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn signed_legacy_v1_runtime_remains_readable_during_upgrade() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let legacy_files: &[&str] = if cfg!(feature = "development-runtime") {
+            &[
+                "carbonpaper-key-service.exe",
+                "carbonpaper-protected-setup.exe",
+                "development-client.json",
+            ]
+        } else {
+            &[
+                "carbonpaper.exe",
+                "carbonpaper-key-service.exe",
+                "carbonpaper-protected-setup.exe",
+                "carbonpaper-semantic-worker.exe",
+                "carbonpaper-ml.exe",
+                "carbonpaper-office.exe",
+                "carbonpaper-nmh.exe",
+            ]
+        };
+        let manifest = ReleaseManifest {
+            format: 1,
+            product: PRODUCT.into(),
+            version: "0.9.1".into(),
+            architecture: "x86_64".into(),
+            service_protocol: PROTOCOL_VERSION,
+            files: legacy_files
+                .iter()
+                .map(|name| ((*name).into(), "a".repeat(64)))
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut payload = SIGNING_CONTEXT.to_vec();
+        payload.extend_from_slice(&bytes);
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(key.sign(&payload).to_bytes());
+        let public_key =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+
+        assert!(
+            verify_manifest(&bytes, &signature, &public_key).is_ok(),
+            "an upgrade must be able to authenticate the previously installed v1 runtime"
+        );
+    }
+
+    #[test]
+    fn new_install_sources_require_the_reader_and_original_components() {
+        let mut manifest = ReleaseManifest {
+            format: 1,
+            product: PRODUCT.into(),
+            version: "0.9.1".into(),
+            architecture: "x86_64".into(),
+            service_protocol: PROTOCOL_VERSION,
+            files: REQUIRED_FILES
+                .iter()
+                .map(|name| ((*name).into(), "a".repeat(64)))
+                .collect(),
+        };
+        assert_eq!(manifest.validate_for_install(), Err(BrokerError::Integrity));
+        manifest
+            .files
+            .insert("carbonpaper-mcp-reader.exe".into(), "b".repeat(64));
+        manifest.validate_for_install().unwrap();
+        manifest.files.remove("carbonpaper-key-service.exe");
+        assert_eq!(manifest.validate(), Err(BrokerError::Integrity));
+        assert_eq!(manifest.validate_for_install(), Err(BrokerError::Integrity));
+    }
+
     #[test]
     fn signature_covers_all_files_and_rejects_update_manifest_reuse() {
         let key = SigningKey::from_bytes(&[7; 32]);

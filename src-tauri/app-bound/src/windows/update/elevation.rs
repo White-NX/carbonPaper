@@ -446,6 +446,7 @@ pub fn run_elevated(args: &[String]) -> Result<()> {
     let destination = caller.image.parent().ok_or(BrokerError::Integrity)?;
     let _parents = verify_destination(destination)?;
     let release = read_release(&source, manifest::RELEASE_PUBLIC_KEY)?;
+    release.manifest.validate_for_install()?;
     let current = read_release(destination, manifest::RELEASE_PUBLIC_KEY)?;
     if hex::encode(Sha256::digest(&release.bytes)) != args[11]
         || release.manifest.version != args[7]

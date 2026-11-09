@@ -17,6 +17,35 @@ static REPAIR_OFFER_DISMISSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static PROTECTED_ENVIRONMENT_READY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static STARTUP_FAILURE: std::sync::OnceLock<(&'static str, String)> = std::sync::OnceLock::new();
+
+/// Delegation precedes the application's logging subscriber. Replay recovery
+/// failures once it exists so the terminal is not their only diagnostic sink.
+pub(crate) fn log_startup_diagnostics() {
+    let setup_log = carbonpaper_app_bound::windows::install::setup_log_path()
+        .map_or_else(|_| "unavailable".into(), |path| path.display().to_string());
+    tracing::info!(
+        "[APP_BOUND] startup build={} service={} initialized={} repair_needed={} setup_log={}",
+        if cfg!(feature = "app-bound-dev") {
+            "development-service"
+        } else if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        carbonpaper_app_bound::protocol::SERVICE_NAME,
+        protected_environment_ready(),
+        REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire),
+        setup_log,
+    );
+    if let Some((stage, error)) = STARTUP_FAILURE.get() {
+        tracing::error!(
+            "[APP_BOUND] startup result=error stage={} error={}",
+            stage,
+            error
+        );
+    }
+}
 
 #[derive(serde::Serialize)]
 pub struct AppBoundStatus {
@@ -116,6 +145,7 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
                 }
                 Err(error) => {
                     eprintln!("[app-bound dev] {error}");
+                    let _ = STARTUP_FAILURE.set(("development_initialization", error));
                     REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
@@ -154,10 +184,11 @@ fn delegate_startup_in_directory(
     }
     match delegate() {
         Ok(result) => Ok(result),
-        Err(_) => {
+        Err(error) => {
             // Keep archive capture and repair usable after delegation failures.
             // A protected copy reaches this only after successful sanitization;
             // failed delegation never enables its broker access.
+            let _ = STARTUP_FAILURE.set(("delegate_runtime", error));
             REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Release);
             Ok(false)
         }
@@ -269,9 +300,10 @@ pub async fn app_bound_status(
             processing.reason = Some("repair_required".into());
         }
         let package_available = supported_build()
-            && installation_source()
-                .ok()
-                .is_some_and(|dir| manifest::read_manifest(&dir).is_ok());
+            && installation_source().ok().is_some_and(|dir| {
+                manifest::read_manifest(&dir)
+                    .is_ok_and(|(release, _)| release.validate_for_install().is_ok())
+            });
         let offer_enable = package_available
             && ((repair && !REPAIR_OFFER_DISMISSED.load(std::sync::atomic::Ordering::Acquire))
                 || (storage.background_processing_enabled()
@@ -353,8 +385,11 @@ pub(crate) async fn install_runtime(source: PathBuf, enable: bool) -> Result<(),
         move || carbonpaper_app_bound::development::install_package(&source, enable).map(|_| ());
     #[cfg(not(feature = "app-bound-dev"))]
     let action = move || {
-        let (release, _) =
-            manifest::read_manifest(&source).map_err(|_| "APP_BOUND_PACKAGE_UNAVAILABLE")?;
+        let (release, _) = manifest::read_manifest(&source)
+            .map_err(|e| format!("APP_BOUND_PACKAGE_UNAVAILABLE: {e}"))?;
+        release
+            .validate_for_install()
+            .map_err(|e| format!("APP_BOUND_PACKAGE_UNAVAILABLE: {e}"))?;
         let setup = source.join("carbonpaper-protected-setup.exe");
         // Keep the executable locked across UAC and execution to prevent its
         // replacement between validation and the elevated process opening it.
@@ -382,17 +417,28 @@ pub(crate) async fn install_runtime(source: PathBuf, enable: bool) -> Result<(),
             if error.raw_os_error() == Some(1223) {
                 "APP_BOUND_CANCELLED".into()
             } else {
-                "APP_BOUND_INSTALL_FAILED".into()
+                format!("APP_BOUND_INSTALL_FAILED: {error}")
             }
         })?;
         if !status.success() {
-            return Err("APP_BOUND_INSTALL_FAILED".into());
+            return Err(carbonpaper_app_bound::windows::install::setup_failure_message(status));
         }
         Ok(())
     };
-    tokio::task::spawn_blocking(action)
+    let result = tokio::task::spawn_blocking(action)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+        .and_then(|result| result);
+    if let Err(error) = &result {
+        let setup_log = carbonpaper_app_bound::windows::install::setup_log_path()
+            .map_or_else(|_| "unavailable".into(), |path| path.display().to_string());
+        tracing::error!(
+            "[APP_BOUND] install result=error error={} setup_log={}",
+            error,
+            setup_log
+        );
+    }
+    result
 }
 
 pub(crate) fn schedule_restart(app: &AppHandle) -> Result<(), String> {

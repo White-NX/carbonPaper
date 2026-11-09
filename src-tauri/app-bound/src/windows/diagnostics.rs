@@ -10,6 +10,8 @@ use std::{
 const LOG_DIRECTORY: &str = "logs";
 const LOG_FILE: &str = "service.log";
 const ROTATED_LOG_FILE: &str = "service.log.1";
+const SETUP_LOG_FILE: &str = "setup.log";
+const ROTATED_SETUP_LOG_FILE: &str = "setup.log.1";
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 static LOGGER: OnceLock<ServiceLogger> = OnceLock::new();
@@ -26,6 +28,16 @@ pub(super) struct RequestTimings {
 
 pub fn init(state_root: &Path) {
     let _ = LOGGER.set(ServiceLogger::new(state_root.join(LOG_DIRECTORY)));
+}
+
+/// Setup writes only fixed, redacted fields to a user-readable protected
+/// directory. Its failures remain available without access to the key ledger.
+pub(super) fn init_setup(system_root: &Path) {
+    let _ = LOGGER.set(ServiceLogger::with_files(
+        system_root.join(LOG_DIRECTORY),
+        SETUP_LOG_FILE,
+        ROTATED_SETUP_LOG_FILE,
+    ));
 }
 
 pub fn event(level: &str, event: &str, stage: &str, error: Option<BrokerError>) {
@@ -48,13 +60,25 @@ pub(super) fn timed_event(
 
 struct ServiceLogger {
     directory: PathBuf,
+    file_name: &'static str,
+    rotated_file_name: &'static str,
     lock: Mutex<()>,
 }
 
 impl ServiceLogger {
     fn new(directory: PathBuf) -> Self {
+        Self::with_files(directory, LOG_FILE, ROTATED_LOG_FILE)
+    }
+
+    fn with_files(
+        directory: PathBuf,
+        file_name: &'static str,
+        rotated_file_name: &'static str,
+    ) -> Self {
         Self {
             directory,
+            file_name,
+            rotated_file_name,
             lock: Mutex::new(()),
         }
     }
@@ -86,8 +110,8 @@ impl ServiceLogger {
         timings: Option<&RequestTimings>,
     ) -> std::io::Result<()> {
         fs::create_dir_all(&self.directory)?;
-        let current = self.directory.join(LOG_FILE);
-        rotate_if_needed(&current, &self.directory.join(ROTATED_LOG_FILE))?;
+        let current = self.directory.join(self.file_name);
+        rotate_if_needed(&current, &self.directory.join(self.rotated_file_name))?;
         let mut file = OpenOptions::new().create(true).append(true).open(current)?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -130,6 +154,28 @@ fn rotate_if_needed(current: &Path, rotated: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[test]
+    fn setup_log_identifies_the_failed_upgrade_stage_without_private_data() {
+        let directory = tempfile::tempdir().expect("create setup log directory");
+        let logger = ServiceLogger::with_files(
+            directory.path().to_path_buf(),
+            SETUP_LOG_FILE,
+            ROTATED_SETUP_LOG_FILE,
+        );
+        logger.event(
+            "error",
+            "install_failed",
+            "read_previous_runtime_manifest",
+            Some(BrokerError::Integrity),
+        );
+        let output = fs::read_to_string(directory.path().join(SETUP_LOG_FILE)).unwrap();
+        assert!(output.contains(
+            "event=install_failed stage=read_previous_runtime_manifest error=app_bound_integrity_failure"
+        ));
+        assert_eq!(output.split_whitespace().count(), 5);
+        assert!(!directory.path().join(LOG_FILE).exists());
+    }
 
     #[test]
     fn logger_appends_redacted_fixed_fields() {
