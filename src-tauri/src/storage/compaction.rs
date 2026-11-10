@@ -17,6 +17,40 @@ const OCR_QUEUE_VERSION: &str = "storage_ocr_queue_version";
 /// the multi-gigabyte OCR table. Only emptiness is part of the reader contract.
 pub(super) const OCR_INDEXED: &str = "1";
 
+/// A representation-only update must not invalidate source revisions or
+/// expensive derived caches. Only the named notification triggers are parked;
+/// referential, queue and format guards continue running. DDL, data and trigger
+/// restoration commit atomically, including after a crash or failed checkpoint.
+pub(super) fn representation_transaction<T>(
+    conn: &Connection,
+    triggers: &[&str],
+    operation: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut definitions = Vec::new();
+    for name in triggers {
+        let definition: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(sql) = definition {
+            tx.execute_batch(&format!("DROP TRIGGER {name};"))
+                .map_err(|e| e.to_string())?;
+            definitions.push(sql);
+        }
+    }
+    let result = operation(&tx)?;
+    for definition in definitions {
+        tx.execute_batch(&definition).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
 pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     tx.execute_batch(
@@ -165,11 +199,11 @@ impl StorageState {
     }
 
     fn compact_storage_batch(&self) -> Result<usize, String> {
-        let markers = {
+        let compacted = {
             let guard = self.get_connection_named("storage_compaction")?;
             let conn = guard.as_ref().ok_or("Database not initialized")?;
-            compact_ocr_markers(conn, 1024)?
+            compact_ocr_markers(conn, 1024)? + super::vector_blocks::compact(conn)?
         };
-        Ok(markers + self.compact_process_icons_batch()?)
+        Ok(compacted + self.compact_process_icons_batch()?)
     }
 }

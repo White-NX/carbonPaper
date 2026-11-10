@@ -2,7 +2,7 @@
 //! This function exposes only a format number; it grants no access to content.
 use rusqlite::{functions::FunctionFlags, Connection, OptionalExtension};
 
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 const KEY: &str = "storage_layout_version";
 
 pub(super) fn register_and_check(conn: &Connection) -> rusqlite::Result<()> {
@@ -52,7 +52,13 @@ pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     // Metadata writes stop old startup before it publishes the connection.
     // Source/icon guards also fence an older process that was already open.
-    for table in ["app_metadata", "screenshots", "page_icons"] {
+    for table in [
+        "app_metadata",
+        "screenshots",
+        "page_icons",
+        "derived_embeddings",
+        "vector_blocks",
+    ] {
         for event in ["INSERT", "UPDATE", "DELETE"] {
             tx.execute_batch(&format!(
                 "DROP TRIGGER IF EXISTS storage_layout_{table}_{event};
@@ -79,7 +85,9 @@ mod tests {
             "PRAGMA trusted_schema=OFF;
             CREATE TABLE app_metadata(key TEXT PRIMARY KEY,value TEXT);
             CREATE TABLE screenshots(id INTEGER PRIMARY KEY);
-            CREATE TABLE page_icons(id INTEGER PRIMARY KEY);",
+            CREATE TABLE page_icons(id INTEGER PRIMARY KEY);
+            CREATE TABLE derived_embeddings(id INTEGER PRIMARY KEY);
+            CREATE TABLE vector_blocks(id INTEGER PRIMARY KEY);",
         )
         .unwrap();
         register_and_check(&conn).unwrap();

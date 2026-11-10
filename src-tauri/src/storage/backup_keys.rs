@@ -246,6 +246,9 @@ fn protected_key(
 
 // identities must match protected_migration::text_identity and the writers.
 fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> Result<(), String> {
+    if columns(conn, "derived_embeddings")?.contains("vector_block_id") {
+        super::vector_blocks::validate(conn)?;
+    }
     for (table, identity, column, text) in [
         (
             "smart_clusters",
@@ -330,9 +333,15 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
         if !columns(conn, table)?.contains(column) {
             continue;
         }
+        let source =
+            if table == "derived_embeddings" && columns(conn, table)?.contains("vector_block_id") {
+                "derived_embeddings_read"
+            } else {
+                table
+            };
         let mut query = conn
             .prepare(&format!(
-                "SELECT {identity},{column} FROM {table} WHERE {column} IS NOT NULL"
+                "SELECT {identity},{column} FROM {source} WHERE {column} IS NOT NULL"
             ))
             .map_err(|e| e.to_string())?;
         let mut rows = query.query([]).map_err(|e| e.to_string())?;

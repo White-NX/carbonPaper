@@ -26,7 +26,7 @@ pub(super) const ANN_TAIL_UPDATES_SQL: &str = r#"
                   AND j.source_fingerprint = e.source_fingerprint
                 THEN cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key) END
     FROM derived_ann_changes c INDEXED BY idx_derived_ann_changes_epoch
-    LEFT JOIN derived_embeddings e
+    LEFT JOIN derived_embeddings_read e
       ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
     LEFT JOIN derived_index_jobs j
       ON j.index_kind = c.index_kind AND j.subject_key = c.subject_key
@@ -604,7 +604,7 @@ impl StorageState {
                            AND j.source_fingerprint = e.source_fingerprint
                         THEN cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key) END
                     FROM derived_ann_changes c
-                    LEFT JOIN derived_embeddings e
+                    LEFT JOIN derived_embeddings_read e
                       ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
                     LEFT JOIN derived_index_jobs j
                       ON j.index_kind = c.index_kind AND j.subject_key = c.subject_key

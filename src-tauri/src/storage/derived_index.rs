@@ -840,6 +840,7 @@ impl StorageState {
             ON CONFLICT(index_kind, subject_key) DO UPDATE SET
                 dimensions = excluded.dimensions,
                 vector_f32 = excluded.vector_f32,
+                vector_block_id = NULL, vector_offset = NULL, vector_length = NULL,
                 model_id = excluded.model_id,
                 model_revision = excluded.model_revision,
                 embedding_version = excluded.embedding_version,
@@ -1872,9 +1873,17 @@ pub(super) fn visible_embedding_source_with_indexes(
     embedding_index: &str,
     job_index: &str,
 ) -> String {
+    embedding_source("derived_embeddings", embedding_index, job_index)
+}
+
+pub(super) fn visible_embedding_payload_source(job_index: &str) -> String {
+    embedding_source("derived_embeddings_read", "", job_index)
+}
+
+fn embedding_source(table: &str, embedding_index: &str, job_index: &str) -> String {
     format!(
         r#"
-        FROM derived_embeddings e {embedding_index}
+        FROM {table} e {embedding_index}
         INNER JOIN derived_index_jobs j {job_index}
           ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
         WHERE e.index_kind = ?1 AND j.status = 'completed'
@@ -1887,7 +1896,7 @@ pub(super) fn visible_embedding_source_with_indexes(
 }
 
 pub(super) fn visible_embedding_source() -> String {
-    visible_embedding_source_with_indexes("", "")
+    visible_embedding_payload_source("")
 }
 
 fn visible_embedding_metadata_source() -> String {

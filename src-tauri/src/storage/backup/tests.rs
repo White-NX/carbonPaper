@@ -142,6 +142,13 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
             let (data, key) = encrypted(storage, value);
             conn.execute(sql, params![data, key]).unwrap();
         }
+        let vector = storage
+            .protected
+            .seal("vectors", "clip_image:image-fixture", &[0, 0, 128, 63])
+            .unwrap();
+        conn.execute("INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,model_id,model_revision,embedding_version,source_fingerprint)
+            VALUES('clip_image','image-fixture',1,?1,'fixture','1',1,'source')", [&vector]).unwrap();
+        while crate::storage::vector_blocks::compact(conn).unwrap() != 0 {}
         conn.execute("INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms) VALUES('2026-11-05',0,2000000000000,'fixture',2000000000000)", []).unwrap();
         let (payload, key) = encrypted(storage, br#"{"private":"settings"}"#);
         conn.execute("INSERT INTO recap_payloads(kind,key,day,revision,data,row_key) VALUES('settings','fixture','2026-11-05',0,?1,?2)", params![payload, key]).unwrap();
@@ -452,6 +459,9 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
             .unwrap(),
         0
     );
+    assert_eq!(conn.query_row(
+        "SELECT cp_unseal(vector_f32,'vectors',index_kind||':'||subject_key) FROM derived_embeddings_read WHERE subject_key='image-fixture'",
+        [], |r| r.get::<_, Vec<u8>>(0)).unwrap(), vec![0,0,128,63]);
     assert_eq!(
         conn.query_row(
             "SELECT revision FROM screenshot_processing_revisions WHERE screenshot_id=7",

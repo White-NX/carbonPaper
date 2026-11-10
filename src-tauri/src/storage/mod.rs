@@ -45,6 +45,7 @@ mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
 mod types;
+mod vector_blocks;
 mod vector_query_metrics;
 pub(crate) mod wire_time;
 

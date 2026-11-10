@@ -852,6 +852,7 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        super::vector_blocks::initialize(conn)?;
         super::migration::dedup::migrate(conn)?;
         super::compaction::initialize(conn)?;
         Self::init_recap_tables(conn)?;
@@ -1658,7 +1659,7 @@ impl StorageState {
         Ok(recovered)
     }
 
-    fn add_column_if_missing(
+    pub(super) fn add_column_if_missing(
         conn: &Connection,
         table: &str,
         column: &str,
