@@ -774,7 +774,6 @@ impl StorageState {
 
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_image_hash ON screenshots(image_hash);
-            CREATE INDEX IF NOT EXISTS idx_text_hash ON ocr_results(text_hash);
             CREATE INDEX IF NOT EXISTS idx_screenshot_id ON ocr_results(screenshot_id);
             CREATE INDEX IF NOT EXISTS idx_created_at ON screenshots(created_at);
             CREATE INDEX IF NOT EXISTS idx_process_name ON screenshots(process_name);
@@ -853,6 +852,7 @@ impl StorageState {
 
         self.ensure_schema(conn)?;
         super::migration::dedup::migrate(conn)?;
+        super::compaction::initialize(conn)?;
         Self::init_recap_tables(conn)?;
         let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
         if recovered > 0 {

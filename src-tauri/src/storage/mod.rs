@@ -13,6 +13,7 @@ mod backup_keys;
 mod blind_index;
 mod blind_search;
 mod classification;
+mod compaction;
 mod connection;
 pub(crate) mod database_snapshot;
 mod derived_index;
@@ -119,6 +120,7 @@ pub struct StorageState {
     ocr_row_count: AtomicU64,
     /// Whether the lazy OCR indexer background thread has been started.
     lazy_indexer_started: AtomicBool,
+    storage_compaction_started: AtomicBool,
     /// Whether thumbnail warmup has already completed this session
     pub(crate) thumbnail_warmup_done: AtomicBool,
     /// Whether startup VACUUM is currently running
@@ -253,6 +255,7 @@ impl StorageState {
             lock_holder: Mutex::new(""),
             ocr_row_count: AtomicU64::new(0),
             lazy_indexer_started: AtomicBool::new(false),
+            storage_compaction_started: AtomicBool::new(false),
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),

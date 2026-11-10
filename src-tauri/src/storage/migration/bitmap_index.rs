@@ -347,16 +347,17 @@ impl StorageState {
     pub fn process_lazy_indexing_batch(&self) -> Result<usize, String> {
         let hmac_key = self.credential_state.get_hmac_key()?;
 
-        // 1. Fetch rows that have NO hash (newly captured during this version)
+        // The queue contains only pending rows, rather than a hash entry for
+        // every historical OCR result.
         let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
             let guard = self.get_connection_named("lazy_indexer_read")?;
             let conn = guard.as_ref().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, text_enc, text_key_encrypted
-                     FROM ocr_results
-                     WHERE text_hash = '' AND is_deleted = 0
-                     ORDER BY id ASC
+                    "SELECT o.id, o.text_enc, o.text_key_encrypted
+                     FROM ocr_index_pending p CROSS JOIN ocr_results o ON o.id=p.ocr_id
+                     WHERE o.text_hash = '' AND o.is_deleted = 0
+                     ORDER BY p.ocr_id ASC
                      LIMIT ?1",
                 )
                 .map_err(|e| format!("lazy prepare: {}", e))?;
@@ -442,8 +443,7 @@ impl StorageState {
                 Err(_) => continue,
             };
 
-            let text_hash = Self::compute_hmac_hash(&plaintext, hmac_key);
-            row_hashes.push((*ocr_id, text_hash));
+            row_hashes.push((*ocr_id, super::super::compaction::OCR_INDEXED.to_owned()));
 
             let bigrams = Self::bigram_tokenize(&plaintext);
             for token in bigrams {
@@ -583,8 +583,7 @@ impl StorageState {
                 Err(_) => continue,
             };
 
-            let text_hash = Self::compute_hmac_hash(&plaintext, hmac_key);
-            row_hashes.push((*ocr_id, text_hash));
+            row_hashes.push((*ocr_id, super::super::compaction::OCR_INDEXED.to_owned()));
 
             let bigrams = Self::bigram_tokenize(&plaintext);
             for token in bigrams {
