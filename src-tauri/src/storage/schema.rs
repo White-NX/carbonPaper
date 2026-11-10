@@ -853,6 +853,7 @@ impl StorageState {
 
         self.ensure_schema(conn)?;
         super::vector_blocks::initialize(conn)?;
+        super::ocr_keys::initialize(conn)?;
         super::migration::dedup::migrate(conn)?;
         super::compaction::initialize(conn)?;
         Self::init_recap_tables(conn)?;

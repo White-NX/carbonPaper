@@ -89,7 +89,7 @@ impl StorageState {
             let relevant: &[&str] = match table {
                 "screenshots" => &["id", "created_at", "window_title", "process_name", "window_title_enc",
                     "process_name_enc", "page_url_enc", "content_key_encrypted", "is_deleted"],
-                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "is_deleted"],
+                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "ocr_key_id", "is_deleted"],
                 _ => &["screenshot_id", "ref_enc", "content_key_encrypted"],
             };
             let mut changes = relevant.iter().filter(|c| columns.iter().any(|name| name == **c))

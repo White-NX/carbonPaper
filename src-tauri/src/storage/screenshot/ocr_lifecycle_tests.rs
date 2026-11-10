@@ -603,6 +603,10 @@ fn ocr_text_prefix_query_replays_insertion_order() {
                     (8, X'05', X'00',  50.0, 99.0, 0);",
         )
         .expect("OCR ordering fixture");
+    connection
+        .execute_batch("CREATE TABLE app_metadata(key TEXT PRIMARY KEY,value TEXT);")
+        .unwrap();
+    crate::storage::ocr_keys::initialize(&connection).unwrap();
 
     let sql = ocr_text_prefix_query(2);
     let mut stmt = connection.prepare(&sql).expect("prefix query");

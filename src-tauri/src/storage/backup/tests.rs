@@ -188,6 +188,7 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
     storage
         .create_smart_cluster("Private new topic", 0.5, None, None)
         .unwrap();
+    while storage.compact_ocr_keys_batch().unwrap() != 0 {}
     cluster
 }
 

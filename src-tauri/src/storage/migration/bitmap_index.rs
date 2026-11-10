@@ -354,8 +354,8 @@ impl StorageState {
             let conn = guard.as_ref().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT o.id, o.text_enc, o.text_key_encrypted
-                     FROM ocr_index_pending p CROSS JOIN ocr_results o ON o.id=p.ocr_id
+                    "SELECT o.id, o.text_enc, o.text_key_ref
+                     FROM ocr_index_pending p CROSS JOIN ocr_results_read o ON o.id=p.ocr_id
                      WHERE o.text_hash = '' AND o.is_deleted = 0
                      ORDER BY p.ocr_id ASC
                      LIMIT ?1",
@@ -434,8 +434,9 @@ impl StorageState {
             std::collections::HashMap::new();
         let mut row_hashes: Vec<(i64, String)> = Vec::new();
 
+        let decoder = self.ocr_decoder();
         for (ocr_id, text_enc, text_key_enc) in &rows {
-            let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+            let plaintext = match decoder.decrypt(text_enc, text_key_enc) {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -574,8 +575,9 @@ impl StorageState {
             std::collections::HashMap::new();
         let mut row_hashes: Vec<(i64, String)> = Vec::new();
 
+        let decoder = self.ocr_decoder();
         for (ocr_id, text_enc, text_key_enc) in &rows {
-            let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+            let plaintext = match decoder.decrypt(text_enc, text_key_enc) {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(s) => s,
                     Err(_) => continue,

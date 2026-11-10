@@ -380,6 +380,7 @@ pub(crate) fn configure_sqlcipher_connection(
 pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<ConnectionStatus> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     super::layout::register_and_check(conn)?;
+    super::ocr_keys::register(conn)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     // Decrypted projections must never spill into SQLite temporary files or
     // be usable by a schema supplied from the public bootstrap database.

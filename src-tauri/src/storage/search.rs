@@ -270,7 +270,10 @@ fn build_empty_search_sql(
     } else {
         "FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id"
     };
-    let mut sql = format!("SELECT {SEARCH_RESULT_COLUMNS} {from_clause}");
+    let mut sql = format!(
+        "SELECT {SEARCH_RESULT_COLUMNS} {from_clause}
+        LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id"
+    );
     let mut where_clauses = vec![
         "s.is_deleted = 0".to_string(),
         "r.is_deleted = 0".to_string(),
@@ -322,7 +325,10 @@ fn build_empty_search_sql(
 /// list down to its order. One constant makes that true by construction
 /// instead of by review.
 const SEARCH_RESULT_COLUMNS: &str =
-    "r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
+    "r.id, r.screenshot_id, r.text_enc,
+         cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
+             k.screenshot_id,k.scope_tag,k.wrapped_key,
+             (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id')), r.confidence,
          r.box_x1, r.box_y1, r.box_x2, r.box_y2,
          r.box_x3, r.box_y3, r.box_x4, r.box_y4,
          s.image_path, s.window_title_enc, cp_process(s.process_name),
@@ -331,7 +337,10 @@ const SEARCH_RESULT_COLUMNS: &str =
          CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
          s.category";
 
-const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted,
+const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, r.text_enc,
+     cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
+         k.screenshot_id,k.scope_tag,k.wrapped_key,
+         (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id')),
      CAST(strftime('%s', s.created_at) AS INTEGER)";
 
 /// Recall already chose a bounded set of OCR ids. Without statistics SQLite
@@ -356,6 +365,7 @@ fn search_rows_by_id_sql(columns: &str, count: usize) -> String {
          SELECT {columns} FROM requested
          CROSS JOIN ocr_results r NOT INDEXED ON r.id = requested.id
          CROSS JOIN screenshots s NOT INDEXED ON r.screenshot_id = s.id
+         LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id
          WHERE r.is_deleted = 0 AND s.is_deleted = 0"
     )
 }
@@ -588,6 +598,7 @@ impl StorageState {
             .filter_map(|id| grouped.remove(&id))
             .collect();
 
+        let decoder = self.ocr_decoder();
         let decrypted = unwrap_batch_parallel(&self.credential_state, batches, |session, rows| {
             let unwrap = |ciphertext: &[u8]| session.unwrap_row_key(ciphertext);
             let mut screenshot_key = rows
@@ -601,12 +612,11 @@ impl StorageState {
                     let text = match known_text.get(&raw.id) {
                         Some(text) => text.clone(),
                         None => match (raw.text_enc.as_ref(), raw.text_key_enc.as_ref()) {
-                            (Some(data), Some(key)) => {
-                                Self::decrypt_payload_with_unwrap(data, key, &unwrap)
-                                    .ok()
-                                    .and_then(|value| String::from_utf8(value).ok())
-                                    .unwrap_or_default()
-                            }
+                            (Some(data), Some(key)) => decoder
+                                .decrypt_with_unwrap(data, key, &unwrap)
+                                .ok()
+                                .and_then(|value| String::from_utf8(value).ok())
+                                .unwrap_or_default(),
                             _ => String::new(),
                         },
                     };
@@ -731,8 +741,9 @@ impl StorageState {
     /// same outcome as never having proposed it. A locked session is different
     /// and does fail, because every remaining row would fail the same way.
     fn decrypt_candidates(&self, rows: Vec<CandidateRow>) -> Result<Vec<VerifiedRow>, String> {
+        let decoder = self.ocr_decoder();
         unwrap_batch_parallel(&self.credential_state, rows, |session, row| {
-            let text = Self::decrypt_payload_with_unwrap(&row.text_enc, &row.text_key_enc, &|c| {
+            let text = decoder.decrypt_with_unwrap(&row.text_enc, &row.text_key_enc, &|c| {
                 session.unwrap_row_key(c)
             });
             let text = match text {
@@ -1282,7 +1293,8 @@ mod tests {
     fn search_fixture() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory search database");
         conn.execute_batch(
-            "CREATE TABLE screenshots (
+            "CREATE TABLE app_metadata(key TEXT PRIMARY KEY,value TEXT);
+             CREATE TABLE screenshots (
                  id INTEGER PRIMARY KEY,
                  image_path TEXT NOT NULL,
                  created_at TEXT NOT NULL,
@@ -1319,6 +1331,7 @@ mod tests {
                  ON ocr_results(is_deleted, screenshot_id);",
         )
         .expect("search fixture schema");
+        crate::storage::ocr_keys::initialize(&conn).unwrap();
         conn.create_scalar_function(
             "cp_process",
             1,
@@ -1393,8 +1406,10 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        conn.execute_batch("CREATE TABLE app_metadata(key TEXT PRIMARY KEY, value TEXT)")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_metadata(key TEXT PRIMARY KEY, value TEXT)",
+        )
+        .unwrap();
         ensure_schema(conn).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         let index = BlindIndex::open(&tx).unwrap();
@@ -1591,7 +1606,8 @@ mod tests {
         let sql = format!(
             "SELECT {SEARCH_RESULT_COLUMNS}
              FROM ocr_results r
-             JOIN screenshots s ON r.screenshot_id = s.id"
+             JOIN screenshots s ON r.screenshot_id = s.id
+             LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id"
         );
         let raw = conn
             .prepare(&sql)
@@ -1602,7 +1618,10 @@ mod tests {
         assert_eq!(raw.id, 42);
         assert_eq!(raw.screenshot_id, 7);
         assert_eq!(raw.text_enc.as_deref(), Some(&[0x01u8][..]));
-        assert_eq!(raw.text_key_enc.as_deref(), Some(&[0x02u8][..]));
+        assert_eq!(
+            raw.text_key_enc.as_deref(),
+            Some(b"CPORKEY1\0\x02".as_slice())
+        );
         assert_eq!(raw.confidence, 0.75);
         assert_eq!(
             raw.box_coords,

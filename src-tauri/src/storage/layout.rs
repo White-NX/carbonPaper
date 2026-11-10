@@ -2,7 +2,7 @@
 //! This function exposes only a format number; it grants no access to content.
 use rusqlite::{functions::FunctionFlags, Connection, OptionalExtension};
 
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 const KEY: &str = "storage_layout_version";
 
 pub(super) fn register_and_check(conn: &Connection) -> rusqlite::Result<()> {
@@ -58,6 +58,8 @@ pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
         "page_icons",
         "derived_embeddings",
         "vector_blocks",
+        "ocr_results",
+        "ocr_keys",
     ] {
         for event in ["INSERT", "UPDATE", "DELETE"] {
             tx.execute_batch(&format!(
@@ -87,7 +89,9 @@ mod tests {
             CREATE TABLE screenshots(id INTEGER PRIMARY KEY);
             CREATE TABLE page_icons(id INTEGER PRIMARY KEY);
             CREATE TABLE derived_embeddings(id INTEGER PRIMARY KEY);
-            CREATE TABLE vector_blocks(id INTEGER PRIMARY KEY);",
+            CREATE TABLE vector_blocks(id INTEGER PRIMARY KEY);
+            CREATE TABLE ocr_results(id INTEGER PRIMARY KEY);
+            CREATE TABLE ocr_keys(id INTEGER PRIMARY KEY);",
         )
         .unwrap();
         register_and_check(&conn).unwrap();

@@ -186,9 +186,17 @@ impl StorageState {
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
+                let started = std::time::Instant::now();
                 match storage.compact_storage_batch() {
                     Ok(0) => std::thread::sleep(Duration::from_secs(5)),
-                    Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                    // CNG already paces encrypted batches. Count that work
+                    // toward the interval instead of adding a fixed delay to
+                    // every legacy page; still yield between transactions.
+                    Ok(_) => std::thread::sleep(
+                        Duration::from_millis(20)
+                            .saturating_sub(started.elapsed())
+                            .max(Duration::from_millis(2)),
+                    ),
                     Err(error) => {
                         tracing::warn!("[DB:COMPACT] Background rewrite deferred: {error}");
                         std::thread::sleep(Duration::from_secs(30));
@@ -204,6 +212,6 @@ impl StorageState {
             let conn = guard.as_ref().ok_or("Database not initialized")?;
             compact_ocr_markers(conn, 1024)? + super::vector_blocks::compact(conn)?
         };
-        Ok(compacted + self.compact_process_icons_batch()?)
+        Ok(compacted + self.compact_process_icons_batch()? + self.compact_ocr_keys_batch()?)
     }
 }

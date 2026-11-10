@@ -33,7 +33,7 @@ impl StorageState {
                 ON CONFLICT(screenshot_id) DO UPDATE SET revision=revision+1;
             END;
             DROP TRIGGER IF EXISTS app_bound_ocr_update;
-            CREATE TRIGGER app_bound_ocr_update AFTER UPDATE OF text_enc,text_key_encrypted,is_deleted,screenshot_id ON ocr_results BEGIN
+            CREATE TRIGGER app_bound_ocr_update AFTER UPDATE OF text_enc,text_key_encrypted,ocr_key_id,is_deleted,screenshot_id ON ocr_results BEGIN
                 INSERT INTO screenshot_processing_revisions(screenshot_id,revision) VALUES(NEW.screenshot_id,1)
                 ON CONFLICT(screenshot_id) DO UPDATE SET revision=revision+1;
                 UPDATE screenshot_processing_revisions SET revision=revision+1 WHERE screenshot_id=OLD.screenshot_id AND OLD.screenshot_id!=NEW.screenshot_id;
