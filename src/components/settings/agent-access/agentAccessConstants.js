@@ -2,6 +2,10 @@ export const AGENT_SKILL_NAME = 'carbonpaper-memory';
 export const AGENT_SKILL_REPO = 'https://github.com/White-NX/carbonPaperSkill';
 export const AGENT_SETUP_VARIANTS = ['codex', 'claude', 'cursor', 'generic'];
 export const DEFAULT_AGENT_SETUP_VARIANT = 'codex';
+export function canIssueUnattendedCredential(status) {
+  return Boolean(status?.enabled && status.available &&
+    ['ready', 'preparing', 'syncing', 'reconciling'].includes(status.phase));
+}
 export const CONTENT_FILTER_LEVELS = ['standard', 'minimal', 'off'];
 export const CONTENT_FILTER_CATEGORIES = ['cat_01', 'cat_02', 'cat_03', 'cat_04', 'cat_05'];
 export const CONTENT_FILTER_MODES = ['remove_paragraph', 'reject', 'mask'];

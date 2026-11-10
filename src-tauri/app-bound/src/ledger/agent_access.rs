@@ -125,6 +125,7 @@ impl Ledger {
                 | Request::AgentWriterKeys { .. }
                 | Request::AgentReaderKeys { .. }
                 | Request::AgentFence { .. }
+                | Request::AgentFenceBatch { .. }
                 | Request::AgentPublish { .. }
                 | Request::AgentIssue { .. }
                 | Request::AgentRevoke { .. }
@@ -214,6 +215,7 @@ impl Ledger {
             Request::AgentWriterKeys { generation }
             | Request::AgentReaderKeys { generation }
             | Request::AgentFence { generation }
+            | Request::AgentFenceBatch { generation, .. }
             | Request::AgentPublish { generation, .. }
             | Request::AgentIssue { generation, .. } => Some(generation.as_str()),
             Request::AgentCheck { context } => Some(context.generation.as_str()),
@@ -240,10 +242,17 @@ impl Ledger {
                     outbox_key,
                 })))
             }
-            Request::AgentFence { .. } => {
+            Request::AgentFence { .. } | Request::AgentFenceBatch { .. } => {
+                let count = match request {
+                    Request::AgentFenceBatch { count, .. } => *count,
+                    _ => 1,
+                };
+                if count == 0 || count > MAX_AGENT_FENCE_BATCH_SIZE {
+                    return Err(BrokerError::InvalidRequest);
+                }
                 let source = view
                     .source
-                    .checked_add(1)
+                    .checked_add(i64::from(count))
                     .ok_or(BrokerError::LimitExceeded)?;
                 db(conn.execute(
                     "UPDATE agent_views SET source_revision=?2,phase='syncing' WHERE owner=?1",
@@ -364,7 +373,7 @@ mod tests {
     fn call(ledger: &mut Ledger, who: &Principal, request: Request) -> Result<Response> {
         ledger.handle(who, request, 110, &TestProtection)
     }
-    fn ready(ledger: &mut Ledger, who: &Principal, dataset: &str) -> AgentViewKeys {
+    fn preparing(ledger: &mut Ledger, who: &Principal, dataset: &str) -> AgentViewKeys {
         let path = std::env::temp_dir()
             .join("agent-memory.db")
             .to_string_lossy()
@@ -380,6 +389,10 @@ mod tests {
         .unwrap() else {
             panic!()
         };
+        keys
+    }
+    fn ready(ledger: &mut Ledger, who: &Principal, dataset: &str) -> AgentViewKeys {
+        let keys = preparing(ledger, who, dataset);
         let Response::AgentStatus(status) = call(ledger, who, Request::AgentStatus {}).unwrap()
         else {
             panic!()
@@ -462,6 +475,146 @@ mod tests {
             call(&mut ledger, &reader, Request::AgentAuthorize { token_hash }).unwrap(),
             Response::AgentContext(_)
         ));
+    }
+
+    #[test]
+    fn first_preparation_can_issue_a_credential_without_authorizing_reads() {
+        let (mut ledger, who, dataset) = fixture();
+        let keys = preparing(&mut ledger, &who, &dataset);
+        let token_hash = "a".repeat(64);
+        let Response::AgentGrant(grant) = call(
+            &mut ledger,
+            &who,
+            Request::AgentIssue {
+                generation: keys.binding.generation.clone(),
+                label: "configured before history".into(),
+                token_hash: token_hash.clone(),
+                expires_at_ms: None,
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let mut reader = who.clone();
+        reader.role = RuntimeRole::McpReader;
+        for request in [
+            Request::AgentReaderKeys {
+                generation: keys.binding.generation.clone(),
+            },
+            Request::AgentAuthorize {
+                token_hash: token_hash.clone(),
+            },
+        ] {
+            assert_eq!(
+                call(&mut ledger, &reader, request).unwrap_err(),
+                BrokerError::Busy
+            );
+        }
+        call(&mut ledger, &who, Request::AgentDisable {}).unwrap();
+        let Response::AgentStatus(status) =
+            call(&mut ledger, &who, Request::AgentStatus {}).unwrap()
+        else {
+            panic!()
+        };
+        assert!(!status.enabled);
+        assert!(
+            status
+                .grants
+                .iter()
+                .find(|v| v.id == grant.id)
+                .unwrap()
+                .revoked
+        );
+        assert!(call(&mut ledger, &reader, Request::AgentAuthorize { token_hash }).is_err());
+    }
+
+    #[test]
+    fn revision_batches_fence_reads_and_reject_invalid_or_stale_reservations() {
+        let (mut ledger, who, dataset) = fixture();
+        let keys = ready(&mut ledger, &who, &dataset);
+        let generation = keys.binding.generation.clone();
+        let Response::AgentStatus(before) =
+            call(&mut ledger, &who, Request::AgentStatus {}).unwrap()
+        else {
+            panic!()
+        };
+        for count in [0, MAX_AGENT_FENCE_BATCH_SIZE + 1] {
+            assert_eq!(
+                call(
+                    &mut ledger,
+                    &who,
+                    Request::AgentFenceBatch {
+                        generation: generation.clone(),
+                        count,
+                    }
+                )
+                .unwrap_err(),
+                BrokerError::InvalidRequest
+            );
+        }
+        assert_eq!(
+            call(
+                &mut ledger,
+                &who,
+                Request::AgentFenceBatch {
+                    generation: "c".repeat(64),
+                    count: 1,
+                }
+            )
+            .unwrap_err(),
+            BrokerError::DatasetMismatch
+        );
+        let Response::AgentRevision(last) = call(
+            &mut ledger,
+            &who,
+            Request::AgentFenceBatch {
+                generation: generation.clone(),
+                count: MAX_AGENT_FENCE_BATCH_SIZE,
+            },
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            last,
+            before.source_revision + i64::from(MAX_AGENT_FENCE_BATCH_SIZE)
+        );
+        let mut reader = who.clone();
+        reader.role = RuntimeRole::McpReader;
+        assert_eq!(
+            call(
+                &mut ledger,
+                &reader,
+                Request::AgentReaderKeys {
+                    generation: generation.clone(),
+                }
+            )
+            .unwrap_err(),
+            BrokerError::Busy
+        );
+        assert_eq!(
+            call(
+                &mut ledger,
+                &who,
+                Request::AgentPublish {
+                    generation: generation.clone(),
+                    revision: last - 1,
+                    complete: true,
+                }
+            )
+            .unwrap_err(),
+            BrokerError::Integrity
+        );
+        call(
+            &mut ledger,
+            &who,
+            Request::AgentPublish {
+                generation,
+                revision: last,
+                complete: true,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -578,6 +731,10 @@ mod tests {
                 generation: keys.binding.generation.clone(),
             },
             Request::AgentDisable {},
+            Request::AgentFenceBatch {
+                generation: keys.binding.generation.clone(),
+                count: 1,
+            },
             Request::AgentIssue {
                 generation: keys.binding.generation.clone(),
                 label: "x".into(),

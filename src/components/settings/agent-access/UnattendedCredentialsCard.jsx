@@ -8,6 +8,7 @@ import { ConfirmDialog } from '../../ConfirmDialog';
 import { SettingsRow, SettingsStatus } from '../SettingsPrimitives';
 import { SettingsSelect } from '../SettingsControls';
 import { useUnattendedCredentials } from './useUnattendedCredentials';
+import { canIssueUnattendedCredential } from './agentAccessConstants';
 
 const PHASES = {
   ready: 'ready', preparing: 'preparing', syncing: 'preparing', reconciling: 'preparing',
@@ -18,6 +19,7 @@ export function UnattendedCredentialsView({ credentials: c, now = Date.now() }) 
   const { t, i18n } = useTranslation();
   const status = c.status;
   const ready = status?.enabled && status.available && status.phase === 'ready';
+  const canIssue = canIssueUnattendedCredential(status);
   const phase = PHASES[status?.phase] || 'preparing';
   const preparing = status?.enabled && phase === 'preparing';
   const progress = status?.preparation;
@@ -38,7 +40,8 @@ export function UnattendedCredentialsView({ credentials: c, now = Date.now() }) 
     {status && !status.available && <Banner tone="info">{t('settings.security.access.requirements')}</Banner>}
     {preparing && <ProgressBlock label={t('settings.security.access.preparing')} percent={percent} showCount={false} />}
     {status?.enabled && !ready && !preparing && <Button icon={RefreshCw} loading={c.busy} disabled={!status.available} onClick={c.resume}>{t('settings.security.access.resume')}</Button>}
-    {ready && <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); c.issue(); }}>
+    {canIssue && <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); c.issue(); }}>
+      {!ready && <Banner tone="info">{t('settings.security.credentials.preparing')}</Banner>}
       {c.replacement && <Banner tone="warning">{t('settings.security.credentials.replaceMessage', { label: c.replacement.label })}</Banner>}
       <SettingsRow label={t('settings.security.credentials.label')} control={<input value={c.label} maxLength={80} aria-label={t('settings.security.credentials.label')}
         disabled={c.busy} onChange={(event) => c.setLabel(event.target.value)}
@@ -62,7 +65,7 @@ export function UnattendedCredentialsView({ credentials: c, now = Date.now() }) 
             <p>{t('settings.security.credentials.lastUsed', { date: date(grant.last_used_at_ms) })}</p>
           </div>
           {!grant.revoked && <div className="flex flex-wrap gap-2">
-            <Button disabled={c.busy || !ready} onClick={() => c.replace(grant)}>{t('settings.security.credentials.replace')}</Button>
+            <Button disabled={c.busy || !canIssue} onClick={() => c.replace(grant)}>{t('settings.security.credentials.replace')}</Button>
             <Button variant="danger" disabled={c.busy} onClick={() => c.requestRevoke(grant)}>{t('settings.security.credentials.revoke')}</Button>
           </div>}
         </li>;

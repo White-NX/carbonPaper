@@ -17,6 +17,7 @@ struct Authority {
     source: i64,
     applied: i64,
     phase: String,
+    fence_calls: usize,
 }
 fn fixture() -> (tempfile::TempDir, StorageState, Arc<Mutex<Authority>>) {
     let directory = tempfile::tempdir().unwrap();
@@ -31,10 +32,15 @@ fn fixture() -> (tempfile::TempDir, StorageState, Arc<Mutex<Authority>>) {
         source: 0,
         applied: 0,
         phase: "disabled".into(),
+        fence_calls: 0,
     }));
     let service = authority.clone();
     *storage.agent_writer.authority.lock().unwrap() = Some(Arc::new(move |request| {
         let mut state = service.lock().unwrap();
+        let reserved = match &request {
+            Request::AgentFenceBatch { count, .. } => i64::from(*count),
+            _ => 1,
+        };
         match request {
             Request::AgentPrepare {
                 dataset_id,
@@ -62,12 +68,13 @@ fn fixture() -> (tempfile::TempDir, StorageState, Arc<Mutex<Authority>>) {
                 applied_revision: state.applied,
                 grants: vec![],
             })),
-            Request::AgentFence { generation } => {
+            Request::AgentFence { generation } | Request::AgentFenceBatch { generation, .. } => {
                 assert_eq!(
                     Some(generation.as_str()),
                     state.binding.as_ref().map(|b| b.generation.as_str())
                 );
-                state.source += 1;
+                state.source += reserved;
+                state.fence_calls += 1;
                 state.phase = "syncing".into();
                 Ok(Response::AgentRevision(state.source))
             }
@@ -110,6 +117,265 @@ fn seed_history(storage: &StorageState) -> i64 {
 fn view(storage: &StorageState) -> AgentRepository {
     let binding = storage.agent_binding().unwrap();
     AgentRepository::open(Path::new(&binding.view_path), &[7; 32], &binding, true).unwrap()
+}
+fn outbox_events(storage: &StorageState) -> Vec<(i64, ExportEvent)> {
+    let binding = storage.agent_binding().unwrap();
+    let guard = storage.get_connection_named("agent_test_outbox").unwrap();
+    let mut statement = guard
+        .as_ref()
+        .unwrap()
+        .prepare("SELECT id,envelope FROM agent_outbox ORDER BY id")
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((row.get(0)?, open_event(&[8; 32], &binding, &bytes).unwrap()))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn source_transactions_batch_unique_revisions_and_discard_unused_ranges_on_both_outcomes() {
+    let (_directory, storage, authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    let before = authority.lock().unwrap().fence_calls;
+    {
+        let guard = storage.get_connection_named("agent_test_batch").unwrap();
+        let tx = guard.as_ref().unwrap().unchecked_transaction().unwrap();
+        for index in 0..600 {
+            tx.execute(
+                "UPDATE screenshots SET category=?1 WHERE id=42",
+                [format!("category-{index}")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let events = outbox_events(&storage);
+    assert_eq!(events.len(), 600);
+    assert!(events.windows(2).all(|v| v[0].1.revision < v[1].1.revision));
+    assert_eq!(authority.lock().unwrap().fence_calls - before, 3);
+    storage.sync_agent_access().unwrap();
+    assert_eq!(
+        view(&storage)
+            .snapshot(42)
+            .unwrap()
+            .unwrap()
+            .category
+            .as_deref(),
+        Some("category-599")
+    );
+    {
+        let guard = storage
+            .get_connection_named("agent_test_scalar_emission")
+            .unwrap();
+        let conn = guard.as_ref().unwrap();
+        for behavior in [
+            None,
+            Some(rusqlite::TransactionBehavior::Deferred),
+            Some(rusqlite::TransactionBehavior::Immediate),
+        ] {
+            let tx = behavior.map(|v| rusqlite::Transaction::new_unchecked(conn, v).unwrap());
+            let _: String = conn.query_row(
+                "SELECT cp_agent_emit('source','revision','put','{}') FROM screenshots WHERE id=42",
+                [], |r| r.get(0),
+            ).unwrap();
+            if let Some(tx) = tx {
+                tx.commit().unwrap();
+            }
+        }
+    }
+    storage.sync_agent_access().unwrap();
+    let published = authority.lock().unwrap().applied;
+    {
+        let guard = storage
+            .get_connection_named("agent_test_new_transaction")
+            .unwrap();
+        let tx = guard.as_ref().unwrap().unchecked_transaction().unwrap();
+        tx.execute(
+            "UPDATE screenshots SET category='after commit' WHERE id=42",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert!(outbox_events(&storage)[0].1.revision > published);
+    storage.sync_agent_access().unwrap();
+    {
+        let guard = storage
+            .get_connection_named("agent_test_rolled_back_range")
+            .unwrap();
+        let tx = guard.as_ref().unwrap().unchecked_transaction().unwrap();
+        tx.execute(
+            "UPDATE screenshots SET category='rolled back' WHERE id=42",
+            [],
+        )
+        .unwrap();
+        tx.rollback().unwrap();
+    }
+    assert!(outbox_events(&storage).is_empty());
+    storage.sync_agent_access().unwrap();
+    let published = authority.lock().unwrap().applied;
+    {
+        let guard = storage
+            .get_connection_named("agent_test_after_rollback")
+            .unwrap();
+        let tx = guard.as_ref().unwrap().unchecked_transaction().unwrap();
+        tx.execute(
+            "UPDATE screenshots SET category='after rollback' WHERE id=42",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert!(outbox_events(&storage)[0].1.revision > published);
+    storage.sync_agent_access().unwrap();
+    assert_eq!(
+        view(&storage)
+            .snapshot(42)
+            .unwrap()
+            .unwrap()
+            .category
+            .as_deref(),
+        Some("after rollback")
+    );
+}
+
+#[test]
+fn unsupported_batch_fencing_uses_single_events_but_service_denial_aborts_source_writes() {
+    for unsupported in [true, false] {
+        let (_directory, storage, authority) = fixture();
+        seed_history(&storage);
+        storage.begin_agent_access().unwrap();
+        storage.sync_agent_access().unwrap();
+        let original = storage
+            .agent_writer
+            .authority
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        *storage.agent_writer.authority.lock().unwrap() = Some(Arc::new(move |request| {
+            if matches!(request, Request::AgentFenceBatch { .. }) {
+                let error = if unsupported {
+                    BrokerError::InvalidRequest
+                } else {
+                    BrokerError::AccessDenied
+                };
+                return Err(format!("AGENT_SERVICE_UNAVAILABLE: {error}"));
+            }
+            original(request)
+        }));
+        let result = {
+            let guard = storage
+                .get_connection_named("agent_test_fence_compatibility")
+                .unwrap();
+            let tx = guard.as_ref().unwrap().unchecked_transaction().unwrap();
+            let result = tx.execute("UPDATE screenshots SET category='updated' WHERE id=42", []);
+            if result.is_ok() {
+                tx.commit().unwrap();
+            } else {
+                tx.rollback().unwrap();
+            }
+            result
+        };
+        if unsupported {
+            assert!(result.is_ok());
+            assert_eq!(outbox_events(&storage).len(), 1);
+            storage.sync_agent_access().unwrap();
+            assert_eq!(
+                view(&storage)
+                    .snapshot(42)
+                    .unwrap()
+                    .unwrap()
+                    .category
+                    .as_deref(),
+                Some("updated")
+            );
+        } else {
+            assert!(result.is_err());
+            assert!(outbox_events(&storage).is_empty());
+            assert_eq!(authority.lock().unwrap().phase, "ready");
+            let guard = storage
+                .get_connection_named("agent_test_denied_write")
+                .unwrap();
+            let category: Option<String> = guard
+                .as_ref()
+                .unwrap()
+                .query_row("SELECT category FROM screenshots WHERE id=42", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(category.is_none());
+        }
+    }
+}
+
+#[test]
+fn opportunistic_outbox_sync_skips_busy_writers_and_durably_applied_events() {
+    let (_directory, storage, _authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    let binding = storage.agent_binding().unwrap();
+    let mut repo =
+        AgentRepository::open(Path::new(&binding.view_path), &[7; 32], &binding, false).unwrap();
+    {
+        let guard = storage
+            .get_connection_named("agent_test_busy_writer")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET category='pending' WHERE id=42", [])
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    storage
+                        .apply_agent_outbox(&binding, &mut repo, true)
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
+        });
+    }
+    let events = outbox_events(&storage);
+    assert_eq!(events.len(), 1);
+    repo.apply_outbox_batch(&[events[0].1.clone()], events[0].0)
+        .unwrap();
+    {
+        let guard = storage
+            .get_connection_named("agent_test_deferred_ack")
+            .unwrap();
+        // An applied envelope need not be decrypted a second time when its
+        // acknowledgement was interrupted after the durable Agent commit.
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE agent_outbox SET envelope=X'00' WHERE id=?1",
+                [events[0].0],
+            )
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET category='newer' WHERE id=42", [])
+            .unwrap();
+    }
+    storage
+        .apply_agent_outbox(&binding, &mut repo, true)
+        .unwrap();
+    assert!(outbox_events(&storage).is_empty());
+    assert_eq!(
+        repo.snapshot(42).unwrap().unwrap().category.as_deref(),
+        Some("newer")
+    );
 }
 #[test]
 fn database_maintenance_fences_ready_access_and_reconciles_after_locked_reopen() {
@@ -212,10 +478,22 @@ fn failed_history_page_does_not_publish_a_prefix_or_advance_past_unprepared_ocr(
     assert!(projected.ocr(42).is_err());
     drop(projected);
     assert_ne!(authority.lock().unwrap().phase, "ready");
+    let checkpoint: Checkpoint =
+        serde_json::from_str(&view(&storage).preparation_checkpoint().unwrap().unwrap()).unwrap();
+    assert_eq!(checkpoint.phase, 1);
+    assert!(checkpoint.cursor.is_empty());
 
     {
         let guard = storage
             .get_connection_named("agent_test_repair_history_key")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE agent_access_state SET checkpoint='superseded legacy cursor'",
+                [],
+            )
             .unwrap();
         guard.as_ref().unwrap().execute(
             "UPDATE ocr_results SET text_key_encrypted=(SELECT text_key_encrypted FROM ocr_results WHERE id=43) WHERE id=44",
@@ -231,6 +509,42 @@ fn failed_history_page_does_not_publish_a_prefix_or_advance_past_unprepared_ocr(
         .collect::<Vec<_>>();
     assert_eq!(ids, vec![43, 44]);
     assert_eq!(authority.lock().unwrap().phase, "ready");
+}
+
+#[test]
+fn older_preparations_migrate_the_resume_cursor_without_rewriting_source_state() {
+    let (_directory, storage, _authority) = fixture();
+    seed_history(&storage);
+    let binding = storage.begin_agent_access().unwrap();
+    {
+        let conn = Connection::open(&binding.view_path).unwrap();
+        conn.execute_batch(&format!("PRAGMA key=\"x'{}'\"", hex::encode([7; 32])))
+            .unwrap();
+        conn.execute(
+            "DELETE FROM agent_metadata WHERE key='preparation_checkpoint'",
+            [],
+        )
+        .unwrap();
+    }
+    storage.sync_agent_access().unwrap();
+    let checkpoint: Checkpoint =
+        serde_json::from_str(&view(&storage).preparation_checkpoint().unwrap().unwrap()).unwrap();
+    assert!(checkpoint.complete);
+    let guard = storage
+        .get_connection_named("agent_test_legacy_state")
+        .unwrap();
+    let saved: String = guard
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT checkpoint FROM agent_access_state WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let legacy: Checkpoint = serde_json::from_str(&saved).unwrap();
+    assert!(!legacy.complete);
+    assert_eq!(view(&storage).ocr(42).unwrap()[0].text, "historical OCR");
 }
 
 #[test]

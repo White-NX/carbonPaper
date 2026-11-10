@@ -11,6 +11,10 @@ use windows::Win32::Security::Cryptography::{
 };
 
 fn ephemeral_key() -> CngKeyHandle {
+    ephemeral_key_with_length(None)
+}
+
+fn ephemeral_key_with_length(bits: Option<u32>) -> CngKeyHandle {
     let mut provider = NCRYPT_PROV_HANDLE::default();
     let name = HSTRING::from(CNG_PROVIDER_NAME);
     // SAFETY: name and output storage are live for this synchronous call.
@@ -32,6 +36,19 @@ fn ephemeral_key() -> CngKeyHandle {
     unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) }.unwrap();
     created.unwrap();
     let key = CngKeyHandle { key: raw_key };
+    if let Some(bits) = bits {
+        // SAFETY: the unnamed key is owned and has not been finalized; this
+        // changes only the isolated fixture's modulus size.
+        unsafe {
+            windows::Win32::Security::Cryptography::NCryptSetProperty(
+                key.key,
+                windows::Win32::Security::Cryptography::NCRYPT_LENGTH_PROPERTY,
+                &bits.to_ne_bytes(),
+                NCRYPT_FLAGS(0),
+            )
+        }
+        .unwrap();
+    }
     // SAFETY: this is a newly created, unfinalized test key with no UI policy.
     unsafe { NCryptFinalizeKey(key.key, NCRYPT_FLAGS(0)) }.unwrap();
     key
@@ -555,6 +572,101 @@ fn native_batch_reader_rechecks_authorization_after_admission() {
     assert!(
         !state.silent_read_auth_required(),
         "policy revocation is not a CNG failure"
+    );
+}
+
+#[test]
+fn native_parallel_history_batch_preserves_key_order_and_uses_the_retained_handle() {
+    let state = authorized_state();
+    let key = ephemeral_key_with_length(Some(2048));
+    let ciphertexts: Vec<_> = (0..128u8)
+        .map(|v| wrap_for_test(&key, &[v; MASTER_KEY_LEN]))
+        .collect();
+    *state.cached_private_key.lock().unwrap() = Some(key);
+    let mut timings = RowKeyDecryptTimings::default();
+    let keys = decrypt_row_keys_with_cng_measured(&state, &ciphertexts, &mut timings, &|| false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(timings.calls, ciphertexts.len());
+    assert_eq!(keys.len(), ciphertexts.len());
+    for (v, key) in keys.iter().enumerate() {
+        assert_eq!(key.as_slice(), &[v as u8; MASTER_KEY_LEN]);
+    }
+}
+
+#[test]
+fn native_parallel_history_batch_honors_cancellation_after_lock_wait() {
+    let (state, ciphertext) = native_fixture();
+    let cancelled = AtomicBool::new(false);
+    let first = AtomicBool::new(true);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let held = state.cached_private_key.lock().unwrap();
+        let reader = scope.spawn(|| {
+            let mut timings = RowKeyDecryptTimings::default();
+            let result =
+                decrypt_row_keys_with_cng_measured(&state, &[ciphertext], &mut timings, &|| {
+                    if first.swap(false, Ordering::AcqRel) {
+                        entered.send(()).unwrap();
+                        false
+                    } else {
+                        cancelled.load(Ordering::Acquire)
+                    }
+                });
+            assert!(result.unwrap().is_none());
+            assert_eq!(timings.calls, 0);
+        });
+        waiting.recv().unwrap();
+        cancelled.store(true, Ordering::Release);
+        drop(held);
+        reader.join().unwrap();
+    });
+}
+
+#[test]
+fn native_parallel_history_batch_discards_prefixes_on_cancellation_or_policy_revocation() {
+    use std::sync::atomic::AtomicUsize;
+    let (state, ciphertext) = native_fixture();
+    let ciphertexts = vec![ciphertext; 128];
+    let checks = AtomicUsize::new(0);
+    let mut timings = RowKeyDecryptTimings::default();
+    assert!(
+        decrypt_row_keys_with_cng_measured(&state, &ciphertexts, &mut timings, &|| {
+            checks.fetch_add(1, Ordering::Relaxed) >= 12
+        })
+        .unwrap()
+        .is_none()
+    );
+    assert!(timings.calls < ciphertexts.len());
+
+    state.background_enabled_for_tests(false);
+    checks.store(0, Ordering::Relaxed);
+    let mut timings = RowKeyDecryptTimings::default();
+    let result = decrypt_row_keys_with_cng_measured(&state, &ciphertexts, &mut timings, &|| {
+        if checks.fetch_add(1, Ordering::Relaxed) >= 12 {
+            state.invalidate_session();
+        }
+        false
+    });
+    assert!(matches!(result, Err(CredentialError::AuthRequired)));
+    assert!(timings.calls < ciphertexts.len());
+    assert!(!state.silent_read_auth_required());
+}
+
+#[test]
+fn native_parallel_history_batch_rejects_corruption_without_revoking_valid_authorization() {
+    let (state, ciphertext) = native_fixture();
+    let mut ciphertexts = vec![ciphertext.clone(); 128];
+    ciphertexts[35] = b"invalid".to_vec();
+    let mut timings = RowKeyDecryptTimings::default();
+    assert!(matches!(
+        decrypt_row_keys_with_cng_measured(&state, &ciphertexts, &mut timings, &|| false),
+        Err(CredentialError::SystemError(_))
+    ));
+    assert!(!state.silent_read_auth_required());
+    assert_eq!(
+        decrypt_row_key_with_cng_silent(&state, &ciphertext).unwrap(),
+        vec![7; MASTER_KEY_LEN]
     );
 }
 

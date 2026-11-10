@@ -113,6 +113,48 @@ fn outbox_cannot_cross_dataset_or_generation_and_never_contains_plaintext() {
     other.generation = "c".repeat(64);
     assert!(open_event(&[7; 32], &other, &bytes).is_err());
 }
+
+#[test]
+fn preparation_pages_and_resume_cursors_commit_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("agent-memory.db");
+    let binding = binding(&path);
+    let mut repo = AgentRepository::open(&path, &[7; 32], &binding, false).unwrap();
+    repo.apply_preparation_batch(&[], "initial cursor").unwrap();
+    let event = ExportEvent {
+        dataset_id: binding.dataset_id.clone(),
+        generation: binding.generation.clone(),
+        revision: 1,
+        change: TextChange::Put {
+            record: TextRecord::Snapshot(SnapshotText {
+                screenshot_id: 42,
+                ..Default::default()
+            }),
+        },
+    };
+    let invalid = ExportEvent {
+        generation: "c".repeat(64),
+        ..event.clone()
+    };
+    assert!(repo
+        .apply_preparation_batch(&[event.clone(), invalid], "failed page")
+        .is_err());
+    assert!(repo.snapshot(42).unwrap().is_none());
+    assert_eq!(
+        repo.preparation_checkpoint().unwrap().as_deref(),
+        Some("initial cursor")
+    );
+    repo.apply_preparation_batch(&[event], "committed page")
+        .unwrap();
+    drop(repo);
+    let repo = AgentRepository::open(&path, &[7; 32], &binding, true).unwrap();
+    assert!(repo.snapshot(42).unwrap().is_some());
+    assert_eq!(
+        repo.preparation_checkpoint().unwrap().as_deref(),
+        Some("committed page")
+    );
+    assert_eq!(repo.checkpoint().unwrap(), 0);
+}
 #[test]
 fn stale_deletes_and_gaps_cannot_damage_newer_rows_or_revive_deleted_children() {
     let directory = tempfile::tempdir().unwrap();

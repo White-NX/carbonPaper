@@ -116,7 +116,8 @@ pub struct CredentialManagerState {
     /// Cached master key used by background data encryption.
     cached_master_key: Mutex<Option<Vec<u8>>>,
     /// Private-key context authenticated by the explicit unlock. All readers
-    /// borrow this handle; the mutex serializes NCrypt operations on it.
+    /// borrow this handle. The mutex excludes verification/reset and ordinary
+    /// readers while a bounded historical batch shares it with scoped workers.
     #[cfg(windows)]
     cached_private_key: Mutex<Option<CngKeyHandle>>,
     /// Data directory containing persisted key material.
@@ -1437,6 +1438,7 @@ impl Drop for CngKeyHandle {
         use windows::Win32::Security::Cryptography::{NCryptFreeObject, NCRYPT_HANDLE};
         // SAFETY: this object exclusively owns the handle; no reader can keep
         // a raw handle after the credential state's mutex guard is released.
+        // Historical batch workers all join before that guard is dropped.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(self.key.0)) };
     }
 }
@@ -1521,6 +1523,137 @@ pub(crate) struct RowKeyDecryptTimings {
     pub calls: usize,
     pub lock_wait: std::time::Duration,
     pub decrypt: std::time::Duration,
+}
+
+/// Unwrap one bounded history page with at most four native workers. The
+/// existing handle mutex stays held until every scoped worker has joined:
+/// verification cannot mutate the handle and reset cannot free it mid-call.
+/// Native handles never leave this operation; callers zeroize the returned
+/// page keys after hydration.
+pub(crate) fn decrypt_row_keys_with_cng_measured(
+    state: &CredentialManagerState,
+    ciphertexts: &[Vec<u8>],
+    timings: &mut RowKeyDecryptTimings,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Vec<zeroize::Zeroizing<Vec<u8>>>>, CredentialError> {
+    if cancelled() {
+        return Ok(None);
+    }
+    if !state.protected_read_authorized() {
+        return Err(CredentialError::AuthRequired);
+    }
+    if ciphertexts.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::AtomicUsize;
+        use zeroize::Zeroizing;
+
+        let wait_started = std::time::Instant::now();
+        let retained = state
+            .cached_private_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        timings.lock_wait += wait_started.elapsed();
+        if cancelled() {
+            return Ok(None);
+        }
+        if !state.protected_read_authorized() {
+            return Err(CredentialError::AuthRequired);
+        }
+        let key = retained.as_ref().ok_or(CredentialError::AuthRequired)?;
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |v| v.get())
+            .min(4)
+            .min(ciphertexts.len());
+        let calls = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let decrypt_started = std::time::Instant::now();
+        let unwrap = |rows: &[Vec<u8>]| {
+            let mut output = Vec::with_capacity(rows.len());
+            for ciphertext in rows {
+                if failed.load(Ordering::Acquire) || cancelled() {
+                    return Ok(None);
+                }
+                if !state.protected_read_authorized() {
+                    failed.store(true, Ordering::Release);
+                    return Err(CredentialError::AuthRequired);
+                }
+                let attempted_at = std::time::Instant::now();
+                calls.fetch_add(1, Ordering::Relaxed);
+                let result = key.unwrap_row_key(ciphertext);
+                if matches!(result, Err(CredentialError::AuthRequired)) {
+                    // The retained mutex also prevents an old native denial
+                    // from racing a newer verification's publication.
+                    state.require_silent_read_authentication(attempted_at);
+                }
+                match result {
+                    Ok(value) => output.push(Zeroizing::new(value)),
+                    Err(error) => {
+                        failed.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(Some(output))
+        };
+        let results = if workers == 1 {
+            vec![unwrap(ciphertexts)]
+        } else {
+            std::thread::scope(|scope| {
+                let readers: Vec<_> = ciphertexts
+                    .chunks(ciphertexts.len().div_ceil(workers))
+                    .map(|rows| scope.spawn(|| unwrap(rows)))
+                    .collect();
+                readers
+                    .into_iter()
+                    .map(|reader| {
+                        reader.join().unwrap_or_else(|_| {
+                            failed.store(true, Ordering::Release);
+                            Err(CredentialError::SystemError(
+                                "CNG history worker failed".into(),
+                            ))
+                        })
+                    })
+                    .collect()
+            })
+        };
+        timings.calls += calls.load(Ordering::Relaxed);
+        // Report wall time, keeping this comparable with the serialized path.
+        timings.decrypt += decrypt_started.elapsed();
+        let mut output = Vec::with_capacity(ciphertexts.len());
+        let mut interrupted = false;
+        let mut error = None;
+        for result in results {
+            match result {
+                Ok(Some(rows)) => output.extend(rows),
+                Ok(None) => interrupted = true,
+                Err(cause) => {
+                    if error.is_none() {
+                        error = Some(cause);
+                    }
+                }
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if interrupted || cancelled() {
+            return Ok(None);
+        }
+        if !state.protected_read_authorized() {
+            return Err(CredentialError::AuthRequired);
+        }
+        Ok(Some(output))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = timings;
+        Err(CredentialError::SystemError(
+            "CNG is only available on Windows".into(),
+        ))
+    }
 }
 
 /// Measures private-key contention separately from CNG execution. Cancellation

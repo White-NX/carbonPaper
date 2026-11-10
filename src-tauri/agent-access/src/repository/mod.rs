@@ -244,6 +244,18 @@ impl AgentRepository {
         db(self.conn.execute("INSERT INTO agent_metadata VALUES('checkpoint',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [id.to_string()]))?;
         Ok(())
     }
+    /// Desktop source cursors are opaque to the reader and remain scoped to
+    /// this repository's dataset/generation binding.
+    pub fn preparation_checkpoint(&self) -> Result<Option<String>, String> {
+        db(self
+            .conn
+            .query_row(
+                "SELECT value FROM agent_metadata WHERE key='preparation_checkpoint'",
+                [],
+                |r| r.get(0),
+            )
+            .optional())
+    }
     pub fn has_gaps(&self) -> Result<bool, String> {
         db(self
             .conn
@@ -495,7 +507,17 @@ impl AgentRepository {
     }
 
     pub fn apply_batch(&mut self, events: &[ExportEvent]) -> Result<(), String> {
-        self.apply_batch_with_checkpoint(events, None)
+        self.apply_batch_with_checkpoints(events, None, None)
+    }
+
+    /// Commit a historical source page and its resume cursor together, without
+    /// a second transaction or a write to the capture database.
+    pub fn apply_preparation_batch(
+        &mut self,
+        events: &[ExportEvent],
+        checkpoint: &str,
+    ) -> Result<(), String> {
+        self.apply_batch_with_checkpoints(events, None, Some(checkpoint))
     }
 
     /// Publish the durable outbox position in the same transaction as its rows.
@@ -504,15 +526,16 @@ impl AgentRepository {
         events: &[ExportEvent],
         checkpoint: i64,
     ) -> Result<(), String> {
-        self.apply_batch_with_checkpoint(events, Some(checkpoint))
+        self.apply_batch_with_checkpoints(events, Some(checkpoint), None)
     }
 
-    fn apply_batch_with_checkpoint(
+    fn apply_batch_with_checkpoints(
         &mut self,
         events: &[ExportEvent],
         checkpoint: Option<i64>,
+        preparation: Option<&str>,
     ) -> Result<(), String> {
-        if events.is_empty() && checkpoint.is_none() {
+        if events.is_empty() && checkpoint.is_none() && preparation.is_none() {
             return Ok(());
         }
         let tx = db(self.conn.transaction())?;
@@ -524,6 +547,9 @@ impl AgentRepository {
         }
         if let Some(checkpoint) = checkpoint {
             db(tx.execute("INSERT INTO agent_metadata VALUES('checkpoint',?1) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(agent_metadata.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",[checkpoint.to_string()]))?;
+        }
+        if let Some(preparation) = preparation {
+            db(tx.execute("INSERT INTO agent_metadata VALUES('preparation_checkpoint',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [preparation]))?;
         }
         db(tx.commit())
     }

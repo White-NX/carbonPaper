@@ -263,6 +263,60 @@ async fn native_agent_grants_and_independent_dpapi_keys_survive_reopen_and_revok
         BrokerError::AccessDenied
     );
     fixture.set_role(RuntimeRole::Desktop);
+    let generation = restored.binding.generation.clone();
+    let Response::AgentRevision(revision) = fixture
+        .request(Request::AgentFenceBatch {
+            generation: generation.clone(),
+            count: MAX_AGENT_FENCE_BATCH_SIZE,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        revision,
+        status.source_revision + i64::from(MAX_AGENT_FENCE_BATCH_SIZE)
+    );
+    fixture.set_role(RuntimeRole::McpReader);
+    assert_eq!(
+        fixture
+            .request(Request::AgentCheck {
+                context: context.clone()
+            })
+            .await
+            .unwrap_err(),
+        BrokerError::AccessDenied
+    );
+    assert_eq!(
+        fixture
+            .request(Request::AgentReaderKeys {
+                generation: generation.clone(),
+            })
+            .await
+            .unwrap_err(),
+        BrokerError::Busy
+    );
+    fixture.set_role(RuntimeRole::Desktop);
+    fixture
+        .request(Request::AgentPublish {
+            generation,
+            revision,
+            complete: true,
+        })
+        .await
+        .unwrap();
+    fixture.set_role(RuntimeRole::McpReader);
+    let Response::AgentContext(context) = fixture
+        .request(Request::AgentAuthorize {
+            token_hash: token_hash.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    fixture.set_role(RuntimeRole::Desktop);
     fixture
         .request(Request::AgentRevoke { grant_id: grant.id })
         .await

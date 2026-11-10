@@ -6,6 +6,7 @@ import { usePolling } from '../../../hooks/usePolling';
 import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
 import { securityErrorMessage } from '../security/securityLevels';
 import { openSettingsWindow } from '../../../lib/settings_api';
+import { canIssueUnattendedCredential } from './agentAccessConstants';
 
 export function useUnattendedCredentials() {
   const { t } = useTranslation();
@@ -88,7 +89,7 @@ export function useUnattendedCredentials() {
     }
   };
   const issue = async () => {
-    if (!label.trim() || !status?.enabled || status.phase !== 'ready') return false;
+    if (!label.trim() || !canIssueUnattendedCredential(status)) return false;
     const expiresAtMs = expiry === 'never' ? null : Date.now() + Number(expiry.slice(0, -1)) * 86400000;
     const succeeded = await run(async () => {
       const result = await issueAgentCredential({ label: label.trim(), expiresAtMs, replaceGrantId: replacement?.id ?? null });

@@ -70,6 +70,35 @@ describe('unattended credential management', () => {
     expect(invoke.mock.calls.some(([name]) => name === 'agent_access_revoke_credential')).toBe(false);
   });
 
+  it.each(['preparing', 'syncing', 'reconciling'])('creates and replaces credentials during %s with a readiness explanation', async (phase) => {
+    status = { ...status, phase, preparation: { processed: 20, total: 100 } };
+    render(<UnattendedCredentialsCard />);
+    const label = await screen.findByRole('textbox', { name: '智能体名称' });
+    expect(screen.getByText(/文本历史准备完成后，凭据即可使用/)).toBeInTheDocument();
+    await userEvent.type(label, 'Configured early');
+    await userEvent.click(screen.getByRole('button', { name: '创建并复制凭据' }));
+    await screen.findByText(/凭据已复制到 Windows 剪贴板/);
+    expect(invoke).toHaveBeenCalledWith('agent_access_issue_credential', expect.objectContaining({ label: 'Configured early', replaceGrantId: null }));
+    await waitFor(() => expect(label).toHaveValue(''));
+
+    await userEvent.click(screen.getAllByRole('button', { name: '替换' })[0]);
+    await userEvent.click(screen.getByRole('button', { name: '替换并复制凭据' }));
+    await screen.findByText('新凭据已复制，原凭据已撤销。');
+    expect(invoke).toHaveBeenCalledWith('agent_access_issue_credential', expect.objectContaining({ label: 'Agent A', replaceGrantId: 'grant-a' }));
+    expect(status.phase).toBe(phase);
+    expect(status.grants.find((item) => item.id === 'grant-b').revoked).toBe(false);
+    expect(clipboard).not.toHaveBeenCalled();
+  });
+
+  it('keeps creation and replacement unavailable when protected components are unavailable', async () => {
+    status = { ...status, phase: 'preparing', available: false };
+    render(<UnattendedCredentialsCard />);
+    await screen.findByRole('button', { name: '安全设置' });
+    await waitFor(() => expect(screen.getAllByRole('button', { name: '替换' })[0]).toBeDisabled());
+    expect(screen.queryByRole('textbox', { name: '智能体名称' })).not.toBeInTheDocument();
+    expect(invoke.mock.calls.some(([name]) => name === 'agent_access_issue_credential')).toBe(false);
+  });
+
   it('cancels revocation without changing grants and confirms only the selected credential', async () => {
     render(<UnattendedCredentialsCard />);
     await screen.findByRole('textbox', { name: '智能体名称' });

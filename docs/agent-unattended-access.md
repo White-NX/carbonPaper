@@ -71,9 +71,11 @@ the active wizard, so it remains usable under startup overlay coordination.
 permissions; **Feature guide** in Privacy settings reopens it.
 
 **AI → Agent access** retains connection and privacy-filter controls and manages
-unattended credentials. Text preparation must finish before creating a labeled
-credential; interrupted preparation offers an explicit continuation action.
-Once issuance starts, concurrent capture synchronization does not cancel it.
+unattended credentials. Credentials can be created or replaced during initial
+text preparation and synchronization, so client configuration can be completed
+while history is being prepared. The settings explain that credentials become
+usable once history is ready. Interrupted preparation offers an explicit
+continuation action. Concurrent capture synchronization does not cancel issuance.
 Reader key acquisition and requests still require a complete, synchronized view.
 Each credential has an optional expiry, last-use information, replacement and
 independent revocation. Interactive token-copy, token-rotation and smoke-test
@@ -155,7 +157,11 @@ flowchart LR
 ```
 
 Historical preparation unwraps OCR, recap-search and vector-domain keys while
-authenticated, then rewraps them for the authorized generation. It decodes only
+authenticated, then rewraps them for the authorized generation. Bounded OCR and
+projection pages share the retained, authenticated CNG handle across at most
+four scoped workers. The handle mutex excludes verification and reset until
+every worker has joined; authorization and cancellation are rechecked during
+the batch, and page keys are zeroized after hydration. It decodes only
 the text needed by small projections and never opens screenshots or thumbnails.
 Capture and processing stage freshly generated row/domain keys before clearing
 them, so new OCR and vectors can become available while the UI is locked.
@@ -173,13 +179,20 @@ checks OCR and recap-search digests before decrypting their source payloads;
 semantic reads validate the existing vector model, revision and dimensions.
 CLIP scans read vectors in bounded pages.
 
-Events commit alongside source changes. Revision fencing, tombstones and
-source deletion checks prevent older callbacks from overwriting newer records
-or reviving deleted children. Historical preparation uses a persistent checkpoint
-and commits each bounded source page in one Agent transaction. Outbox batches
-commit their record updates and applied position together. Preparation drains
-concurrent updates between pages and logs cumulative phase, row-key, read and
-write timings at bounded intervals. It pauses on lock, cancellation or
+Events commit alongside source changes. Explicit source transactions reserve
+bounded ranges of service revisions, assigning a distinct revision to each event and
+discarding unused revisions on commit or rollback. Older services that do not
+support ranges continue to fence events individually. Revision fencing,
+tombstones and source deletion checks prevent older callbacks from overwriting newer records
+or reviving deleted children. Historical preparation commits each bounded source
+page and its persistent resume cursor in the same Agent transaction. Older main
+database checkpoints are used only until the next historical page commits; new
+pages do not write their cursors to the main database. Outbox batches commit
+their record updates and applied position together, allowing source
+acknowledgements to resume without replaying applied envelopes. Preparation attempts a bounded
+outbox batch every two seconds when the main connection is available and drains
+remaining updates before publishing readiness. It logs cumulative phase,
+row-key, read and write timings at bounded intervals. It pauses on lock, cancellation or
 maintenance. The main database must remain available; missing files, mismatched
 datasets or changed ciphertext fail the read rather than return a stale copy.
 

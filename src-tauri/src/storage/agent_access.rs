@@ -9,14 +9,16 @@ use carbonpaper_agent_access::{
     repository::{open_event, seal_access_key, seal_event, AgentRepository},
     types::*,
 };
-use carbonpaper_app_bound::protocol::{AgentViewBinding, AgentViewKeys, Request, Response};
+use carbonpaper_app_bound::protocol::{
+    AgentViewBinding, AgentViewKeys, BrokerError, Request, Response, MAX_AGENT_FENCE_BATCH_SIZE,
+};
 use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -55,6 +57,8 @@ struct Checkpoint {
     baseline: i64,
     complete: bool,
 }
+
+type PreparedHistoryKeys = HashMap<Vec<u8>, Zeroizing<Vec<u8>>>;
 
 struct PreparationTimings {
     kind: &'static str,
@@ -123,6 +127,12 @@ struct WriterKeys {
     content: Zeroizing<Vec<u8>>,
     outbox: Zeroizing<Vec<u8>>,
 }
+
+struct RevisionRange {
+    generation: String,
+    next: i64,
+    remaining: u32,
+}
 #[derive(Default)]
 pub(crate) struct AgentWriter {
     keys: Mutex<Option<WriterKeys>>,
@@ -136,6 +146,7 @@ pub(crate) struct AgentWriter {
     stopped: AtomicBool,
     cancelled: AtomicBool,
     configured: AtomicBool,
+    fence_batch_unsupported: AtomicBool,
     #[cfg(test)]
     authority: Mutex<Option<Arc<dyn Fn(Request) -> Result<Response, String> + Send + Sync>>>,
 }
@@ -465,14 +476,76 @@ impl AgentWriter {
         }
         Ok(())
     }
-    fn queue_event(&self, change: TextChange) -> Result<String, String> {
-        let binding = self.binding().ok_or("AGENT_ACCESS_DISABLED")?;
-        let Response::AgentRevision(revision) = self.request(Request::AgentFence {
+    fn next_revision(
+        &self,
+        binding: &AgentViewBinding,
+        range: Option<&Mutex<Option<RevisionRange>>>,
+    ) -> Result<i64, String> {
+        let single = || match self.request(Request::AgentFence {
             generation: binding.generation.clone(),
-        })?
-        else {
-            return Err("AGENT_INVALID_REVISION".into());
+        })? {
+            Response::AgentRevision(revision) if revision > 0 => Ok(revision),
+            _ => Err("AGENT_INVALID_REVISION".into()),
         };
+        let Some(range) = range else {
+            return single();
+        };
+        let mut reserved = range.lock().unwrap_or_else(|e| e.into_inner());
+        if reserved
+            .as_ref()
+            .is_none_or(|v| v.generation != binding.generation || v.remaining == 0)
+        {
+            if self.fence_batch_unsupported.load(Ordering::Acquire) {
+                return single();
+            }
+            let last = match self.request(Request::AgentFenceBatch {
+                generation: binding.generation.clone(),
+                count: MAX_AGENT_FENCE_BATCH_SIZE,
+            }) {
+                Ok(Response::AgentRevision(revision)) => revision,
+                // An installed older service still fences each event. Only a
+                // definite unsupported request permits this compatibility path.
+                Err(error)
+                    if error
+                        == format!(
+                            "AGENT_SERVICE_UNAVAILABLE: {}",
+                            BrokerError::InvalidRequest
+                        ) =>
+                {
+                    self.fence_batch_unsupported.store(true, Ordering::Release);
+                    return single();
+                }
+                Err(error) => return Err(error),
+                _ => return Err("AGENT_INVALID_REVISION".into()),
+            };
+            let first = last
+                .checked_sub(i64::from(MAX_AGENT_FENCE_BATCH_SIZE) - 1)
+                .filter(|v| *v > 0)
+                .ok_or("AGENT_INVALID_REVISION")?;
+            *reserved = Some(RevisionRange {
+                generation: binding.generation.clone(),
+                next: first,
+                remaining: MAX_AGENT_FENCE_BATCH_SIZE,
+            });
+        }
+        let reserved = reserved.as_mut().unwrap();
+        let revision = reserved.next;
+        reserved.remaining -= 1;
+        if reserved.remaining > 0 {
+            reserved.next = revision.checked_add(1).ok_or("AGENT_INVALID_REVISION")?;
+        }
+        Ok(revision)
+    }
+    fn queue_event(&self, change: TextChange) -> Result<String, String> {
+        self.queue_event_in_transaction(change, None)
+    }
+    fn queue_event_in_transaction(
+        &self,
+        change: TextChange,
+        range: Option<&Mutex<Option<RevisionRange>>>,
+    ) -> Result<String, String> {
+        let binding = self.binding().ok_or("AGENT_ACCESS_DISABLED")?;
+        let revision = self.next_revision(&binding, range)?;
         let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(keys) = keys.as_ref() {
             let event = ExportEvent {
@@ -512,6 +585,19 @@ impl AgentWriter {
     }
     pub(super) fn register(self: &Arc<Self>, conn: &Connection) -> Result<(), String> {
         Self::register_digest(conn)?;
+        // A reserved range belongs to one source transaction on this connection.
+        // Discard unused revisions on either outcome: reusing them after a
+        // readiness publication could fail to fence a later committed update.
+        let revisions = Arc::new(Mutex::new(None::<RevisionRange>));
+        let committed = revisions.clone();
+        db(conn.commit_hook(Some(move || {
+            *committed.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            false
+        })))?;
+        let rolled_back = revisions.clone();
+        db(conn.rollback_hook(Some(move || {
+            *rolled_back.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        })))?;
         // Trigger-callable functions return only a flag, decoded ciphertext or
         // an independently encrypted envelope. Plaintext decryption functions
         // remain DIRECTONLY and are never made available to an untrusted schema.
@@ -558,7 +644,22 @@ impl AgentWriter {
                     return Err(sql_error("AGENT_INVALID_RECORD_KIND".into()));
                 }
                 let change = live_projection(&kind, &key, &action, value).map_err(sql_error)?;
-                writer.queue_event(change).map(Some).map_err(sql_error)
+                // Only explicit source write transactions may retain a range.
+                // Read-only scalar calls may never invoke commit/rollback hooks
+                // and must not lend stale revisions to later writes.
+                // SAFETY: inspect the callback's connection on this same thread;
+                // the borrowed handle never escapes or executes another query.
+                let connection = unsafe { args.get_connection() }?;
+                let source_transaction = !connection.is_autocommit()
+                    && connection.transaction_state(Some("main"))?
+                        == rusqlite::TransactionState::Write;
+                writer
+                    .queue_event_in_transaction(
+                        change,
+                        source_transaction.then_some(revisions.as_ref()),
+                    )
+                    .map(Some)
+                    .map_err(sql_error)
             }),
         )?;
         Ok(())
@@ -925,6 +1026,10 @@ impl StorageState {
                 baseline: status.source_revision,
                 complete: false,
             };
+            repo.apply_preparation_batch(
+                &[],
+                &serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?,
+            )?;
             let guard = self.get_connection_named("agent_prepare_state")?;
             let conn = guard.as_ref().unwrap();
             db(conn.execute(
@@ -1089,12 +1194,18 @@ impl StorageState {
             )?
         };
         let mut checkpoint: Checkpoint = {
-            let guard = self.get_connection_named("agent_checkpoint")?;
-            let value: String = db(guard.as_ref().unwrap().query_row(
-                "SELECT checkpoint FROM agent_access_state WHERE id=1",
-                [],
-                |r| r.get(0),
-            ))?;
+            let value = match repo.preparation_checkpoint()? {
+                Some(value) => value,
+                // Resume an older preparation from its last durable source
+                // cursor. Its next page migrates the cursor into the Agent DB.
+                None => self.with_read_connection_named("agent_checkpoint", |conn| {
+                    db(conn.query_row(
+                        "SELECT checkpoint FROM agent_access_state WHERE id=1",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    ))
+                })?,
+            };
             serde_json::from_str(&value).map_err(|_| "AGENT_INVALID_CHECKPOINT")?
         };
         if checkpoint.generation != binding.generation {
@@ -1106,6 +1217,7 @@ impl StorageState {
             }
             self.agent_writer.progress_phase("preparing", None);
             let mut timings = PreparationTimings::new("");
+            let mut last_outbox = Instant::now();
             while checkpoint.phase < SOURCES.len() {
                 if self.agent_maintenance_pending() {
                     return Ok(());
@@ -1125,17 +1237,23 @@ impl StorageState {
                 let rows = self.agent_source_page(source, &checkpoint.cursor, None)?;
                 timings.read += read_started.elapsed();
                 let complete = rows.is_empty();
+                let processed = rows.len() as u64;
+                let mut events = Vec::with_capacity(rows.len());
                 if complete {
                     checkpoint.phase += 1;
                     checkpoint.cursor.clear();
                 } else {
-                    let processed = rows.len() as u64;
                     let cursor = rows.last().unwrap().0.clone();
-                    let mut events = Vec::with_capacity(rows.len());
                     let hydrate_started = Instant::now();
+                    let prepared =
+                        self.prepare_agent_history_keys(kind, &rows, &mut timings.row_keys)?;
                     for (_, value) in rows {
-                        let records =
-                            self.hydrate_agent_record(kind, value, &mut timings.row_keys)?;
+                        let records = self.hydrate_agent_record(
+                            kind,
+                            value,
+                            &mut timings.row_keys,
+                            &prepared,
+                        )?;
                         for record in records {
                             events.push(ExportEvent {
                                 dataset_id: binding.dataset_id.clone(),
@@ -1152,32 +1270,47 @@ impl StorageState {
                     if !self.is_session_valid() {
                         return Err("AUTH_REQUIRED".into());
                     }
-                    let write_started = Instant::now();
-                    repo.apply_batch(&events)?;
-                    timings.write += write_started.elapsed();
-                    timings.processed += processed;
                     checkpoint.cursor = cursor;
-                    self.agent_writer
-                        .progress
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .processed += processed;
                 }
-                let checkpoint_started = Instant::now();
-                self.save_agent_checkpoint(&checkpoint)?;
-                timings.checkpoint += checkpoint_started.elapsed();
-                // Keep source updates moving between snapshot pages.
-                let outbox_started = Instant::now();
-                self.apply_agent_outbox(&binding, &mut repo)?;
-                timings.outbox += outbox_started.elapsed();
+                if self.agent_maintenance_pending() {
+                    return Ok(());
+                }
+                let write_started = Instant::now();
+                repo.apply_preparation_batch(
+                    &events,
+                    &serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?,
+                )?;
+                if complete {
+                    timings.checkpoint += write_started.elapsed();
+                } else {
+                    timings.write += write_started.elapsed();
+                }
+                timings.processed += processed;
+                self.agent_writer
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .processed += processed;
+                // Catch up at a bounded cadence and skip a busy source writer.
+                // The final drain still runs before readiness can be published.
+                if last_outbox.elapsed() >= Duration::from_secs(2) {
+                    let outbox_started = Instant::now();
+                    self.apply_agent_outbox(&binding, &mut repo, true)?;
+                    timings.outbox += outbox_started.elapsed();
+                    last_outbox = Instant::now();
+                }
                 timings.page_finished(complete);
             }
             checkpoint.complete = true;
-            self.save_agent_checkpoint(&checkpoint)?;
+            repo.apply_preparation_batch(
+                &[],
+                &serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?,
+            )?;
         }
-        self.apply_agent_outbox(&binding, &mut repo)?;
+        self.apply_agent_outbox(&binding, &mut repo, false)?;
         if self.is_session_valid() {
             let mut row_key_timings = RowKeyDecryptTimings::default();
+            let prepared = PreparedHistoryKeys::new();
             for (kind, key, revision) in repo.gaps()? {
                 if self.agent_maintenance_pending() {
                     return Ok(());
@@ -1201,9 +1334,12 @@ impl StorageState {
                     })?;
                 } else {
                     for (_, value) in rows {
-                        for record in
-                            self.hydrate_agent_record(&kind, value, &mut row_key_timings)?
-                        {
+                        for record in self.hydrate_agent_record(
+                            &kind,
+                            value,
+                            &mut row_key_timings,
+                            &prepared,
+                        )? {
                             repo.apply(&ExportEvent {
                                 dataset_id: binding.dataset_id.clone(),
                                 generation: binding.generation.clone(),
@@ -1330,59 +1466,12 @@ impl StorageState {
             db(tx.commit())?;
         }
     }
-    fn save_agent_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), String> {
-        let guard = self.get_connection_named("agent_save_checkpoint")?;
-        db(guard.as_ref().unwrap().execute(
-            "UPDATE agent_access_state SET checkpoint=?1 WHERE id=1",
-            [serde_json::to_string(checkpoint).map_err(|e| e.to_string())?],
-        ))?;
-        Ok(())
-    }
     fn apply_agent_outbox(
         &self,
         binding: &AgentViewBinding,
         repo: &mut AgentRepository,
+        opportunistic: bool,
     ) -> Result<(), String> {
-        let gaps: Vec<(String, String, i64, String)> = {
-            let guard = self.get_connection_named("agent_read_gaps")?;
-            let mut query = db(guard.as_ref().unwrap().prepare(
-                "SELECT kind,key,revision,operation FROM agent_projection_gaps ORDER BY revision",
-            ))?;
-            let rows =
-                db(query.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?;
-            db(rows.collect())?
-        };
-        for (kind, key, revision, operation) in gaps {
-            if self.agent_maintenance_pending() {
-                return Ok(());
-            }
-            if self.agent_writer.cancelled.load(Ordering::Acquire) {
-                return Err("AGENT_CANCELLED".into());
-            }
-            let change = match operation.as_str() {
-                "delete" => TextChange::Delete {
-                    kind: kind.clone(),
-                    key: key.clone(),
-                },
-                "delete_day" => TextChange::DeleteDay { date: key.clone() },
-                "source_changed" => TextChange::SourceChanged,
-                _ => TextChange::Gap {
-                    kind: kind.clone(),
-                    key: key.clone(),
-                },
-            };
-            repo.apply(&ExportEvent {
-                dataset_id: binding.dataset_id.clone(),
-                generation: binding.generation.clone(),
-                revision,
-                change,
-            })?;
-            let guard = self.get_connection_named("agent_ack_gap")?;
-            db(guard.as_ref().unwrap().execute(
-                "DELETE FROM agent_projection_gaps WHERE kind=?1 AND key=?2 AND revision<=?3",
-                params![kind, key, revision],
-            ))?;
-        }
         loop {
             if self.agent_maintenance_pending() {
                 return Ok(());
@@ -1390,19 +1479,42 @@ impl StorageState {
             if self.agent_writer.cancelled.load(Ordering::Acquire) {
                 return Err("AGENT_CANCELLED".into());
             }
-            let rows: Vec<(i64, Vec<u8>)> = {
-                let guard = self.get_connection_named("agent_read_outbox")?;
-                let mut statement = db(guard
-                    .as_ref()
-                    .unwrap()
-                    .prepare("SELECT id,envelope FROM agent_outbox ORDER BY id LIMIT 256"))?;
-                let rows = db(statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?))))?;
-                db(rows.collect())?
+            let applied = repo.checkpoint()?;
+            let (gaps, rows, pending_ack) = {
+                let guard = if opportunistic {
+                    let Some(guard) = self.try_get_connection_named("agent_read_outbox")? else {
+                        return Ok(());
+                    };
+                    guard
+                } else {
+                    self.get_connection_named("agent_read_outbox")?
+                };
+                let conn = guard.as_ref().unwrap();
+                let mut statement = db(conn.prepare(
+                    "SELECT kind,key,revision,operation FROM agent_projection_gaps ORDER BY revision LIMIT 256",
+                ))?;
+                let gaps: Vec<(String, String, i64, String)> =
+                    db(db(statement
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?
+                    .collect())?;
+                let mut statement = db(conn.prepare(
+                    "SELECT id,envelope FROM agent_outbox WHERE id>?1 ORDER BY id LIMIT 256",
+                ))?;
+                let rows: Vec<(i64, Vec<u8>)> = db(db(
+                    statement.query_map([applied], |r| Ok((r.get(0)?, r.get(1)?)))
+                )?
+                .collect())?;
+                let pending_ack: bool = db(conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_outbox WHERE id<=?1)",
+                    [applied],
+                    |r| r.get(0),
+                ))?;
+                (gaps, rows, pending_ack)
             };
-            if rows.is_empty() {
+            if rows.is_empty() && gaps.is_empty() && !pending_ack {
                 break;
             }
-            let last = rows.last().unwrap().0;
+            let last = rows.last().map_or(applied, |r| r.0);
             let outbox_key = {
                 let keys = self
                     .agent_writer
@@ -1414,7 +1526,27 @@ impl StorageState {
                     .outbox
                     .clone()
             };
-            let mut events = Vec::with_capacity(rows.len());
+            let mut events = Vec::with_capacity(gaps.len() + rows.len());
+            for (kind, key, revision, operation) in &gaps {
+                let change = match operation.as_str() {
+                    "delete" => TextChange::Delete {
+                        kind: kind.clone(),
+                        key: key.clone(),
+                    },
+                    "delete_day" => TextChange::DeleteDay { date: key.clone() },
+                    "source_changed" => TextChange::SourceChanged,
+                    _ => TextChange::Gap {
+                        kind: kind.clone(),
+                        key: key.clone(),
+                    },
+                };
+                events.push(ExportEvent {
+                    dataset_id: binding.dataset_id.clone(),
+                    generation: binding.generation.clone(),
+                    revision: *revision,
+                    change,
+                });
+            }
             for (_, bytes) in rows {
                 if self.agent_writer.cancelled.load(Ordering::Acquire) {
                     return Err("AGENT_CANCELLED".into());
@@ -1427,12 +1559,33 @@ impl StorageState {
             if self.agent_writer.cancelled.load(Ordering::Acquire) {
                 return Err("AGENT_CANCELLED".into());
             }
-            repo.apply_outbox_batch(&events, last)?;
-            let guard = self.get_connection_named("agent_ack_outbox")?;
-            db(guard
-                .as_ref()
-                .unwrap()
-                .execute("DELETE FROM agent_outbox WHERE id<=?1", [last]))?;
+            if !events.is_empty() {
+                repo.apply_outbox_batch(&events, last)?;
+            }
+            let guard = if opportunistic {
+                let Some(guard) = self.try_get_connection_named("agent_ack_outbox")? else {
+                    // The durable Agent cursor prevents replay while source
+                    // acknowledgement waits for the next available transaction.
+                    return Ok(());
+                };
+                guard
+            } else {
+                self.get_connection_named("agent_ack_outbox")?
+            };
+            let tx = db(guard.as_ref().unwrap().unchecked_transaction())?;
+            db(tx.execute("DELETE FROM agent_outbox WHERE id<=?1", [last]))?;
+            {
+                let mut ack = db(tx.prepare(
+                    "DELETE FROM agent_projection_gaps WHERE kind=?1 AND key=?2 AND revision<=?3",
+                ))?;
+                for (kind, key, revision, _) in gaps {
+                    db(ack.execute(params![kind, key, revision]))?;
+                }
+            }
+            db(tx.commit())?;
+            if opportunistic {
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -1472,11 +1625,77 @@ impl StorageState {
             })
             .collect()
     }
+    fn prepare_agent_history_keys(
+        &self,
+        kind: &str,
+        rows: &[(String, Value)],
+        timings: &mut RowKeyDecryptTimings,
+    ) -> Result<PreparedHistoryKeys, String> {
+        let mut wrapped = Vec::new();
+        let mut unique = HashSet::new();
+        let nonempty = |value: &Value| value.as_str().is_some_and(|v| !v.is_empty());
+        let mut add = |encoded: &Value| -> Result<(), String> {
+            let encoded = encoded
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .ok_or("AGENT_INVALID_SOURCE")?;
+            let key = hex::decode(encoded).map_err(|_| "AGENT_INVALID_SOURCE")?;
+            if unique.insert(key.clone()) {
+                wrapped.push(key);
+            }
+            Ok(())
+        };
+        for (_, value) in rows {
+            match kind {
+                "ocr" => add(&value["key_enc"])?,
+                "snapshot" => {
+                    if ["window_title_enc", "process_name_enc", "page_url_enc"]
+                        .iter()
+                        .any(|field| nonempty(&value[*field]))
+                    {
+                        add(&value["key_enc"])?;
+                    }
+                    if nonempty(&value["links_enc"]) && nonempty(&value["links_key"]) {
+                        add(&value["links_key"])?;
+                    }
+                }
+                "recap" if value["part"] == "search" || nonempty(&value["data_enc"]) => {
+                    add(&value["key_enc"])?;
+                }
+                _ => {}
+            }
+        }
+        if wrapped.is_empty() {
+            return Ok(PreparedHistoryKeys::new());
+        }
+        let keys = crate::credential_manager::decrypt_row_keys_with_cng_measured(
+            &self.credential_state,
+            &wrapped,
+            timings,
+            &|| self.agent_writer.cancelled.load(Ordering::Acquire) || !self.is_session_valid(),
+        )
+        .map_err(|error| match error {
+            CredentialError::AuthRequired => "AUTH_REQUIRED".into(),
+            _ => error.to_string(),
+        })?
+        .ok_or_else(|| {
+            if self.is_session_valid() {
+                "AGENT_CANCELLED"
+            } else {
+                "AUTH_REQUIRED"
+            }
+            .to_string()
+        })?;
+        // Plaintext row keys live only within this bounded source page and are
+        // zeroized even if hydration, cancellation or the atomic commit fails.
+        Ok(wrapped.into_iter().zip(keys).collect())
+    }
     fn hydrate_agent_record(
         &self,
         kind: &str,
         mut value: Value,
         timings: &mut RowKeyDecryptTimings,
+        prepared: &PreparedHistoryKeys,
     ) -> Result<Vec<TextRecord>, String> {
         if kind == "ocr" || kind == "vector_key" || (kind == "recap" && value["part"] == "search") {
             if !self.is_session_valid() {
@@ -1494,7 +1713,7 @@ impl StorageState {
                 )
                 .map_err(|e| e.to_string())?
             } else {
-                self.unwrap_agent_history_key(&wrapped, timings)?
+                self.unwrap_agent_history_key(&wrapped, timings, prepared)?
             });
             let (domain, id, digest) = if kind == "vector_key" {
                 (
@@ -1559,6 +1778,7 @@ impl StorageState {
                         row_key = Some(Zeroizing::new(self.unwrap_agent_history_key(
                             key.as_deref().ok_or("AGENT_INVALID_SOURCE")?,
                             timings,
+                            prepared,
                         )?));
                     }
                     let bytes = hex::decode(encoded).map_err(|_| "AGENT_INVALID_SOURCE")?;
@@ -1580,6 +1800,7 @@ impl StorageState {
                     &hex::decode(data).map_err(|_| "AGENT_INVALID_SOURCE")?,
                     &hex::decode(key).map_err(|_| "AGENT_INVALID_SOURCE")?,
                     timings,
+                    prepared,
                 )?;
                 let links: Vec<TextLink> =
                     serde_json::from_slice(&plain).map_err(|_| "AGENT_INVALID_SOURCE")?;
@@ -1593,6 +1814,7 @@ impl StorageState {
                     &hex::decode(data).map_err(|_| "AGENT_INVALID_SOURCE")?,
                     &hex::decode(key).map_err(|_| "AGENT_INVALID_SOURCE")?,
                     timings,
+                    prepared,
                 )?;
                 value[if kind == "ocr" { "text" } else { "content" }] =
                     json!(String::from_utf8(plain.to_vec()).map_err(|_| "AGENT_INVALID_SOURCE")?);
@@ -1608,7 +1830,11 @@ impl StorageState {
         &self,
         wrapped: &[u8],
         timings: &mut RowKeyDecryptTimings,
+        prepared: &PreparedHistoryKeys,
     ) -> Result<Vec<u8>, String> {
+        if let Some(key) = prepared.get(wrapped) {
+            return Ok(key.to_vec());
+        }
         crate::credential_manager::decrypt_row_key_with_cng_measured(
             &self.credential_state,
             wrapped,
@@ -1627,8 +1853,9 @@ impl StorageState {
         encrypted: &[u8],
         wrapped: &[u8],
         timings: &mut RowKeyDecryptTimings,
+        prepared: &PreparedHistoryKeys,
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        let key = Zeroizing::new(self.unwrap_agent_history_key(wrapped, timings)?);
+        let key = Zeroizing::new(self.unwrap_agent_history_key(wrapped, timings, prepared)?);
         decrypt_with_master_key(&key, encrypted)
             .map(Zeroizing::new)
             .map_err(|error| error.to_string())

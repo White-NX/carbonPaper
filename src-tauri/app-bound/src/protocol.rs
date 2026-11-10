@@ -9,6 +9,7 @@ pub const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 pub const PREPARE_TTL_SECS: i64 = 600;
 pub const LEASE_TTL_SECS: i64 = 300;
 pub const MAX_ACTIVE_TASKS: u64 = 100_000;
+pub const MAX_AGENT_FENCE_BATCH_SIZE: u32 = 256;
 pub const DAY_SECS: i64 = 86_400;
 #[cfg(not(feature = "development-runtime"))]
 pub const SERVICE_NAME: &str = "CarbonPaperKeyService";
@@ -381,6 +382,10 @@ pub enum Request {
     AgentFence {
         generation: String,
     },
+    AgentFenceBatch {
+        generation: String,
+        count: u32,
+    },
     AgentPublish {
         generation: String,
         revision: i64,
@@ -502,6 +507,7 @@ impl Request {
             Self::AgentWriterKeys { .. } => "agent_writer_keys",
             Self::AgentReaderKeys { .. } => "agent_reader_keys",
             Self::AgentFence { .. } => "agent_fence",
+            Self::AgentFenceBatch { .. } => "agent_fence_batch",
             Self::AgentPublish { .. } => "agent_publish",
             Self::AgentIssue { .. } => "agent_issue",
             Self::AgentRevoke { .. } => "agent_revoke",
@@ -545,6 +551,7 @@ impl Request {
                 | Self::AgentAuthorize { .. }
                 | Self::AgentCheck { .. }
                 | Self::AgentFence { .. }
+                | Self::AgentFenceBatch { .. }
                 | Self::AgentPublish { .. }
                 | Self::InspectTask { .. }
                 | Self::RenewLease { .. }
