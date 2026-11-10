@@ -165,8 +165,11 @@ impl StorageState {
     }
 
     fn compact_storage_batch(&self) -> Result<usize, String> {
-        let guard = self.get_connection_named("storage_compaction")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
-        compact_ocr_markers(conn, 1024)
+        let markers = {
+            let guard = self.get_connection_named("storage_compaction")?;
+            let conn = guard.as_ref().ok_or("Database not initialized")?;
+            compact_ocr_markers(conn, 1024)?
+        };
+        Ok(markers + self.compact_process_icons_batch()?)
     }
 }

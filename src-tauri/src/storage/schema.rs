@@ -216,6 +216,7 @@ impl StorageState {
 
     /// Initialize database tables.
     pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+        super::layout::register_and_check(conn).map_err(|e| e.to_string())?;
         #[cfg(test)]
         if crate::credential_manager::get_cached_public_key(&self.credential_state).is_none() {
             self.credential_state
@@ -864,6 +865,7 @@ impl StorageState {
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
         super::blind_index::ensure_schema(conn)?;
+        super::layout::initialize(conn)?;
         #[cfg(test)]
         {
             self.protected.allow_plaintext_fixtures(true);
@@ -1212,6 +1214,7 @@ impl StorageState {
 
         // Content-addressed dedup references
         Self::add_column_if_missing(conn, "screenshots", "page_icon_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "screenshots", "process_icon_id", "INTEGER")?;
         Self::add_column_if_missing(conn, "screenshots", "link_set_id", "INTEGER")?;
 
         // Classification columns

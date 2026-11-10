@@ -266,6 +266,8 @@ pub(super) struct RawScreenshotRow {
     // Classification
     pub(super) category: Option<String>,
     pub(super) category_confidence: Option<f64>,
+    pub(super) process_icon_ref_enc: Option<Vec<u8>>,
+    pub(super) process_icon_ref_key: Option<Vec<u8>>,
 }
 
 impl RawScreenshotRow {
@@ -279,10 +281,12 @@ impl RawScreenshotRow {
         s.source, s.page_url_enc,
         pi.icon_enc, pi.icon_key_encrypted,
         ls.links_enc, ls.links_key_encrypted,
-        s.category, s.category_confidence
+        s.category, s.category_confidence,
+        pri.icon_enc, pri.icon_key_encrypted
         FROM screenshots s
         LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
-        LEFT JOIN link_sets ls ON s.link_set_id = ls.id";
+        LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+        LEFT JOIN page_icons pri ON s.process_icon_id = pri.id";
 
     /// Decrypt encrypted fields and produce a ScreenshotRecord.
     /// CNG decryption happens here, outside of the DB mutex.
@@ -323,6 +327,10 @@ impl RawScreenshotRow {
             String::from_utf8(decrypted).ok()
         };
         let page_icon = decrypt_shared(self.page_icon_ref_enc, self.page_icon_ref_key);
+        let metadata = super::process_icons::restore_metadata_icon(
+            metadata,
+            decrypt_shared(self.process_icon_ref_enc, self.process_icon_ref_key),
+        );
         let visible_links = decrypt_shared(self.link_set_ref_enc, self.link_set_ref_key)
             .and_then(|value| serde_json::from_str::<Vec<VisibleLink>>(&value).ok());
 
@@ -380,6 +388,8 @@ impl RawScreenshotRow {
             link_set_ref_key: row.get(19)?,
             category: row.get(20)?,
             category_confidence: row.get(21)?,
+            process_icon_ref_enc: row.get(22)?,
+            process_icon_ref_key: row.get(23)?,
         })
     }
 }

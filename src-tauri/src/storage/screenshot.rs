@@ -620,10 +620,8 @@ impl StorageState {
         let mut guard = self.get_connection_named("save_screenshot")?;
         let conn = guard.as_mut().unwrap();
 
-        let metadata_json = request
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_string(m).ok());
+        let (metadata_json, process_icon_id) =
+            self.serialize_metadata_with_shared_icon(conn, request.metadata.as_ref())?;
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
                 encrypt_with_master_key(&row_key, value.as_bytes())
@@ -672,8 +670,8 @@ impl StorageState {
                 window_title, process_name, metadata,
                 window_title_enc, process_name_enc, metadata_enc,
                 content_key_encrypted,
-                source, page_url_enc, page_icon_id, link_set_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                source, page_url_enc, page_icon_id, link_set_id, process_icon_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &image_path_str,
                 &request.image_hash,
@@ -694,6 +692,7 @@ impl StorageState {
                 page_url_enc_save,
                 page_icon_id,
                 link_set_id,
+                process_icon_id,
             ],
         )
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
@@ -841,10 +840,8 @@ impl StorageState {
         let mutex_wait_dur = fn_start.elapsed() - exists_dur - img_encrypt_dur - file_write_dur;
 
         let t3 = std::time::Instant::now();
-        let metadata_json = request
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_string(m).ok());
+        let (metadata_json, process_icon_id) =
+            self.serialize_metadata_with_shared_icon(conn, request.metadata.as_ref())?;
 
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
@@ -894,8 +891,8 @@ impl StorageState {
                 window_title, process_name, metadata,
                 window_title_enc, process_name_enc, metadata_enc,
                 content_key_encrypted, status,
-                source, page_url_enc, page_icon_id, link_set_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                source, page_url_enc, page_icon_id, link_set_id, process_icon_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &image_path_str,
                 &request.image_hash,
@@ -917,6 +914,7 @@ impl StorageState {
                 page_url_enc,
                 page_icon_id,
                 link_set_id,
+                process_icon_id,
             ],
         )
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
@@ -3125,9 +3123,11 @@ impl StorageState {
     }
 
     /// Clean up orphaned page_icons and link_sets entries after screenshot deletion.
-    fn cleanup_orphaned_dedup_entries(conn: &Connection) -> Result<(), String> {
+    pub(super) fn cleanup_orphaned_dedup_entries(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
-              "DELETE FROM page_icons WHERE id NOT IN (SELECT DISTINCT page_icon_id FROM screenshots WHERE is_deleted = 0 AND page_icon_id IS NOT NULL);
+              "DELETE FROM page_icons WHERE id NOT IN (
+                    SELECT page_icon_id FROM screenshots WHERE is_deleted = 0 AND page_icon_id IS NOT NULL
+                    UNION SELECT process_icon_id FROM screenshots WHERE is_deleted = 0 AND process_icon_id IS NOT NULL);
                DELETE FROM link_sets WHERE id NOT IN (SELECT DISTINCT link_set_id FROM screenshots WHERE is_deleted = 0 AND link_set_id IS NOT NULL);"
         )
         .map_err(|e| format!("Failed to cleanup orphaned dedup entries: {}", e))?;
