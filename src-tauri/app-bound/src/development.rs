@@ -100,7 +100,7 @@ fn verify_registered_image(
     if !identity::path_eq(&process.image, &registration.executable_path) {
         return Err(BrokerError::AccessDenied);
     }
-    let mut image = identity::locked_file(&process.image)?;
+    let mut image = identity::locked_development_image(&process.image)?;
     identity::verify_file(&mut image, &registration.executable_sha256)?;
     Ok(image)
 }
@@ -122,10 +122,7 @@ pub(crate) fn verify_client(mut process: ProcessIdentity) -> Result<VerifiedCall
     let (release, runtime_id) = manifest::read_manifest(&runtime)?;
     let image_lock = verify_registered_image(&process, &client_registration(&runtime, &release)?)?;
     process.principal.runtime_id = runtime_id;
-    Ok(VerifiedCaller {
-        principal: process.principal,
-        image_lock,
-    })
+    Ok(VerifiedCaller::new(process, image_lock))
 }
 
 /// Assemble a tiny signed broker package after Cargo has linked the desktop.

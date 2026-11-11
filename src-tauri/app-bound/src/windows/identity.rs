@@ -6,6 +6,7 @@ use std::{
     fs::File,
     io::Read,
     os::windows::fs::{MetadataExt, OpenOptionsExt},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle as WindowsHandle},
     path::{Path, PathBuf},
 };
 use windows::{
@@ -358,10 +359,25 @@ pub fn ensure_directory(path: &Path, readable: bool) -> Result<()> {
 }
 
 pub fn locked_file(path: &Path) -> Result<File> {
+    locked_file_with_sharing(path, FILE_SHARE_READ.0)
+}
+
+#[cfg(feature = "development-runtime")]
+pub(crate) fn locked_development_image(path: &Path) -> Result<File> {
+    // Pin the verified bytes against writes, but allow Cargo to unlink/replace
+    // the pathname after exit even before the service retires its cache entry.
+    // A replacement process has a new kernel identity and is verified afresh.
+    locked_file_with_sharing(
+        path,
+        FILE_SHARE_READ.0 | windows::Win32::Storage::FileSystem::FILE_SHARE_DELETE.0,
+    )
+}
+
+fn locked_file_with_sharing(path: &Path, sharing: u32) -> Result<File> {
     no_reparse(path)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ.0)
+        .share_mode(sharing)
         .open(path)
         .map_err(|_| BrokerError::Integrity)?;
     let metadata = file.metadata().map_err(|_| BrokerError::Integrity)?;
@@ -395,6 +411,53 @@ pub fn verify_file(file: &mut File, expected: &str) -> Result<()> {
 pub struct VerifiedCaller {
     pub principal: Principal,
     pub image_lock: File,
+    image: PathBuf,
+    process_handle: WindowsHandle,
+}
+
+impl VerifiedCaller {
+    pub(crate) fn new(process: ProcessIdentity, image_lock: File) -> Self {
+        let handle = std::mem::ManuallyDrop::new(process.handle);
+        // SAFETY: ownership of the live process handle transfers exactly once
+        // to the standard owned handle; ManuallyDrop prevents a second close.
+        let process_handle = unsafe { WindowsHandle::from_raw_handle(handle.0 .0) };
+        Self {
+            principal: process.principal,
+            image_lock,
+            image: process.image,
+            process_handle,
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        let (mut creation, mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: the owned query handle stays live through this call. Exit
+        // time is zero only for a live process, including an exit code of 259.
+        unsafe {
+            GetProcessTimes(
+                HANDLE(self.process_handle.as_raw_handle()),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+            .is_ok()
+                && exit.dwHighDateTime == 0
+                && exit.dwLowDateTime == 0
+        }
+    }
+
+    pub(crate) fn matches_process(&self, process: &ProcessIdentity) -> bool {
+        self.principal.process_identity == process.principal.process_identity
+            && self.principal.sid == process.principal.sid
+            && path_eq(&self.image, &process.image)
+            && self.is_running()
+    }
 }
 
 pub fn verify_main(process: ProcessIdentity) -> Result<VerifiedCaller> {
@@ -446,10 +509,7 @@ fn verify_protected_main(mut process: ProcessIdentity) -> Result<VerifiedCaller>
             .ok_or(BrokerError::Integrity)?,
     )?;
     process.principal.runtime_id = manifest_id;
-    Ok(VerifiedCaller {
-        principal: process.principal,
-        image_lock: file,
-    })
+    Ok(VerifiedCaller::new(process, file))
 }
 
 pub fn safe_runtime_id(value: &str) -> bool {

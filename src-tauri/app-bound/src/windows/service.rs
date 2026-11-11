@@ -386,6 +386,11 @@ async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
         if STOP.load(Ordering::SeqCst) {
             break Ok(());
         }
+        // Also release exited callers while no requests arrive. Never block a
+        // scheduler worker behind a concurrent first-time image verification.
+        if let Ok(mut callers) = cache.try_lock() {
+            prune_callers(&mut callers);
+        }
         tokio::select! {
             maintenance = &mut maintenance_task => {
                 maintenance_result_consumed = true;
@@ -584,24 +589,39 @@ async fn verify_caller_blocking(
             GetNamedPipeClientProcessId(handle, &mut pid).map_err(|_| BrokerError::AccessDenied)?;
         }
         let process = identity::inspect_process(pid)?;
-        // Development images are rebuilt in Cargo's output directory. Pin the
-        // registered image throughout this request, but do not retain it after
-        // disconnect and prevent the next incremental build from replacing it.
-        if cfg!(feature = "development-runtime") && !cfg!(test) {
-            return Ok((pipe, Arc::new(identity::verify_main(process)?)));
-        }
-        let mut cache = cache.lock().map_err(|_| BrokerError::Unavailable)?;
-        let id = process.principal.process_identity.clone();
-        if !cache.contains_key(&id) {
-            if cache.len() >= 32 {
-                cache.clear();
-            }
-            cache.insert(id.clone(), Arc::new(identity::verify_main(process)?));
-        }
-        let caller = cache.get(&id).ok_or(BrokerError::AccessDenied)?.clone();
+        let caller = cache_verified_caller(process, &cache, identity::verify_main)?;
         Ok((pipe, caller))
     });
     await_blocking(handle, Some(deadline)).await
+}
+
+fn prune_callers(callers: &mut HashMap<String, Arc<VerifiedCaller>>) {
+    callers.retain(|_, caller| caller.is_running());
+}
+
+fn cache_verified_caller(
+    process: identity::ProcessIdentity,
+    cache: &CallerCache,
+    verify: impl FnOnce(identity::ProcessIdentity) -> Result<VerifiedCaller>,
+) -> Result<Arc<VerifiedCaller>> {
+    let mut callers = cache.lock().map_err(|_| BrokerError::Unavailable)?;
+    prune_callers(&mut callers);
+    let id = process.principal.process_identity.clone();
+    if let Some(caller) = callers.get(&id) {
+        if !caller.matches_process(&process) {
+            return Err(BrokerError::AccessDenied);
+        }
+        return Ok(caller.clone());
+    }
+    // Serialize the first verification so simultaneous connections from one
+    // image cannot each hash the whole file. Hits still use OS SID/path/PID and
+    // creation time; only an immutable, pinned image receives cached trust.
+    let caller = Arc::new(verify(process)?);
+    if callers.len() >= 32 {
+        callers.clear();
+    }
+    callers.insert(id, caller.clone());
+    Ok(caller)
 }
 
 async fn run_request_blocking(
@@ -852,6 +872,9 @@ impl KeyProtector for DpapiProtector<'_> {
 
 #[cfg(test)]
 mod native_tests;
+
+#[cfg(test)]
+mod caller_cache_tests;
 
 #[cfg(test)]
 mod tests {

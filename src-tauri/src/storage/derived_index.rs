@@ -1230,10 +1230,15 @@ impl StorageState {
             .prepare(&format!(
                 r#"
                 SELECT {JOB_ROW_COLUMNS}
-                FROM derived_index_jobs
-                WHERE index_kind = ?1
-                  AND {CLAIMABLE_JOB_PREDICATE}
-                  AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                FROM (
+                    SELECT {JOB_ROW_COLUMNS} FROM derived_index_jobs
+                    WHERE index_kind = ?1 AND status IN ('pending', 'waiting_for_auth')
+                      AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                    UNION ALL
+                    SELECT {JOB_ROW_COLUMNS} FROM derived_index_jobs
+                    WHERE index_kind = ?1 AND status = 'failed' AND attempts < ?2
+                      AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                )
                 ORDER BY updated_at, subject_key
                 LIMIT ?3
                 "#
