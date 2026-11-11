@@ -161,4 +161,52 @@ describe('SearchBox', () => {
     await screen.findByPlaceholderText('search.task.annIndexWaitingForPower');
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '11.25');
   });
+
+  it('shows estimated database optimization ahead of backfills and restores their progress on completion', async () => {
+    const compaction = { phase: 'running', running: true, percent: 42.5, revision: 2 };
+    getBackgroundIndexProgress.mockResolvedValue({
+      storage_compaction: compaction,
+      clip: { phase: 'running', running: true, processed: 3, total: 10 },
+    });
+    const onSubmit = vi.fn();
+    render(<SearchBox onSelectResult={vi.fn()} onSubmit={onSubmit} />);
+    const input = await screen.findByPlaceholderText('search.task.storageCompactionSummaryPlaceholder');
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '42.5');
+    fireEvent.focus(input);
+    expect(screen.getByText('search.task.storageCompactionRunningTitle')).toBeInTheDocument();
+    expect(screen.getByText('search.task.clipIndexRunningTitle')).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: 'invoice' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onSubmit).toHaveBeenCalledWith({ query: 'invoice' });
+    act(() => events['storage-compaction-progress']({
+      payload: { ...compaction, phase: 'idle', running: false, percent: 100, revision: 3 },
+    }));
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '30');
+    expect(screen.queryByText('search.task.storageCompactionRunningTitle')).not.toBeInTheDocument();
+  });
+
+  it('uses indeterminate optimization progress when unknown and retains the estimate through waits', async () => {
+    const compaction = { phase: 'running', running: true, percent: null, revision: 2 };
+    getBackgroundIndexProgress.mockResolvedValue({ storage_compaction: compaction });
+    render(<SearchBox onSelectResult={vi.fn()} />);
+    await screen.findByPlaceholderText('search.task.storageCompactionRunningTitle');
+    expect(screen.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+    for (const [index, [phase, label]] of [
+      ['waiting_for_unlock', 'WaitingForUnlock'],
+      ['waiting_for_verification', 'WaitingForVerification'],
+      ['waiting_for_maintenance', 'WaitingForMaintenance'],
+      ['retry_wait', 'RetryWait'],
+    ].entries()) {
+      act(() => events['storage-compaction-progress']({
+        payload: { ...compaction, phase, running: false, percent: 58, revision: index + 3 },
+      }));
+      expect(screen.getByPlaceholderText('search.task.storageCompaction' + label)).toBeInTheDocument();
+      expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '58');
+    }
+    act(() => events['storage-compaction-progress']({
+      payload: { ...compaction, phase: 'idle', running: false, percent: 100, revision: 7 },
+    }));
+    expect(screen.getByPlaceholderText('search.placeholder.unified')).toBeInTheDocument();
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+  });
 });

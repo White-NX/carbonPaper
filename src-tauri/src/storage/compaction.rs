@@ -4,7 +4,13 @@ use super::StorageState;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
+
+mod progress;
+pub(super) use progress::ProgressState;
+use progress::Snapshot;
+pub use progress::StorageCompactionProgress;
 
 #[cfg(test)]
 mod tests;
@@ -12,6 +18,9 @@ mod tests;
 const OCR_CURSOR: &str = "storage_ocr_marker_cursor_v1";
 const OCR_DONE: &str = "storage_ocr_marker_done_v1";
 const OCR_QUEUE_VERSION: &str = "storage_ocr_queue_version";
+const PROGRESS_EVENT: &str = "storage-compaction-progress";
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Keep the legacy column name so old rows remain readable without rebuilding
 /// the multi-gigabyte OCR table. Only emptiness is part of the reader contract.
@@ -169,13 +178,96 @@ fn compact_ocr_markers(conn: &Connection, limit: usize) -> Result<usize, String>
     Ok(ids.len())
 }
 
+/// Counts visits rather than successful rewrites: unchanged, preserved and
+/// racing rows can be visited again. Vector work also includes block GC.
+#[derive(Debug, Default, Clone, Copy)]
+struct BatchWork {
+    marker_rows_scanned: u64,
+    vector_work_units: u64,
+    icon_rows_scanned: u64,
+    ocr_key_rows_scanned: u64,
+    marker_time: Duration,
+    vector_time: Duration,
+    icon_time: Duration,
+    ocr_key_time: Duration,
+}
+
+impl BatchWork {
+    fn total(&self) -> u64 {
+        self.marker_rows_scanned
+            + self.vector_work_units
+            + self.icon_rows_scanned
+            + self.ocr_key_rows_scanned
+    }
+
+    fn add(&mut self, batch: Self) {
+        self.marker_rows_scanned += batch.marker_rows_scanned;
+        self.vector_work_units += batch.vector_work_units;
+        self.icon_rows_scanned += batch.icon_rows_scanned;
+        self.ocr_key_rows_scanned += batch.ocr_key_rows_scanned;
+        self.marker_time += batch.marker_time;
+        self.vector_time += batch.vector_time;
+        self.icon_time += batch.icon_time;
+        self.ocr_key_time += batch.ocr_key_time;
+    }
+}
+
+struct Diagnostics {
+    generation: u64,
+    snapshot: Snapshot,
+    started: Instant,
+    last_progress: Instant,
+    last_report: Instant,
+    work: BatchWork,
+    batches: u64,
+    batch_time: Duration,
+    throttle_time: Duration,
+    active: bool,
+}
+
+impl Diagnostics {
+    fn new(generation: u64, snapshot: Snapshot) -> Self {
+        Self {
+            generation,
+            snapshot,
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            last_report: Instant::now(),
+            work: BatchWork::default(),
+            batches: 0,
+            batch_time: Duration::ZERO,
+            throttle_time: Duration::ZERO,
+            active: snapshot.pending(),
+        }
+    }
+
+    fn report(&mut self, message: &'static str) {
+        tracing::info!(
+            generation = self.generation,
+            batches = self.batches,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            batch_time_ms = self.batch_time.as_millis() as u64,
+            throttle_time_ms = self.throttle_time.as_millis() as u64,
+            work = ?self.work,
+            estimated_percent = ?self.snapshot.estimated_percent(),
+            checkpoints = ?self.snapshot.checkpoints,
+            max_ids = ?self.snapshot.max_ids,
+            pending = self.snapshot.pending(),
+            free_pages = self.snapshot.free_pages,
+            "[DB:COMPACT] {message}"
+        );
+        self.last_report = Instant::now();
+    }
+}
+
 impl StorageState {
-    pub(crate) fn start_storage_compaction(self: &Arc<Self>) {
+    pub(crate) fn start_storage_compaction(self: &Arc<Self>, app: AppHandle) {
         if self.storage_compaction_started.swap(true, Ordering::AcqRel) {
             return;
         }
         let storage = Arc::clone(self);
         std::thread::spawn(move || {
+            let mut diagnostics: Option<Diagnostics> = None;
             while !crate::IS_QUITTING.load(Ordering::Relaxed)
                 && !crate::IS_UPDATING.load(Ordering::Relaxed)
             {
@@ -183,35 +275,228 @@ impl StorageState {
                     || storage.is_database_maintenance_pending()
                     || crate::maintenance::is_active()
                 {
+                    let progress = storage.storage_compaction_progress();
+                    if progress.phase != "idle" {
+                        storage.publish_compaction_progress(
+                            &app,
+                            storage.db_generation(),
+                            "waiting_for_maintenance",
+                            progress.percent,
+                        );
+                    }
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
-                let started = std::time::Instant::now();
-                match storage.compact_storage_batch() {
-                    Ok(0) => std::thread::sleep(Duration::from_secs(5)),
-                    // CNG already paces encrypted batches. Count that work
-                    // toward the interval instead of adding a fixed delay to
-                    // every legacy page; still yield between transactions.
-                    Ok(_) => std::thread::sleep(
-                        Duration::from_millis(20)
-                            .saturating_sub(started.elapsed())
-                            .max(Duration::from_millis(2)),
-                    ),
-                    Err(error) => {
-                        tracing::warn!("[DB:COMPACT] Background rewrite deferred: {error}");
-                        std::thread::sleep(Duration::from_secs(30));
+
+                if diagnostics
+                    .as_ref()
+                    .is_none_or(|state| state.generation != storage.db_generation())
+                {
+                    match storage.read_compaction_snapshot() {
+                        Ok((generation, snapshot)) => {
+                            let mut state = Diagnostics::new(generation, snapshot);
+                            state.report("Loaded restartable scan checkpoints");
+                            diagnostics = Some(state);
+                        }
+                        Err(error) => {
+                            storage.publish_compaction_progress(
+                                &app,
+                                storage.db_generation(),
+                                "retry_wait",
+                                None,
+                            );
+                            tracing::warn!("[DB:COMPACT] Checkpoint read deferred: {error}");
+                            std::thread::sleep(Duration::from_secs(30));
+                            continue;
+                        }
                     }
                 }
+                let state = diagnostics.as_mut().expect("diagnostics initialized");
+                let generation = state.generation;
+                // Continue reporting activity while queue/GC work is making
+                // progress. Only a zero-work batch establishes an auth wait.
+                if state.snapshot.pending() && !storage.storage_compaction_progress().running {
+                    storage.publish_compaction_progress(
+                        &app,
+                        generation,
+                        state.snapshot.phase(storage.silent_read_wait_reason()),
+                        state.snapshot.estimated_percent(),
+                    );
+                }
+
+                let waiting = Instant::now();
+                let Some(rewrite_permit) = storage
+                    .rewrite_budget
+                    .acquire(&storage.foreground_db_activity)
+                else {
+                    break;
+                };
+                state.throttle_time += waiting.elapsed();
+                // Maintenance or a database swap may have begun during the
+                // cooldown. Recheck before entering any rewrite transaction.
+                if storage.db_generation() != generation
+                    || !storage.is_initialized()
+                    || storage.is_database_maintenance_pending()
+                    || crate::maintenance::is_active()
+                {
+                    continue;
+                }
+                let started = Instant::now();
+                let mut work = BatchWork::default();
+                let mut result = storage.compact_storage_batch(&mut work);
+                // Release the shared slot after every database guard has left
+                // scope. The next worker pays the cooldown without DB locks.
+                drop(rewrite_permit);
+                // A backup restore or directory migration invalidates both
+                // counters and IDs. Never publish a result for the old file.
+                if storage.db_generation() != generation {
+                    continue;
+                }
+                state.work.add(work);
+                state.batches += 1;
+                state.batch_time += started.elapsed();
+                if work.total() > 0 {
+                    state.active = true;
+                }
+                if work.total() == 0
+                    || result.is_err()
+                    || state.last_progress.elapsed() >= PROGRESS_INTERVAL
+                {
+                    match storage.read_compaction_snapshot() {
+                        Ok((current, snapshot)) if current == generation => {
+                            state.snapshot = snapshot;
+                            state.last_progress = Instant::now();
+                        }
+                        Ok(_) => continue,
+                        Err(error) if result.is_ok() => {
+                            result = Err(format!("checkpoint read: {error}"));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if let Err(error) = result {
+                    storage.publish_compaction_progress(
+                        &app,
+                        generation,
+                        "retry_wait",
+                        state.snapshot.estimated_percent(),
+                    );
+                    // Earlier stages may have committed before this failure;
+                    // their visits remain included in the diagnostic totals.
+                    tracing::warn!("[DB:COMPACT] Background rewrite deferred: {error}");
+                    state.report("Partial batch preserved; retrying in 30 seconds");
+                    std::thread::sleep(Duration::from_secs(30));
+                    continue;
+                }
+                if work.total() == 0 {
+                    if state.snapshot.pending() {
+                        storage.publish_compaction_progress(
+                            &app,
+                            generation,
+                            storage
+                                .silent_read_wait_reason()
+                                .unwrap_or("waiting_for_verification"),
+                            state.snapshot.estimated_percent(),
+                        );
+                    } else {
+                        if state.active {
+                            state.report("Background scan completed");
+                            state.active = false;
+                        }
+                        storage.publish_compaction_progress(
+                            &app,
+                            generation,
+                            "idle",
+                            state.snapshot.estimated_percent(),
+                        );
+                    }
+                    if state.active && state.last_report.elapsed() >= LOG_INTERVAL {
+                        state.report("Background scan waiting");
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                } else {
+                    storage.publish_compaction_progress(
+                        &app,
+                        generation,
+                        "running",
+                        state
+                            .snapshot
+                            .pending()
+                            .then(|| state.snapshot.estimated_percent())
+                            .flatten(),
+                    );
+                    if state.last_report.elapsed() >= LOG_INTERVAL {
+                        state.report("Background scan progress");
+                    }
+                }
+            }
+            if let Some(mut state) = diagnostics {
+                state.report("Background rewrite stopped");
+                storage.publish_compaction_progress(&app, state.generation, "idle", None);
             }
         });
     }
 
-    fn compact_storage_batch(&self) -> Result<usize, String> {
-        let compacted = {
+    fn read_compaction_snapshot(&self) -> Result<(u64, Snapshot), String> {
+        let guard = self.get_connection_named("storage_compaction_checkpoint")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        Ok((self.db_generation(), Snapshot::read(conn)?))
+    }
+
+    fn publish_compaction_progress(
+        &self,
+        app: &AppHandle,
+        generation: u64,
+        phase: &'static str,
+        percent: Option<f64>,
+    ) {
+        let mut state = self
+            .storage_compaction_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.db_generation() != generation {
+            return;
+        }
+        let previous_phase = state.snapshot().phase;
+        if let Some(progress) = state.update(generation, phase, percent) {
+            if previous_phase != phase {
+                tracing::info!(
+                    generation,
+                    phase,
+                    estimated_percent = ?percent,
+                    "[DB:COMPACT] Background rewrite state changed"
+                );
+            }
+            // Emit after releasing the progress lock. UI polling reads only
+            // this cache and never waits for the rewrite's database lock.
+            drop(state);
+            let _ = app.emit(PROGRESS_EVENT, progress);
+        }
+    }
+
+    fn compact_storage_batch(&self, work: &mut BatchWork) -> Result<(), String> {
+        {
             let guard = self.get_connection_named("storage_compaction")?;
             let conn = guard.as_ref().ok_or("Database not initialized")?;
-            compact_ocr_markers(conn, 1024)? + super::vector_blocks::compact(conn)?
-        };
-        Ok(compacted + self.compact_process_icons_batch()? + self.compact_ocr_keys_batch()?)
+            let started = Instant::now();
+            let result = compact_ocr_markers(conn, 256);
+            work.marker_time = started.elapsed();
+            work.marker_rows_scanned =
+                result.map_err(|error| format!("OCR markers: {error}"))? as u64;
+            let started = Instant::now();
+            let result = super::vector_blocks::compact(conn);
+            work.vector_time = started.elapsed();
+            work.vector_work_units =
+                result.map_err(|error| format!("vector blocks: {error}"))? as u64;
+        }
+        let started = Instant::now();
+        let result = self.compact_process_icons_batch();
+        work.icon_time = started.elapsed();
+        work.icon_rows_scanned = result.map_err(|error| format!("process icons: {error}"))? as u64;
+        let started = Instant::now();
+        let result = self.compact_ocr_keys_batch();
+        work.ocr_key_time = started.elapsed();
+        work.ocr_key_rows_scanned = result.map_err(|error| format!("OCR keys: {error}"))? as u64;
+        Ok(())
     }
 }

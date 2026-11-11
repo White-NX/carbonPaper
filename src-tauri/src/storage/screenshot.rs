@@ -2981,6 +2981,12 @@ impl StorageState {
         freelist_threshold: i64,
         vacuum_pages: i64,
     ) -> Result<IncrementalVacuumResult, String> {
+        // Acquire before the maintenance gate and connection. Waiting for the
+        // shared rewrite budget must leave foreground database reads available.
+        let Some(_rewrite_permit) = self.rewrite_budget.acquire(&self.foreground_db_activity)
+        else {
+            return Ok(IncrementalVacuumResult::default());
+        };
         let Some(_maintenance) = self.try_database_maintenance("run_incremental_vacuum_if_idle")
         else {
             return Ok(IncrementalVacuumResult::default());
@@ -3009,7 +3015,8 @@ impl StorageState {
             return Ok(IncrementalVacuumResult::default());
         }
 
-        let pages = vacuum_pages.max(1);
+        // Smaller commits bound each burst and the exclusive maintenance hold.
+        let pages = vacuum_pages.clamp(1, 64);
         let page_count_before: i64 = conn
             .query_row("PRAGMA page_count;", [], |row| row.get(0))
             .map_err(|e| format!("Failed to read page_count before vacuum: {}", e))?;

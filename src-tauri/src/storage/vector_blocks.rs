@@ -4,7 +4,7 @@
 use super::{compaction::representation_transaction, StorageState};
 use rusqlite::{params, Connection, OptionalExtension};
 
-const CURSOR: &str = "storage_vector_block_cursor_v1";
+pub(super) const CURSOR: &str = "storage_vector_block_cursor_v1";
 const PAGE_ROWS: usize = 64;
 const MAX_BLOCK_BYTES: usize = 256 * 1024;
 const MAX_VECTOR_BYTES: usize = 64 * 1024;

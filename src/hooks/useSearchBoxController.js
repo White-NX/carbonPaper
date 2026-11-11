@@ -76,6 +76,18 @@ function annTaskLabel(run, percent, t) {
   });
 }
 
+function storageCompactionTaskLabel(run, percent, t) {
+  const state = {
+    waiting_for_unlock: 'WaitingForUnlock',
+    waiting_for_verification: 'WaitingForVerification',
+    waiting_for_maintenance: 'WaitingForMaintenance',
+    retry_wait: 'RetryWait',
+  }[run?.phase];
+  return t(`search.task.storageCompaction${state || (percent === null ? 'RunningTitle' : 'SummaryPlaceholder')}`, {
+    progress: percent === null ? '…' : Math.round(percent),
+  });
+}
+
 export function useSearchBoxController({
   onSelectResult,
   onSubmit,
@@ -318,13 +330,20 @@ export function useSearchBoxController({
   const annIndexPercent = Number.isFinite(backgroundIndex.ann?.percent)
     ? Math.max(0, Math.min(100, backgroundIndex.ann.percent)) : null;
   const annIndexTaskLabel = annTaskLabel(backgroundIndex.ann, annIndexPercent, t);
+  const hasStorageCompactionTask = isIndexTaskPending(backgroundIndex.storage_compaction);
+  const storageCompactionPercent = Number.isFinite(backgroundIndex.storage_compaction?.percent)
+    ? Math.max(0, Math.min(100, backgroundIndex.storage_compaction.percent)) : null;
+  const storageCompactionLabel = storageCompactionTaskLabel(
+    backgroundIndex.storage_compaction, storageCompactionPercent, t,
+  );
 
   const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels
-    || hasSemanticIndexTask || hasClipIndexTask || hasAnnIndexTask;
+    || hasStorageCompactionTask || hasSemanticIndexTask || hasClipIndexTask || hasAnnIndexTask;
   const progressFillPercent = (() => {
     if (hasDeleteTask) return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
     if (hasClusterTask) return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
     if (isDownloadingModels) return downloadProgress <= 0 ? 8 : Math.min(100, downloadProgress);
+    if (hasStorageCompactionTask) return storageCompactionPercent;
     // Cleanup and downloads take precedence over long index backfills; the
     // dropdown still shows each pending task independently.
     if (hasAnnIndexTask) return annIndexPercent;
@@ -338,6 +357,7 @@ export function useSearchBoxController({
   })();
   const progressActive = (() => {
     if (hasDeleteTask || hasClusterTask || isDownloadingModels) return true;
+    if (hasStorageCompactionTask) return backgroundIndex.storage_compaction.running;
     if (hasAnnIndexTask) return backgroundIndex.ann.running;
     if (hasClipIndexTask) return backgroundIndex.clip.running;
     if (hasSemanticIndexTask) return backgroundIndex.semantic.running;
@@ -354,6 +374,7 @@ export function useSearchBoxController({
     if (isDownloadingModels) {
       return t('search.task.modelDownloadSummaryPlaceholder', { progress: Math.round(downloadProgress) });
     }
+    if (hasStorageCompactionTask) return storageCompactionLabel;
     if (hasAnnIndexTask) return annIndexTaskLabel;
     if (hasClipIndexTask) {
       return clipIndexTaskLabel;
@@ -487,6 +508,8 @@ export function useSearchBoxController({
     clipIndexTaskLabel,
     hasAnnIndexTask,
     annIndexTaskLabel,
+    hasStorageCompactionTask,
+    storageCompactionLabel,
     showProgressBar,
     progressFillPercent,
     progressActive,

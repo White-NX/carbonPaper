@@ -36,6 +36,7 @@ mod protected_migration;
 mod recap;
 mod recap_protected;
 mod recap_search;
+mod rewrite_budget;
 mod schema;
 mod screenshot;
 mod screenshot_reader;
@@ -53,6 +54,7 @@ pub(crate) mod wire_time;
 pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
 pub use background_scheduler::BackgroundTaskState;
 pub(crate) use classification::{ClassificationFeedback, ClassificationLease};
+pub use compaction::StorageCompactionProgress;
 #[allow(unused_imports)]
 pub use derived_index::*;
 #[allow(unused_imports)]
@@ -125,6 +127,9 @@ pub struct StorageState {
     /// Whether the lazy OCR indexer background thread has been started.
     lazy_indexer_started: AtomicBool,
     storage_compaction_started: AtomicBool,
+    storage_compaction_progress: Mutex<compaction::ProgressState>,
+    /// Online compaction and incremental vacuum share one paced execution slot.
+    rewrite_budget: rewrite_budget::RewriteBudget,
     /// Whether thumbnail warmup has already completed this session
     pub(crate) thumbnail_warmup_done: AtomicBool,
     /// Whether startup VACUUM is currently running
@@ -260,6 +265,8 @@ impl StorageState {
             ocr_row_count: AtomicU64::new(0),
             lazy_indexer_started: AtomicBool::new(false),
             storage_compaction_started: AtomicBool::new(false),
+            storage_compaction_progress: Mutex::new(compaction::ProgressState::default()),
+            rewrite_budget: rewrite_budget::RewriteBudget::default(),
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),
@@ -575,6 +582,7 @@ impl StorageState {
     /// before its statement runs.
     pub(super) fn bump_db_generation(&self) {
         self.db_generation.fetch_add(1, Ordering::Release);
+        self.reset_storage_compaction_progress();
     }
 }
 

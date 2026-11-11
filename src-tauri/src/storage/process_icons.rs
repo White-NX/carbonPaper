@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-const CURSOR: &str = "storage_process_icon_cursor_v1";
+pub(super) const CURSOR: &str = "storage_process_icon_cursor_v1";
 
 fn take_icon(metadata: &mut Value) -> Option<String> {
     let object = metadata.as_object_mut()?;

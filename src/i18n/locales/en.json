@@ -1469,6 +1469,12 @@
       "modelDownloadSummaryPlaceholder": "Downloading models ({{progress}}%)",
       "modelDownloadRunningTitle": "Downloading Model Files",
       "modelDownloadRunningDesc": "Downloading required model files in background, progress: {{progress}}%.",
+      "storageCompactionRunningTitle": "Optimizing database",
+      "storageCompactionSummaryPlaceholder": "Optimizing database · about {{progress}}%",
+      "storageCompactionWaitingForUnlock": "Database optimization waiting for unlock",
+      "storageCompactionWaitingForVerification": "Database optimization waiting for verification",
+      "storageCompactionWaitingForMaintenance": "Database optimization waiting for maintenance",
+      "storageCompactionRetryWait": "Database optimization waiting to retry",
       "stopTooltip": "Stop smart clustering",
       "stop": "Stop"
     }

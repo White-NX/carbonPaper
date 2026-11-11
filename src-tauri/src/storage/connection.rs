@@ -124,6 +124,7 @@ struct ActivityState {
     active_readers: usize,
     active_writer: bool,
     waiting_writers: usize,
+    last_read_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -158,6 +159,7 @@ impl ActivityGate {
                 .unwrap_or_else(|error| error.into_inner());
         }
         state.active_readers += 1;
+        state.last_read_at = Some(Instant::now());
         drop(state);
 
         ActivityReadGuard {
@@ -210,6 +212,15 @@ impl ActivityGate {
             acquired_at: Instant::now(),
         })
     }
+
+    pub(super) fn has_recent_read_activity(&self, within: Duration) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active_readers > 0 || state.last_read_at.is_some_and(|at| at.elapsed() < within)
+    }
 }
 
 pub(crate) struct ActivityReadGuard {
@@ -234,6 +245,7 @@ impl Drop for ActivityReadGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.active_readers = state.active_readers.saturating_sub(1);
+        state.last_read_at = Some(Instant::now());
         self.inner.changed.notify_all();
     }
 }

@@ -474,6 +474,38 @@ fn incremental_vacuum_exhausts_more_than_one_pragma_step() {
     assert!(result.stepped_pages > 1);
     assert!(result.reclaimed_pages > 1);
     assert!(result.freelist_after < result.freelist_before);
+
+    // A large requested cleanup now spans paced commits. It must eventually
+    // drain the freelist and release maintenance between every pair of cycles.
+    let mut cycles = 0;
+    loop {
+        assert!(storage
+            .try_database_maintenance("between_vacuum_cycles")
+            .is_some());
+        let result = storage.run_incremental_vacuum_if_idle(0, 500).unwrap();
+        if !result.attempted {
+            break;
+        }
+        assert!(result.requested_pages <= 64);
+        assert!(result.stepped_pages <= 64);
+        assert!(result.reclaimed_pages > 0);
+        cycles += 1;
+        assert!(
+            cycles < 20,
+            "bounded cycles must finish the 800-row fixture"
+        );
+    }
+    assert!(cycles > 1);
+    assert_eq!(
+        storage
+            .get_connection_named("vacuum_completed")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]

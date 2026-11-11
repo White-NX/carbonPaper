@@ -23,6 +23,7 @@ const MAX_CACHED_KEYS: usize = 64;
 
 pub(super) mod backup;
 mod migration;
+pub(super) use migration::CURSOR as COMPACTION_CURSOR;
 
 fn invalid() -> CredentialError {
     CredentialError::CryptoError("Invalid OCR key or payload binding".into())

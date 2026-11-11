@@ -3,7 +3,7 @@ use crate::storage::compaction::representation_transaction;
 use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 
-const CURSOR: &str = "storage_ocr_key_cursor_v1";
+pub(in crate::storage) const CURSOR: &str = "storage_ocr_key_cursor_v1";
 const PAGE_ROWS: i64 = 128;
 const PAGE_BYTES: usize = 512 * 1024;
 

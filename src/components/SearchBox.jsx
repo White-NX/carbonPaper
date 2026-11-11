@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image as ImageIcon, Search, Loader2, X, Square, CornerDownLeft } from 'lucide-react';
+import { Database, Image as ImageIcon, Search, Loader2, X, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 import { ProgressBar } from './overlay/ProgressBlock';
@@ -35,6 +35,8 @@ export function SearchBox({ onSelectResult, onSubmit, monitorPaused, handlePause
         clipIndexTaskLabel,
         hasAnnIndexTask,
         annIndexTaskLabel,
+        hasStorageCompactionTask,
+        storageCompactionLabel,
         showProgressBar,
         progressFillPercent,
         progressActive,
@@ -152,6 +154,12 @@ export function SearchBox({ onSelectResult, onSubmit, monitorPaused, handlePause
                                 </button>
                             )}
                         </div>
+                    )}
+                    {hasStorageCompactionTask && (
+                        <Banner icon={Database} title={t('search.task.storageCompactionRunningTitle')}
+                            className="shrink-0 rounded-none border-x-0 border-t-0">
+                            <p role="status">{storageCompactionLabel}</p>
+                        </Banner>
                     )}
                     {hasAnnIndexTask && (
                         <Banner icon={ImageIcon} title={t('search.task.annIndexRunningTitle')}
