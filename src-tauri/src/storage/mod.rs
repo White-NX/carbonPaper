@@ -194,6 +194,7 @@ struct NamedConnectionGuard<'a> {
     lock_holder: &'a Mutex<&'static str>,
     caller: &'static str,
     acquired_at: std::time::Instant,
+    rewrite_io: Option<rewrite_budget::ConnectionIoSample>,
 }
 
 impl Deref for NamedConnectionGuard<'_> {
@@ -212,6 +213,9 @@ impl DerefMut for NamedConnectionGuard<'_> {
 
 impl Drop for NamedConnectionGuard<'_> {
     fn drop(&mut self) {
+        if let Some(sample) = self.rewrite_io.take() {
+            sample.finish(self.guard.as_ref());
+        }
         let hold_duration = self.acquired_at.elapsed();
         if hold_duration.as_secs() >= 1 {
             tracing::warn!(
@@ -344,6 +348,11 @@ impl StorageState {
         self.foreground_db_activity.read("foreground_query")
     }
 
+    pub(crate) fn background_db_read(&self) -> connection::ActivityReadGuard {
+        self.foreground_db_activity
+            .background_read("background_query")
+    }
+
     pub(crate) fn database_maintenance(
         &self,
         caller: &'static str,
@@ -437,6 +446,7 @@ impl StorageState {
             );
         }
         Ok(NamedConnectionGuard {
+            rewrite_io: rewrite_budget::ConnectionIoSample::begin(guard.as_ref()),
             guard,
             lock_holder: &self.lock_holder,
             caller,
@@ -462,6 +472,7 @@ impl StorageState {
             *holder = caller;
         }
         Ok(Some(NamedConnectionGuard {
+            rewrite_io: rewrite_budget::ConnectionIoSample::begin(guard.as_ref()),
             guard,
             lock_holder: &self.lock_holder,
             caller,

@@ -222,6 +222,8 @@ struct Diagnostics {
     batches: u64,
     batch_time: Duration,
     throttle_time: Duration,
+    rewrite_io_bytes: u64,
+    rewrite_cpu_time: Duration,
     active: bool,
 }
 
@@ -237,6 +239,8 @@ impl Diagnostics {
             batches: 0,
             batch_time: Duration::ZERO,
             throttle_time: Duration::ZERO,
+            rewrite_io_bytes: 0,
+            rewrite_cpu_time: Duration::ZERO,
             active: snapshot.pending(),
         }
     }
@@ -248,6 +252,8 @@ impl Diagnostics {
             elapsed_ms = self.started.elapsed().as_millis() as u64,
             batch_time_ms = self.batch_time.as_millis() as u64,
             throttle_time_ms = self.throttle_time.as_millis() as u64,
+            estimated_rewrite_io_bytes = self.rewrite_io_bytes,
+            rewrite_cpu_time_ms = self.rewrite_cpu_time.as_millis() as u64,
             work = ?self.work,
             estimated_percent = ?self.snapshot.estimated_percent(),
             checkpoints = ?self.snapshot.checkpoints,
@@ -344,6 +350,7 @@ impl StorageState {
                 let started = Instant::now();
                 let mut work = BatchWork::default();
                 let mut result = storage.compact_storage_batch(&mut work);
+                let usage = rewrite_permit.usage();
                 // Release the shared slot after every database guard has left
                 // scope. The next worker pays the cooldown without DB locks.
                 drop(rewrite_permit);
@@ -353,6 +360,8 @@ impl StorageState {
                     continue;
                 }
                 state.work.add(work);
+                state.rewrite_io_bytes += usage.io_bytes.unwrap_or(0);
+                state.rewrite_cpu_time += usage.cpu_time.unwrap_or_default();
                 state.batches += 1;
                 state.batch_time += started.elapsed();
                 if work.total() > 0 {
