@@ -2251,6 +2251,17 @@ impl StorageState {
             .transaction()
             .map_err(|e| format!("Failed to start soft-delete transaction: {}", e))?;
 
+        let affected_ids = {
+            let mut statement = tx
+                .prepare(&format!("SELECT id FROM screenshots WHERE {filter_plain}"))
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map(params_ref.as_slice(), |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+
         let queue_screenshots_sql = format!(
             "INSERT OR IGNORE INTO delete_queue_screenshots (id) SELECT id FROM screenshots WHERE {}",
             filter_plain
@@ -2291,10 +2302,12 @@ impl StorageState {
             .map_err(|e| format!("Failed to mark screenshots deleted: {}", e))?
             as i64;
 
+        self.persist_staged_deletions_on_conn(&tx, &affected_ids)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit soft-delete transaction: {}", e))?;
         drop(guard);
-        self.finish_staged_deletions()?;
+        self.processing_stage
+            .invalidate_screenshot_receipts(&affected_ids);
 
         if ocr_marked > 0 {
             let _ = self
@@ -2347,11 +2360,27 @@ impl StorageState {
         let mut queued_ocr = 0i64;
         let mut ocr_marked = 0i64;
         let mut screenshots_marked = 0i64;
+        let mut affected_ids = Vec::new();
 
         for chunk in normalized_ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let params_ref: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+            {
+                let mut statement = tx
+                    .prepare(&format!(
+                        "SELECT id FROM screenshots WHERE is_deleted=0 AND id IN ({placeholders})"
+                    ))
+                    .map_err(|e| e.to_string())?;
+                let rows = statement
+                    .query_map(params_ref.as_slice(), |row| row.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())?;
+                affected_ids.extend(
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())?,
+                );
+            }
 
             let queue_screenshot_sql = format!(
                 "INSERT OR IGNORE INTO delete_queue_screenshots (id)
@@ -2401,10 +2430,12 @@ impl StorageState {
                 as i64;
         }
 
+        self.persist_staged_deletions_on_conn(&tx, &affected_ids)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit selected screenshot soft-delete: {}", e))?;
         drop(guard);
-        self.finish_staged_deletions()?;
+        self.processing_stage
+            .invalidate_screenshot_receipts(&affected_ids);
 
         if ocr_marked > 0 {
             let _ = self

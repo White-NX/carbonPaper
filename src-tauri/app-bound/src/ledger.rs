@@ -131,6 +131,45 @@ impl Ledger {
         }))
     }
 
+    pub fn registered_owner_sids(&self) -> Result<Vec<String>> {
+        let mut statement = db(self.conn.prepare("SELECT sid FROM owners"))?;
+        let rows = db(statement.query_map([], |row| row.get(0)))?;
+        db(rows.collect())
+    }
+
+    pub fn apply_revocations(
+        &mut self,
+        sid: &str,
+        intents: &[crate::revocation::Revocation],
+    ) -> Result<()> {
+        if self.registered_runtime(sid)?.is_none() {
+            // A removed owner has no grants; stale inbox entries cannot bind
+            // a later, independent registration or prevent its installation.
+            return Ok(());
+        }
+        let tx = db(self.conn.transaction())?;
+        for intent in intents {
+            intent.validate()?;
+            match intent {
+                crate::revocation::Revocation::RetireOwner => {
+                    Self::retire_where(&tx, sid, None)?;
+                    db(tx.execute("UPDATE owners SET dataset_id=NULL WHERE sid=?1", [sid]))?;
+                }
+                crate::revocation::Revocation::Screenshots {
+                    dataset_id,
+                    screenshot_ids,
+                } => {
+                    for id in screenshot_ids {
+                        Self::revoke_recap_source(&tx, sid, dataset_id, *id)?;
+                        db(tx.execute("UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3", params![sid, dataset_id, id]))?;
+                        db(tx.execute("DELETE FROM leases WHERE task IN (SELECT id FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)", params![sid, dataset_id, id]))?;
+                    }
+                }
+            }
+        }
+        db(tx.commit())
+    }
+
     pub fn registered_runtime(&self, sid: &str) -> Result<Option<String>> {
         db(self
             .conn

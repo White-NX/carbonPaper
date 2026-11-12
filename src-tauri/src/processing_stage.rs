@@ -35,9 +35,63 @@ pub(crate) trait Broker: Send + Sync {
     fn call(&self, request: Request) -> protocol::Result<Response>;
     fn installed(&self) -> protocol::Result<bool>;
     fn supported(&self) -> bool;
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> protocol::Result<bool> {
+        persist_revocation_through_pipe(self, intent)
+    }
+}
+
+fn persist_revocation_through_pipe<B: Broker + ?Sized>(
+    broker: &B,
+    intent: carbonpaper_app_bound::revocation::Revocation,
+) -> protocol::Result<bool> {
+    use carbonpaper_app_bound::revocation::Revocation;
+    if !broker.supported() || !broker.installed()? {
+        return Ok(false);
+    }
+    intent.validate()?;
+    match intent {
+        Revocation::RetireOwner => {
+            let Response::Status(status) = broker.call(Request::Status {})? else {
+                return Err(BrokerError::Integrity);
+            };
+            if let Some(dataset_id) = status.dataset_id {
+                broker.call(Request::RetireDataset { dataset_id })?;
+            }
+        }
+        Revocation::Screenshots {
+            dataset_id,
+            screenshot_ids,
+        } => {
+            broker.call(Request::RevokeScreenshots {
+                dataset_id,
+                screenshot_ids,
+            })?;
+        }
+    }
+    Ok(true)
 }
 struct NativeBroker;
 impl Broker for NativeBroker {
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> protocol::Result<bool> {
+        if !self.supported() {
+            return Ok(false);
+        }
+        if carbonpaper_app_bound::windows::revocation::append(
+            &carbonpaper_app_bound::windows::identity::current_sid()?,
+            &intent,
+        )?
+        .is_some()
+        {
+            return Ok(true);
+        }
+        persist_revocation_through_pipe(self, intent)
+    }
     fn installed(&self) -> protocol::Result<bool> {
         carbonpaper_app_bound::windows::identity::active_runtime().map(|runtime| runtime.is_some())
     }
@@ -450,21 +504,39 @@ impl ProcessingStaging {
 
     pub fn retire_dataset(&self) -> Result<(), String> {
         self.available.store(false, Ordering::Release);
-        if self.broker.supported() && self.broker.installed().map_err(|e| e.to_string())? {
-            // Restore/switch must retire the service's actual dataset even if
-            // the local staging DB is corrupt, absent, or from an old backup.
-            let Response::Status(status) = self
-                .call_broker_logged(Request::Status {}, None)
-                .map_err(|e| e.to_string())?
-            else {
-                return Err(BrokerError::Integrity.to_string());
-            };
-            if let Some(dataset_id) = status.dataset_id {
-                self.call_broker_logged(Request::RetireDataset { dataset_id }, None)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        self.issued
+            .lock()
+            .map_err(|_| "staging lock poisoned")?
+            .clear();
+        // The protected inbox survives archive replacement, directory switches
+        // and lost local staging. The service drains it before any new grant.
+        self.broker
+            .persist_revocation(carbonpaper_app_bound::revocation::Revocation::RetireOwner)
+            .map_err(|e| e.to_string())?;
         self.discard_revoked_inputs()
+    }
+
+    pub(crate) fn persist_screenshot_revocations(
+        &self,
+        dataset_id: &str,
+        ids: &[i64],
+    ) -> Result<(), String> {
+        for screenshot_ids in ids.chunks(128) {
+            self.broker
+                .persist_revocation(carbonpaper_app_bound::revocation::Revocation::Screenshots {
+                    dataset_id: dataset_id.into(),
+                    screenshot_ids: screenshot_ids.to_vec(),
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_screenshot_receipts(&self, ids: &[i64]) {
+        self.issued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, receipt| !ids.contains(&receipt.receipt.screenshot_id));
     }
 
     pub fn stage(

@@ -153,6 +153,8 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         repair_runtime(&source, &destination, &manifest, &runtime_id)?;
     }
     let mut ledger = Ledger::open(&state.join("keys.db"))?;
+    super::revocation::provision(&state, &sid)?;
+    super::revocation::drain(&state, &sid, &mut ledger)?;
     let previous = ledger.owner_registration(&sid)?;
     if let Some((old_id, _)) = &previous {
         let old_root = root.join("Runtime").join(old_id);

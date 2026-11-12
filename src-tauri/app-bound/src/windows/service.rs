@@ -226,7 +226,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         diagnostics::event("info", "service_starting", "startup", None);
         allow_peer_identity_queries()?;
         identity::assert_protected(&directory)?;
-        let ledger = Arc::new(LedgerLock::new(Ledger::open(&directory.join("keys.db"))?));
+        let mut opened = Ledger::open(&directory.join("keys.db"))?;
+        #[cfg(not(test))]
+        super::revocation::drain_all(&directory, &mut opened)?;
+        let ledger = Arc::new(LedgerLock::new(opened));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             // Authority work is synchronous by design. Keep it on a bounded
@@ -459,7 +462,11 @@ async fn maintenance_loop(ledger: Arc<LedgerLock>) -> Result<()> {
         }
         run_ledger_blocking(
             ledger.clone(),
-            |ledger| ledger.maintenance(now_secs()),
+            |ledger| {
+                #[cfg(not(test))]
+                super::revocation::drain_all(&identity::state_root()?, ledger)?;
+                ledger.maintenance(now_secs())
+            },
             None,
             None,
         )
@@ -642,6 +649,10 @@ async fn run_request_blocking(
                 pipe: HANDLE(pipe.as_raw_handle()),
                 sid: &caller.principal.sid,
             };
+            #[cfg(not(test))]
+            if ledger.registered_runtime(&caller.principal.sid)?.is_some() {
+                super::revocation::drain(&identity::state_root()?, &caller.principal.sid, ledger)?;
+            }
             let response = ledger
                 .handle(&caller.principal, request, now_secs(), &protector)
                 .unwrap_or_else(Response::Error);

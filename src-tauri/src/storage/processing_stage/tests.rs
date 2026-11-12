@@ -39,8 +39,20 @@ struct TestBroker {
     supported_storage_keys: AtomicBool,
     acquisitions: AtomicUsize,
     inspected: Mutex<Vec<String>>,
+    revocations: Mutex<Vec<carbonpaper_app_bound::revocation::Revocation>>,
 }
 impl Broker for TestBroker {
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> carbonpaper_app_bound::protocol::Result<bool> {
+        intent.validate()?;
+        if !self.installed.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.revocations.lock().unwrap().push(intent);
+        Ok(true)
+    }
     fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
         Ok(self.installed.load(Ordering::SeqCst))
     }
@@ -50,6 +62,14 @@ impl Broker for TestBroker {
     fn call(&self, request: Request) -> carbonpaper_app_bound::protocol::Result<Response> {
         if !self.online.load(Ordering::SeqCst) {
             return Err(BrokerError::Unavailable);
+        }
+        {
+            let mut intents = self.revocations.lock().unwrap();
+            self.ledger
+                .lock()
+                .unwrap()
+                .apply_revocations(&self.principal.lock().unwrap().sid, &intents)?;
+            intents.clear();
         }
         if matches!(&request, Request::AcquireTask { .. }) {
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
@@ -135,6 +155,7 @@ fn fixture() -> Fixture {
         supported_storage_keys: AtomicBool::new(true),
         acquisitions: AtomicUsize::new(0),
         inspected: Mutex::new(Vec::new()),
+        revocations: Mutex::new(Vec::new()),
     });
     storage.replace_processing_stage_for_tests(ProcessingStaging::with_test_broker(broker.clone()));
     storage
@@ -495,6 +516,66 @@ fn failed_deletion_keeps_the_outbox_and_blocks_further_key_claims() {
             .screenshot_id,
         2
     );
+}
+
+#[test]
+fn offline_deletion_commits_and_revokes_even_if_the_archive_queue_is_restored() {
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    insert_input(storage, 2, Consumer::Classification.bit());
+    broker.online.store(false, Ordering::SeqCst);
+    assert!(storage.delete_screenshot(1).unwrap());
+    assert!(!storage.staged_screenshot_active(1).unwrap());
+    // An archive/queue rollback cannot remove the protected inbox obligation.
+    sql(
+        storage,
+        "UPDATE screenshots SET is_deleted=0 WHERE id=1; DELETE FROM app_bound_revocations;",
+    );
+    broker.online.store(true, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
+    assert!(!storage
+        .processing_stage
+        .owns_screenshot(1, Consumer::Classification));
+    assert_eq!(
+        storage
+            .processing_stage
+            .claim(storage, Consumer::Classification)
+            .unwrap()
+            .unwrap()
+            .receipt
+            .screenshot_id,
+        2
+    );
+}
+
+#[test]
+fn offline_retirement_survives_missing_staging_and_a_new_dataset_attachment() {
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    let task = storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
+        .unwrap()
+        .unwrap();
+    storage.processing_stage.shutdown();
+    broker.online.store(false, Ordering::SeqCst);
+    storage.processing_stage.retire_dataset().unwrap();
+    broker.online.store(true, Ordering::SeqCst);
+    broker
+        .call(Request::AttachDataset {
+            dataset_id: carbonpaper_app_bound::protocol::random_id(),
+        })
+        .unwrap();
+    assert!(broker
+        .call(Request::AcquireTask {
+            task_id: task.receipt.task_id,
+            consumer: Consumer::Classification,
+            ciphertext_digest: "a".repeat(64),
+        })
+        .is_err());
 }
 
 #[test]

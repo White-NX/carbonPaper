@@ -1,6 +1,7 @@
 pub(crate) mod diagnostics;
 pub mod identity;
 pub mod install;
+pub mod revocation;
 pub mod service;
 pub mod transport;
 pub mod update;

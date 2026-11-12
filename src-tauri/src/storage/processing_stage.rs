@@ -161,6 +161,25 @@ impl StorageState {
         }
     }
 
+    pub(super) fn persist_staged_deletions_on_conn(
+        &self,
+        conn: &Connection,
+        ids: &[i64],
+    ) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let dataset: String = conn
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key=?1",
+                [DATASET_KEY],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.processing_stage
+            .persist_screenshot_revocations(&dataset, ids)
+    }
+
     pub(crate) fn staged_source_revision(&self, id: i64) -> Result<i64, String> {
         let guard = self.get_connection_named("staged_source_revision")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
