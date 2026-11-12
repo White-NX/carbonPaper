@@ -606,6 +606,9 @@ where
     if let Some(metrics) = metrics {
         metrics.update(|progress| progress.phase = "vector_scan");
     }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("query_deadline_exceeded_during_exact_scan".to_string());
+    }
     let mut statement = conn
         .prepare(&visible_embedding_page_sql())
         .map_err(|error| format!("Failed to prepare resident vector scan: {error}"))?;

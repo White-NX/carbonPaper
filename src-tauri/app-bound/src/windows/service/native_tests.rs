@@ -13,11 +13,10 @@ struct NativeBrokerFixture {
 impl NativeBrokerFixture {
     fn new(enabled: bool) -> Self {
         let directory = tempfile::tempdir().expect("create synthetic broker storage");
-        let process = identity::inspect_process(std::process::id()).expect("inspect test process");
-        let principal = Principal {
-            runtime_id: "native-test-runtime".into(),
-            ..process.principal
-        };
+        let mut process =
+            identity::inspect_process(std::process::id()).expect("inspect test process");
+        process.principal.runtime_id = "native-test-runtime".into();
+        let principal = process.principal.clone();
         let mut ledger = Ledger::open(&directory.path().join("keys.db")).expect("open ledger");
         ledger
             .register_owner(&principal.sid, &principal.runtime_id, enabled)
@@ -25,10 +24,8 @@ impl NativeBrokerFixture {
         // Only this fixture's kernel-derived process identity is preapproved.
         // The real handler still checks the pipe client's PID and process token.
         // Signed installation and the SYSTEM peer check remain release tests.
-        let caller = VerifiedCaller {
-            principal: principal.clone(),
-            image_lock: identity::locked_file(&process.image).expect("lock test executable"),
-        };
+        let image_lock = identity::locked_file(&process.image).expect("lock test executable");
+        let caller = VerifiedCaller::new(process, image_lock);
         Self {
             directory,
             ledger: Some(Arc::new(LedgerLock::new(ledger))),
@@ -406,33 +403,82 @@ async fn native_dpapi_rejects_a_different_pipe_token_sid() {
         .await
         .register_owner(other_sid, &fixture.principal.runtime_id, true)
         .unwrap();
-    {
-        let mut cache = fixture.cache.lock().unwrap();
-        Arc::get_mut(cache.get_mut(&fixture.principal.process_identity).unwrap())
-            .unwrap()
-            .principal
-            .sid = other_sid.into();
-    }
-    fixture
-        .request(Request::AttachDataset {
-            dataset_id: fixture.dataset.clone(),
-        })
-        .await
+    // Caller-cache verification now rejects a mismatched SID before dispatch.
+    // Exercise the independent DPAPI token guard directly on a real pipe so
+    // this regression still reaches impersonation and transaction rollback.
+    let name = format!(r"\\.\pipe\CarbonPaper.DpapiSidTest.{}", random_id());
+    let mut pipe = ServerOptions::new()
+        .first_pipe_instance(true)
+        .reject_remote_clients(true)
+        .create(&name)
         .unwrap();
-    assert_eq!(
-        fixture
-            .request(Request::PrepareTask {
-                dataset_id: fixture.dataset.clone(),
-                screenshot_id: 1,
-                consumers: 1,
-                payload_bytes: 40,
-            })
-            .await
-            .unwrap_err(),
-        BrokerError::AccessDenied
-    );
-    let Response::Status(status) = fixture.request(Request::Status {}).await.unwrap() else {
-        panic!("expected status after rejected protection");
+    let ledger = fixture.ledger.as_ref().unwrap().clone();
+    let mut who = fixture.principal.clone();
+    who.sid = other_sid.into();
+    let dataset = fixture.dataset.clone();
+    let server = tokio::spawn(async move {
+        pipe.connect().await.unwrap();
+        pipe.read_u8().await.unwrap();
+        run_ledger_blocking(
+            ledger,
+            move |ledger| {
+                let protector = DpapiProtector {
+                    pipe: HANDLE(pipe.as_raw_handle()),
+                    sid: &who.sid,
+                };
+                ledger.handle(
+                    &who,
+                    Request::AttachDataset {
+                        dataset_id: dataset.clone(),
+                    },
+                    now_secs(),
+                    &protector,
+                )?;
+                assert_eq!(
+                    ledger
+                        .handle(
+                            &who,
+                            Request::PrepareTask {
+                                dataset_id: dataset,
+                                screenshot_id: 1,
+                                consumers: 1,
+                                payload_bytes: 40
+                            },
+                            now_secs(),
+                            &protector
+                        )
+                        .unwrap_err(),
+                    BrokerError::AccessDenied
+                );
+                let response = ledger.handle(&who, Request::Status {}, now_secs(), &protector)?;
+                Ok((pipe, response))
+            },
+            None,
+            None,
+        )
+        .await
+    });
+    let client = tokio::task::spawn_blocking(move || {
+        use std::{io::Write, os::windows::fs::OpenOptionsExt};
+        use windows::Win32::Storage::FileSystem::{SECURITY_IMPERSONATION, SECURITY_SQOS_PRESENT};
+        let mut client = std::fs::OpenOptions::new()
+            .access_mode(transport::PIPE_CLIENT_ACCESS)
+            .custom_flags((SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION).0)
+            .open(&name)
+            .unwrap();
+        client.write_all(&[1]).unwrap();
+        client
+    })
+    .await
+    .unwrap();
+    let (_pipe, Response::Status(status)) = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected status after rejected protection")
     };
+    drop(client);
     assert_eq!(status.active_tasks, 0);
 }

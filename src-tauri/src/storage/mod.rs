@@ -13,6 +13,7 @@ mod backup_keys;
 mod blind_index;
 mod blind_search;
 mod classification;
+mod compaction;
 mod connection;
 pub(crate) mod database_snapshot;
 mod derived_index;
@@ -21,17 +22,21 @@ mod document_ref;
 mod encryption;
 mod image_io;
 mod initialization;
+mod layout;
 mod link_scoring;
 pub mod migration;
 mod mode;
+mod ocr_keys;
 mod policy;
 mod process;
+mod process_icons;
 mod processing_stage;
 mod protected;
 mod protected_migration;
 mod recap;
 mod recap_protected;
 mod recap_search;
+mod rewrite_budget;
 mod schema;
 mod screenshot;
 mod screenshot_reader;
@@ -42,12 +47,14 @@ mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
 mod types;
+mod vector_blocks;
 mod vector_query_metrics;
 pub(crate) mod wire_time;
 
 pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
 pub use background_scheduler::BackgroundTaskState;
 pub(crate) use classification::{ClassificationFeedback, ClassificationLease};
+pub use compaction::StorageCompactionProgress;
 #[allow(unused_imports)]
 pub use derived_index::*;
 #[allow(unused_imports)]
@@ -119,6 +126,10 @@ pub struct StorageState {
     ocr_row_count: AtomicU64,
     /// Whether the lazy OCR indexer background thread has been started.
     lazy_indexer_started: AtomicBool,
+    storage_compaction_started: AtomicBool,
+    storage_compaction_progress: Mutex<compaction::ProgressState>,
+    /// Online compaction and incremental vacuum share one paced execution slot.
+    rewrite_budget: rewrite_budget::RewriteBudget,
     /// Whether thumbnail warmup has already completed this session
     pub(crate) thumbnail_warmup_done: AtomicBool,
     /// Whether startup VACUUM is currently running
@@ -183,6 +194,7 @@ struct NamedConnectionGuard<'a> {
     lock_holder: &'a Mutex<&'static str>,
     caller: &'static str,
     acquired_at: std::time::Instant,
+    rewrite_io: Option<rewrite_budget::ConnectionIoSample>,
 }
 
 impl Deref for NamedConnectionGuard<'_> {
@@ -201,6 +213,9 @@ impl DerefMut for NamedConnectionGuard<'_> {
 
 impl Drop for NamedConnectionGuard<'_> {
     fn drop(&mut self) {
+        if let Some(sample) = self.rewrite_io.take() {
+            sample.finish(self.guard.as_ref());
+        }
         let hold_duration = self.acquired_at.elapsed();
         if hold_duration.as_secs() >= 1 {
             tracing::warn!(
@@ -253,6 +268,9 @@ impl StorageState {
             lock_holder: Mutex::new(""),
             ocr_row_count: AtomicU64::new(0),
             lazy_indexer_started: AtomicBool::new(false),
+            storage_compaction_started: AtomicBool::new(false),
+            storage_compaction_progress: Mutex::new(compaction::ProgressState::default()),
+            rewrite_budget: rewrite_budget::RewriteBudget::default(),
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),
@@ -328,6 +346,11 @@ impl StorageState {
 
     pub(crate) fn foreground_db_read(&self) -> connection::ActivityReadGuard {
         self.foreground_db_activity.read("foreground_query")
+    }
+
+    pub(crate) fn background_db_read(&self) -> connection::ActivityReadGuard {
+        self.foreground_db_activity
+            .background_read("background_query")
     }
 
     pub(crate) fn database_maintenance(
@@ -423,6 +446,7 @@ impl StorageState {
             );
         }
         Ok(NamedConnectionGuard {
+            rewrite_io: rewrite_budget::ConnectionIoSample::begin(guard.as_ref()),
             guard,
             lock_holder: &self.lock_holder,
             caller,
@@ -448,6 +472,7 @@ impl StorageState {
             *holder = caller;
         }
         Ok(Some(NamedConnectionGuard {
+            rewrite_io: rewrite_budget::ConnectionIoSample::begin(guard.as_ref()),
             guard,
             lock_holder: &self.lock_holder,
             caller,
@@ -568,6 +593,7 @@ impl StorageState {
     /// before its statement runs.
     pub(super) fn bump_db_generation(&self) {
         self.db_generation.fetch_add(1, Ordering::Release);
+        self.reset_storage_compaction_progress();
     }
 }
 

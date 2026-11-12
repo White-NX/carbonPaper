@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) const EXPIRE_RECAP_SQL: &str = "UPDATE recap_objects SET state='retired',key_blob=NULL
+    WHERE owner=?1 AND state!='retired'
+    AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))";
+pub(super) const PRUNE_RECAP_SQL: &str = "DELETE FROM recap_objects
+    WHERE owner=?1 AND state='retired' AND created<?2";
+
 impl Ledger {
     pub(super) fn init_recap(conn: &Connection) -> Result<()> {
         db(conn.execute_batch("CREATE TABLE IF NOT EXISTS recap_objects (
@@ -8,6 +14,10 @@ impl Ledger {
             key_blob BLOB,digest TEXT,created INTEGER NOT NULL,expires INTEGER NOT NULL,
             prepared_until INTEGER NOT NULL,bytes INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS recap_objects_slot ON recap_objects(owner,dataset,slot,state);
+            CREATE INDEX IF NOT EXISTS recap_objects_live
+                ON recap_objects(owner,state,expires,prepared_until,bytes,created) WHERE state!='retired';
+            CREATE INDEX IF NOT EXISTS recap_objects_retired_created
+                ON recap_objects(owner,created) WHERE state='retired';
             CREATE TABLE IF NOT EXISTS recap_sources (
                 object_id TEXT NOT NULL REFERENCES recap_objects(id) ON DELETE CASCADE,
                 screenshot_id INTEGER NOT NULL,PRIMARY KEY(object_id,screenshot_id));
@@ -241,12 +251,8 @@ impl Ledger {
     }
 
     pub(super) fn reap_recap(conn: &Connection, sid: &str, now: i64) -> Result<()> {
-        db(conn.execute("UPDATE recap_objects SET state='retired',key_blob=NULL WHERE owner=?1 AND state!='retired'
-            AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))",params![sid,now]))?;
-        db(conn.execute(
-            "DELETE FROM recap_objects WHERE owner=?1 AND state='retired' AND created<?2",
-            params![sid, now - 60 * DAY_SECS],
-        ))?;
+        db(conn.execute(EXPIRE_RECAP_SQL, params![sid, now]))?;
+        db(conn.execute(PRUNE_RECAP_SQL, params![sid, now - 60 * DAY_SECS]))?;
         Ok(())
     }
 }

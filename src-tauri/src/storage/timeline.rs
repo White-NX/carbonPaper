@@ -231,7 +231,7 @@ fn timeline_projection(include_details: bool) -> &'static str {
         "s.id, s.image_path, s.created_at,
          CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, cp_process(s.process_name),
          s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
-         s.content_key_encrypted, s.page_icon_id,
+         s.content_key_encrypted, COALESCE(s.process_icon_id, s.page_icon_id),
          pi.icon_enc, pi.icon_key_encrypted, s.category"
     } else {
         // Do not fetch ciphertext or large metadata blobs just to draw frame positions.
@@ -258,7 +258,7 @@ fn timeline_rows_sql_with_details(bucket: Option<i64>, include_details: bool) ->
     // reverse the join and restart the GROUP BY coroutine for every screenshot.
     let projection = timeline_projection(include_details);
     let icon_join = if include_details {
-        "LEFT JOIN page_icons pi ON pi.id = s.page_icon_id"
+        "LEFT JOIN page_icons pi ON pi.id = COALESCE(s.process_icon_id, s.page_icon_id)"
     } else {
         ""
     };
@@ -387,7 +387,7 @@ fn read_rows_by_ids(
     // Force rowid seeks for this bounded ID list, including before ANALYZE.
     let sql = format!(
         "SELECT {} FROM screenshots s NOT INDEXED
-         LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
+         LEFT JOIN page_icons pi ON pi.id = COALESCE(s.process_icon_id, s.page_icon_id)
          WHERE s.is_deleted = 0 AND s.id IN ({}) ORDER BY s.created_at, s.id",
         timeline_projection(true),
         vec!["?"; ids.len()].join(",")

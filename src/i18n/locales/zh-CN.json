@@ -1469,6 +1469,12 @@
       "modelDownloadSummaryPlaceholder": "模型文件下载中 ({{progress}}%)",
       "modelDownloadRunningTitle": "后台模型下载中",
       "modelDownloadRunningDesc": "正在下载所需的模型文件，当前进度 {{progress}}%。",
+      "storageCompactionRunningTitle": "正在优化数据库",
+      "storageCompactionSummaryPlaceholder": "正在优化数据库 · 约 {{progress}}%",
+      "storageCompactionWaitingForUnlock": "数据库优化等待解锁",
+      "storageCompactionWaitingForVerification": "数据库优化等待身份验证",
+      "storageCompactionWaitingForMaintenance": "数据库优化等待维护完成",
+      "storageCompactionRetryWait": "数据库优化等待重试",
       "stopTooltip": "停止处理智能聚类",
       "stop": "停止"
     }

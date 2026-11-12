@@ -89,7 +89,7 @@ impl StorageState {
             let relevant: &[&str] = match table {
                 "screenshots" => &["id", "created_at", "window_title", "process_name", "window_title_enc",
                     "process_name_enc", "page_url_enc", "content_key_encrypted", "is_deleted"],
-                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "is_deleted"],
+                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "ocr_key_id", "is_deleted"],
                 _ => &["screenshot_id", "ref_enc", "content_key_encrypted"],
             };
             let mut changes = relevant.iter().filter(|c| columns.iter().any(|name| name == **c))
@@ -626,12 +626,14 @@ impl StorageState {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let mut statement = conn
                     .prepare(&format!(
-                        "SELECT metadata,metadata_enc,content_key_encrypted FROM screenshots
-                     WHERE id IN ({placeholders}) AND is_deleted=0
-                     AND (status IS NULL OR status<>'aborted')
-                     AND (source IS NULL OR source<>'extension')
-                     AND (metadata IS NOT NULL OR metadata_enc IS NOT NULL)
-                     ORDER BY id DESC"
+                        "SELECT s.metadata,s.metadata_enc,s.content_key_encrypted,
+                            pi.icon_enc,pi.icon_key_encrypted FROM screenshots s
+                     LEFT JOIN page_icons pi ON pi.id=s.process_icon_id
+                     WHERE s.id IN ({placeholders}) AND s.is_deleted=0
+                     AND (s.status IS NULL OR s.status<>'aborted')
+                     AND (s.source IS NULL OR s.source<>'extension')
+                     AND (s.metadata IS NOT NULL OR s.metadata_enc IS NOT NULL OR s.process_icon_id IS NOT NULL)
+                     ORDER BY s.id DESC"
                     ))
                     .map_err(|e| e.to_string())?;
                 let rows = statement
@@ -640,6 +642,8 @@ impl StorageState {
                             row.get::<_, Option<String>>(0)?,
                             row.get::<_, Option<Vec<u8>>>(1)?,
                             row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
                         ))
                     })
                     .map_err(|e| e.to_string())?
@@ -648,9 +652,28 @@ impl StorageState {
                 rows
             };
             // Decrypt outside the database mutex; stop as soon as an icon is found.
-            for (plain, encrypted, key) in rows {
+            for (plain, encrypted, key, icon_enc, icon_key) in rows {
                 if !self.is_session_valid() {
                     return Err("AUTH_REQUIRED".into());
+                }
+                if let (Some(data), Some(key)) = (icon_enc, icon_key) {
+                    match self.decrypt_payload_with_row_key_silent(&data, &key) {
+                        Ok(bytes) => {
+                            let icon = String::from_utf8(bytes)
+                                .ok()
+                                .filter(|i| !i.trim().is_empty());
+                            if !self.is_session_valid() {
+                                return Err("AUTH_REQUIRED".into());
+                            }
+                            if icon.is_some() {
+                                return Ok(icon);
+                            }
+                        }
+                        Err(BackgroundReadError::AuthRequired) => {
+                            return Err("AUTH_REQUIRED".into())
+                        }
+                        Err(_) => {}
+                    }
                 }
                 let mut bytes = match (encrypted, key) {
                     (Some(data), Some(key)) => {

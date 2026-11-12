@@ -840,6 +840,7 @@ impl StorageState {
             ON CONFLICT(index_kind, subject_key) DO UPDATE SET
                 dimensions = excluded.dimensions,
                 vector_f32 = excluded.vector_f32,
+                vector_block_id = NULL, vector_offset = NULL, vector_length = NULL,
                 model_id = excluded.model_id,
                 model_revision = excluded.model_revision,
                 embedding_version = excluded.embedding_version,
@@ -1229,10 +1230,15 @@ impl StorageState {
             .prepare(&format!(
                 r#"
                 SELECT {JOB_ROW_COLUMNS}
-                FROM derived_index_jobs
-                WHERE index_kind = ?1
-                  AND {CLAIMABLE_JOB_PREDICATE}
-                  AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                FROM (
+                    SELECT {JOB_ROW_COLUMNS} FROM derived_index_jobs
+                    WHERE index_kind = ?1 AND status IN ('pending', 'waiting_for_auth')
+                      AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                    UNION ALL
+                    SELECT {JOB_ROW_COLUMNS} FROM derived_index_jobs
+                    WHERE index_kind = ?1 AND status = 'failed' AND attempts < ?2
+                      AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                )
                 ORDER BY updated_at, subject_key
                 LIMIT ?3
                 "#
@@ -1872,9 +1878,17 @@ pub(super) fn visible_embedding_source_with_indexes(
     embedding_index: &str,
     job_index: &str,
 ) -> String {
+    embedding_source("derived_embeddings", embedding_index, job_index)
+}
+
+pub(super) fn visible_embedding_payload_source(job_index: &str) -> String {
+    embedding_source("derived_embeddings_read", "", job_index)
+}
+
+fn embedding_source(table: &str, embedding_index: &str, job_index: &str) -> String {
     format!(
         r#"
-        FROM derived_embeddings e {embedding_index}
+        FROM {table} e {embedding_index}
         INNER JOIN derived_index_jobs j {job_index}
           ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
         WHERE e.index_kind = ?1 AND j.status = 'completed'
@@ -1887,7 +1901,7 @@ pub(super) fn visible_embedding_source_with_indexes(
 }
 
 pub(super) fn visible_embedding_source() -> String {
-    visible_embedding_source_with_indexes("", "")
+    visible_embedding_payload_source("")
 }
 
 fn visible_embedding_metadata_source() -> String {

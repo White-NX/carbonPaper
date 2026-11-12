@@ -49,6 +49,7 @@ fn previous_rows_sql(columns: &str, count: usize) -> String {
     format!(
         "SELECT {columns}
          FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id
+         LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id
          WHERE r.id IN ({placeholders}) AND r.is_deleted = 0 AND s.is_deleted = 0"
     )
 }

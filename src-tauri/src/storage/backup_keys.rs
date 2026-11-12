@@ -83,6 +83,11 @@ const DOMAINS: &[Domain] = &[
         wrapping: "wrapped_key",
         payloads: &[],
     },
+    Domain {
+        table: "ocr_keys",
+        wrapping: "wrapped_key",
+        payloads: &[],
+    },
 ];
 
 fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
@@ -98,6 +103,7 @@ fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
 }
 
 fn inventory(conn: &Connection) -> Result<Vec<(usize, HashSet<String>)>, String> {
+    super::ocr_keys::backup::validate_references(conn)?;
     let mut tables = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
         .map_err(|e| e.to_string())?;
@@ -129,8 +135,13 @@ fn inventory(conn: &Connection) -> Result<Vec<(usize, HashSet<String>)>, String>
                 ));
             }
             for payload in domain.payloads.iter().filter(|p| available.contains(**p)) {
+                let legacy_only = if table == "ocr_results" && available.contains("ocr_key_id") {
+                    " AND ocr_key_id IS NULL"
+                } else {
+                    ""
+                };
                 let missing: bool = conn.query_row(&format!(
-                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {payload} IS NOT NULL AND length({payload})>0 AND ({} IS NULL OR length({})=0))",
+                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {payload} IS NOT NULL AND length({payload})>0 AND ({} IS NULL OR length({})=0){legacy_only})",
                     domain.wrapping, domain.wrapping), [], |r| r.get(0)).map_err(|e| e.to_string())?;
                 if missing {
                     return Err(format!("Missing content key for {table}.{payload}"));
@@ -209,6 +220,9 @@ fn validate_row(
     key: &[u8],
 ) -> Result<(), String> {
     let d = &DOMAINS[index];
+    if d.table == "ocr_keys" {
+        return super::ocr_keys::backup::validate_key(conn, rowid, key);
+    }
     for column in d.payloads.iter().filter(|p| available.contains(**p)) {
         let bytes: Option<Vec<u8>> = conn
             .query_row(
@@ -246,6 +260,9 @@ fn protected_key(
 
 // identities must match protected_migration::text_identity and the writers.
 fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> Result<(), String> {
+    if columns(conn, "derived_embeddings")?.contains("vector_block_id") {
+        super::vector_blocks::validate(conn)?;
+    }
     for (table, identity, column, text) in [
         (
             "smart_clusters",
@@ -330,9 +347,15 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
         if !columns(conn, table)?.contains(column) {
             continue;
         }
+        let source =
+            if table == "derived_embeddings" && columns(conn, table)?.contains("vector_block_id") {
+                "derived_embeddings_read"
+            } else {
+                table
+            };
         let mut query = conn
             .prepare(&format!(
-                "SELECT {identity},{column} FROM {table} WHERE {column} IS NOT NULL"
+                "SELECT {identity},{column} FROM {source} WHERE {column} IS NOT NULL"
             ))
             .map_err(|e| e.to_string())?;
         let mut rows = query.query([]).map_err(|e| e.to_string())?;
@@ -389,6 +412,7 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
         .map_err(|e| e.to_string())?;
     let mut completed = 0u64;
     let mut protected = HashMap::new();
+    let mut ocr_groups = HashMap::new();
     progress(0, count);
     for (index, available) in present {
         let d = &DOMAINS[index];
@@ -417,6 +441,9 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
                 let cipher = protected_key(conn, rowid, &key, &hex::encode(fingerprint))?;
                 protected.insert(cipher.id.clone(), cipher);
             }
+            if index == 8 {
+                ocr_groups.insert(rowid, Zeroizing::new(key.to_vec()));
+            }
             writer
                 .write_all(&[index as u8])
                 .and_then(|_| writer.write_all(&rowid.to_le_bytes()))
@@ -429,6 +456,7 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
             }
         }
     }
+    super::ocr_keys::backup::validate_members(conn, &ocr_groups, cancelled)?;
     validate_protected(conn, &protected)
 }
 
@@ -488,6 +516,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let mut completed = 0u64;
         let mut protected = HashMap::new();
+        let mut ocr_groups = HashMap::new();
         progress(0, bundle.count);
         for (index, available) in &present {
             let d = &DOMAINS[*index];
@@ -515,6 +544,9 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
                     let cipher = protected_key(&tx, rowid, key, &bundle.fingerprint())?;
                     protected.insert(cipher.id.clone(), cipher);
                 }
+                if *index == 8 {
+                    ocr_groups.insert(rowid, Zeroizing::new(key.to_vec()));
+                }
                 let wrapping =
                     wrap_storage_domain_key(credentials, key).map_err(|e| e.to_string())?;
                 let checked = Zeroizing::new(
@@ -534,6 +566,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
                 }
             }
         }
+        super::ocr_keys::backup::validate_members(&tx, &ocr_groups, cancelled)?;
         validate_protected(&tx, &protected)?;
         normalize_images(&tx, directory, credentials, cancelled, true)?;
         if !columns(&tx, "protected_storage_keys")?.is_empty() {

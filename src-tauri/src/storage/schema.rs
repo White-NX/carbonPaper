@@ -216,6 +216,7 @@ impl StorageState {
 
     /// Initialize database tables.
     pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+        super::layout::register_and_check(conn).map_err(|e| e.to_string())?;
         #[cfg(test)]
         if crate::credential_manager::get_cached_public_key(&self.credential_state).is_none() {
             self.credential_state
@@ -774,7 +775,6 @@ impl StorageState {
 
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_image_hash ON screenshots(image_hash);
-            CREATE INDEX IF NOT EXISTS idx_text_hash ON ocr_results(text_hash);
             CREATE INDEX IF NOT EXISTS idx_screenshot_id ON ocr_results(screenshot_id);
             CREATE INDEX IF NOT EXISTS idx_created_at ON screenshots(created_at);
             CREATE INDEX IF NOT EXISTS idx_process_name ON screenshots(process_name);
@@ -852,7 +852,10 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        super::vector_blocks::initialize(conn)?;
+        super::ocr_keys::initialize(conn)?;
         super::migration::dedup::migrate(conn)?;
+        super::compaction::initialize(conn)?;
         Self::init_recap_tables(conn)?;
         let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
         if recovered > 0 {
@@ -864,6 +867,7 @@ impl StorageState {
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
         super::blind_index::ensure_schema(conn)?;
+        super::layout::initialize(conn)?;
         #[cfg(test)]
         {
             self.protected.allow_plaintext_fixtures(true);
@@ -1212,6 +1216,7 @@ impl StorageState {
 
         // Content-addressed dedup references
         Self::add_column_if_missing(conn, "screenshots", "page_icon_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "screenshots", "process_icon_id", "INTEGER")?;
         Self::add_column_if_missing(conn, "screenshots", "link_set_id", "INTEGER")?;
 
         // Classification columns
@@ -1655,7 +1660,7 @@ impl StorageState {
         Ok(recovered)
     }
 
-    fn add_column_if_missing(
+    pub(super) fn add_column_if_missing(
         conn: &Connection,
         table: &str,
         column: &str,

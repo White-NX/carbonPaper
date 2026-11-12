@@ -122,8 +122,10 @@ pub(crate) struct WalCheckpointResult {
 #[derive(Default)]
 struct ActivityState {
     active_readers: usize,
+    foreground_readers: usize,
     active_writer: bool,
     waiting_writers: usize,
+    last_foreground_read_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -145,6 +147,14 @@ pub(crate) struct ActivityGate {
 
 impl ActivityGate {
     pub(crate) fn read(&self, caller: &'static str) -> ActivityReadGuard {
+        self.acquire_read(caller, true)
+    }
+
+    pub(crate) fn background_read(&self, caller: &'static str) -> ActivityReadGuard {
+        self.acquire_read(caller, false)
+    }
+
+    fn acquire_read(&self, caller: &'static str, foreground: bool) -> ActivityReadGuard {
         let mut state = self
             .inner
             .state
@@ -158,11 +168,16 @@ impl ActivityGate {
                 .unwrap_or_else(|error| error.into_inner());
         }
         state.active_readers += 1;
+        if foreground {
+            state.foreground_readers += 1;
+            state.last_foreground_read_at = Some(Instant::now());
+        }
         drop(state);
 
         ActivityReadGuard {
             inner: Arc::clone(&self.inner),
             caller,
+            foreground,
             acquired_at: Instant::now(),
         }
     }
@@ -210,11 +225,24 @@ impl ActivityGate {
             acquired_at: Instant::now(),
         })
     }
+
+    pub(super) fn has_recent_foreground_activity(&self, within: Duration) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.foreground_readers > 0
+            || state
+                .last_foreground_read_at
+                .is_some_and(|at| at.elapsed() < within)
+    }
 }
 
 pub(crate) struct ActivityReadGuard {
     inner: Arc<ActivityGateInner>,
     caller: &'static str,
+    foreground: bool,
     acquired_at: Instant,
 }
 
@@ -234,6 +262,10 @@ impl Drop for ActivityReadGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.active_readers = state.active_readers.saturating_sub(1);
+        if self.foreground {
+            state.foreground_readers = state.foreground_readers.saturating_sub(1);
+            state.last_foreground_read_at = Some(Instant::now());
+        }
         self.inner.changed.notify_all();
     }
 }
@@ -379,6 +411,8 @@ pub(crate) fn configure_sqlcipher_connection(
 /// Apply the connection-local policy shared by primary and independent reads.
 pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<ConnectionStatus> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    super::layout::register_and_check(conn)?;
+    super::ocr_keys::register(conn)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     // Decrypted projections must never spill into SQLite temporary files or
     // be usable by a schema supplied from the public bootstrap database.
@@ -941,6 +975,22 @@ mod tests {
         reader_release_tx.send(()).unwrap();
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn background_readers_keep_maintenance_fencing_without_foreground_throttling() {
+        let gate = ActivityGate::default();
+        let background = gate.background_read("classification_cache_refresh");
+        assert!(!gate.has_recent_foreground_activity(Duration::from_secs(2)));
+        assert!(gate.try_write("maintenance").is_none());
+        drop(background);
+        assert!(!gate.has_recent_foreground_activity(Duration::from_secs(2)));
+        drop(gate.try_write("maintenance_after_background").unwrap());
+        let foreground = gate.read("image_query");
+        assert!(gate.has_recent_foreground_activity(Duration::from_secs(2)));
+        assert!(gate.try_write("maintenance").is_none());
+        drop(foreground);
+        assert!(gate.has_recent_foreground_activity(Duration::from_secs(2)));
     }
 
     #[test]

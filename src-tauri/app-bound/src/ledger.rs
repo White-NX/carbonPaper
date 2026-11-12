@@ -9,6 +9,15 @@ use std::path::Path;
 mod recap;
 mod storage_keys;
 
+const USAGE_SQL: &str = "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
+    SELECT bytes FROM tasks WHERE owner=?1 AND state!='retired'
+    UNION ALL SELECT bytes FROM recap_objects WHERE owner=?1 AND state!='retired')";
+const EXPIRE_TASKS_SQL: &str = "UPDATE tasks SET state='retired',key_blob=NULL
+    WHERE owner=?1 AND state!='retired'
+    AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))";
+const PRUNE_TASKS_SQL: &str = "DELETE FROM tasks
+    WHERE owner=?1 AND state='retired' AND expires<?2";
+
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub sid: String,
@@ -60,6 +69,10 @@ impl Ledger {
                 bytes INTEGER NOT NULL, UNIQUE(owner, dataset, screenshot_id)
             );
             CREATE INDEX IF NOT EXISTS broker_tasks_owner ON tasks(owner, state, created);
+            CREATE INDEX IF NOT EXISTS broker_tasks_live
+                ON tasks(owner,state,expires,prepared_until,bytes,created) WHERE state!='retired';
+            CREATE INDEX IF NOT EXISTS broker_tasks_retired_expiry
+                ON tasks(owner,expires) WHERE state='retired';
             CREATE TABLE IF NOT EXISTS leases (
                 task TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                 consumer INTEGER NOT NULL, id TEXT NOT NULL, process TEXT NOT NULL,
@@ -624,13 +637,9 @@ impl Ledger {
     }
 
     fn usage(conn: &Connection, sid: &str) -> Result<(u64, u64)> {
-        db(conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
-                SELECT bytes FROM tasks WHERE owner=?1 AND state!='retired'
-                UNION ALL SELECT bytes FROM recap_objects WHERE owner=?1 AND state!='retired')",
-            [sid],
-            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-        ))
+        db(conn.query_row(USAGE_SQL, [sid], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        }))
     }
 
     fn retire_where(conn: &Connection, sid: &str, dataset: Option<&str>) -> Result<()> {
@@ -643,18 +652,11 @@ impl Ledger {
 
     fn reap(conn: &Connection, sid: &str, now: i64, limits: Limits) -> Result<()> {
         Self::reap_recap(conn, sid, now)?;
-        db(conn.execute(
-            "UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND state!='retired'
-            AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))",
-            params![sid, now],
-        ))?;
+        db(conn.execute(EXPIRE_TASKS_SQL, params![sid, now]))?;
         Self::make_room(conn, sid, 0, limits.capacity_bytes)?;
         // Unknown IDs fail closed too, so old tombstones can be reclaimed once
         // no valid input grant could survive. Keys are never reconstructed.
-        db(conn.execute(
-            "DELETE FROM tasks WHERE owner=?1 AND state='retired' AND expires<?2",
-            params![sid, now - 60 * DAY_SECS],
-        ))?;
+        db(conn.execute(PRUNE_TASKS_SQL, params![sid, now - 60 * DAY_SECS]))?;
         Ok(())
     }
 
@@ -733,6 +735,95 @@ mod recap_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_ledger_indexes_keep_retained_history_out_of_request_scans() {
+        let (mut ledger, who, ds) = fixture();
+        let task = prepare(&mut ledger, &who, &ds, 1, Consumer::Clip.bit());
+        ledger.conn.execute(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1000)
+             INSERT INTO tasks(id,owner,dataset,screenshot_id,binding,state,created,expires,prepared_until,bytes)
+             SELECT printf('%064x',n),?1,?2,n+1000,'retained binding','retired',100,9999999,100,1024
+             FROM history", params![who.sid, ds],
+        ).unwrap();
+        ledger.conn.execute(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1000)
+             INSERT INTO recap_objects(id,owner,dataset,slot,binding,state,created,expires,prepared_until,bytes)
+             SELECT printf('%064x',n),?1,?2,'old context','retained binding','retired',100,9999999,100,1024
+             FROM history", params![who.sid, ds],
+        ).unwrap();
+        // Reopen a pre-index ledger. Schema initialization must upgrade it
+        // without rewriting existing bindings, keys, leases or retention times.
+        ledger
+            .conn
+            .execute_batch(
+                "DROP INDEX broker_tasks_live; DROP INDEX broker_tasks_retired_expiry;
+            DROP INDEX recap_objects_live; DROP INDEX recap_objects_retired_created;",
+            )
+            .unwrap();
+        let mut ledger = Ledger::from_connection(ledger.conn).unwrap();
+        let Response::Status(status) = ledger
+            .handle(&who, Request::Status {}, 102, &TestProtection)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (status.active_tasks, status.active_bytes),
+            (1, task.task.payload_bytes)
+        );
+        assert!(acquire(&mut ledger, &who, &task.task.task_id, Consumer::Clip, 103).is_ok());
+
+        for (sql, indexes) in [
+            (USAGE_SQL, &["broker_tasks_live", "recap_objects_live"][..]),
+            (EXPIRE_TASKS_SQL, &["broker_tasks_live"][..]),
+            (PRUNE_TASKS_SQL, &["broker_tasks_retired_expiry"][..]),
+            (recap::EXPIRE_RECAP_SQL, &["recap_objects_live"][..]),
+            (
+                recap::PRUNE_RECAP_SQL,
+                &["recap_objects_retired_created"][..],
+            ),
+        ] {
+            let mut stmt = ledger
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let mut rows = stmt.raw_query();
+            let mut plan = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                plan.push_str(&row.get::<_, String>(3).unwrap());
+                plan.push('\n');
+            }
+            for name in indexes {
+                assert!(
+                    plan.contains(name),
+                    "request query lost its history index: {sql}\n{plan}"
+                );
+            }
+        }
+        assert_eq!(
+            ledger
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE state='retired'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            ledger
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM recap_objects WHERE state='retired'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1000
+        );
+    }
     pub(super) struct TestProtection;
     impl KeyProtector for TestProtection {
         fn protect(&self, key: &TaskKey) -> Result<Vec<u8>> {

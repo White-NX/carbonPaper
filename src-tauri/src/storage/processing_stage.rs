@@ -5,6 +5,15 @@ use crate::task_error::TaskError;
 use rusqlite::{params, Connection, OptionalExtension};
 
 const DATASET_KEY: &str = "app_bound_dataset_id";
+const PRUNE_RECEIPTS_SQL: &str =
+    "DELETE FROM app_bound_receipts WHERE acknowledged=1 AND recorded_at<?1";
+const PENDING_RECEIPTS_SQL: &str = "SELECT task_id,consumer,dataset_id,
+    CASE WHEN length(receipt_json)<=4096 THEN receipt_json ELSE '' END
+    FROM app_bound_receipts WHERE acknowledged=0 ORDER BY recorded_at,task_id LIMIT 64";
+const PENDING_RECEIPT_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM app_bound_receipts WHERE acknowledged=0";
+const PENDING_CLASSIFICATION_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM app_bound_receipts WHERE acknowledged=0 AND consumer=?1";
 
 #[cfg(test)]
 mod tests;
@@ -33,7 +42,7 @@ impl StorageState {
                 ON CONFLICT(screenshot_id) DO UPDATE SET revision=revision+1;
             END;
             DROP TRIGGER IF EXISTS app_bound_ocr_update;
-            CREATE TRIGGER app_bound_ocr_update AFTER UPDATE OF text_enc,text_key_encrypted,is_deleted,screenshot_id ON ocr_results BEGIN
+            CREATE TRIGGER app_bound_ocr_update AFTER UPDATE OF text_enc,text_key_encrypted,ocr_key_id,is_deleted,screenshot_id ON ocr_results BEGIN
                 INSERT INTO screenshot_processing_revisions(screenshot_id,revision) VALUES(NEW.screenshot_id,1)
                 ON CONFLICT(screenshot_id) DO UPDATE SET revision=revision+1;
                 UPDATE screenshot_processing_revisions SET revision=revision+1 WHERE screenshot_id=OLD.screenshot_id AND OLD.screenshot_id!=NEW.screenshot_id;
@@ -56,6 +65,13 @@ impl StorageState {
             )
             .map_err(|e| e.to_string())?;
         }
+        // Polling and pruning must visit the queue, not retained receipt payloads.
+        // Older archives need recorded_at added before this index can be built.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_app_bound_receipts_queue
+             ON app_bound_receipts(acknowledged,recorded_at,task_id,consumer);",
+        )
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT OR IGNORE INTO app_metadata(key,value) VALUES(?1,?2)",
             params![DATASET_KEY, carbonpaper_app_bound::protocol::random_id()],
@@ -270,12 +286,14 @@ impl StorageState {
         let guard = self.get_connection_named("pending_staged_receipts")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         conn.execute(
-            "DELETE FROM app_bound_receipts WHERE acknowledged=1 AND recorded_at<?1",
+            PRUNE_RECEIPTS_SQL,
             [carbonpaper_app_bound::protocol::now_secs()
                 - 60 * carbonpaper_app_bound::protocol::DAY_SECS],
         )
         .map_err(|e| e.to_string())?;
-        let mut stmt=conn.prepare("SELECT task_id,consumer,dataset_id,CASE WHEN length(receipt_json)<=4096 THEN receipt_json ELSE '' END FROM app_bound_receipts WHERE acknowledged=0 ORDER BY recorded_at,task_id LIMIT 64").map_err(|e|e.to_string())?;
+        let mut stmt = conn
+            .prepare(PENDING_RECEIPTS_SQL)
+            .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -320,11 +338,7 @@ impl StorageState {
         let count: i64 = guard
             .as_ref()
             .ok_or("Database not initialized")?
-            .query_row(
-                "SELECT COUNT(*) FROM app_bound_receipts WHERE acknowledged=0",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(PENDING_RECEIPT_COUNT_SQL, [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
         Ok(count.max(0) as u64)
     }
@@ -335,7 +349,7 @@ impl StorageState {
             .as_ref()
             .ok_or("Database not initialized")?
             .query_row(
-                "SELECT COUNT(*) FROM app_bound_receipts WHERE acknowledged=0 AND consumer=?1",
+                PENDING_CLASSIFICATION_COUNT_SQL,
                 [carbonpaper_app_bound::protocol::Consumer::Classification.bit()],
                 |row| row.get(0),
             )

@@ -137,7 +137,7 @@ impl StorageState {
     }
 
     pub(crate) fn load_classification_anchors(&self) -> Result<AnchorSnapshot, String> {
-        let _activity = self.foreground_db_read();
+        let _activity = self.background_db_read();
         let generation = self.db_generation();
         {
             let guard = self.get_connection_named("load_classification_anchors")?;

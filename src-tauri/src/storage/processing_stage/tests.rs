@@ -221,6 +221,103 @@ fn category(storage: &StorageState, id: i64) -> Option<String> {
 }
 
 #[test]
+fn legacy_receipt_upgrade_preserves_pending_results_and_indexes_retained_history() {
+    let mut fixture = fixture();
+    let (_, storage, _) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    let receipt = storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
+        .unwrap()
+        .unwrap()
+        .receipt;
+    storage
+        .commit_staged_category(&receipt, None, None)
+        .unwrap();
+    let dataset = storage.processing_dataset_id().unwrap();
+    {
+        let guard = storage.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_app_bound_receipts_queue;
+            ALTER TABLE app_bound_receipts DROP COLUMN recorded_at;",
+        )
+        .unwrap();
+        storage.init_processing_stage_schema(conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT recorded_at FROM app_bound_receipts", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        conn.execute(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1000)
+             INSERT INTO app_bound_receipts(task_id,consumer,dataset_id,receipt_json,acknowledged,recorded_at)
+             SELECT printf('%064x',n),1,?1,'retained receipt',1,?2 FROM history",
+            params![dataset, now_secs()],
+        ).unwrap();
+        conn.execute("INSERT INTO app_bound_receipts(task_id,consumer,dataset_id,receipt_json,acknowledged,recorded_at)
+            VALUES('expired',1,?1,'old receipt',1,0)", [&dataset]).unwrap();
+        for sql in [
+            PRUNE_RECEIPTS_SQL,
+            PENDING_RECEIPTS_SQL,
+            PENDING_RECEIPT_COUNT_SQL,
+            PENDING_CLASSIFICATION_COUNT_SQL,
+        ] {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let mut rows = statement.raw_query();
+            let mut plan = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                plan.push_str(&row.get::<_, String>(3).unwrap());
+                plan.push('\n');
+            }
+            assert!(
+                plan.contains("idx_app_bound_receipts_queue"),
+                "receipt polling lost its queue index: {sql}\n{plan}"
+            );
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "receipt polling sorts retained history: {plan}"
+            );
+        }
+    }
+    assert_eq!(storage.processing_dataset_id().unwrap(), dataset);
+    assert_eq!(storage.pending_staged_receipt_count().unwrap(), 1);
+    assert_eq!(
+        storage
+            .pending_staged_classification_receipt_count()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        storage.pending_staged_receipts().unwrap(),
+        vec![receipt.clone()]
+    );
+    {
+        let guard = storage.db.lock().unwrap();
+        assert_eq!(
+            guard
+                .as_ref()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM app_bound_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1001
+        );
+    }
+    storage.clear_staged_receipt(&receipt).unwrap();
+    assert_eq!(
+        storage
+            .pending_staged_classification_receipt_count()
+            .unwrap(),
+        0
+    );
+    assert!(storage.pending_staged_receipts().unwrap().is_empty());
+}
+
+#[test]
 fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_reads() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();

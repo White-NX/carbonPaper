@@ -415,7 +415,7 @@ async fn learn_feedback(
     let id = feedback.screenshot_id;
     let revision = feedback.source_revision;
     let input = tokio::task::spawn_blocking(move || {
-        let _activity = read_storage.foreground_db_read();
+        let _activity = read_storage.background_db_read();
         if read_storage.db_generation() != generation
             || read_storage.staged_source_revision(id)? != revision
         {
