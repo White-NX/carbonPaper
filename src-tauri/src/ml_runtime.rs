@@ -1226,6 +1226,7 @@ async fn postprocess_maintenance_pass(app: &AppHandle) {
     let maintenance_result = tokio::task::spawn_blocking(move || {
         if maintenance_storage.background_processing_enabled() {
             let _ = maintenance_storage.processing_stage.refresh();
+            maintenance_storage.request_protected_key_publication();
         } else {
             let _ = maintenance_storage.processing_stage.disable_if_installed();
         }

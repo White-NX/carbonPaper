@@ -197,6 +197,7 @@ pub(crate) struct ProcessingStaging {
     available: AtomicBool,
     supported_consumers: AtomicU8,
     supported_storage_keys: AtomicBool,
+    fatal_broker_error: Mutex<Option<BrokerError>>,
     broker: Arc<dyn Broker>,
     // Only receipts issued by this process can authorize a new archive write.
     // Python and user-writable SQLite rows cannot change their screenshot scope.
@@ -214,6 +215,7 @@ impl ProcessingStaging {
             available: AtomicBool::new(false),
             supported_consumers: AtomicU8::new(Consumer::LEGACY_MASK),
             supported_storage_keys: AtomicBool::new(false),
+            fatal_broker_error: Mutex::new(None),
             broker: Arc::new(NativeBroker),
             issued: Mutex::new(HashMap::new()),
             scan_cursor: Mutex::new(String::new()),
@@ -352,8 +354,12 @@ impl ProcessingStaging {
         ) {
             return Err(BrokerError::InvalidRequest);
         }
-        if !self.available() {
-            self.refresh().map_err(|_| BrokerError::Unavailable)?;
+        if let Some(error) = *self
+            .fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Err(error);
         }
         if !self.available() {
             return Err(BrokerError::Disabled);
@@ -364,7 +370,27 @@ impl ProcessingStaging {
         self.call_broker_logged(request, None)
     }
 
+    pub(crate) fn quarantine_broker(&self, error: BrokerError) {
+        *self
+            .fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(error);
+        self.available.store(false, Ordering::Release);
+        self.supported_storage_keys.store(false, Ordering::Release);
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status.installed = true;
+        status.available = false;
+        status.reason = Some(error.to_string());
+    }
+
     pub fn refresh(&self) -> Result<(), String> {
+        if let Some(error) = *self
+            .fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Err(error.to_string());
+        }
         let supported = self.broker.supported();
         let installed = match self.broker.installed() {
             Ok(value) => value,
@@ -416,6 +442,13 @@ impl ProcessingStaging {
         })();
         match result {
             Ok(broker) => {
+                let fault = self
+                    .fatal_broker_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(error) = *fault {
+                    return Err(error.to_string());
+                }
                 self.supported_storage_keys
                     .store(broker.supported_storage_keys, Ordering::Release);
                 self.supported_consumers.store(

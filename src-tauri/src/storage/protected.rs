@@ -15,7 +15,10 @@ use carbonpaper_app_bound::{
 use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, RwLock, Weak,
+};
 
 const TEXT_PREFIX: &str = "cpe1:";
 const PROCESS_PREFIX: &str = "cpp1:";
@@ -36,7 +39,8 @@ struct State {
     keys: HashMap<String, Arc<CipherKey>>,
     writes: HashMap<String, String>,
     published: HashSet<String>,
-    attempted: HashSet<String>,
+    queued_reads: HashSet<String>,
+    publication_retry_at: Option<std::time::Instant>,
     processes: HashMap<String, Vec<u8>>,
     grant_checked_at: HashMap<String, std::time::Instant>,
 }
@@ -45,22 +49,32 @@ pub(super) struct ProtectedStorage {
     credentials: Arc<CredentialManagerState>,
     staging: RwLock<Arc<crate::processing_stage::ProcessingStaging>>,
     state: Mutex<State>,
+    weak_self: Weak<Self>,
+    publication_running: AtomicBool,
+    publication_lock: Mutex<()>,
     #[cfg(test)]
     allow_plaintext: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    automatic_publication_for_tests: AtomicBool,
 }
 
 impl ProtectedStorage {
     pub(super) fn new(
         credentials: Arc<CredentialManagerState>,
         staging: Arc<crate::processing_stage::ProcessingStaging>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
             credentials,
             staging: RwLock::new(staging),
             state: Mutex::new(State::default()),
+            weak_self: weak.clone(),
+            publication_running: AtomicBool::new(false),
+            publication_lock: Mutex::new(()),
             #[cfg(test)]
             allow_plaintext: std::sync::atomic::AtomicBool::new(false),
-        }
+            #[cfg(test)]
+            automatic_publication_for_tests: AtomicBool::new(false),
+        })
     }
     pub(super) fn reset(&self) {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::default();
@@ -77,7 +91,8 @@ impl ProtectedStorage {
         let writes: HashSet<_> = state.writes.values().cloned().collect();
         state.keys.retain(|id, _| writes.contains(id));
         state.published.clear();
-        state.attempted.clear();
+        state.queued_reads.clear();
+        state.publication_retry_at = None;
         state.grant_checked_at.clear();
     }
 
@@ -314,20 +329,13 @@ impl ProtectedStorage {
                     .insert(id.into(), key.clone());
                 key
             };
-            let publish_now = !published
-                && self.credentials.background_processing_enabled()
-                && self
-                    .state
+            if !published && self.credentials.background_processing_enabled() {
+                self.state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .attempted
+                    .queued_reads
                     .insert(id.into());
-            if publish_now {
-                if let Err(error) = self.publish(&record, &key, fresh) {
-                    if error != "AUTH_REQUIRED" {
-                        return Err(error);
-                    }
-                }
+                self.schedule_publication();
             }
             return Ok(key);
         }
@@ -359,15 +367,29 @@ impl ProtectedStorage {
             })
             .map_err(|error| {
                 if matches!(error, BrokerError::Integrity | BrokerError::DatasetMismatch) {
+                    if self.record_is_current(&record) {
+                        self.staging
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .quarantine_broker(error);
+                    }
                     error.to_string()
                 } else {
                     "AUTH_REQUIRED".into()
                 }
             })?;
         let Response::StorageKey(grant) = response else {
+            self.staging
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .quarantine_broker(BrokerError::Integrity);
             return Err("Invalid protected key grant".into());
         };
         if grant.binding != record.binding {
+            self.staging
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .quarantine_broker(BrokerError::Integrity);
             return Err("Protected key grant identity mismatch".into());
         }
         let key = Arc::new(CipherKey::new(
@@ -399,50 +421,167 @@ impl ProtectedStorage {
             })
             .map_err(|error| {
                 if matches!(error, BrokerError::Integrity | BrokerError::DatasetMismatch) {
+                    if self.record_is_current(record) {
+                        self.staging
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .quarantine_broker(error);
+                    }
                     error.to_string()
                 } else {
                     "AUTH_REQUIRED".into()
                 }
             })?;
         if !matches!(response, Response::Ok) {
+            if self.record_is_current(record) {
+                self.staging
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .quarantine_broker(BrokerError::Integrity);
+            }
             return Err("Invalid protected key acknowledgement".into());
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .records
+            .get(&key.id)
+            .is_none_or(|current| current.binding != record.binding)
+        {
+            return Ok(());
+        }
         state.published.insert(key.id.clone());
+        state.queued_reads.remove(&key.id);
         state
             .grant_checked_at
             .insert(key.id.clone(), std::time::Instant::now());
         Ok(())
     }
 
-    pub(super) fn publish_write_keys(&self, force: bool) -> Result<(), String> {
+    fn record_is_current(&self, record: &KeyRecord) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .records
+            .get(&record.binding.key_id)
+            .is_some_and(|current| current.binding == record.binding)
+    }
+
+    pub(super) fn schedule_publication(&self) {
+        // Ordinary fixtures own short-lived temporary archives. Tests that
+        // exercise this lane explicitly enable it and wait for its completion.
+        #[cfg(test)]
+        if !self.automatic_publication_for_tests.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.credentials.background_processing_enabled() {
+            return;
+        }
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .publication_retry_at
+                .is_some_and(|retry| retry > std::time::Instant::now())
+                || (state.queued_reads.is_empty()
+                    && state.writes.values().all(|id| state.published.contains(id)))
+            {
+                return;
+            }
+        }
+        if self.publication_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = self.weak_self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("protected-key-publication".into())
+            .spawn(move || {
+                let Some(storage) = weak.upgrade() else {
+                    return;
+                };
+                struct Running(Arc<ProtectedStorage>);
+                impl Drop for Running {
+                    fn drop(&mut self) {
+                        self.0.publication_running.store(false, Ordering::Release);
+                    }
+                }
+                let _running = Running(storage.clone());
+                if let Err(error) = storage.publish_pending_keys() {
+                    storage
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .publication_retry_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                    tracing::debug!("[APP_BOUND] Background key publication deferred: {error}");
+                }
+            });
+        if spawned.is_err() {
+            self.publication_running.store(false, Ordering::Release);
+            tracing::warn!("[APP_BOUND] Could not schedule background key publication");
+        }
+    }
+
+    pub(super) fn publish_pending_keys(&self) -> Result<(), String> {
         if !self.credentials.background_processing_enabled() {
             return Ok(());
         }
+        let _publication = self
+            .publication_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let staging = self
+            .staging
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !staging.available() {
+            staging.refresh().map_err(|_| "AUTH_REQUIRED")?;
+        }
+        if !staging.storage_keys_available() {
+            return Err("AUTH_REQUIRED".into());
+        }
         let pending = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let ids: Vec<_> = state
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ids: Vec<_> = state
                 .writes
                 .values()
-                .filter(|id| {
-                    !state.published.contains(*id) && (force || !state.attempted.contains(*id))
-                })
+                .filter(|id| !state.published.contains(*id))
                 .cloned()
                 .collect();
+            for id in &state.queued_reads {
+                if ids.len() >= 64 {
+                    break;
+                }
+                if !state.published.contains(id) && !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
             let mut pending = Vec::new();
-            for id in ids {
-                state.attempted.insert(id.clone());
-                pending.push((state.records[&id].clone(), state.keys[&id].clone()));
+            for id in ids.into_iter().take(64) {
+                if let (Some(record), Some(key)) = (state.records.get(&id), state.keys.get(&id)) {
+                    pending.push((
+                        record.clone(),
+                        key.clone(),
+                        state.writes.values().any(|current| *current == id),
+                    ));
+                }
             }
             pending
         };
-        for (record, key) in pending {
-            if let Err(error) = self.publish(&record, &key, true) {
-                if error != "AUTH_REQUIRED" {
-                    return Err(error);
-                }
+        for (record, key, fresh) in pending {
+            if !self.credentials.background_processing_enabled() {
+                return Err("AUTH_REQUIRED".into());
             }
+            if !self.record_is_current(&record) {
+                continue;
+            }
+            // Stop at the first outage. Every key does not need a fresh status
+            // probe or another full pipe timeout in the same publication pass.
+            self.publish(&record, &key, fresh)?;
         }
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publication_retry_at = None;
         Ok(())
     }
 
@@ -484,7 +623,10 @@ impl ProtectedStorage {
         let response = match request() {
             Ok(response) => Ok(response),
             Err(_) if self.credentials.protected_read_authorized() => {
-                self.read_key(id, "ann")?;
+                let key = self.read_key(id, "ann")?;
+                // Resuming encryption is an explicit background operation and
+                // still requires durable write provenance, even after Hello.
+                self.publish(&record, &key, false)?;
                 request()
             }
             Err(error) => Err(error),
@@ -711,8 +853,16 @@ impl StorageState {
     pub(crate) fn protected_ann_resume_key(&self, id: &str) -> Result<Arc<CipherKey>, String> {
         self.protected.resume_ann_key(id)
     }
+    #[cfg(test)]
     pub(crate) fn publish_protected_keys(&self) -> Result<(), String> {
-        self.protected.publish_write_keys(true)
+        match self.protected.publish_pending_keys() {
+            Err(error) if error == "AUTH_REQUIRED" => Ok(()),
+            result => result,
+        }
+    }
+
+    pub(crate) fn request_protected_key_publication(&self) {
+        self.protected.schedule_publication();
     }
 
     pub(crate) fn rotate_protected_write_keys(&self) -> Result<(), String> {

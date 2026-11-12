@@ -425,7 +425,7 @@ pub async fn app_bound_set_policy(
             if !was_enabled {
                 storage.rotate_protected_write_keys()?;
             }
-            storage.publish_protected_keys()?;
+            storage.request_protected_key_publication();
             crate::ai::recap::protected::sync_after_unlock(&recap_app)?;
         }
         storage.processing_stage.reconcile(&storage)
