@@ -60,9 +60,11 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
   const canEnable = backgroundEnabled && status?.supported && (status?.installed || status?.package_available) && validLimits;
   const canRepair = status?.supported && status?.package_available;
   const needsRepair = status?.reason === 'repair_required';
+  const recovering = status?.reason === 'service_unavailable';
   const needsUpgrade = status?.reason === 'upgrade_required';
-  const needsMaintenance = needsRepair || needsUpgrade;
+  const needsMaintenance = needsRepair || needsUpgrade || recovering;
   const stateText = !status ? t('settings.feedback.loading') : needsUpgrade ? t('appBound.waitingForUpgrade')
+    : recovering ? t('appBound.waitingForRecovery')
     : needsRepair ? t('appBound.waitingForRepair') : status?.enabled
     ? status.available
       ? t('appBound.active')
@@ -86,11 +88,12 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
               ? setAppBoundPolicy(!status.enabled, status.enabled ? status.limits.retention_days : Number(days),
                 status.enabled ? status.limits.capacity_bytes / 1024 / 1024 : Number(capacity))
               : installAppBound(true))}>
-            {busy ? t('appBound.working') : needsUpgrade ? t('appBound.upgrade') : needsRepair ? t('appBound.repair') : status?.enabled
+            {busy ? t('appBound.working') : needsUpgrade ? t('appBound.upgrade') : needsRepair || recovering ? t('appBound.repair') : status?.enabled
               ? t('appBound.disable') : t('appBound.enable')}
           </Button>
         </div>
         {needsUpgrade && <Banner tone="info">{t('appBound.upgradeHint')}</Banner>}
+        {recovering && <Banner tone="info">{t('appBound.recoveryHint')}</Banner>}
         {!status?.installed && <p className="text-xs text-ide-muted">
           {t('appBound.installHint')}
         </p>}

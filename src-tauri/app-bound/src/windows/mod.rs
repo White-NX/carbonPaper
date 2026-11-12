@@ -6,6 +6,7 @@ pub mod revocation;
 pub mod service;
 pub mod transport;
 pub mod update;
+pub(crate) mod watchdog;
 
 pub use identity::{current_sid, protected_root, state_root};
 pub use transport::call;

@@ -307,6 +307,8 @@
     "upgradeDescription": "更新后，重启电脑后仍可继续整理新记录。原有设置会保留。",
     "upgradeHint": "更新时 Windows 会请求管理员授权，完成后应用会重新启动。",
     "waitingForUpgrade": "等待组件更新",
+    "waitingForRecovery": "后台组件正在恢复",
+    "recoveryHint": "后台组件暂时无法响应，应用会自动重试；解锁后可继续整理原始记录。",
     "closeOldVersion": "旧版 CarbonPaper 仍在运行。请从托盘菜单选择“彻底退出”，然后重新打开新版。",
     "uninstall": "移除后台组件",
     "cancelled": "已取消，当前设置保持不变。",

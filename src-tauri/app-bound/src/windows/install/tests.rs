@@ -85,6 +85,19 @@ fn existing_service_repair_reapplies_restart_policy() {
     configure_named_service(&missing_executable, &fixture.name, &fixture.name)
         .expect("repair the existing service through the installer");
 
+    let context = crate::windows::update::CoordinatorContext::new().unwrap();
+    context
+        .with_permissions(|| {
+            assert!(fixture.open(SERVICE_START | SERVICE_QUERY_STATUS).is_ok());
+            for access in [SERVICE_STOP, SERVICE_CHANGE_CONFIG, 0x0004_0000] {
+                assert!(
+                    fixture.open(access).is_err(),
+                    "a restricted client must not receive service mutation rights"
+                );
+            }
+        })
+        .unwrap();
+
     {
         let service = fixture
             .open(SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)

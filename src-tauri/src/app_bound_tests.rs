@@ -243,3 +243,25 @@ fn manually_updated_packages_run_the_newer_version_without_downgrading_activatio
     assert!(!package_is_newer("0.9.2+repack", "0.9.2").unwrap());
     assert!(package_is_newer("0.9", "0.9.2").is_err());
 }
+
+#[test]
+fn broker_status_distinguishes_recovery_from_disabled_policy_and_registration_damage() {
+    assert_eq!(
+        status_reason(Some("app_bound_unavailable")),
+        Some("service_unavailable")
+    );
+    assert_eq!(
+        status_reason(Some("app_bound_task_busy")),
+        Some("service_unavailable")
+    );
+    assert_eq!(
+        status_reason(Some("app_bound_integrity_failure")),
+        Some("repair_required")
+    );
+    assert_eq!(
+        status_reason(Some("app_bound_access_denied")),
+        Some("repair_required")
+    );
+    assert_eq!(status_reason(Some("disabled")), Some("disabled"));
+    assert_eq!(status_reason(None), None);
+}

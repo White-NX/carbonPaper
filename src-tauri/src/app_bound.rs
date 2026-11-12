@@ -349,13 +349,17 @@ pub async fn app_bound_status(
     let storage = storage.inner().clone();
     tokio::task::spawn_blocking(move || {
         let upgrade = UPGRADE_NEEDED.load(std::sync::atomic::Ordering::Acquire);
-        let repair = REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire);
-        if !upgrade && !repair && storage.background_processing_enabled() {
+        let launch_repair = REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire);
+        if !upgrade && !launch_repair && storage.background_processing_enabled() {
             let _ = storage.processing_stage.refresh();
-        } else if !upgrade && !repair {
+        } else if !upgrade && !launch_repair {
             let _ = storage.processing_stage.disable_if_installed();
         }
         let mut processing = storage.processing_stage.status();
+        if processing.installed && !processing.available {
+            processing.reason = status_reason(processing.reason.as_deref()).map(str::to_string);
+        }
+        let repair = launch_repair || processing.reason.as_deref() == Some("repair_required");
         if repair || upgrade {
             processing.installed = true;
             processing.available = false;
@@ -386,6 +390,24 @@ pub async fn app_bound_status(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn status_reason(reason: Option<&str>) -> Option<&str> {
+    match reason {
+        Some(
+            "app_bound_unavailable"
+            | "app_bound_task_busy"
+            | "app_bound_storage_failure"
+            | "app_bound_protection_failure",
+        ) => Some("service_unavailable"),
+        Some(
+            "app_bound_access_denied"
+            | "app_bound_integrity_failure"
+            | "app_bound_dataset_mismatch"
+            | "app_bound_version_mismatch",
+        ) => Some("repair_required"),
+        other => other,
+    }
 }
 
 #[tauri::command]

@@ -307,6 +307,8 @@
     "upgradeDescription": "After updating, new records can keep being organized after your PC restarts. Your existing settings will be preserved.",
     "upgradeHint": "Windows will ask for administrator permission to update. The app will restart when it finishes.",
     "waitingForUpgrade": "Waiting for component update",
+    "waitingForRecovery": "Background component is recovering",
+    "recoveryHint": "The background component is temporarily unavailable. The app will retry automatically; unlock to continue organizing your records.",
     "closeOldVersion": "An older CarbonPaper is still running. Choose Quit Completely from its tray menu, then open the new version again.",
     "uninstall": "Remove background component",
     "cancelled": "Cancelled. Your current settings are unchanged.",

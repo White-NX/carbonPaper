@@ -518,7 +518,7 @@ fn configure_named_service(path: &Path, service_name: &str, display_name: &str) 
         let service = match OpenServiceW(
             manager.0,
             PCWSTR(name.as_ptr()),
-            SERVICE_CHANGE_CONFIG | SERVICE_START,
+            SERVICE_CHANGE_CONFIG | SERVICE_START | 0x0004_0000,
         ) {
             Ok(handle) => {
                 let handle = ServiceHandle(handle);
@@ -561,8 +561,41 @@ fn configure_named_service(path: &Path, service_name: &str, display_name: &str) 
             Err(_) => return Err(BrokerError::AccessDenied),
         };
         configure_failure_actions(&service)?;
+        configure_start_permissions(&service)?;
     }
     Ok(())
+}
+
+fn configure_start_permissions(handle: &ServiceHandle) -> Result<()> {
+    use windows::Win32::{
+        Foundation::{LocalFree, HLOCAL},
+        Security::{
+            self, Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            PSECURITY_DESCRIPTOR,
+        },
+    };
+    // Ordinary clients can start/query this fixed service, but cannot stop it,
+    // replace its command line or change the service's access policy.
+    let sddl = wide(std::ffi::OsStr::new(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0014;;;AU)",
+    ));
+    // SAFETY: SCM copies the allocated descriptor into this owned service;
+    // LocalFree releases it only after that synchronous call returns.
+    unsafe {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|_| BrokerError::AccessDenied)?;
+        let result =
+            SetServiceObjectSecurity(handle.0, Security::DACL_SECURITY_INFORMATION, descriptor)
+                .map_err(|_| BrokerError::AccessDenied);
+        LocalFree(HLOCAL(descriptor.0));
+        result
+    }
 }
 
 fn configure_failure_actions(handle: &ServiceHandle) -> Result<()> {

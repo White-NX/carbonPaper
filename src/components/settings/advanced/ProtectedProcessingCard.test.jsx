@@ -86,4 +86,13 @@ describe('ProtectedProcessingCard', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('已取消');
     expect(screen.getByRole('status')).toHaveTextContent('已开启');
   });
+
+  it('reports an unresponsive installed service even before its enabled policy is known', async () => {
+    getAppBoundStatus.mockResolvedValue({ ...active, enabled: false, available: false, reason: 'service_unavailable' });
+    render(<ProtectedProcessingCard />);
+    expect(await screen.findByRole('status')).toHaveTextContent('后台组件正在恢复');
+    fireEvent.click(screen.getByRole('button', { name: '修复组件' }));
+    await waitFor(() => expect(installAppBound).toHaveBeenCalledWith(false));
+    expect(setAppBoundPolicy).not.toHaveBeenCalled();
+  });
 });

@@ -155,6 +155,24 @@ pub fn running_pid() -> Result<u32> {
     Ok(status.dwProcessId)
 }
 
+pub(super) fn ensure_started() -> Result<()> {
+    let Some(handle) = try_open_service(SERVICE_QUERY_STATUS | SERVICE_START)? else {
+        return Err(BrokerError::Unavailable);
+    };
+    if query_status(&handle)?.dwCurrentState == SERVICE_STOPPED {
+        // SAFETY: only the registered fixed-name service can be started. SCM
+        // verifies permissions and retains its administrator-owned command.
+        unsafe {
+            if let Err(error) = StartServiceW(handle.0, None) {
+                if error.code() != windows::core::HRESULT::from_win32(1056) {
+                    return Err(BrokerError::Unavailable);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let mut name = wide(SERVICE_NAME.as_ref());
     let table = [
@@ -223,6 +241,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         }
         let directory = identity::state_root()?;
         diagnostics::init(&directory);
+        let _watchdog = super::watchdog::start()?;
+        let startup = super::watchdog::begin_work();
         diagnostics::event("info", "service_starting", "startup", None);
         allow_peer_identity_queries()?;
         identity::assert_protected(&directory)?;
@@ -253,6 +273,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
             .enable_all()
             .build()
             .map_err(|_| BrokerError::Unavailable)?;
+        drop(startup);
         let serve_result = runtime.block_on(serve(ledger));
         // Tokio cannot cancel a blocking task after it has started. Bound runtime
         // shutdown so a stuck DPAPI or SQLite call cannot prevent service stop.
@@ -401,6 +422,7 @@ async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
     report(SERVICE_RUNNING, 0);
     diagnostics::event("info", "service_ready", "serve", None);
     let result = loop {
+        super::watchdog::poll();
         if STOP.load(Ordering::SeqCst) {
             break Ok(());
         }
@@ -581,6 +603,7 @@ where
     // cancelled after this starts, the blocking closure still owns the ledger
     // and releases it only after the synchronous operation finishes.
     let handle = tokio::task::spawn_blocking(move || {
+        let _work = super::watchdog::begin_work();
         mark_timing(&timing, |timing| {
             timing.worker_started = Some(Instant::now())
         });
@@ -604,6 +627,7 @@ async fn verify_caller_blocking(
     // drop the async future, but DPAPI/identity code must never observe a
     // handle that was closed by that cancellation.
     let handle = tokio::task::spawn_blocking(move || {
+        let _work = super::watchdog::begin_work();
         let handle = HANDLE(pipe.as_raw_handle());
         let mut pid = 0;
         // SAFETY: pipe owns this handle; PID comes from the kernel.
