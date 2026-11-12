@@ -28,6 +28,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const STAGING_FILE: &str = "processing-staging.db";
 const CLIP_SIZE: u32 = 224;
 const MAX_ATTEMPTS: i64 = 5;
+const ABANDON_PROTECTION_PENDING: &str = "abandon_protection_pending";
 
 pub(crate) mod recap;
 
@@ -903,6 +904,28 @@ impl ProcessingStaging {
         consumer: Consumer,
         error: BrokerError,
     ) -> Result<(), String> {
+        if error == BrokerError::Protection {
+            let exhausted = self.with_store(|s| {
+                let attempts: i64 = s.connection.query_row(
+                    "SELECT attempts FROM staged_work WHERE task_id=?1 AND consumer=?2",
+                    params![id, consumer.bit()], |row| row.get(0)).map_err(|e| e.to_string())?;
+                let attempts = attempts.saturating_add(1).min(MAX_ATTEMPTS);
+                let exhausted = attempts >= MAX_ATTEMPTS;
+                // Relinquish local ownership before trying the broker cleanup.
+                // An outage during abandonment cannot keep archive work blocked.
+                s.connection.execute("UPDATE staged_work SET state=?3,attempts=?4,lease_id=NULL,deadline=0,next_attempt=?5,error_code=?6
+                    WHERE task_id=?1 AND consumer=?2 AND state!='completed'",
+                    params![id, consumer.bit(), if exhausted { "waiting_for_auth" } else { "pending" }, attempts,
+                        protocol::now_secs() + 30 * (1i64 << attempts.min(5)),
+                        if exhausted { ABANDON_PROTECTION_PENDING } else { "app_bound_protection_failure" }])
+                    .map_err(|e| e.to_string())?;
+                Ok(exhausted)
+            })?;
+            if exhausted {
+                let _ = self.abandon_protection_failure(id, consumer)?;
+            }
+            return Ok(());
+        }
         if error == BrokerError::Retired {
             if let Ok(Response::TaskState(state)) =
                 self.call_broker_logged(Request::InspectTask { task_id: id.into() }, Some(consumer))
@@ -929,6 +952,74 @@ impl ProcessingStaging {
         })?;
         if terminal {
             self.retire_task(id)?;
+        }
+        Ok(())
+    }
+
+    fn abandon_protection_failure(&self, id: &str, consumer: Consumer) -> Result<bool, String> {
+        let result = self.call_broker_logged(
+            Request::AbandonConsumer {
+                task_id: id.into(),
+                consumer,
+            },
+            Some(consumer),
+        );
+        let acknowledged = matches!(
+            result,
+            Ok(Response::Ok) | Err(BrokerError::Retired | BrokerError::DatasetMismatch)
+        );
+        self.with_store(|s| {
+            s.connection
+                .execute(
+                    "UPDATE staged_work SET next_attempt=?3,error_code=?4
+                WHERE task_id=?1 AND consumer=?2 AND state='waiting_for_auth' AND error_code=?5",
+                    params![
+                        id,
+                        consumer.bit(),
+                        protocol::now_secs() + 30,
+                        if acknowledged {
+                            "app_bound_protection_failure"
+                        } else {
+                            ABANDON_PROTECTION_PENDING
+                        },
+                        ABANDON_PROTECTION_PENDING
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })?;
+        Ok(acknowledged)
+    }
+
+    fn reconcile_protection_failures(&self) -> Result<(), String> {
+        let pending = self.with_store(|s| {
+            let mut statement = s
+                .connection
+                .prepare(
+                    "SELECT task_id,consumer FROM staged_work
+                WHERE state='waiting_for_auth' AND error_code=?1 AND next_attempt<=?2
+                ORDER BY next_attempt,task_id LIMIT 32",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map(
+                    params![ABANDON_PROTECTION_PENDING, protocol::now_secs()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u8>(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())
+        })?;
+        for (id, bit) in pending {
+            let Some(consumer) = Consumer::ALL
+                .into_iter()
+                .find(|consumer| consumer.bit() == bit)
+            else {
+                continue;
+            };
+            if !self.abandon_protection_failure(&id, consumer)? {
+                break;
+            }
         }
         Ok(())
     }
@@ -1201,6 +1292,7 @@ impl ProcessingStaging {
         }
         let mut processed = 0u64;
         storage.finish_staged_deletions()?;
+        self.reconcile_protection_failures()?;
         self.reconcile_recap()?;
         self.renew_live_leases()?;
         let preparing = self.with_store(|s| {

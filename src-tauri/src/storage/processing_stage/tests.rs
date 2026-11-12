@@ -38,6 +38,8 @@ struct TestBroker {
     supported_consumers: AtomicU8,
     supported_storage_keys: AtomicBool,
     acquisitions: AtomicUsize,
+    failed_acquisition: Mutex<Option<(String, Consumer)>>,
+    fail_abandon: AtomicBool,
     inspected: Mutex<Vec<String>>,
     revocations: Mutex<Vec<carbonpaper_app_bound::revocation::Revocation>>,
 }
@@ -73,6 +75,21 @@ impl Broker for TestBroker {
         }
         if matches!(&request, Request::AcquireTask { .. }) {
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Request::AcquireTask {
+            task_id, consumer, ..
+        } = &request
+        {
+            if self.failed_acquisition.lock().unwrap().as_ref()
+                == Some(&(task_id.clone(), *consumer))
+            {
+                return Err(BrokerError::Protection);
+            }
+        }
+        if matches!(&request, Request::AbandonConsumer { .. })
+            && self.fail_abandon.load(Ordering::SeqCst)
+        {
+            return Err(BrokerError::Unavailable);
         }
         if let Request::InspectTask { task_id } = &request {
             self.inspected.lock().unwrap().push(task_id.clone());
@@ -154,6 +171,8 @@ fn fixture() -> Fixture {
         supported_consumers: AtomicU8::new(Consumer::ALL_MASK),
         supported_storage_keys: AtomicBool::new(true),
         acquisitions: AtomicUsize::new(0),
+        failed_acquisition: Mutex::new(None),
+        fail_abandon: AtomicBool::new(false),
         inspected: Mutex::new(Vec::new()),
         revocations: Mutex::new(Vec::new()),
     });
@@ -944,6 +963,93 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
     assert!(storage
         .processing_stage
         .claim(&storage, Consumer::MiniLm)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn task_dpapi_failures_survive_restart_then_release_only_the_affected_consumer_to_archive_work() {
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
+    insert_input(
+        storage,
+        1,
+        Consumer::Classification.bit() | Consumer::MiniLm.bit(),
+    );
+    insert_input(storage, 2, Consumer::Classification.bit());
+    let connection = Connection::open(dir.join(STAGING_FILE)).unwrap();
+    let task_id: String = connection
+        .query_row(
+            "SELECT task_id FROM staged_inputs WHERE screenshot_id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    *broker.failed_acquisition.lock().unwrap() = Some((task_id.clone(), Consumer::Classification));
+    for attempt in 1..=5 {
+        broker.fail_abandon.store(attempt == 5, Ordering::SeqCst);
+        assert!(storage
+            .processing_stage
+            .claim_screenshot(storage, Consumer::Classification, 1)
+            .unwrap()
+            .is_none());
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT attempts FROM staged_work WHERE task_id=?1 AND consumer=1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, attempt);
+        connection
+            .execute(
+                "UPDATE staged_work SET next_attempt=0 WHERE task_id=?1",
+                [&task_id],
+            )
+            .unwrap();
+        if attempt == 2 {
+            restart_stage(dir, storage, broker);
+        }
+        // Status remains healthy: only acquisition for this task is failing.
+        storage.processing_stage.refresh().unwrap();
+        assert!(storage.processing_stage.available());
+    }
+    assert!(!storage
+        .processing_stage
+        .owns_screenshot(1, Consumer::Classification));
+    assert!(!storage
+        .processing_stage
+        .owned_screenshot_ids(Consumer::Classification)
+        .unwrap()
+        .contains(&1));
+    assert_eq!(storage.recover_incomplete_ocr_postprocess().unwrap(), 2);
+    assert!(storage
+        .list_pending_ocr_postprocess_ids(10)
+        .unwrap()
+        .contains(&1));
+    assert!(storage
+        .update_screenshot_category(1, "Development", Some(0.9))
+        .unwrap());
+    storage
+        .set_ocr_postprocess_status(1, "completed", None)
+        .unwrap();
+    // The persisted abandonment is retried after another process restart.
+    broker.fail_abandon.store(false, Ordering::SeqCst);
+    restart_stage(dir, storage, broker);
+    storage.processing_stage.reconcile(storage).unwrap();
+    let Response::TaskState(state) = broker.call(Request::InspectTask { task_id }).unwrap() else {
+        panic!()
+    };
+    assert_eq!(state.abandoned_consumers, Consumer::Classification.bit());
+    assert!(!state.retired);
+    assert!(storage
+        .processing_stage
+        .claim_screenshot(storage, Consumer::MiniLm, 1)
+        .unwrap()
+        .is_some());
+    assert!(storage
+        .processing_stage
+        .claim_screenshot(storage, Consumer::Classification, 2)
         .unwrap()
         .is_some());
 }
