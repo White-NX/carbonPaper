@@ -578,6 +578,14 @@ pub fn safe_runtime_id(value: &str) -> bool {
         && !value.ends_with('.')
 }
 
+pub(super) fn safe_sid(value: &str) -> bool {
+    value.starts_with("S-1-")
+        && value.len() <= 184
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'S')
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Activation {
@@ -591,6 +599,7 @@ pub fn active_runtime() -> Result<Option<PathBuf>> {
 /// The SID comes from an OS process token, never an IPC request.
 pub(crate) fn active_runtime_for_sid(sid: &str) -> Result<Option<PathBuf>> {
     let root = protected_root()?;
+    super::activation::wait_for_projection(&root, sid)?;
     let path = root.join("Activations").join(format!("{sid}.json"));
     if !path.exists() {
         return Ok(None);

@@ -155,6 +155,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     let mut ledger = Ledger::open(&state.join("keys.db"))?;
     super::revocation::provision(&state, &sid)?;
     super::revocation::drain(&state, &sid, &mut ledger)?;
+    super::activation::reconcile(&root, &ledger)?;
     let previous = ledger.owner_registration(&sid)?;
     if let Some((old_id, _)) = &previous {
         let old_root = root.join("Runtime").join(old_id);
@@ -213,6 +214,25 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         copy_trusted(&setup_path, backup)?;
     }
     let service_existed = service::try_open_service(SERVICE_QUERY_STATUS)?.is_some();
+    let system_runtime_id = if replace_service {
+        runtime_id.clone()
+    } else {
+        let installed: Activation = serde_json::from_slice(
+            old_service_registration
+                .as_ref()
+                .ok_or(BrokerError::Integrity)?,
+        )
+        .map_err(|_| BrokerError::Integrity)?;
+        installed.runtime_id
+    };
+    super::activation::begin(
+        &root,
+        &super::activation::PendingActivation {
+            sid: sid.clone(),
+            runtime_id: runtime_id.clone(),
+            system_runtime_id,
+        },
+    )?;
     let result = (|| {
         stop_service()?;
         if replace_service {
@@ -245,14 +265,18 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     if let Err(error) = result {
         // Restore registration only, never rewind the task/key database.
         let _ = stop_service();
-        let _ = ledger.restore_registration(&sid, previous);
-        let _ = restore_optional(&activation_path, old_activation.as_deref());
-        let _ = restore_optional(&service_registration, old_service_registration.as_deref());
+        let mut restored = ledger.restore_registration(&sid, previous).is_ok();
+        restored &= restore_optional(&activation_path, old_activation.as_deref()).is_ok();
+        restored &=
+            restore_optional(&service_registration, old_service_registration.as_deref()).is_ok();
         if let Some(backup) = &old_service {
-            let _ = copy_trusted(backup, &service_path);
+            restored &= copy_trusted(backup, &service_path).is_ok();
         }
         if let Some(backup) = &old_setup {
-            let _ = copy_trusted(backup, &setup_path);
+            restored &= copy_trusted(backup, &setup_path).is_ok();
+        }
+        if restored {
+            let _ = super::activation::finish(&root);
         }
         if service_existed {
             let _ = start_service();
@@ -263,6 +287,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         }
         return Err(error);
     }
+    super::activation::finish(&root)?;
     for backup in [old_service, old_setup].into_iter().flatten() {
         let _ = fs::remove_file(backup);
     }
@@ -453,7 +478,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     replace(&temporary, path)
 }
 
-fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
+pub(super) fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
     assert_protected(source)?;
     let temporary = target.with_extension(format!("tmp-{}", &random_id()[..16]));
     let mut input = locked_file(source)?;

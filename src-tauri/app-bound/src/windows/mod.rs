@@ -1,3 +1,4 @@
+pub(crate) mod activation;
 pub(crate) mod diagnostics;
 pub mod identity;
 pub mod install;

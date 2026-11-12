@@ -226,9 +226,24 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         diagnostics::event("info", "service_starting", "startup", None);
         allow_peer_identity_queries()?;
         identity::assert_protected(&directory)?;
-        let mut opened = Ledger::open(&directory.join("keys.db"))?;
+        let opened = Ledger::open(&directory.join("keys.db"))?;
         #[cfg(not(test))]
-        super::revocation::drain_all(&directory, &mut opened)?;
+        let opened = {
+            let mut opened = opened;
+            if let Err(error) = super::activation::reconcile_after_interruption(
+                &identity::protected_root()?,
+                &opened,
+            ) {
+                diagnostics::event(
+                    "warn",
+                    "activation_recovery_deferred",
+                    "startup",
+                    Some(error),
+                );
+            }
+            super::revocation::drain_all(&directory, &mut opened)?;
+            opened
+        };
         let ledger = Arc::new(LedgerLock::new(opened));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
