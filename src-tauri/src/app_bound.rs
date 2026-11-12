@@ -13,6 +13,7 @@ use tauri::{AppHandle, Manager};
 
 const OFFER_SEEN: &str = "app_bound_offer_seen";
 static REPAIR_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UPGRADE_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REPAIR_OFFER_DISMISSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static PROTECTED_ENVIRONMENT_READY: std::sync::atomic::AtomicBool =
@@ -105,7 +106,7 @@ pub(crate) fn protected_resource(relative: &str) -> Result<Option<PathBuf>, Stri
 }
 
 /// Called before the single-instance plugin: movable portable and installer
-/// copies remain launchers for the registered protected runtime.
+/// copies launch the registered runtime unless this package is newer.
 pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
     #[cfg(feature = "app-bound-dev")]
     {
@@ -181,6 +182,25 @@ fn try_delegate_startup(args: &[String], directory: &Path) -> Result<bool, Strin
         return Ok(false);
     }
     let (release, _) = manifest::read_manifest(&active).map_err(|e| e.to_string())?;
+    if package_is_newer(env!("CARGO_PKG_VERSION"), &release.version)? {
+        // A manual package update must run the new UI rather than silently
+        // delegating to an older protected copy. Activation remains an explicit
+        // authenticated action; an ordinary login never starts a UAC prompt.
+        UPGRADE_NEEDED.store(true, std::sync::atomic::Ordering::Release);
+        if existing_desktop_instance() {
+            // The single-instance plugin would otherwise raise the old UI and
+            // discard this new process. Ask for an ordinary exit before it can
+            // touch the shared archive; background launches remain silent.
+            if !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--hidden" | "--autostart"))
+            {
+                show_old_version_running();
+            }
+            return Ok(true);
+        }
+        return Ok(false);
+    }
     let executable = active.join("carbonpaper.exe");
     let mut locked = identity::locked_file(&executable).map_err(|e| e.to_string())?;
     identity::verify_file(
@@ -212,6 +232,78 @@ fn try_delegate_startup(args: &[String], directory: &Path) -> Result<bool, Strin
         return Err("Protected application could not start".into());
     }
     Ok(true)
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn package_is_newer(candidate: &str, active: &str) -> Result<bool, String> {
+    manifest::compare_versions(candidate, active)
+        .map(|order| order.is_gt())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn existing_desktop_instance() -> bool {
+    use windows::{
+        core::PCWSTR,
+        Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId},
+    };
+    let class = identity::wide(std::ffi::OsStr::new("com.eyling.carbonpaper-sic"));
+    let name = identity::wide(std::ffi::OsStr::new("com.eyling.carbonpaper-siw"));
+    // SAFETY: this queries the plugin's fixed local window. Its owner is
+    // checked against the OS token; it is never used as an IPC authority.
+    unsafe {
+        let Ok(window) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR(name.as_ptr())) else {
+            return false;
+        };
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        let Ok(process) = identity::inspect_process(pid) else {
+            return true;
+        };
+        if identity::current_sid().is_ok_and(|sid| sid != process.principal.sid) {
+            return false;
+        }
+        // Another copy of this newer UI may already be offering activation.
+        // Its normal single-instance handoff is safe and needs no exit prompt.
+        if process
+            .image
+            .parent()
+            .and_then(|dir| manifest::read_manifest(dir).ok())
+            .is_some_and(|(release, _)| {
+                package_is_newer(env!("CARGO_PKG_VERSION"), &release.version) == Ok(false)
+            })
+        {
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn show_old_version_running() {
+    use windows::{
+        core::PCWSTR,
+        Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK},
+    };
+    let locale = crate::registry_config::get_string("language").unwrap_or_default();
+    let text = identity::wide(std::ffi::OsStr::new(&crate::i18n::t(
+        &locale,
+        "appBound.closeOldVersion",
+    )));
+    let title = identity::wide(std::ffi::OsStr::new("CarbonPaper"));
+    // SAFETY: this informational dialog has no privileged action or shared
+    // application state and both strings remain valid until it closes.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 #[cfg(not(feature = "app-bound-dev"))]
@@ -256,24 +348,33 @@ pub async fn app_bound_status(
     crate::settings_window::check_settings_ui(&window)?;
     let storage = storage.inner().clone();
     tokio::task::spawn_blocking(move || {
-        if storage.background_processing_enabled() {
+        let upgrade = UPGRADE_NEEDED.load(std::sync::atomic::Ordering::Acquire);
+        let repair = REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire);
+        if !upgrade && !repair && storage.background_processing_enabled() {
             let _ = storage.processing_stage.refresh();
-        } else {
+        } else if !upgrade && !repair {
             let _ = storage.processing_stage.disable_if_installed();
         }
         let mut processing = storage.processing_stage.status();
-        let repair = REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire);
-        if repair {
+        if repair || upgrade {
             processing.installed = true;
             processing.available = false;
-            processing.reason = Some("repair_required".into());
+            processing.reason = Some(
+                if upgrade {
+                    "upgrade_required"
+                } else {
+                    "repair_required"
+                }
+                .into(),
+            );
         }
         let package_available = supported_build()
             && installation_source()
                 .ok()
                 .is_some_and(|dir| manifest::read_manifest(&dir).is_ok());
         let offer_enable = package_available
-            && ((repair && !REPAIR_OFFER_DISMISSED.load(std::sync::atomic::Ordering::Acquire))
+            && (((repair || upgrade)
+                && !REPAIR_OFFER_DISMISSED.load(std::sync::atomic::Ordering::Acquire))
                 || (storage.background_processing_enabled()
                     && !processing.installed
                     && !crate::registry_config::get_bool(OFFER_SEEN).unwrap_or(false)));

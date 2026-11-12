@@ -68,6 +68,17 @@ describe('ProtectedProcessingCard', () => {
     expect(screen.getByRole('button', { name: '启用' })).toBeDisabled();
   });
 
+  it('updates a manually installed package before attempting broker policy changes', async () => {
+    getAppBoundStatus.mockResolvedValue({ ...active, enabled: false, available: false, reason: 'upgrade_required' });
+    render(<ProtectedProcessingCard backgroundEnabled={false} />);
+    const upgrade = await screen.findByRole('button', { name: '更新后台组件' });
+    expect(upgrade).toBeEnabled();
+    expect(screen.getByRole('button', { name: '保存限制' })).toBeDisabled();
+    fireEvent.click(upgrade);
+    await waitFor(() => expect(installAppBound).toHaveBeenCalledWith(false));
+    expect(setAppBoundPolicy).not.toHaveBeenCalled();
+  });
+
   it('keeps current status after cancelled removal', async () => {
     uninstallAppBound.mockRejectedValue('APP_BOUND_CANCELLED');
     render(<ProtectedProcessingCard />);

@@ -232,3 +232,14 @@ fn protected_runtime_location_matches_the_service_directory_layout() {
         assert!(!protected_runtime_directory(Path::new(directory), root));
     }
 }
+
+#[test]
+fn manually_updated_packages_run_the_newer_version_without_downgrading_activation() {
+    assert!(package_is_newer("0.9.2", "0.9.1").unwrap());
+    assert!(package_is_newer("0.10.0", "0.9.9").unwrap());
+    assert!(package_is_newer("0.9.2", "0.9.2-rc.1").unwrap());
+    assert!(!package_is_newer("0.9.1", "0.9.2").unwrap());
+    assert!(!package_is_newer("0.9.2-rc.1", "0.9.2").unwrap());
+    assert!(!package_is_newer("0.9.2+repack", "0.9.2").unwrap());
+    assert!(package_is_newer("0.9", "0.9.2").is_err());
+}

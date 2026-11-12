@@ -59,6 +59,18 @@ describe('AppBoundUpgradePrompt', () => {
     await waitFor(() => expect(installAppBound).toHaveBeenCalledWith(false));
   });
 
+  it('offers a manual package upgrade without activating it on startup or enabling a disabled policy', async () => {
+    getAppBoundStatus.mockResolvedValue({ offer_enable: true, reason: 'upgrade_required' });
+    installAppBound.mockRejectedValue('APP_BOUND_CANCELLED');
+    render(<AppBoundUpgradePrompt visible />);
+    const upgrade = await screen.findByRole('button', { name: '更新后台组件' });
+    expect(installAppBound).not.toHaveBeenCalled();
+    fireEvent.click(upgrade);
+    expect(await screen.findByRole('alert')).toHaveTextContent('已取消');
+    expect(installAppBound).toHaveBeenCalledWith(false);
+    expect(upgrade).toBeEnabled();
+  });
+
   it('does not reopen an acknowledged offer', async () => {
     getAppBoundStatus.mockResolvedValue({ offer_enable: false });
     render(<AppBoundUpgradePrompt visible />);

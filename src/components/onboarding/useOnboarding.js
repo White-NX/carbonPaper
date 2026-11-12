@@ -37,7 +37,8 @@ async function loadContext() {
   const appBoundStatus = appBound.status === 'fulfilled' ? appBound.value : null;
   return {
     browsers: browsers.status === 'fulfilled' ? browsers.value : {},
-    appBoundAvailable: Boolean(appBoundStatus?.offer_enable) && appBoundStatus?.reason !== 'repair_required',
+    appBoundAvailable: Boolean(appBoundStatus?.offer_enable)
+      && !['repair_required', 'upgrade_required'].includes(appBoundStatus?.reason),
     rerankerInstalled: models.status === 'fulfilled' && models.value?.[RERANKER_MODEL_ID]?.complete === true,
     smartClusterEnabled: config.status === 'fulfilled' && Boolean(config.value?.smart_cluster_enabled),
   };

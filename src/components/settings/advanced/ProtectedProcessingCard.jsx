@@ -3,6 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { ShieldCheck } from 'lucide-react';
 import { SettingsDisclosure } from '../SettingsPrimitives';
 import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
+import { Button } from '../../ui/Button';
+import { Banner } from '../../ui/Banner';
+import { usePolling } from '../../../hooks/usePolling';
 import {
   getAppBoundStatus, installAppBound, setAppBoundPolicy, uninstallAppBound, appBoundErrorMessage,
 } from '../../../lib/app_bound_api';
@@ -37,12 +40,7 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
-  useEffect(() => {
-    if (!active) return undefined;
-    refresh();
-    const timer = setInterval(refresh, 10000);
-    return () => clearInterval(timer);
-  }, [refresh, active]);
+  usePolling(refresh, { intervalMs: 10000, enabled: active });
 
   const run = async (action) => {
     setBusy(true);
@@ -62,7 +60,10 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
   const canEnable = backgroundEnabled && status?.supported && (status?.installed || status?.package_available) && validLimits;
   const canRepair = status?.supported && status?.package_available;
   const needsRepair = status?.reason === 'repair_required';
-  const stateText = !status ? t('settings.feedback.loading') : needsRepair ? t('appBound.waitingForRepair') : status?.enabled
+  const needsUpgrade = status?.reason === 'upgrade_required';
+  const needsMaintenance = needsRepair || needsUpgrade;
+  const stateText = !status ? t('settings.feedback.loading') : needsUpgrade ? t('appBound.waitingForUpgrade')
+    : needsRepair ? t('appBound.waitingForRepair') : status?.enabled
     ? status.available
       ? t('appBound.active')
       : t('appBound.waitingForRepair')
@@ -79,16 +80,17 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
         </p>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span className="text-sm text-ide-text" role="status">{stateText}</span>
-          <button type="button" disabled={busy || !status || (needsRepair ? !canRepair : !status.enabled && !canEnable)}
-            className="rounded-lg bg-ide-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
-            onClick={() => run(() => needsRepair ? installAppBound(false) : status.installed
+          <Button variant="primary" loading={busy}
+            disabled={!status || (needsMaintenance ? !canRepair : !status.enabled && !canEnable)}
+            onClick={() => run(() => needsMaintenance ? installAppBound(false) : status.installed
               ? setAppBoundPolicy(!status.enabled, status.enabled ? status.limits.retention_days : Number(days),
                 status.enabled ? status.limits.capacity_bytes / 1024 / 1024 : Number(capacity))
               : installAppBound(true))}>
-            {busy ? t('appBound.working') : needsRepair ? t('appBound.repair') : status?.enabled
+            {busy ? t('appBound.working') : needsUpgrade ? t('appBound.upgrade') : needsRepair ? t('appBound.repair') : status?.enabled
               ? t('appBound.disable') : t('appBound.enable')}
-          </button>
+          </Button>
         </div>
+        {needsUpgrade && <Banner tone="info">{t('appBound.upgradeHint')}</Banner>}
         {!status?.installed && <p className="text-xs text-ide-muted">
           {t('appBound.installHint')}
         </p>}
@@ -112,18 +114,18 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
           </div>
           <p className="text-xs text-ide-muted">{t('appBound.limitHint')}</p>
           <div className="flex flex-wrap gap-3 text-xs">
-            <button type="button" disabled={busy || !validLimits || needsRepair} className="text-ide-accent disabled:opacity-50"
+            <Button variant="ghost" size="xs" disabled={busy || !validLimits || needsMaintenance}
               onClick={() => run(() => setAppBoundPolicy(status.enabled, Number(days), Number(capacity)))}>
               {t('appBound.saveLimits')}
-            </button>
-            {!needsRepair && <button type="button" disabled={busy || !canRepair} className="text-ide-accent disabled:opacity-50"
-              onClick={() => run(() => installAppBound(false))}>{t('appBound.repair')}</button>}
-            <button type="button" disabled={busy} className="text-ide-muted disabled:opacity-50"
-              onClick={() => run(uninstallAppBound)}>{t('appBound.uninstall')}</button>
+            </Button>
+            {!needsMaintenance && <Button variant="ghost" size="xs" disabled={busy || !canRepair}
+              onClick={() => run(() => installAppBound(false))}>{t('appBound.repair')}</Button>}
+            <Button variant="ghost" size="xs" disabled={busy}
+              onClick={() => run(uninstallAppBound)}>{t('appBound.uninstall')}</Button>
           </div>
         </SettingsDisclosure>}
-        {message && <p role="alert" className="text-xs text-amber-600 dark:text-amber-400">{message}</p>}
-        {statusError && <p role="alert" className="text-xs text-ide-error">{statusError}</p>}
+        {message && <Banner tone="error">{message}</Banner>}
+        {statusError && <Banner tone="error">{statusError}</Banner>}
       </div>
     </section>
   );
