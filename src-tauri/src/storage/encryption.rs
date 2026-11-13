@@ -8,6 +8,8 @@ use rand::RngCore;
 
 use super::{BackgroundReadError, StorageState};
 
+pub(super) type RowKeyUnwrapper<'a> = dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError> + 'a;
+
 #[cfg(test)]
 use crate::credential_manager::decrypt_row_key_with_cng;
 
@@ -83,7 +85,7 @@ impl StorageState {
     pub(crate) fn decrypt_payload_with_unwrap(
         encrypted_data: &[u8],
         encrypted_key: &[u8],
-        unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+        unwrap_row_key: &RowKeyUnwrapper<'_>,
     ) -> Result<Vec<u8>, BackgroundReadError> {
         let mut row_key = unwrap_row_key(encrypted_key).map_err(|error| match error {
             CredentialError::AuthRequired => BackgroundReadError::AuthRequired,

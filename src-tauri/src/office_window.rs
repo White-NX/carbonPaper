@@ -124,9 +124,12 @@ unsafe extern "system" fn enumerate_document_window(hwnd: HWND, lparam: LPARAM) 
     // SAFETY: `lparam` is the live `EnumerationContext` pointer passed to the
     // synchronous EnumChildWindows call above.
     let context = unsafe { &mut *(lparam.0 as *mut EnumerationContext) };
+    // SAFETY: EnumChildWindows supplied this HWND; the helper only queries its
+    // process ID into a local initialized output value.
     if unsafe { window_pid(hwnd) } != context.pid {
         return true.into();
     }
+    // SAFETY: the callback HWND is queried with a bounded local UTF-16 buffer.
     let class_name = unsafe { window_class(hwnd) };
     let Some(priority) = context
         .application
@@ -139,6 +142,7 @@ unsafe extern "system" fn enumerate_document_window(hwnd: HWND, lparam: LPARAM) 
         context.first_match = hwnd.0 as isize;
         context.first_priority = priority;
     }
+    // SAFETY: this only queries the callback HWND and retains no Rust pointers.
     if unsafe { IsWindowVisible(hwnd).as_bool() } && priority < context.visible_priority {
         context.visible_match = hwnd.0 as isize;
         context.visible_priority = priority;
@@ -148,12 +152,16 @@ unsafe extern "system" fn enumerate_document_window(hwnd: HWND, lparam: LPARAM) 
 
 unsafe fn window_pid(hwnd: HWND) -> u32 {
     let mut pid = 0;
+    // SAFETY: the caller supplies a window handle and `pid` remains exclusively
+    // writable for the synchronous query; an invalid handle leaves it zero.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     pid
 }
 
 unsafe fn window_class(hwnd: HWND) -> String {
     let mut buffer = [0u16; 256];
+    // SAFETY: the HWND is supplied by the caller; the API writes at most the
+    // slice's capacity and its returned character count bounds the subsequent read.
     let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
     if len > 0 {
         String::from_utf16_lossy(&buffer[..len as usize])
@@ -164,6 +172,8 @@ unsafe fn window_class(hwnd: HWND) -> String {
 
 unsafe fn window_title(hwnd: HWND) -> String {
     let mut buffer = [0u16; 512];
+    // SAFETY: the bounded UTF-16 buffer stays live for this synchronous HWND
+    // query; only the returned written characters are read afterward.
     let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
     if len > 0 {
         String::from_utf16_lossy(&buffer[..len as usize])

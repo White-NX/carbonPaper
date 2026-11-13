@@ -12,7 +12,7 @@ use crate::windows_platform::{self, ProcessIdentity};
 use rand::RngCore;
 use serde::Serialize;
 use std::os::windows::io::AsRawHandle;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HANDLE;
@@ -66,7 +66,7 @@ pub fn generate_nmh_auth_token(data_dir: &std::path::Path) -> Result<String, Str
 
 /// Read the NMH auth token from the data dir.
 #[allow(dead_code)]
-pub fn read_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
+pub fn read_nmh_auth_token(data_dir: &Path) -> Result<String, String> {
     let token_path = data_dir.join("nmh_auth_token");
     std::fs::read_to_string(&token_path)
         .map_err(|e| format!("Failed to read NMH auth token: {}", e))
@@ -729,6 +729,10 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
 }
 
 /// Send losslessly decoded extension pixels to the Rust OCR pipeline and commit results.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The OCR handoff keeps verified extension metadata and its selected route explicit."
+)]
 async fn process_extension_ocr(
     app: &tauri::AppHandle,
     storage: &StorageState,
@@ -772,6 +776,7 @@ async fn process_extension_ocr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn storage_responses_serialize_success_and_error_without_opposite_fields() {

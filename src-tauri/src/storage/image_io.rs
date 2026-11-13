@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use super::{BackgroundReadError, StorageState};
 
+type ThumbnailReadResult = (String, Result<(String, String), String>);
+
 const IMAGE_BY_ID_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
     WHERE id = ?1 AND is_deleted = 0";
 const IMAGE_BY_PATH_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
@@ -383,7 +385,7 @@ impl StorageState {
             })
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
-        let thumb_path = Self::thumbnail_path_for(&abs_path);
+        let thumb_path = Self::thumbnail_path_for(abs_path);
 
         // Phase 3: Try reading cached thumbnail
         if thumb_path.exists() {
@@ -519,10 +521,7 @@ impl StorageState {
     /// Batch read thumbnails for multiple image paths in a single operation.
     /// Does one DB query to fetch all encrypted keys, then processes each thumbnail outside the lock.
     /// Returns a Vec of (path, Result<(base64, mime_type), error_string>).
-    pub fn batch_read_thumbnails(
-        &self,
-        paths: &[String],
-    ) -> Vec<(String, Result<(String, String), String>)> {
+    pub fn batch_read_thumbnails(&self, paths: &[String]) -> Vec<ThumbnailReadResult> {
         if paths.is_empty() {
             return Vec::new();
         }

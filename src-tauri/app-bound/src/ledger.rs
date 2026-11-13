@@ -318,6 +318,10 @@ impl Ledger {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Separates the authenticated principal, policy, dataset and key protector at dispatch."
+    )]
     fn dispatch(
         conn: &Connection,
         who: &Principal,
@@ -695,7 +699,8 @@ impl Ledger {
         if !valid_id(id) {
             return Err(BrokerError::InvalidRequest);
         }
-        let row: Option<(String,String,u8,u8,Option<Vec<u8>>,Option<String>,i64)> = db(conn.query_row(
+        type StoredTaskRow = (String, String, u8, u8, Option<Vec<u8>>, Option<String>, i64);
+        let row: Option<StoredTaskRow> = db(conn.query_row(
             "SELECT binding,state,done,abandoned,key_blob,digest,expires FROM tasks WHERE id=?1 AND owner=?2", params![id,who.sid],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional())?;
         let Some((binding, state, done, abandoned, key, digest, expires)) = row else {

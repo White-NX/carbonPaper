@@ -336,12 +336,8 @@ pub async fn run_scheduled_slice(
         )
         .await;
     }
-    if !manual && quantum.is_some() {
-        return index_pipeline::run_automatic_quantum::<ClipPipeline>(
-            app,
-            quantum.expect("quantum context"),
-        )
-        .await;
+    if let Some(quantum) = quantum.filter(|_| !manual) {
+        return index_pipeline::run_automatic_quantum::<ClipPipeline>(app, quantum).await;
     }
     run_scheduled_request(app, manual, true, None).await
 }
@@ -1685,8 +1681,10 @@ mod tests {
 
     #[test]
     fn clip_batch_configuration_fits_worker_request_limits() {
-        assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
-        assert!(ENCODE_CHUNK <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+        const {
+            assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
+            assert!(ENCODE_CHUNK <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+        }
         assert!(!EMBED_TIMEOUT.is_zero());
         assert!(EMBED_TIMEOUT.as_millis() <= crate::ml_protocol::MAX_ML_TIMEOUT_MS as u128);
     }

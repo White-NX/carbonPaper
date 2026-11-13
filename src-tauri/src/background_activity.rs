@@ -422,10 +422,12 @@ mod tests {
 
     #[test]
     fn classification_state_preserves_in_flight_over_pending_receipts() {
-        let mut state = ActivityState::default();
-        state.classification = Some(active("classification", WorkSource::Staged));
-        state.classification_phase = ClassificationPhase::InFlight;
-        state.classification_ack_pending = 2;
+        let mut state = ActivityState {
+            classification: Some(active("classification", WorkSource::Staged)),
+            classification_phase: ClassificationPhase::InFlight,
+            classification_ack_pending: 2,
+            ..Default::default()
+        };
         reconcile_classification_state(&mut state);
         assert_eq!(state.classification_phase, ClassificationPhase::InFlight);
         assert!(state.classification.is_some());
@@ -439,22 +441,22 @@ mod tests {
     #[test]
     fn blocked_reason_changes_are_tracked_per_task() {
         let mut blocked = HashMap::new();
-        assert_eq!(
-            update_blocked(&mut blocked, "semantic_index", "waiting_for_idle"),
-            true
-        );
-        assert_eq!(
-            update_blocked(&mut blocked, "semantic_index", "waiting_for_idle"),
-            false
-        );
-        assert_eq!(
-            update_blocked(&mut blocked, "clip_index", "waiting_for_idle"),
-            true
-        );
-        assert_eq!(
-            update_blocked(&mut blocked, "semantic_index", "retry_wait"),
-            true
-        );
+        assert!(update_blocked(
+            &mut blocked,
+            "semantic_index",
+            "waiting_for_idle"
+        ));
+        assert!(!update_blocked(
+            &mut blocked,
+            "semantic_index",
+            "waiting_for_idle"
+        ));
+        assert!(update_blocked(
+            &mut blocked,
+            "clip_index",
+            "waiting_for_idle"
+        ));
+        assert!(update_blocked(&mut blocked, "semantic_index", "retry_wait"));
     }
 
     #[test]
@@ -497,8 +499,10 @@ mod tests {
 
     #[test]
     fn scheduler_blocked_state_rearms_no_work_transition() {
-        let mut state = ActivityState::default();
-        state.no_work = true;
+        let mut state = ActivityState {
+            no_work: true,
+            ..Default::default()
+        };
 
         let (transitions, became_idle) = apply_scheduler_state(
             &mut state,

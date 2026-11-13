@@ -11,6 +11,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+#[cfg(not(feature = "app-bound-dev"))]
 mod repair;
 
 const OFFER_SEEN: &str = "app_bound_offer_seen";
@@ -21,6 +22,18 @@ static REPAIR_OFFER_DISMISSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static PROTECTED_ENVIRONMENT_READY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RepairOutcome {
+    Repaired {
+        restart_required: bool,
+    },
+    #[cfg(not(feature = "app-bound-dev"))]
+    DownloadRequired {
+        size_bytes: Option<u64>,
+    },
+}
 
 #[derive(serde::Serialize)]
 pub struct AppBoundStatus {
@@ -178,7 +191,7 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
                 }
             }
         }
-        return Ok(false);
+        Ok(false)
     }
     #[cfg(not(feature = "app-bound-dev"))]
     {
@@ -674,6 +687,11 @@ fn repaired_client_restart_required(
     Ok(false)
 }
 
+/// Repair the registered protected runtime from verified local or release sources.
+/// Requires a main/settings window and an authenticated session. `package_path`
+/// selects an optional ZIP; `allow_full_download` opts into a complete package.
+/// Returns a status-tagged outcome with `restart_required` or `size_bytes`.
+/// Frontend: `lib/app_bound_api.js` (`repairAppBound`).
 #[tauri::command]
 pub async fn app_bound_repair(
     window: tauri::Window,
@@ -682,7 +700,7 @@ pub async fn app_bound_repair(
     storage: tauri::State<'_, Arc<StorageState>>,
     package_path: Option<String>,
     allow_full_download: Option<bool>,
-) -> Result<repair::RepairOutcome, String> {
+) -> Result<RepairOutcome, String> {
     crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credentials)?;
     if !supported_build() {
@@ -698,9 +716,9 @@ pub async fn app_bound_repair(
         } else {
             schedule_restart(&app)?;
         }
-        return Ok(repair::RepairOutcome::Repaired {
+        Ok(RepairOutcome::Repaired {
             restart_required: true,
-        });
+        })
     }
     #[cfg(not(feature = "app-bound-dev"))]
     {
@@ -713,7 +731,7 @@ pub async fn app_bound_repair(
         })
         .await
         .map_err(|e| e.to_string())??;
-        if let repair::RepairOutcome::Repaired { restart_required } = &mut outcome {
+        if let RepairOutcome::Repaired { restart_required } = &mut outcome {
             let storage = storage.inner().clone();
             let runtime_restart = *restart_required;
             *restart_required = tokio::task::spawn_blocking(move || {

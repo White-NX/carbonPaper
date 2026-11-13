@@ -34,6 +34,7 @@ pub struct InstallOptions {
 /// Unelevated restart helper. It can only launch this user's registered main
 /// executable and accepts no executable path, DLL path or arbitrary arguments.
 pub fn launch_after(pid: u32) -> Result<()> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
@@ -44,6 +45,8 @@ pub fn launch_after(pid: u32) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let mut exit_code = 0;
+            // SAFETY: ProcessIdentity owns this query-capable process handle;
+            // the initialized exit-code output stays live during the call.
             unsafe {
                 windows::Win32::System::Threading::GetExitCodeProcess(
                     process.handle.0,
@@ -79,6 +82,7 @@ pub fn launch_after(pid: u32) -> Result<()> {
 }
 
 pub fn install(options: InstallOptions) -> Result<PathBuf> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
@@ -313,6 +317,8 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         if service_existed {
             let _ = maintenance.restart_after_failure();
         } else if let Ok(Some(handle)) = service::try_open_service(0x0001_0000) {
+            // SAFETY: the newly created service's owned SCM handle has DELETE
+            // access and remains live while rollback marks it for removal.
             unsafe {
                 let _ = DeleteService(handle.0);
             }
@@ -872,6 +878,8 @@ fn start_named_service(handle: &ServiceHandle) -> Result<()> {
     if service::query_status(handle)?.dwCurrentState == SERVICE_RUNNING {
         return Ok(());
     }
+    // SAFETY: the caller retains an SCM handle with START access. No argument
+    // strings or borrowed buffers are passed to the synchronous start request.
     unsafe {
         if let Err(error) = StartServiceW(handle.0, None) {
             if error.code() != windows::core::HRESULT::from_win32(1056) {
@@ -898,6 +906,7 @@ pub fn uninstall(caller_pid: u32) -> Result<()> {
 }
 
 pub fn uninstall_owner(caller_pid: u32, remove_runtime: bool) -> Result<()> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
@@ -1007,6 +1016,8 @@ pub fn uninstall_owner(caller_pid: u32, remove_runtime: bool) -> Result<()> {
     }
     if ledger.registered_owners()? == 0 {
         if let Some(handle) = service::try_open_service(0x0001_0000)? {
+            // SAFETY: this stopped service's owned SCM handle has DELETE
+            // access and is retained until SCM accepts the removal request.
             unsafe {
                 DeleteService(handle.0).map_err(|_| BrokerError::AccessDenied)?;
             }

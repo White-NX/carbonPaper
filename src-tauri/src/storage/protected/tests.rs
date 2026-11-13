@@ -639,7 +639,7 @@ fn interrupted_legacy_migration_preserves_rows_and_revisions_then_retires_plaint
     let (directory, storage) = fixture();
     let credentials = storage.credential_state.clone();
     let original_dataset = storage.processing_dataset_id().unwrap();
-    let vector = vec![0.1234567f32, 0.7654321, 0.2345678];
+    let vector = [0.1234567f32, 0.7654321, 0.2345678];
     let vector_bytes = vector
         .iter()
         .flat_map(|value| value.to_le_bytes())

@@ -797,6 +797,10 @@ impl StorageState {
         ))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Caches result evidence with both version fences and their independent read connection."
+    )]
     fn store_order(
         &self,
         key: String,
@@ -819,8 +823,7 @@ impl StorageState {
                 .semantic_cache_reset_generation
                 .load(AtomicOrdering::Acquire)
                 != reset_generation
-            || sqlite_data_version(&version_connection)
-                .map_or(true, |current| current != data_version)
+            || (sqlite_data_version(&version_connection) != Ok(data_version))
         {
             return;
         }

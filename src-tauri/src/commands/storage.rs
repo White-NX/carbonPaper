@@ -228,6 +228,10 @@ mod tests {
 ///
 /// Authentication: required. `max_records` caps the result (sampling evenly across range).
 /// Returns lightweight `TimelineRecord` objects. Frontend: `lib/monitor_api.js`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn storage_get_timeline(
     window: tauri::Window,
@@ -376,6 +380,10 @@ pub async fn storage_list_recent_screenshots(
 ///
 /// Authentication: required. Returns an array of `SearchResult` objects; optional
 /// filters are omitted as JSON `null`. Frontend: `lib/monitor_api.js`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn storage_search(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,

@@ -650,7 +650,7 @@ where
                     .checked_add(1)
                     .ok_or_else(|| "Resident vector row count overflow".to_string())?;
                 // Publish counters in small batches, rather than locking once per vector.
-                if total_rows % 256 == 0 {
+                if total_rows.is_multiple_of(256) {
                     if let Some(metrics) = metrics {
                         metrics.update(|progress| {
                             progress.rows_scanned = total_rows;
@@ -1043,6 +1043,10 @@ impl StorageState {
     /// next query sees a mismatch and reloads rather than trusting a matrix that
     /// straddled a write. Reading the epoch afterwards would invert that: the
     /// matrix would claim a freshness the pages before the write do not have.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keeps index identity, query bounds, resource budget and execution metrics explicit."
+    )]
     fn load_or_stream_topk(
         &self,
         index_kind: DerivedIndexKind,

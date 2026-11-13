@@ -13,6 +13,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+type DerivedAnnSnapshot = (u64, u64, u64, u32, String, String, u32);
+
 pub(super) const ANN_TAIL_UPDATES_SQL: &str = r#"
     SELECT c.subject_key,
            CASE WHEN j.status = 'completed'
@@ -263,6 +265,10 @@ impl StorageState {
         .transpose()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Records the complete persisted ANN failure state in one update."
+    )]
     pub fn record_derived_ann_build_failure(
         &self,
         index_kind: DerivedIndexKind,
@@ -723,7 +729,7 @@ impl StorageState {
     pub(crate) fn derived_index_snapshot_for_ann(
         &self,
         index_kind: DerivedIndexKind,
-    ) -> Result<(u64, u64, u64, u32, String, String, u32), String> {
+    ) -> Result<DerivedAnnSnapshot, String> {
         self.with_vector_scan_connection("derived_index_snapshot_for_ann", |conn| {
             let snapshot = derived_index_snapshot_metadata_from_conn(conn, index_kind)?;
             let contract = snapshot

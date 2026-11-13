@@ -29,6 +29,8 @@ pub struct OwnedHandle(pub HANDLE);
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: this wrapper owns the valid kernel handle and closes it
+            // exactly once after its final use.
             unsafe {
                 let _ = CloseHandle(self.0);
             }
@@ -133,6 +135,8 @@ pub fn token_sid(token: HANDLE) -> Result<String> {
 }
 
 pub fn current_sid() -> Result<String> {
+    // SAFETY: the current-process pseudo handle is always live and is only
+    // borrowed while querying its token; no owner attempts to close it.
     unsafe { process_sid(GetCurrentProcess()) }
 }
 
@@ -267,7 +271,7 @@ fn assert_path_protected(
 /// # Safety
 /// The owner and ACL must belong to a valid Windows security descriptor that
 /// stays live until this function returns. A null DACL is rejected.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "development-runtime")))]
 unsafe fn validate_protected_acl(
     owner: PSID,
     acl: *const Security::ACL,
@@ -641,7 +645,7 @@ mod tests {
                 None,
             )
             .expect("valid ACL regression fixture");
-            let result = (|| {
+            let result = {
                 let mut owner = PSID::default();
                 let mut defaulted = BOOL::default();
                 Security::GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted)
@@ -656,7 +660,7 @@ mod tests {
                 )
                 .expect("ACL regression fixture has a DACL");
                 validate_protected_acl(owner, acl, ordinary_directory)
-            })();
+            };
             LocalFree(HLOCAL(descriptor.0));
             result
         }

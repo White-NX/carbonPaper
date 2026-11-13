@@ -443,6 +443,9 @@ impl Renderer {
             .bitmaps
             .retain(|id, _| model.records.iter().any(|record| record.id == *id));
         for record in &model.records {
+            // SAFETY: this painter is confined to the panel's UI thread. The
+            // thumbnail owns a complete BGRA buffer, retained through bitmap
+            // creation and in the painter cache alongside the resulting bitmap.
             if let Err(error) = unsafe { self.root_painter.prepare_thumbnail(record) } {
                 tracing::debug!("Tray thumbnail upload deferred: {error}");
             }

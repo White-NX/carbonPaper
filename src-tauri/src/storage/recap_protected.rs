@@ -64,6 +64,10 @@ impl StorageState {
         Ok(true)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the recap commit envelope and its separate protected authorization."
+    )]
     pub(crate) fn recap_commit_protected<T: Serialize>(
         &self,
         authorization: &crate::ai::recap::protected::ProtectedRun,

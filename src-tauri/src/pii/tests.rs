@@ -59,7 +59,7 @@ fn luhn_complete(body: &str) -> String {
                 }
             })
             .sum();
-        if sum % 10 == 0 {
+        if sum.is_multiple_of(10) {
             return candidate;
         }
     }

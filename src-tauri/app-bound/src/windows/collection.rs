@@ -511,6 +511,7 @@ fn collector_source(root: &Path, own: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 pub fn run_after(pid: u32) -> Result<()> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
@@ -562,9 +563,13 @@ pub fn run_after(pid: u32) -> Result<()> {
             );
         }
     }
+    // SAFETY: only a scalar PID and access mask are supplied. A successful
+    // process handle is immediately owned until waiting for the caller ends.
     if let Ok(parent) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
         let parent = identity::OwnedHandle(parent);
         loop {
+            // SAFETY: the owned process handle has SYNCHRONIZE access and
+            // stays live throughout this bounded wait.
             match unsafe { WaitForSingleObject(parent.0, 1000) } {
                 WAIT_OBJECT_0 => break,
                 WAIT_TIMEOUT => continue,
@@ -636,6 +641,8 @@ fn collect_after_exit_pass(root: &Path, state: &Path) -> Result<bool> {
         // Finish an interrupted service removal without racing a reinstall.
         let mut maintenance = install::ServiceMaintenance::stop()?;
         if let Some(handle) = service::try_open_service(0x0001_0000)? {
+            // SAFETY: the owned SCM handle has DELETE access and remains
+            // live while SCM marks the stopped service for removal.
             unsafe { windows::Win32::System::Services::DeleteService(handle.0) }
                 .map_err(|_| BrokerError::AccessDenied)?;
             maintenance.commit();

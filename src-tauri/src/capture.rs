@@ -519,10 +519,11 @@ impl ActiveWindowFingerprint {
             // Office root HWND can switch documents without changing handles.
             // Keep non-Office fingerprints title-free so dynamic browser,
             // terminal, or media titles do not create artificial focus scans.
-            title: office_document_hwnd
-                .is_some()
-                .then(|| info.title.clone())
-                .unwrap_or_default(),
+            title: if office_document_hwnd.is_some() {
+                info.title.clone()
+            } else {
+                Default::default()
+            },
             office_document_hwnd,
         }
     }
@@ -1921,6 +1922,10 @@ pub async fn run_capture_loop(
     tracing::info!("Rust capture loop ended");
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The handoff carries the capture identity and its owned image and state."
+)]
 async fn process_ocr_async(
     app: &tauri::AppHandle,
     storage: Arc<StorageState>,
@@ -2052,6 +2057,10 @@ impl OcrRouteConfig {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The OCR boundary carries capture metadata and the selected execution route."
+)]
 pub(crate) async fn process_ocr_inner(
     app: &tauri::AppHandle,
     storage: &StorageState,

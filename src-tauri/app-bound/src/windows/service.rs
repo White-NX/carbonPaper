@@ -104,6 +104,8 @@ fn mark_timing(timing: &Option<SharedTiming>, mark: impl FnOnce(&mut ConnectionT
 pub struct ServiceHandle(pub SC_HANDLE);
 impl Drop for ServiceHandle {
     fn drop(&mut self) {
+        // SAFETY: this uniquely owned SCM handle came from a successful open
+        // or create call; Drop closes it exactly once after its final use.
         unsafe {
             let _ = CloseServiceHandle(self.0);
         }
@@ -328,6 +330,8 @@ fn allow_peer_identity_queries() -> Result<()> {
     // Standard-user clients must verify the actual SYSTEM process token. Give
     // them only QUERY_LIMITED_INFORMATION on the process and TOKEN_QUERY on its
     // token, never VM access, handle duplication, token duplication or mutation.
+    // SAFETY: the current-process pseudo handle stays live; the token output
+    // is initialized and its owned handle is retained while its DACL is updated.
     unsafe {
         let process = windows::Win32::System::Threading::GetCurrentProcess();
         set_query_dacl(process, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x1000;;;AU)")?;
@@ -846,12 +850,16 @@ async fn handle_connection_inner(
 struct Impersonation;
 impl Impersonation {
     fn begin(pipe: HANDLE, expected_sid: &str) -> Result<Self> {
+        // SAFETY: the caller retains this connected server pipe; impersonation
+        // stays on this thread and the guard always balances it with a revert.
         unsafe {
             ImpersonateNamedPipeClient(pipe).map_err(|_| BrokerError::AccessDenied)?;
         }
         let guard = Self;
         // Verify the pipe token as well as the client process token. SQOS must
         // permit impersonation, and another user's token is never accepted.
+        // SAFETY: the guard keeps this thread impersonating the client; the
+        // token output is initialized and its owned handle outlives SID copying.
         unsafe {
             let mut token = HANDLE::default();
             windows::Win32::System::Threading::OpenThreadToken(
@@ -872,6 +880,8 @@ impl Impersonation {
 impl Drop for Impersonation {
     fn drop(&mut self) {
         // Continuing on a pooled thread after a failed revert is unsafe.
+        // SAFETY: Drop runs on the impersonating thread and reverts its own
+        // token without passing pointers or transferring handle ownership.
         if unsafe { Security::RevertToSelf() }.is_err() {
             std::process::abort();
         }

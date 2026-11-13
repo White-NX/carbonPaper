@@ -412,6 +412,10 @@ impl StorageState {
         self.recap_write_background_checked(kind, key, day, revision, generation, value, |_| Ok(()))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the recap commit envelope and its transaction-local validation callback."
+    )]
     pub(crate) fn recap_write_background_checked<T: Serialize>(
         &self,
         kind: &str,
@@ -430,6 +434,10 @@ impl StorageState {
 
     /// Encryption needs only the public key. The protected caller must validate
     /// its independent service-owned authorization before entering this writer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the recap commit envelope and its transaction-local validation callback."
+    )]
     pub(super) fn recap_commit_payload_checked<T: Serialize>(
         &self,
         kind: &str,
@@ -723,6 +731,10 @@ impl StorageState {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keeps request identity, input/output budgets and the generation fence explicit."
+    )]
     pub(crate) fn recap_reserve(
         &self,
         day: &str,
@@ -738,6 +750,10 @@ impl StorageState {
 
     /// Evidence agents share the same cumulative token and daily limits. A
     /// larger request count never gives each step a fresh token allowance.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Adds the per-request limit to the same budget reservation interface."
+    )]
     pub(crate) fn recap_reserve_with_limit(
         &self,
         day: &str,

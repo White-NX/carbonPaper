@@ -11,6 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use super::encryption::RowKeyUnwrapper;
 use super::{
     wire_time, BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
     DerivedIndexKind, IncrementalVacuumResult, IndexStorageStats, OcrDeleteBatchResult,
@@ -19,6 +20,8 @@ use super::{
 };
 
 const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
+
+type EncryptedMetadataRow = (i64, Option<Vec<u8>>, Option<Vec<u8>>);
 const MAX_OCR_DELETE_CLEANUP_FAILURES: i64 = 3;
 const STARTUP_PENDING_SCREENSHOTS_SQL: &str =
     "SELECT id FROM screenshots WHERE status = 'pending' AND is_deleted = 0 ORDER BY id ASC";
@@ -242,7 +245,7 @@ fn ocr_text_prefix_query(placeholder_count: usize) -> String {
 /// prefix of the full join, so its first `min_chars` characters match the
 /// full text exactly (the MiniLM source contract only consumes that prefix).
 fn assemble_ocr_text_prefixes(
-    rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>,
+    rows: Vec<EncryptedMetadataRow>,
     min_chars: usize,
     deadline: Option<Instant>,
     mut decrypt: impl FnMut(&[u8], &[u8]) -> Result<String, BackgroundReadError>,
@@ -312,6 +315,10 @@ fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
 }
 
 impl StorageState {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the existing OCR status, provenance and elapsed-time update interface."
+    )]
     pub fn set_ocr_status(
         &self,
         screenshot_id: i64,
@@ -1014,7 +1021,7 @@ impl StorageState {
 
         // Timing accumulators for OCR processing
         let mut total_encrypt_dur = std::time::Duration::ZERO;
-        let total_db_insert_dur;
+
         let total_bitmap_dur = std::time::Duration::ZERO;
 
         // Wrap one fresh OCR-only key outside the mutex. AES uses the actual
@@ -1121,7 +1128,7 @@ impl StorageState {
 
             drop(guard);
         }
-        total_db_insert_dur = td0.elapsed();
+        let total_db_insert_dur = td0.elapsed();
         if added > 0 {
             self.ocr_row_count
                 .fetch_add(added as u64, Ordering::Relaxed);
@@ -1582,7 +1589,7 @@ impl StorageState {
     /// callers borrow the authenticated [`CngKeySession`] across worker threads.
     fn decrypt_screenshot_summary_with_unwrap(
         row: EncryptedScreenshotSummaryRow,
-        unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+        unwrap_row_key: &RowKeyUnwrapper<'_>,
         is_authorized: &dyn Fn() -> bool,
     ) -> Result<BackgroundScreenshotSummary, BackgroundReadError> {
         let needs_row_key = row.window_title_enc.is_some() || row.process_name_enc.is_some();
@@ -1974,7 +1981,7 @@ impl StorageState {
                 .open_read_connection_named("get_ocr_text_prefixes_by_screenshot_ids_silent")
                 .map_err(BackgroundReadError::Other)?;
 
-            let mut raw_rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
+            let mut raw_rows: Vec<EncryptedMetadataRow> = Vec::new();
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
             for chunk in screenshot_ids.chunks(500) {
@@ -2019,7 +2026,7 @@ impl StorageState {
         // of one screenshot are contiguous and in insertion order — the exact
         // order the OCR engine emitted the boxes, which is the order their
         // texts were joined into the embedded MiniLM source string.
-        let mut groups: Vec<Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>> = Vec::new();
+        let mut groups: Vec<Vec<EncryptedMetadataRow>> = Vec::new();
         for row in raw_rows {
             match groups.last_mut() {
                 Some(group) if group.last().map(|(id, _, _)| *id) == Some(row.0) => group.push(row),
@@ -2794,10 +2801,7 @@ impl StorageState {
                 .expect("OCR posting cleanup requires an HMAC key");
             for token in Self::bigram_tokenize(&plaintext) {
                 let token_hash = Self::compute_hmac_hash(&token, hmac_key);
-                removals
-                    .entry(token_hash)
-                    .or_insert_with(RoaringBitmap::new)
-                    .insert(bitmap_id);
+                removals.entry(token_hash).or_default().insert(bitmap_id);
             }
 
             // The postings are staged for removal in the same transaction that

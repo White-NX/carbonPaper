@@ -491,8 +491,10 @@ mod tests {
                 <= context::input_allowance(&req, provider.context_tokens)
         );
         assert_eq!(included.len(), 3);
-        let mut settings = RecapSettings::default();
-        settings.language = "en".into();
+        let settings = RecapSettings {
+            language: "en".into(),
+            ..Default::default()
+        };
         let (second, _) = request(&b, &settings, &provider).unwrap();
         assert!(
             matches!((&req.messages[0], &second.messages[0]), (Message::System(a), Message::System(b)) if a == b)

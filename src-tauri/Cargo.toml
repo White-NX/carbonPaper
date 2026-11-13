@@ -16,7 +16,8 @@ app-bound-dev = ["carbonpaper-app-bound/development-runtime"]
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "carbonpaper_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# The Windows desktop binaries consume the Rust library directly.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "carbonpaper-nmh"

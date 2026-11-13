@@ -1,5 +1,8 @@
 use super::*;
 
+type RecapObjectRow = (String, String, Option<Vec<u8>>, Option<String>, i64);
+type StoredRecapObject = (RecapBinding, String, Option<Vec<u8>>, Option<String>, i64);
+
 pub(super) const EXPIRE_RECAP_SQL: &str = "UPDATE recap_objects SET state='retired',key_blob=NULL
     WHERE owner=?1 AND state!='retired'
     AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))";
@@ -36,6 +39,10 @@ impl Ledger {
                 SELECT owner,COUNT(*) FROM (SELECT owner FROM recap_revoked_sources UNION ALL SELECT owner FROM recap_revoked_ranges) GROUP BY owner;"))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Shares the authenticated policy and key-protection context with the main dispatcher."
+    )]
     pub(super) fn dispatch_recap(
         conn: &Connection,
         who: &Principal,
@@ -223,11 +230,11 @@ impl Ledger {
         who: &Principal,
         id: &str,
         dataset: Option<&str>,
-    ) -> Result<(RecapBinding, String, Option<Vec<u8>>, Option<String>, i64)> {
+    ) -> Result<StoredRecapObject> {
         if !valid_id(id) {
             return Err(BrokerError::InvalidRequest);
         }
-        let row:Option<(String,String,Option<Vec<u8>>,Option<String>,i64)>=db(conn.query_row(
+        let row: Option<RecapObjectRow> = db(conn.query_row(
             "SELECT binding,state,key_blob,digest,expires FROM recap_objects WHERE id=?1 AND owner=?2",
             params![id,who.sid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional())?;
         let (binding, state, key, digest, expires) = row.ok_or(BrokerError::Retired)?;

@@ -139,6 +139,8 @@ fn connect(pipe: &File, process: HANDLE, deadline: Instant) -> Result<()> {
         return Err(BrokerError::AccessDenied);
     }
     loop {
+        // SAFETY: the caller retains the pipe and process handles through this
+        // polling loop; PID output is initialized and all operations are synchronous.
         unsafe {
             let _ = ConnectNamedPipe(HANDLE(pipe.as_raw_handle()), None);
             let mut pid = 0;
@@ -224,9 +226,13 @@ fn shell_execute(
     struct Apartment;
     impl Drop for Apartment {
         fn drop(&mut self) {
+            // SAFETY: this guard is created only after successful initialization
+            // on this thread, and Drop balances that call exactly once.
             unsafe { CoUninitialize() };
         }
     }
+    // SAFETY: the reserved pointer is null and initialization applies only to
+    // this helper thread; Apartment balances every successful result.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()?;
     let _apartment = Apartment;
     let executable = identity::wide(executable.as_os_str());
@@ -390,6 +396,8 @@ pub(super) fn coordinate(
     let status = receive(&mut pipe, Instant::now() + Duration::from_secs(180));
     // The elevated child also waits on this exact parent, but the coordinator
     // must not restart an existing application on an early preparation failure.
+    // SAFETY: the caller retains this process handle with SYNCHRONIZE access
+    // for the whole coordinator attempt; waiting transfers no ownership.
     if unsafe { WaitForSingleObject(parent, 60_000) } != WAIT_OBJECT_0 {
         return Err(BrokerError::Busy);
     }
@@ -496,11 +504,15 @@ pub fn run_elevated(args: &[String]) -> Result<()> {
     // Verify the real server PID before consuming any command. IDENTIFICATION
     // SQOS prevents that ordinary server from acquiring this elevated token.
     let mut server_pid = 0;
+    // SAFETY: the connected pipe File owns its handle; the initialized PID
+    // output is exclusively borrowed for this synchronous query.
     unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut server_pid) }
         .map_err(|_| BrokerError::AccessDenied)?;
     if server_pid != coordinator_pid {
         return Err(BrokerError::AccessDenied);
     }
+    // SAFETY: only scalar PID/access inputs are passed; every successful
+    // process handle is immediately owned until the transaction finishes.
     let parent = unsafe {
         OwnedHandle(
             OpenProcess(
@@ -523,6 +535,8 @@ pub fn run_elevated(args: &[String]) -> Result<()> {
     if receive(&mut pipe, Instant::now() + Duration::from_secs(120))? != COMMIT {
         return Err(BrokerError::InvalidRequest);
     }
+    // SAFETY: the owned parent process handle has SYNCHRONIZE access and
+    // remains live throughout this bounded wait for its exit.
     if unsafe { WaitForSingleObject(parent.0, 60_000) } != WAIT_OBJECT_0 {
         return Err(BrokerError::Busy);
     }

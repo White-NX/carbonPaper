@@ -1590,6 +1590,10 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Constructs the protocol capture binding from screenshot metadata and pixels."
+)]
 pub(crate) fn captured_input(
     screenshot_id: i64,
     storage: &StorageState,

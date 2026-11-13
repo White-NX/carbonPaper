@@ -831,10 +831,11 @@ async fn refresh_backlog(app: &AppHandle) {
                 let _ =
                     storage.enqueue_background_task_if_changed(TASK_RECAP_INDEX, false, now_ms());
             }
-            Ok(Ok(false)) => {
-                if crate::ai::recap::search::semantic_enabled(app).is_ok_and(|enabled| !enabled) {
-                    let _ = storage.park_background_task(TASK_RECAP_INDEX, "feature_disabled");
-                }
+            Ok(Ok(false))
+                if crate::ai::recap::search::semantic_enabled(app)
+                    .is_ok_and(|enabled| !enabled) =>
+            {
+                let _ = storage.park_background_task(TASK_RECAP_INDEX, "feature_disabled");
             }
             _ => (),
         }

@@ -131,6 +131,10 @@ const SEARCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300)
 /// `request_id` is chosen by the caller and names the run for
 /// [`ai_search_cancel`]. Errors use the `AI_*` codes. Frontend:
 /// `lib/ai_api.js`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn ai_search(
     app: tauri::AppHandle,

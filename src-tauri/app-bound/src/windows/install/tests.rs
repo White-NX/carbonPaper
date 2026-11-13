@@ -42,11 +42,9 @@ impl Drop for TestService {
 #[test]
 #[ignore = "requires administrator access; creates and deletes a unique, never-started test service"]
 fn existing_service_repair_reapplies_restart_policy() {
-    // SAFETY: IsUserAnAdmin only queries the current process token.
-    assert!(
-        unsafe { IsUserAnAdmin() }.as_bool(),
-        "run this test elevated"
-    );
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
+    let administrator = unsafe { IsUserAnAdmin() }.as_bool();
+    assert!(administrator, "run this test elevated");
     let directory = tempfile::tempdir().expect("create test directory");
     // The service cannot execute code even if somebody attempts to start it.
     let missing_executable = directory.path().join("nonexistent-test-service.exe");

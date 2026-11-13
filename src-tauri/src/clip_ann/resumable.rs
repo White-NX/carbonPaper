@@ -56,9 +56,13 @@ impl BuildWorker {
         let mut child = PendingBuilder::new(child);
         let job = create_builder_job()?;
         assign_builder_job(&job, child.child())?;
-        let mut process = child.take();
-        let stdin = process.stdin.take().ok_or("ANN worker stdin unavailable")?;
-        let stdout = process
+        let stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or("ANN worker stdin unavailable")?;
+        let stdout = child
+            .child_mut()
             .stdout
             .take()
             .ok_or("ANN worker stdout unavailable")?;
@@ -82,7 +86,7 @@ impl BuildWorker {
         Ok(Self {
             generation,
             db_generation,
-            child: process,
+            child: child.take(),
             stdin,
             replies,
             job,
@@ -507,7 +511,7 @@ async fn run_unit(app: &AppHandle, manual: bool) -> Result<ScheduledSliceResult,
         return Ok(ScheduledSliceResult::skipped("ann_reader_loading"));
     }
     let mut state = match storage.ann_build_checkpoint() {
-        Err(error) if matches!(error, TaskError::InvalidCheckpoint(_)) => None,
+        Err(TaskError::InvalidCheckpoint(_)) => None,
         result => result?,
     };
     let contract = model_fingerprint();

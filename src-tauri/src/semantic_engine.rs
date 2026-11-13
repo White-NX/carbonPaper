@@ -635,15 +635,20 @@ fn load_session(
         )
     })?;
     // Completed requests must release CPU before their job cap is restored.
-    let builder = builder
-        .with_config_entry("session.intra_op.allow_spinning", "0")
-        .and_then(|builder| builder.with_config_entry("session.inter_op.allow_spinning", "0"))
-        .map_err(|error| {
-            MlError::new(
-                MlErrorKind::ProviderUnavailable,
-                format!("failed to disable pool spinning: {error}"),
-            )
-        })?;
+    let mut builder = builder;
+    for config_entry in [
+        "session.intra_op.allow_spinning",
+        "session.inter_op.allow_spinning",
+    ] {
+        builder = builder
+            .with_config_entry(config_entry, "0")
+            .map_err(|error| {
+                MlError::new(
+                    MlErrorKind::ProviderUnavailable,
+                    format!("failed to disable pool spinning: {error}"),
+                )
+            })?;
+    }
     let builder = builder
         .with_config_entry("session.use_device_allocator_for_initializers", "0")
         .map_err(|error| {

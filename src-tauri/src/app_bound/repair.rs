@@ -1,4 +1,5 @@
 //! Local-first repair with bounded, independently verified component sources.
+use super::RepairOutcome;
 use carbonpaper_app_bound::{
     manifest,
     protocol::{Request, Response},
@@ -14,20 +15,12 @@ use std::{
     io::{Read, Seek, Write},
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{Duration, Instant},
 };
 use tauri::{Emitter, Window};
 
 const MAX_FULL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-static REPAIR_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum RepairOutcome {
-    Repaired { restart_required: bool },
-    DownloadRequired { size_bytes: Option<u64> },
-}
+static REPAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Serialize)]
 struct Progress {
