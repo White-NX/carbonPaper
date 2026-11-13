@@ -65,6 +65,7 @@ mod power;
 mod processing_stage;
 mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
+pub use app_bound::uninstall_for_package as uninstall_protected_component;
 mod registry_config;
 mod rerank;
 mod resource_utils;

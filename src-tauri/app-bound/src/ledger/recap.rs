@@ -5,6 +5,8 @@ pub(super) const EXPIRE_RECAP_SQL: &str = "UPDATE recap_objects SET state='retir
     AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))";
 pub(super) const PRUNE_RECAP_SQL: &str = "DELETE FROM recap_objects
     WHERE owner=?1 AND state='retired' AND created<?2";
+const EXACT_SOURCE_REVOCATIONS: i64 = 4096;
+const MAX_SOURCE_REVOCATIONS: i64 = 100_000;
 
 impl Ledger {
     pub(super) fn init_recap(conn: &Connection) -> Result<()> {
@@ -24,7 +26,14 @@ impl Ledger {
             CREATE INDEX IF NOT EXISTS recap_source_lookup ON recap_sources(screenshot_id,object_id);
             CREATE TABLE IF NOT EXISTS recap_revoked_sources (
                 owner TEXT NOT NULL REFERENCES owners(sid),dataset TEXT NOT NULL,screenshot_id INTEGER NOT NULL,
-                PRIMARY KEY(owner,dataset,screenshot_id));"))
+                PRIMARY KEY(owner,dataset,screenshot_id));
+            CREATE TABLE IF NOT EXISTS recap_revoked_ranges (
+                owner TEXT NOT NULL REFERENCES owners(sid),dataset TEXT NOT NULL,
+                first_id INTEGER NOT NULL,last_id INTEGER NOT NULL,PRIMARY KEY(owner,dataset));
+            CREATE TABLE IF NOT EXISTS recap_revocation_budgets (
+                owner TEXT PRIMARY KEY REFERENCES owners(sid),entries INTEGER NOT NULL,deny_all INTEGER NOT NULL DEFAULT 0);
+            INSERT OR IGNORE INTO recap_revocation_budgets(owner,entries)
+                SELECT owner,COUNT(*) FROM (SELECT owner FROM recap_revoked_sources UNION ALL SELECT owner FROM recap_revoked_ranges) GROUP BY owner;"))
     }
 
     pub(super) fn dispatch_recap(
@@ -153,7 +162,10 @@ impl Ledger {
                     return Err(BrokerError::Retired);
                 }
                 for id in screenshot_ids {
-                    let revoked:bool=db(conn.query_row("SELECT EXISTS(SELECT 1 FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)",params![who.sid,dataset,id],|r|r.get(0)))?;
+                    let revoked:bool=db(conn.query_row("SELECT
+                        EXISTS(SELECT 1 FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)
+                        OR EXISTS(SELECT 1 FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2 AND ?3 BETWEEN first_id AND last_id)
+                        OR EXISTS(SELECT 1 FROM recap_revocation_budgets WHERE owner=?1 AND deny_all=1)",params![who.sid,dataset,id],|r|r.get(0)))?;
                     if revoked {
                         return Err(BrokerError::Retired);
                     }
@@ -234,9 +246,67 @@ impl Ledger {
         id: i64,
     ) -> Result<()> {
         db(conn.execute(
-            "INSERT OR IGNORE INTO recap_revoked_sources VALUES(?1,?2,?3)",
-            params![sid, dataset, id],
+            "INSERT OR IGNORE INTO recap_revocation_budgets(owner,entries) VALUES(?1,0)",
+            [sid],
         ))?;
+        let (count, saturated): (i64, bool) = db(conn.query_row(
+            "SELECT entries,deny_all FROM recap_revocation_budgets WHERE owner=?1",
+            [sid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
+        if saturated || count >= MAX_SOURCE_REVOCATIONS {
+            // Keep deletion available at the authority cap. A permanent owner
+            // fence conservatively retires recap grants instead of dropping
+            // revocations and letting a restored source acquire another grant.
+            db(conn.execute("UPDATE broker_metadata SET value=2 WHERE key='schema'", []))?;
+            db(conn.execute(
+                "UPDATE recap_revocation_budgets SET deny_all=1,entries=0 WHERE owner=?1",
+                [sid],
+            ))?;
+            db(conn.execute("DELETE FROM recap_revoked_sources WHERE owner=?1", [sid]))?;
+            db(conn.execute("DELETE FROM recap_revoked_ranges WHERE owner=?1", [sid]))?;
+            Self::retire_recap(conn, sid, None)?;
+            return Ok(());
+        }
+        let covered: bool = db(conn.query_row("SELECT EXISTS(SELECT 1 FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2 AND ?3 BETWEEN first_id AND last_id)", params![sid,dataset,id], |row| row.get(0)))?;
+        if !covered {
+            let inserted = db(conn.execute(
+                "INSERT OR IGNORE INTO recap_revoked_sources VALUES(?1,?2,?3)",
+                params![sid, dataset, id],
+            ))?;
+            db(conn.execute(
+                "UPDATE recap_revocation_budgets SET entries=entries+?2 WHERE owner=?1",
+                params![sid, inserted as i64],
+            ))?;
+            let exact: i64 = db(conn.query_row(
+                "SELECT COUNT(*) FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2",
+                params![sid, dataset],
+                |row| row.get(0),
+            ))?;
+            if exact >= EXACT_SOURCE_REVOCATIONS {
+                // Original services understand exact rows only. Commit the
+                // schema fence with compaction so a rollback cannot reopen
+                // the ledger and silently ignore the conservative range.
+                db(conn.execute("UPDATE broker_metadata SET value=2 WHERE key='schema'", []))?;
+                let (first,last): (i64,i64) = db(conn.query_row("SELECT MIN(screenshot_id),MAX(screenshot_id) FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2", params![sid,dataset], |row| Ok((row.get(0)?,row.get(1)?))))?;
+                let existed: bool = db(conn.query_row("SELECT EXISTS(SELECT 1 FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2)", params![sid,dataset], |row|row.get(0)))?;
+                db(conn.execute("INSERT INTO recap_revoked_ranges VALUES(?1,?2,?3,?4) ON CONFLICT(owner,dataset) DO UPDATE SET first_id=MIN(first_id,excluded.first_id),last_id=MAX(last_id,excluded.last_id)", params![sid,dataset,first,last]))?;
+                let removed = db(conn.execute(
+                    "DELETE FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2",
+                    params![sid, dataset],
+                ))?;
+                db(conn.execute(
+                    "UPDATE recap_revocation_budgets SET entries=entries-?2+?3 WHERE owner=?1",
+                    params![sid, removed as i64, i64::from(!existed)],
+                ))?;
+                // Compaction may close small gaps too. Retire existing recap
+                // contexts in the broader range; other task consumers remain live.
+                db(conn.execute("UPDATE recap_objects SET state='retired',key_blob=NULL WHERE owner=?1 AND dataset=?2
+                    AND id IN (SELECT object_id FROM recap_sources WHERE screenshot_id BETWEEN
+                        (SELECT first_id FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2) AND
+                        (SELECT last_id FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2))", params![sid,dataset]))?;
+            }
+        }
         db(conn.execute(
             "UPDATE recap_objects SET state='retired',key_blob=NULL WHERE owner=?1 AND dataset=?2
             AND id IN (SELECT object_id FROM recap_sources WHERE screenshot_id=?3)",

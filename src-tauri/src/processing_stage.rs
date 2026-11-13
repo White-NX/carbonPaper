@@ -1177,7 +1177,7 @@ impl ProcessingStaging {
         if self.initialized() {
             self.with_store(|s| {
                 s.connection
-                    .execute_batch("DELETE FROM staged_inputs; DELETE FROM recap_objects;")
+                    .execute_batch("DELETE FROM staged_inputs; DELETE FROM recap_objects; PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             })?;
@@ -1321,6 +1321,7 @@ impl ProcessingStaging {
 
     pub fn reconcile(&self, storage: &StorageState) -> Result<u64, String> {
         if !self.available() {
+            self.reclaim_local_pages()?;
             return Ok(0);
         }
         let mut processed = 0u64;
@@ -1491,14 +1492,27 @@ impl ProcessingStaging {
         self.with_store(|s| {
             s.connection.execute("UPDATE staged_work SET state='pending',lease_id=NULL WHERE state='processing' AND deadline<=?1",[protocol::now_secs()]).map_err(|e|e.to_string())?;
             s.connection.execute("DELETE FROM staged_inputs WHERE state='retired' AND expires<?1",[protocol::now_secs()-60*protocol::DAY_SECS]).map_err(|e|e.to_string())?;
-            // Each incremental-vacuum result advances one page. execute_batch
-            // steps only once, so drain the results to honor the page budget.
-            let mut vacuum = s.connection.prepare("PRAGMA incremental_vacuum(256)").map_err(|e|e.to_string())?;
-            let mut rows = vacuum.query([]).map_err(|e|e.to_string())?;
-            while rows.next().map_err(|e|e.to_string())?.is_some() {}
             Ok(())
         })?;
+        self.reclaim_local_pages()?;
         Ok(processed)
+    }
+
+    fn reclaim_local_pages(&self) -> Result<(), String> {
+        if !self.initialized() {
+            return Ok(());
+        }
+        self.with_store(|store| {
+            let mut vacuum = store
+                .connection
+                .prepare("PRAGMA incremental_vacuum(256)")
+                .map_err(|e| e.to_string())?;
+            let mut rows = vacuum.query([]).map_err(|e| e.to_string())?;
+            // This local page budget runs even while a service is unavailable;
+            // it never changes a live input or depends on a broker grant.
+            while rows.next().map_err(|e| e.to_string())?.is_some() {}
+            Ok(())
+        })
     }
 }
 

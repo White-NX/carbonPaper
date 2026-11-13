@@ -9,10 +9,12 @@ const manifest = path.join(root, 'src-tauri', 'app-bound', 'Cargo.toml');
 const serviceTest = 'windows::install::tests::existing_service_repair_reapplies_restart_policy';
 const updaterTest = 'windows::update::tests::elevated_update_rejects_corruption_and_preserves_protected_acls';
 const coordinatorTest = 'windows::update::process::tests::elevated_coordinator_keeps_parent_and_runs_with_restricted_permissions';
+const revocationTest = 'windows::revocation::tests::restricted_client_can_append_but_cannot_read_overwrite_or_erase_revocations';
 const requiredTests = [
   serviceTest,
   updaterTest,
   coordinatorTest,
+  revocationTest,
   'windows::transport::tests::delayed_fragmented_reply_is_read_in_full',
   'windows::transport::tests::empty_connected_pipe_waits_until_deadline',
   'windows::service::native_tests::native_policy_round_trip_uses_client_and_server',
@@ -89,7 +91,7 @@ async function main() {
       run(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         path.join(root, 'scripts', 'check-app-bound-service.ps1'),
         '-TestBinary', executable, '-OutputDirectory', reportDirectory]);
-      for (const [prefix, test] of [['service', serviceTest], ['updater', updaterTest], ['coordinator', coordinatorTest]]) {
+      for (const [prefix, test] of [['service', serviceTest], ['updater', updaterTest], ['coordinator', coordinatorTest], ['revocation', revocationTest]]) {
         const result = JSON.parse(readFileSync(path.join(reportDirectory, `${prefix}-result.json`), 'utf8').replace(/^\uFEFF/, ''));
         if (result.exit_code !== 0 || result.tests_passed !== 1 || result.test !== test) {
           throw new Error(`The administrator ${prefix} regression did not complete successfully`);

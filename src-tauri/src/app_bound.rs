@@ -43,6 +43,57 @@ pub(crate) fn supported_build() -> bool {
     !cfg!(debug_assertions) || cfg!(feature = "app-bound-dev")
 }
 
+/// Package uninstall runs before the desktop or delegation starts. The helper
+/// validates this signed caller again after elevation and removes only its SID.
+pub fn uninstall_for_package() -> Result<(), String> {
+    if !supported_build() {
+        return Ok(());
+    }
+    let root = identity::protected_root().map_err(|e| e.to_string())?;
+    if !root.exists() {
+        return Ok(());
+    }
+    let sid = identity::current_sid().map_err(|e| e.to_string())?;
+    let needs_removal = [
+        root.join("Activations").join(format!("{sid}.json")),
+        root.join("Detached").join(format!("{sid}.json")),
+        root.join("System/activation.pending.json"),
+    ]
+    .into_iter()
+    .map(|path| path.try_exists().map_err(|error| error.to_string()))
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .any(|exists| exists);
+    if !needs_removal {
+        return Ok(());
+    }
+    let directory = executable_directory()?;
+    let (release, _) = manifest::read_manifest(&directory).map_err(|e| e.to_string())?;
+    let helper = directory.join("carbonpaper-protected-setup.exe");
+    let mut locked = identity::locked_file(&helper).map_err(|e| e.to_string())?;
+    identity::verify_file(
+        &mut locked,
+        release
+            .files
+            .get("carbonpaper-protected-setup.exe")
+            .ok_or("Installer is missing")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let status = runas::Command::new(&helper)
+        .arg("--uninstall")
+        .arg("--remove-runtime")
+        .arg("--caller-pid")
+        .arg(std::process::id().to_string())
+        .gui(true)
+        .show(false)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("APP_BOUND_UNINSTALL_FAILED".into());
+    }
+    Ok(())
+}
+
 fn installation_source() -> Result<PathBuf, String> {
     #[cfg(feature = "app-bound-dev")]
     return carbonpaper_app_bound::development::package_directory().map_err(|e| e.to_string());
@@ -614,7 +665,11 @@ pub async fn app_bound_uninstall(
         if !status.success() {
             return Err("APP_BOUND_INSTALL_FAILED".into());
         }
-        storage.processing_stage.discard_revoked_inputs()?;
+        if let Err(error) = storage.processing_stage.discard_revoked_inputs() {
+            tracing::warn!(
+                "[APP_BOUND] Local staging cleanup deferred after component removal: {error}"
+            );
+        }
         let _ = storage.processing_stage.refresh();
         Ok(())
     })

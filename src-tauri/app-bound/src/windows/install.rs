@@ -117,6 +117,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         root.join("System"),
         root.join("Runtime"),
         root.join("Activations"),
+        root.join("Detached"),
     ] {
         ensure_directory(&path, true)?;
     }
@@ -169,6 +170,8 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     }
     let activation_path = root.join("Activations").join(format!("{sid}.json"));
     let old_activation = read_optional(&activation_path, 1024)?;
+    let detached_path = root.join("Detached").join(format!("{sid}.json"));
+    let old_detached = read_optional(&detached_path, 1024)?;
     let service_path = root.join("System").join("carbonpaper-key-service.exe");
     let setup_path = root.join("System").join("carbonpaper-protected-setup.exe");
     let service_registration = root.join("System").join("runtime.json");
@@ -235,6 +238,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     )?;
     let result = (|| {
         stop_service()?;
+        ledger.enable_reclamation()?;
         if replace_service {
             copy_trusted(
                 &destination.join("carbonpaper-key-service.exe"),
@@ -259,6 +263,9 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         })
         .map_err(|_| BrokerError::Storage)?;
         atomic_write(&activation_path, &activation)?;
+        if detached_path.exists() {
+            fs::remove_file(&detached_path).map_err(|_| BrokerError::Storage)?;
+        }
         start_service()?;
         Ok(())
     })();
@@ -267,13 +274,25 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         let _ = stop_service();
         let mut restored = ledger.restore_registration(&sid, previous).is_ok();
         restored &= restore_optional(&activation_path, old_activation.as_deref()).is_ok();
-        restored &=
-            restore_optional(&service_registration, old_service_registration.as_deref()).is_ok();
-        if let Some(backup) = &old_service {
-            restored &= copy_trusted(backup, &service_path).is_ok();
-        }
-        if let Some(backup) = &old_setup {
-            restored &= copy_trusted(backup, &setup_path).is_ok();
+        restored &= restore_optional(&detached_path, old_detached.as_deref()).is_ok();
+        if ledger.requires_current_service().unwrap_or(true) {
+            // Another owner may have compacted revocations while the new
+            // service was starting. Never restore a service that cannot read
+            // that committed authority. Reconcile the installed signed service
+            // and its companion while projecting the restored registrations.
+            if restored {
+                restored = super::activation::reconcile(&root, &ledger).is_ok();
+            }
+        } else {
+            restored &=
+                restore_optional(&service_registration, old_service_registration.as_deref())
+                    .is_ok();
+            if let Some(backup) = &old_service {
+                restored &= copy_trusted(backup, &service_path).is_ok();
+            }
+            if let Some(backup) = &old_setup {
+                restored &= copy_trusted(backup, &setup_path).is_ok();
+            }
         }
         if restored {
             let _ = super::activation::finish(&root);
@@ -290,6 +309,14 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     super::activation::finish(&root)?;
     for backup in [old_service, old_setup].into_iter().flatten() {
         let _ = fs::remove_file(backup);
+    }
+    if let Err(error) = super::collection::schedule_after(&root, options.caller_pid) {
+        super::diagnostics::event(
+            "warn",
+            "runtime_collection_deferred",
+            "install",
+            Some(error),
+        );
     }
     Ok(destination)
 }
@@ -480,14 +507,28 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub(super) fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
     assert_protected(source)?;
-    let temporary = target.with_extension(format!("tmp-{}", &random_id()[..16]));
+    copy_locked(&mut locked_file(source)?, target)
+}
+
+pub(super) fn copy_verified(source: &Path, target: &Path, expected: &str) -> Result<()> {
     let mut input = locked_file(source)?;
+    verify_file(&mut input, expected)?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| BrokerError::Storage)?;
+    copy_locked(&mut input, target)?;
+    assert_protected(target)?;
+    verify_file(&mut locked_file(target)?, expected)
+}
+
+fn copy_locked(input: &mut fs::File, target: &Path) -> Result<()> {
+    let temporary = target.with_extension(format!("tmp-{}", &random_id()[..16]));
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(|_| BrokerError::Storage)?;
-    std::io::copy(&mut input, &mut output).map_err(|_| BrokerError::Storage)?;
+    std::io::copy(input, &mut output).map_err(|_| BrokerError::Storage)?;
     output.sync_all().map_err(|_| BrokerError::Storage)?;
     drop(output);
     replace(&temporary, target)
@@ -677,12 +718,24 @@ fn start_service() -> Result<()> {
 }
 
 pub fn uninstall(caller_pid: u32) -> Result<()> {
+    uninstall_owner(caller_pid, false)
+}
+
+pub fn uninstall_owner(caller_pid: u32, remove_runtime: bool) -> Result<()> {
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
-    let caller = verify_main(inspect_process(caller_pid)?)?;
+    let caller = verify_uninstall_caller(caller_pid)?;
     let root = protected_root()?;
     let state = state_root()?;
+    if !root.try_exists().map_err(|_| BrokerError::Storage)?
+        || !state
+            .join("keys.db")
+            .try_exists()
+            .map_err(|_| BrokerError::Storage)?
+    {
+        return Ok(());
+    }
     assert_protected(&root)?;
     assert_protected(&state)?;
     let _lock = fs::OpenOptions::new()
@@ -693,14 +746,88 @@ pub fn uninstall(caller_pid: u32) -> Result<()> {
         .share_mode(0)
         .open(root.join("System/setup.lock"))
         .map_err(|_| BrokerError::Busy)?;
-    stop_service()?;
-    let mut ledger = Ledger::open(&state.join("keys.db"))?;
-    ledger.unregister_owner(&caller.principal.sid)?;
+    if !state
+        .join("keys.db")
+        .try_exists()
+        .map_err(|_| BrokerError::Storage)?
+    {
+        return Ok(());
+    }
+    let mut ledger = Ledger::open_existing(&state.join("keys.db"))?;
     let activation = root
         .join("Activations")
         .join(format!("{}.json", caller.principal.sid));
+    let detached_root = root.join("Detached");
+    let detached = detached_root.join(format!("{}.json", caller.principal.sid));
+    let registered = ledger.registered_runtime(&caller.principal.sid)?;
+    let pending = super::activation::read_pending(&root)?;
+    if registered.is_none()
+        && !activation.try_exists().map_err(|_| BrokerError::Storage)?
+        && (!remove_runtime || !detached.try_exists().map_err(|_| BrokerError::Storage)?)
+        && pending
+            .as_ref()
+            .is_none_or(|pending| pending.sid != caller.principal.sid)
+    {
+        // Other users may own the machine-wide service. Repeated removal of
+        // this user's package does not stop it or create new empty authority.
+        if remove_runtime && ledger.registered_owners()? == 0 {
+            if let Err(error) = super::collection::schedule_after(&root, caller_pid) {
+                super::diagnostics::event(
+                    "warn",
+                    "runtime_collection_deferred",
+                    "uninstall",
+                    Some(error),
+                );
+            }
+        }
+        return Ok(());
+    }
+    stop_service()?;
+    // Recover a prior interrupted registration before replacing its fence with
+    // removal. The installed service may already differ from its old marker.
+    super::activation::reconcile(&root, &ledger)?;
+    ledger.enable_reclamation()?;
+    let service_marker = root.join("System/runtime.json");
+    assert_protected(&service_marker)?;
+    let system: Activation =
+        serde_json::from_slice(&manifest::read_bounded(&service_marker, 1024)?)
+            .map_err(|_| BrokerError::Integrity)?;
+    let runtime_id = registered
+        .clone()
+        .unwrap_or_else(|| caller.principal.runtime_id.clone());
+    super::activation::begin(
+        &root,
+        &super::activation::PendingActivation {
+            sid: caller.principal.sid.clone(),
+            runtime_id,
+            system_runtime_id: system.runtime_id,
+        },
+    )?;
+    ensure_directory(&detached_root, true)?;
+    if remove_runtime {
+        if detached.exists() {
+            fs::remove_file(&detached).map_err(|_| BrokerError::Storage)?;
+        }
+    } else if let Some(runtime_id) = registered {
+        // Component removal leaves the application's current binaries and
+        // native-messaging path available. Keep at most one detached copy per SID.
+        atomic_write(
+            &detached,
+            &serde_json::to_vec(&Activation { runtime_id }).map_err(|_| BrokerError::Storage)?,
+        )?;
+    }
+    ledger.unregister_owner(&caller.principal.sid)?;
     if activation.exists() {
         fs::remove_file(activation).map_err(|_| BrokerError::Storage)?;
+    }
+    super::activation::finish(&root)?;
+    if let Err(error) = super::revocation::remove(&state, &caller.principal.sid) {
+        super::diagnostics::event(
+            "warn",
+            "revocation_cleanup_deferred",
+            "uninstall",
+            Some(error),
+        );
     }
     if ledger.registered_owners()? == 0 {
         if let Some(handle) = service::try_open_service(0x0001_0000)? {
@@ -711,9 +838,53 @@ pub fn uninstall(caller_pid: u32) -> Result<()> {
     } else {
         start_service()?;
     }
-    // Runtime files may still be mapped by this user's application. They are
-    // retained for safe removal after exit; no user archive paths are touched.
+    // Cleanup uses a verified private helper in System and waits for the caller
+    // to exit, so current executable locks cannot strand every old release.
+    if let Err(error) = super::collection::schedule_after(&root, caller_pid) {
+        super::diagnostics::event(
+            "warn",
+            "runtime_collection_deferred",
+            "uninstall",
+            Some(error),
+        );
+    }
     Ok(())
+}
+
+fn verify_uninstall_caller(pid: u32) -> Result<VerifiedCaller> {
+    if let Ok(caller) = verify_main(inspect_process(pid)?) {
+        return Ok(caller);
+    }
+    #[cfg(feature = "development-runtime")]
+    return Err(BrokerError::AccessDenied);
+    #[cfg(not(feature = "development-runtime"))]
+    {
+        let mut process = inspect_process(pid)?;
+        if process
+            .image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.eq_ignore_ascii_case("carbonpaper.exe"))
+        {
+            return Err(BrokerError::AccessDenied);
+        }
+        let directory = process.image.parent().ok_or(BrokerError::Integrity)?;
+        let (release, id) = manifest::read_manifest(directory)?;
+        let mut image = locked_file(&process.image)?;
+        verify_file(
+            &mut image,
+            release
+                .files
+                .get("carbonpaper.exe")
+                .ok_or(BrokerError::Integrity)?,
+        )?;
+        process.principal.runtime_id = id;
+        Ok(VerifiedCaller::new(process, image))
+    }
+}
+
+pub fn collect_after(pid: u32) -> Result<()> {
+    super::collection::run_after(pid)
 }
 
 fn remove_runtime_tree(root: &Path, target: &Path) -> Result<()> {

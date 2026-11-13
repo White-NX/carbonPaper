@@ -546,6 +546,20 @@ fn offline_deletion_commits_and_revokes_even_if_the_archive_queue_is_restored() 
     broker.online.store(false, Ordering::SeqCst);
     assert!(storage.delete_screenshot(1).unwrap());
     assert!(!storage.staged_screenshot_active(1).unwrap());
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM app_bound_revocations", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
     // An archive/queue rollback cannot remove the protected inbox obligation.
     sql(
         storage,
@@ -1050,6 +1064,45 @@ fn task_dpapi_failures_survive_restart_then_release_only_the_affected_consumer_t
     assert!(storage
         .processing_stage
         .claim_screenshot(storage, Consumer::Classification, 2)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn offline_staging_reclaims_free_pages_without_discarding_live_task_inputs() {
+    let mut fixture = fixture();
+    let (directory, storage, broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    let path = directory.join(STAGING_FILE);
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TABLE collection_fixture(payload BLOB); INSERT INTO collection_fixture VALUES(zeroblob(4*1024*1024)); DELETE FROM collection_fixture;").unwrap();
+    let free_before: i64 = connection
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap();
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    broker.online.store(false, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap_err();
+    storage.processing_stage.reconcile(storage).unwrap();
+    let free_after: i64 = connection
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap();
+    assert!(free_before - free_after >= 256);
+    assert!(std::fs::metadata(&path).unwrap().len() < size_before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM staged_inputs WHERE state='active' AND payload IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    broker.online.store(true, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap();
+    assert!(storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_some());
 }

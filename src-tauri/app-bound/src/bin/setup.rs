@@ -41,10 +41,21 @@ fn run() -> carbonpaper_app_bound::Result<()> {
                 .map_err(|_| BrokerError::InvalidRequest)?,
         );
     }
+    if launch_args.first().is_some_and(|s| s == "--collect-after") {
+        if launch_args.len() != 2 {
+            return Err(BrokerError::InvalidRequest);
+        }
+        return install::collect_after(
+            launch_args[1]
+                .parse()
+                .map_err(|_| BrokerError::InvalidRequest)?,
+        );
+    }
     let mut source = None;
     let mut pid = None;
     let mut enable = false;
     let mut uninstall = false;
+    let mut remove_runtime = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -63,6 +74,7 @@ fn run() -> carbonpaper_app_bound::Result<()> {
             }
             "--enable" if !enable => enable = true,
             "--uninstall" if !uninstall => uninstall = true,
+            "--remove-runtime" if !remove_runtime => remove_runtime = true,
             _ => return Err(BrokerError::InvalidRequest),
         }
     }
@@ -71,8 +83,11 @@ fn run() -> carbonpaper_app_bound::Result<()> {
         if source.is_some() || enable {
             return Err(BrokerError::InvalidRequest);
         }
-        install::uninstall(caller_pid)
+        install::uninstall_owner(caller_pid, remove_runtime)
     } else {
+        if remove_runtime {
+            return Err(BrokerError::InvalidRequest);
+        }
         install::install(InstallOptions {
             source: source.ok_or(BrokerError::InvalidRequest)?,
             caller_pid,

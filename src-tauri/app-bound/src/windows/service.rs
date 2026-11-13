@@ -126,6 +126,9 @@ pub fn try_open_service(access: u32) -> Result<Option<ServiceHandle>> {
         match OpenServiceW(manager.0, PCWSTR(name.as_ptr()), access) {
             Ok(handle) => Ok(Some(ServiceHandle(handle))),
             Err(error) if error.code() == windows::core::HRESULT::from_win32(1060) => Ok(None),
+            Err(error) if error.code() == windows::core::HRESULT::from_win32(1072) => {
+                Err(BrokerError::Busy)
+            }
             Err(_) => Err(BrokerError::AccessDenied),
         }
     }
@@ -262,6 +265,9 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
                 );
             }
             super::revocation::drain_all(&directory, &mut opened)?;
+            if super::collection::retire_unused_service(&identity::protected_root()?, &opened)? {
+                return Ok(());
+            }
             opened
         };
         let ledger = Arc::new(LedgerLock::new(opened));
@@ -502,7 +508,19 @@ async fn maintenance_loop(ledger: Arc<LedgerLock>) -> Result<()> {
             |ledger| {
                 #[cfg(not(test))]
                 super::revocation::drain_all(&identity::state_root()?, ledger)?;
-                ledger.maintenance(now_secs())
+                ledger.maintenance(now_secs())?;
+                #[cfg(not(test))]
+                if let Err(error) =
+                    super::collection::maintenance(&identity::protected_root()?, ledger)
+                {
+                    diagnostics::event(
+                        "warn",
+                        "runtime_collection_deferred",
+                        "maintenance",
+                        Some(error),
+                    );
+                }
+                Ok(())
             },
             None,
             None,

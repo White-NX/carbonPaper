@@ -145,6 +145,49 @@ pub fn drain_all(root: &Path, ledger: &mut Ledger) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn remove(root: &Path, sid: &str) -> Result<()> {
+    let target = path(root, sid)?;
+    if target.exists() {
+        identity::assert_revocation_inbox(&target, sid)?;
+        std::fs::remove_file(target).map_err(|_| BrokerError::Busy)?;
+    }
+    Ok(())
+}
+
+pub(super) fn collect_unregistered(root: &Path, ledger: &Ledger) -> Result<()> {
+    let directory = root.join(DIRECTORY);
+    if !directory.try_exists().map_err(|_| BrokerError::Storage)? {
+        return Ok(());
+    }
+    identity::assert_protected(root)?;
+    identity::assert_protected(&directory)?;
+    let owners: std::collections::BTreeSet<_> =
+        ledger.registered_owner_sids()?.into_iter().collect();
+    for entry in std::fs::read_dir(&directory).map_err(|_| BrokerError::Storage)? {
+        let target = entry.map_err(|_| BrokerError::Storage)?.path();
+        if target
+            .extension()
+            .is_none_or(|extension| extension != "log")
+        {
+            continue;
+        }
+        let sid = target
+            .file_stem()
+            .and_then(|sid| sid.to_str())
+            .ok_or(BrokerError::Integrity)?;
+        if !identity::safe_sid(sid) || owners.contains(sid) {
+            continue;
+        }
+        // Inbox append rights are intentional. Validate their dedicated ACL,
+        // rather than treating an owner's append permission as unsafe writes.
+        match remove(root, sid) {
+            Ok(()) | Err(BrokerError::Busy) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

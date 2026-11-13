@@ -109,6 +109,9 @@ test('NSIS packages a fresh signature after Tauri patches the executable and abo
   const script = path.join(compilerDirectory, 'installer.nsi');
   writeFileSync(script, [
     'Unicode true',
+    '!include "LogicLib.nsh"',
+    'Var UpdateMode',
+    'Var DeleteAppDataCheckboxState',
     `!include "${path.join(f.root, 'src-tauri', 'nsis_hooks.nsh')}"`,
     'Name "Protected runtime regression"',
     `OutFile "${installer}"`,
@@ -118,6 +121,9 @@ test('NSIS packages a fresh signature after Tauri patches the executable and abo
     'SetOutPath $INSTDIR',
     ...binaries.map(name => `File "${path.join(f.release, name)}"`),
     `File /r "${f.prebundle}\\*"`,
+    'SectionEnd',
+    'Section "Uninstall"',
+    '!insertmacro NSIS_HOOK_PREUNINSTALL',
     'SectionEnd',
     '',
   ].join('\n'));

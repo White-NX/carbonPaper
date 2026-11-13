@@ -49,9 +49,17 @@ impl Ledger {
         Self::from_connection(db(Connection::open(path))?)
     }
 
+    /// Teardown must never recreate a database removed by another collector.
+    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+        Self::from_connection(db(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ))?)
+    }
+
     fn from_connection(conn: Connection) -> Result<Self> {
         db(conn.busy_timeout(std::time::Duration::from_secs(3)))?;
-        db(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE;
+        db(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA auto_vacuum=INCREMENTAL;
             PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS broker_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
             INSERT OR IGNORE INTO broker_metadata VALUES ('schema', 1);
@@ -84,12 +92,22 @@ impl Ledger {
             [],
             |r| r.get(0),
         ))?;
-        if schema != 1 {
+        if !matches!(schema, 1 | 2) {
             return Err(BrokerError::VersionMismatch);
         }
         Self::init_recap(&conn)?;
         Self::init_storage_keys(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Compacted revocations cannot be interpreted by the original service.
+    /// Keep this fence after owner removal, just like retained key authority.
+    pub(crate) fn requires_current_service(&self) -> Result<bool> {
+        db(self.conn.query_row(
+            "SELECT value>=2 FROM broker_metadata WHERE key='schema'",
+            [],
+            |row| row.get(0),
+        ))
     }
 
     /// Installer-only: caller SID is obtained from the unelevated requesting
@@ -118,6 +136,8 @@ impl Ledger {
         let tx = db(self.conn.transaction())?;
         db(tx.execute("DELETE FROM recap_objects WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM recap_revoked_sources WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revoked_ranges WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revocation_budgets WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM tasks WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_keys WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_public_keys WHERE owner=?1", [sid]))?;
@@ -730,7 +750,34 @@ impl Ledger {
                 },
             )?;
         }
-        db(tx.commit())
+        db(tx.commit())?;
+        // Drain the pragma's result rows: stepping only once reclaims one page,
+        // regardless of the requested budget. Immutable grant pins stay intact.
+        let mut vacuum = db(self.conn.prepare("PRAGMA incremental_vacuum(256)"))?;
+        let mut rows = db(vacuum.query([]))?;
+        while db(rows.next())?.is_some() {}
+        Ok(())
+    }
+
+    /// Elevated install/uninstall runs this after stopping the service. Existing
+    /// databases need one VACUUM to enable future paced incremental reclamation.
+    pub fn enable_reclamation(&self) -> Result<()> {
+        let mode: i64 = db(self
+            .conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0)))?;
+        if mode == 0 {
+            db(self
+                .conn
+                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"))?;
+        }
+        Ok(())
+    }
+
+    pub fn compact_if_empty(&self) -> Result<()> {
+        if self.registered_owners()? == 0 {
+            db(self.conn.execute_batch("VACUUM"))?;
+        }
+        Ok(())
     }
 
     fn make_room(conn: &Connection, sid: &str, incoming: u64, capacity: u64) -> Result<()> {
@@ -894,6 +941,86 @@ mod tests {
             )
             .unwrap();
         (ledger, who, dataset)
+    }
+
+    #[test]
+    fn cleanup_cannot_recreate_a_removed_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        let ledger = Ledger::open(&path).unwrap();
+        drop(ledger);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            Ledger::open_existing(&path),
+            Err(BrokerError::Storage)
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn maintenance_reclaims_file_pages_without_deleting_live_grants_or_retained_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        // Exercise an older database without pointer-map pages too.
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE previous_layout(value BLOB); INSERT INTO previous_layout VALUES(zeroblob(1024));").unwrap();
+        drop(connection);
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger.enable_reclamation().unwrap();
+        assert_eq!(
+            ledger
+                .conn
+                .pragma_query_value(None, "auto_vacuum", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let who = Principal {
+            sid: "test-user".into(),
+            runtime_id: "test-release".into(),
+            process_identity: "10:100".into(),
+        };
+        ledger
+            .register_owner(&who.sid, &who.runtime_id, true)
+            .unwrap();
+        let dataset = random_id();
+        ledger
+            .handle(
+                &who,
+                Request::AttachDataset {
+                    dataset_id: dataset.clone(),
+                },
+                100,
+                &TestProtection,
+            )
+            .unwrap();
+        let task = prepare(&mut ledger, &who, &dataset, 1, Consumer::MiniLm.bit());
+        ledger.conn.execute_batch("CREATE TABLE reclamation_fixture(payload BLOB); INSERT INTO reclamation_fixture VALUES(zeroblob(4*1024*1024)); DELETE FROM reclamation_fixture;").unwrap();
+        let free_before = ledger
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        assert!(free_before > 256);
+        ledger.maintenance(102).unwrap();
+        let free_after = ledger
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(free_before - free_after >= 256);
+        assert!(std::fs::metadata(&path).unwrap().len() < size_before);
+        assert!(acquire(&mut ledger, &who, &task.task.task_id, Consumer::MiniLm, 103).is_ok());
+        ledger.maintenance(100 + 100 * DAY_SECS).unwrap();
+        assert_eq!(
+            acquire(
+                &mut ledger,
+                &who,
+                &task.task.task_id,
+                Consumer::MiniLm,
+                100 + 100 * DAY_SECS
+            )
+            .unwrap_err(),
+            BrokerError::Retired
+        );
     }
     pub(super) fn prepare(
         ledger: &mut Ledger,
