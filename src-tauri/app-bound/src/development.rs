@@ -252,6 +252,7 @@ pub fn install_package(source: &Path, enable: bool) -> std::result::Result<PathB
             .ok_or("Installer is missing")?,
     )
     .map_err(|e| e.to_string())?;
+    crate::privileged::verify_loader_policy(&mut locked).map_err(|e| e.to_string())?;
     let mut command = runas::Command::new(&setup);
     command
         .arg("--source")

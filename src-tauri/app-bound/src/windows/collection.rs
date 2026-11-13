@@ -634,10 +634,11 @@ fn collect_after_exit_pass(root: &Path, state: &Path) -> Result<bool> {
     if empty {
         // The authoritative owner count is checked under the installation lock.
         // Finish an interrupted service removal without racing a reinstall.
-        install::stop_service()?;
+        let mut maintenance = install::ServiceMaintenance::stop()?;
         if let Some(handle) = service::try_open_service(0x0001_0000)? {
             unsafe { windows::Win32::System::Services::DeleteService(handle.0) }
                 .map_err(|_| BrokerError::AccessDenied)?;
+            maintenance.commit();
             return Ok(false);
         }
     }

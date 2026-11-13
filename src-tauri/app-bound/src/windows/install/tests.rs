@@ -98,6 +98,39 @@ fn existing_service_repair_reapplies_restart_policy() {
         })
         .unwrap();
 
+    // Retain an ordinary client's START handle before maintenance changes SCM
+    // configuration. Revoking its ACL afterward would not revoke that handle.
+    {
+        let cached_client = context
+            .with_permissions(|| fixture.open(SERVICE_START | SERVICE_QUERY_STATUS).unwrap())
+            .unwrap();
+        let handle = fixture.open(MAINTENANCE_ACCESS).unwrap();
+        set_service_start_type(&handle, SERVICE_DEMAND_START).unwrap();
+        {
+            let mut maintenance = ServiceMaintenance::from_handle(handle).unwrap();
+            maintenance.pause().unwrap();
+            configure_named_service_with_start_type(
+                &missing_executable,
+                &fixture.name,
+                &fixture.name,
+                SERVICE_DISABLED,
+            )
+            .unwrap();
+            context
+                .with_permissions(|| {
+                    // SAFETY: this is the fixture's retained ordinary START handle;
+                    // the executable does not exist and can never execute code.
+                    let error = unsafe { StartServiceW(cached_client.0, None) }.unwrap_err();
+                    assert_eq!(error.code(), windows::core::HRESULT::from_win32(1058));
+                })
+                .unwrap();
+            assert_eq!(maintenance.start(), Err(BrokerError::Unavailable));
+        }
+        let restored = fixture.open(SERVICE_QUERY_CONFIG).unwrap();
+        assert_eq!(service_start_type(&restored).unwrap(), SERVICE_DEMAND_START);
+    }
+    configure_named_service(&missing_executable, &fixture.name, &fixture.name).unwrap();
+
     {
         let service = fixture
             .open(SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)

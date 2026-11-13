@@ -265,3 +265,41 @@ fn broker_status_distinguishes_recovery_from_disabled_policy_and_registration_da
     assert_eq!(status_reason(Some("disabled")), Some("disabled"));
     assert_eq!(status_reason(None), None);
 }
+
+#[test]
+fn component_repair_requires_restart_for_a_quarantined_client_and_preserves_the_latch() {
+    use carbonpaper_app_bound::protocol::BrokerError;
+    let staging = crate::processing_stage::ProcessingStaging::new();
+    staging.quarantine_broker(BrokerError::Integrity);
+    assert!(repaired_client_restart_required(&staging, false).unwrap());
+    assert!(staging.broker_quarantined());
+    assert!(!staging.available());
+    assert_eq!(
+        staging.refresh().unwrap_err(),
+        BrokerError::Integrity.to_string()
+    );
+}
+
+#[test]
+fn component_repair_cannot_report_success_when_client_refresh_fails() {
+    use carbonpaper_app_bound::protocol::{BrokerError, Request, Response};
+    struct UnavailableBroker;
+    impl crate::processing_stage::Broker for UnavailableBroker {
+        fn installed(&self) -> carbonpaper_app_bound::Result<bool> {
+            Ok(true)
+        }
+        fn supported(&self) -> bool {
+            true
+        }
+        fn call(&self, _: Request) -> carbonpaper_app_bound::Result<Response> {
+            Err(BrokerError::Unavailable)
+        }
+    }
+    let staging =
+        crate::processing_stage::ProcessingStaging::with_test_broker(Arc::new(UnavailableBroker));
+    assert_eq!(
+        repaired_client_restart_required(&staging, false),
+        Err("APP_BOUND_REPAIR_SERVICE_UNAVAILABLE".into())
+    );
+    assert!(!staging.available());
+}

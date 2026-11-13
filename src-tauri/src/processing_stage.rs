@@ -383,6 +383,13 @@ impl ProcessingStaging {
         status.reason = Some(error.to_string());
     }
 
+    pub(crate) fn broker_quarantined(&self) -> bool {
+        self.fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     pub fn refresh(&self) -> Result<(), String> {
         if let Some(error) = *self
             .fatal_broker_error

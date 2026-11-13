@@ -826,6 +826,14 @@ fn apply(
     };
     let _execution_locks =
         update::DirectoryLocks::for_execution(&launcher.package.directory).map_err(invalid)?;
+    let mut bootstrap = identity::locked_file(
+        &launcher
+            .package
+            .directory
+            .join("carbonpaper-protected-setup.exe"),
+    )
+    .map_err(invalid)?;
+    carbonpaper_app_bound::privileged::verify_loader_policy(&mut bootstrap).map_err(invalid)?;
     let mut command = runas::Command::new(
         launcher
             .package

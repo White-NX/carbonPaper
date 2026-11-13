@@ -13,7 +13,7 @@ import { packServiceRepair, repairEntries, verifyRepairRelease, verifyServiceRep
 
 const binaries = ['carbonpaper.exe', 'carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe'];
 
-function testPe(importedDll = 'kernel32.dll') {
+function testPe(importedDll = 'kernel32.dll', dependentLoadFlags = 0x800) {
   const bytes = Buffer.alloc(1024);
   bytes.writeUInt16LE(0x5a4d); bytes.writeUInt32LE(0x80, 0x3c);
   bytes.writeUInt32LE(0x4550, 0x80); bytes.writeUInt16LE(0x8664, 0x84);
@@ -22,6 +22,8 @@ function testPe(importedDll = 'kernel32.dll') {
   bytes.writeUInt32LE(0x1000, 0x98 + 120); bytes.writeUInt32LE(40, 0x98 + 124);
   bytes.writeUInt32LE(0x1000, 0x188 + 12); bytes.writeUInt32LE(0x200, 0x188 + 16); bytes.writeUInt32LE(0x200, 0x188 + 20);
   bytes.writeUInt32LE(0x1040, 0x200 + 12); bytes.write(importedDll, 0x240, 'ascii');
+  bytes.writeUInt32LE(0x1080, 0x98 + 112 + 10 * 8); bytes.writeUInt32LE(80, 0x98 + 116 + 10 * 8);
+  bytes.writeUInt32LE(80, 0x280); bytes.writeUInt16LE(dependentLoadFlags, 0x280 + 78);
   return bytes;
 }
 
@@ -237,6 +239,21 @@ test('privileged helper imports reject a private CRT and malformed PE headers', 
   await assert.rejects(signProtectedRuntime(f.root, f.signingKey), /non-system DLL/);
   writeFileSync(helper, Buffer.from('invalid PE'));
   assert.throws(() => verifyPrivilegedImports(helper), /privileged PE/);
+});
+
+test('privileged helpers restrict allowed DLLs to System32 before their entry point', async (t) => {
+  const f = await fixture(t);
+  const helper = path.join(f.prebundle, 'carbonpaper-protected-setup.exe');
+  writeFileSync(helper, testPe('bcrypt.dll'));
+  assert.deepEqual(verifyPrivilegedImports(helper), ['bcrypt.dll']);
+  for (const flags of [0, 0x200, 0xa00]) {
+    writeFileSync(helper, testPe('bcrypt.dll', flags));
+    await assert.rejects(signProtectedRuntime(f.root, f.signingKey), /System32/);
+  }
+  const missing = testPe('bcrypt.dll');
+  missing.writeUInt32LE(0, 0x98 + 112 + 10 * 8);
+  writeFileSync(helper, missing);
+  assert.throws(() => verifyPrivilegedImports(helper), /load config/);
 });
 
 test('service repair packages contain only the signed components and bind their version, size and archive', async (t) => {

@@ -338,6 +338,16 @@ pub(super) fn coordinate(
         return Err(BrokerError::AccessDenied);
     }
     let _parents = verify_destination(destination)?;
+    let mut bootstrap = locked_file(&source.join(HELPER_NAME))?;
+    identity::verify_file(
+        &mut bootstrap,
+        release
+            .manifest
+            .files
+            .get(HELPER_NAME)
+            .ok_or(BrokerError::Integrity)?,
+    )?;
+    crate::privileged::verify_loader_policy(&mut bootstrap)?;
     let id = format!("{:032x}", rand::random::<u128>());
     let mut pipe = create_pipe(&pipe_name(&id)?)?;
     // UAC waits for the user's choice without an application timeout killing

@@ -83,6 +83,8 @@ pub fn uninstall_for_package() -> Result<(), String> {
             .ok_or("Installer is missing")?,
     )
     .map_err(|e| e.to_string())?;
+    carbonpaper_app_bound::privileged::verify_loader_policy(&mut locked)
+        .map_err(|e| e.to_string())?;
     let status = runas::Command::new(&helper)
         .arg("--uninstall")
         .arg("--remove-runtime")
@@ -563,6 +565,8 @@ pub(crate) async fn install_runtime(source: PathBuf, enable: bool) -> Result<(),
                 .ok_or("Installer is missing")?,
         )
         .map_err(|e| e.to_string())?;
+        carbonpaper_app_bound::privileged::verify_loader_policy(&mut executable)
+            .map_err(|e| e.to_string())?;
         let mut command = runas::Command::new(&setup);
         command
             .arg("--source")
@@ -654,6 +658,22 @@ pub async fn app_bound_install(
     schedule_restart(&app)
 }
 
+#[cfg(not(feature = "app-bound-dev"))]
+fn repaired_client_restart_required(
+    staging: &crate::processing_stage::ProcessingStaging,
+    runtime_restart: bool,
+) -> Result<bool, String> {
+    // A component repair does not reauthorize a quarantined client. Resume with
+    // a fresh process, retaining the integrity latch until that process exits.
+    if runtime_restart || staging.broker_quarantined() {
+        return Ok(true);
+    }
+    staging
+        .refresh()
+        .map_err(|_| "APP_BOUND_REPAIR_SERVICE_UNAVAILABLE".to_string())?;
+    Ok(false)
+}
+
 #[tauri::command]
 pub async fn app_bound_repair(
     window: tauri::Window,
@@ -670,16 +690,21 @@ pub async fn app_bound_repair(
     }
     #[cfg(feature = "app-bound-dev")]
     {
-        let _ = (package_path, allow_full_download, storage);
+        let _ = (package_path, allow_full_download);
         install_runtime(installation_source()?, false).await?;
-        schedule_restart(&app)?;
+        if storage.processing_stage.broker_quarantined() {
+            crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
+            app.request_restart();
+        } else {
+            schedule_restart(&app)?;
+        }
         return Ok(repair::RepairOutcome::Repaired {
             restart_required: true,
         });
     }
     #[cfg(not(feature = "app-bound-dev"))]
     {
-        let outcome = tokio::task::spawn_blocking(move || {
+        let mut outcome = tokio::task::spawn_blocking(move || {
             tauri::async_runtime::block_on(repair::run(
                 &window,
                 package_path.map(PathBuf::from),
@@ -688,25 +713,30 @@ pub async fn app_bound_repair(
         })
         .await
         .map_err(|e| e.to_string())??;
-        if let repair::RepairOutcome::Repaired { restart_required } = &outcome {
-            REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Release);
-            REPAIR_OFFER_DISMISSED.store(true, std::sync::atomic::Ordering::Release);
+        if let repair::RepairOutcome::Repaired { restart_required } = &mut outcome {
+            let storage = storage.inner().clone();
+            let runtime_restart = *restart_required;
+            *restart_required = tokio::task::spawn_blocking(move || {
+                let restart =
+                    repaired_client_restart_required(&storage.processing_stage, runtime_restart)?;
+                if !restart {
+                    storage.request_protected_key_publication();
+                }
+                Ok::<_, String>(restart)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
             if *restart_required {
                 schedule_restart(&app)?;
             } else {
-                let storage = storage.inner().clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = storage.processing_stage.refresh();
-                    storage.request_protected_key_publication();
-                })
-                .await
-                .map_err(|e| e.to_string())?;
                 if let Some(scheduler) =
                     app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
                 {
                     scheduler.wake();
                 }
             }
+            REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Release);
+            REPAIR_OFFER_DISMISSED.store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(outcome)
     }
@@ -736,6 +766,8 @@ pub async fn app_bound_uninstall(
                 .ok_or("Installer is missing")?,
         )
         .map_err(|e| e.to_string())?;
+        carbonpaper_app_bound::privileged::verify_loader_policy(&mut locked)
+            .map_err(|e| e.to_string())?;
         let status = runas::Command::new(&helper)
             .arg("--uninstall")
             .arg("--caller-pid")

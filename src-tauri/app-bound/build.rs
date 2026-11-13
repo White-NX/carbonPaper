@@ -1,4 +1,13 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        // Import resolution happens before Rust can change DLL-search policy.
+        // The setup helper may start elevated in a caller-writable directory.
+        for binary in ["carbonpaper-key-service", "carbonpaper-protected-setup"] {
+            println!("cargo:rustc-link-arg-bin={binary}=/DEPENDENTLOADFLAG:0x800");
+        }
+    }
     for name in [
         "CARBONPAPER_APP_BOUND_DEV_INSTANCE",
         "CARBONPAPER_APP_BOUND_DEV_PUBLIC_KEY",

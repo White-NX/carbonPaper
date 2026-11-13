@@ -324,7 +324,7 @@ pub fn repair(options: RepairOptions) -> std::result::Result<PathBuf, RepairErro
             system_runtime_id: service.runtime_id.clone(),
         },
     )?;
-    install::stop_service()?;
+    let mut maintenance = install::ServiceMaintenance::stop()?;
     let repaired: std::result::Result<(), RepairError> = (|| {
         // Refresh inbox permissions while preserving pending retirement records.
         super::revocation::provision(&state, &caller.principal.sid)?;
@@ -364,15 +364,16 @@ pub fn repair(options: RepairOptions) -> std::result::Result<PathBuf, RepairErro
         write_checkpoint(&root, &ledger)?;
         install::configure_service(&root.join("System/carbonpaper-key-service.exe"))?;
         activation::reconcile(&root, &ledger)?;
-        install::start_service()?;
+        maintenance.start()?;
         Ok(())
     })();
     if repaired.is_err() {
         // Keep other owners usable after a failed file replacement. The
         // durable fence remains for the next repair/startup reconciliation.
-        let _ = install::start_service();
+        let _ = maintenance.restart_after_failure();
     }
     repaired?;
+    maintenance.commit();
     Ok(root.join("Runtime").join(&runtime.runtime_id))
 }
 
