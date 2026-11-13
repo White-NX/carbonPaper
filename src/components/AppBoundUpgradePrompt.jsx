@@ -5,10 +5,11 @@ import { useAppBoundOffer } from '../hooks/useAppBoundOffer';
 import { OverlayShell, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
+import AppBoundRepairFeedback from './AppBoundRepairFeedback';
 
 export default function AppBoundUpgradePrompt({ visible }) {
   const { t } = useTranslation();
-  const { wanted, busy, error, mode, later, activate } = useAppBoundOffer(visible, t);
+  const { wanted, busy, error, mode, later, activate, repair } = useAppBoundOffer(visible, t);
   const shown = useOverlaySlot('appBound', wanted);
   if (!shown) return null;
   const upgrade = mode === 'upgrade';
@@ -16,12 +17,15 @@ export default function AppBoundUpgradePrompt({ visible }) {
     <OverlayShell
       icon={ShieldCheck}
       title={t('appBound.title')}
-      subtitle={upgrade ? t('appBound.upgradeSubtitle') : t('appBound.subtitle')}
+      subtitle={upgrade ? t('appBound.upgradeSubtitle') : mode === 'repair' ? t('appBound.repairSubtitle') : t('appBound.subtitle')}
       footer={(
         <>
           <Button size="md" disabled={busy} onClick={later}>
             {t('appBound.later')}
           </Button>
+          {mode === 'repair' && <Button size="md" disabled={busy} onClick={repair.repairFromFile}>
+            {t('appBound.repairFromFile')}
+          </Button>}
           <Button size="md" variant="primary" icon={ShieldCheck} loading={busy} onClick={activate}>
             {busy ? t('appBound.working') : upgrade ? t('appBound.upgrade')
               : mode === 'repair' ? t('appBound.repair') : t('appBound.enable')}
@@ -33,8 +37,9 @@ export default function AppBoundUpgradePrompt({ visible }) {
         {upgrade ? t('appBound.upgradeDescription') : t('appBound.description')}
       </p>
       <Banner tone="info">
-        {upgrade ? t('appBound.upgradeHint') : t('appBound.installHint')}
+        {upgrade ? t('appBound.upgradeHint') : mode === 'repair' ? t('appBound.repairHint') : t('appBound.installHint')}
       </Banner>
+      <AppBoundRepairFeedback repair={repair} ownerOverlay="appBound" />
       {error && <Banner tone="error">{error}</Banner>}
     </OverlayShell>
   );

@@ -314,7 +314,29 @@
     "cancelled": "Cancelled. Your current settings are unchanged.",
     "backgroundDisabled": "Enable background processing first.",
     "packageUnavailable": "This build does not provide this feature. Use an official release package.",
-    "failed": "Unable to complete this operation. Try again or repair the background component."
+    "failed": "Unable to complete this operation. Try again or repair the background component.",
+    "repairFromFile": "Repair from a local package",
+    "repairSubtitle": "Restore background processing",
+    "repairHint": "Check local files first and download a repair package when needed.",
+    "fullRepairTitle": "Download the complete package",
+    "fullRepairDownload": "Restoring the required files needs the complete application package. Download it and repair?",
+    "fullRepairDownloadSize": "Restoring the required files needs the complete application package, approximately {{size}} MB. Download it and repair?",
+    "downloadAndRepair": "Download and repair",
+    "repairNetworkDisabled": "Network features are turned off. You can repair using an official package you have already downloaded.",
+    "repairDownloadFailed": "The repair download failed. Try again or choose an official package you have already downloaded.",
+    "repairPackageInvalid": "This file is not a usable official repair package. Download it again or choose another package.",
+    "repairVersionMismatch": "The repair package does not match the installed version. Choose an official package for that version.",
+    "repairFullRequired": "Restoring these files requires the complete portable package for the installed version.",
+    "repairServiceUnavailable": "The background component is still unavailable. Try again later.",
+    "repairBusy": "The background component is being maintained. Try again later.",
+    "repairProgress": {
+      "checking": "Checking local files",
+      "downloading": "Downloading repair files",
+      "extracting": "Preparing repair files",
+      "installing": "Restoring the background component",
+      "verifying": "Checking the repair",
+      "complete": "Repair complete"
+    }
   },
   "notifications": {
     "ocr_model_repair": {

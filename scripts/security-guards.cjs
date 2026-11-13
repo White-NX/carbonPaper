@@ -37,6 +37,7 @@ const COMMAND_TIERS = {
   'app_bound::app_bound_acknowledge_offer': 'public',
   'app_bound::app_bound_set_policy': 'session_required',
   'app_bound::app_bound_install': 'session_required',
+  'app_bound::app_bound_repair': 'session_required',
   'app_bound::app_bound_uninstall': 'session_required',
   'commands::utility::set_app_language': 'public',
   'commands::utility::set_app_theme': 'public',
@@ -319,6 +320,7 @@ function checkCommandGuardImplementations() {
   "app_bound::app_bound_status",
   "app_bound::app_bound_set_policy",
   "app_bound::app_bound_install",
+  "app_bound::app_bound_repair",
   "app_bound::app_bound_uninstall"
 ];
   for (const command of settingsCommands) {

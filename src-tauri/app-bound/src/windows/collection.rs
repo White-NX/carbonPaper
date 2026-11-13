@@ -81,6 +81,14 @@ fn persistent_references(
         }
     }
     let system = root.join("System/runtime.json");
+    if retain_service {
+        if let Some(id) = ledger.service_runtime()? {
+            if !identity::safe_runtime_id(&id) {
+                return Err(BrokerError::Integrity);
+            }
+            keep.insert(id);
+        }
+    }
     if retain_service && system.exists() {
         add_activation(&system, &mut keep, &validate)?;
     }
@@ -705,6 +713,7 @@ fn finish_full_uninstall(
             "service.previous",
             "setup.previous",
             "runtime.json",
+            "repair-runtime.json",
         ]
         .into_iter()
         .map(|file| root.join("System").join(file)),

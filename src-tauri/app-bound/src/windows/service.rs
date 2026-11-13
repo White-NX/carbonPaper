@@ -253,6 +253,16 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         #[cfg(not(test))]
         let opened = {
             let mut opened = opened;
+            if let Err(error) =
+                super::repair::remember_installed_service(&identity::protected_root()?, &opened)
+            {
+                diagnostics::event(
+                    "warn",
+                    "service_checkpoint_deferred",
+                    "startup",
+                    Some(error),
+                );
+            }
             if let Err(error) = super::activation::reconcile_after_interruption(
                 &identity::protected_root()?,
                 &opened,

@@ -63,6 +63,9 @@ impl Ledger {
             PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS broker_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
             INSERT OR IGNORE INTO broker_metadata VALUES ('schema', 1);
+            CREATE TABLE IF NOT EXISTS installed_service (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), runtime_id TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS owners (
                 sid TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, enabled INTEGER NOT NULL,
                 retention_days INTEGER NOT NULL, capacity_bytes INTEGER NOT NULL,
@@ -208,6 +211,48 @@ impl Ledger {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional())
+    }
+
+    /// One machine-wide, service-owned checkpoint. Readable launch pointers and
+    /// runtime manifests may be repaired without losing this version authority.
+    pub fn service_runtime(&self) -> Result<Option<String>> {
+        db(self
+            .conn
+            .query_row(
+                "SELECT runtime_id FROM installed_service WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional())
+    }
+
+    /// Committed owners also establish a minimum after interrupted installation.
+    /// Removing one never rewinds the independently retained service floor.
+    pub fn required_service_runtime(&self) -> Result<Option<String>> {
+        let mut required = self.service_runtime()?;
+        for sid in self.registered_owner_sids()? {
+            let id = self
+                .registered_runtime(&sid)?
+                .ok_or(BrokerError::Integrity)?;
+            required = crate::repair::newest_runtime(required, Some(id))?;
+        }
+        Ok(required)
+    }
+
+    pub(crate) fn remember_service_runtime(&self, runtime_id: &str) -> Result<()> {
+        let incoming = crate::repair::runtime_version(runtime_id)?;
+        if let Some(previous) = self.required_service_runtime()? {
+            let previous = crate::repair::runtime_version(&previous)?;
+            if incoming.cmp_precedence(&previous).is_lt() {
+                return Err(BrokerError::VersionMismatch);
+            }
+        }
+        db(self.conn.execute(
+            "INSERT INTO installed_service VALUES(1,?1)
+             ON CONFLICT(singleton) DO UPDATE SET runtime_id=excluded.runtime_id",
+            [runtime_id],
+        ))?;
+        Ok(())
     }
 
     pub fn restore_registration(
@@ -821,6 +866,57 @@ mod recap_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_version_checkpoint_is_bounded_monotonic_and_survives_owner_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        let mut ledger = Ledger::open(&path).unwrap();
+        let old = "1.2.3-0123456789abcdef";
+        let new = "1.2.4-0123456789abcdef";
+        ledger.register_owner("owner", old, false).unwrap();
+        ledger.remember_service_runtime(old).unwrap();
+        ledger.register_owner("other-owner", new, false).unwrap();
+        assert_eq!(
+            ledger.required_service_runtime().unwrap().as_deref(),
+            Some(new)
+        );
+        assert_eq!(
+            ledger.remember_service_runtime(old),
+            Err(BrokerError::VersionMismatch)
+        );
+        ledger.remember_service_runtime(new).unwrap();
+        ledger.unregister_owner("other-owner").unwrap();
+        assert_eq!(
+            ledger.remember_service_runtime(old),
+            Err(BrokerError::VersionMismatch)
+        );
+        ledger
+            .restore_registration("owner", Some((old.into(), false)))
+            .unwrap();
+        assert_eq!(
+            ledger.owner_registration("owner").unwrap(),
+            Some((old.into(), false))
+        );
+        assert_eq!(ledger.service_runtime().unwrap().as_deref(), Some(new));
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM installed_service", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(ledger);
+        assert_eq!(
+            Ledger::open(&path)
+                .unwrap()
+                .service_runtime()
+                .unwrap()
+                .as_deref(),
+            Some(new)
+        );
+    }
 
     #[test]
     fn legacy_ledger_indexes_keep_retained_history_out_of_request_scans() {

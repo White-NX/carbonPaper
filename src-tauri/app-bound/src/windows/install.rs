@@ -159,11 +159,11 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     super::activation::reconcile(&root, &ledger)?;
     let previous = ledger.owner_registration(&sid)?;
     if let Some((old_id, _)) = &previous {
-        let old_root = root.join("Runtime").join(old_id);
-        let (old_manifest, _) = manifest::read_manifest(&old_root)?;
-        if semver::Version::parse(&manifest.version).map_err(|_| BrokerError::VersionMismatch)?
-            < semver::Version::parse(&old_manifest.version)
-                .map_err(|_| BrokerError::VersionMismatch)?
+        let old_version = crate::repair::runtime_version(old_id)?;
+        if semver::Version::parse(&manifest.version)
+            .map_err(|_| BrokerError::VersionMismatch)?
+            .cmp_precedence(&old_version)
+            .is_lt()
         {
             return Err(BrokerError::VersionMismatch);
         }
@@ -176,7 +176,10 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     let setup_path = root.join("System").join("carbonpaper-protected-setup.exe");
     let service_registration = root.join("System").join("runtime.json");
     let old_service_registration = read_optional(&service_registration, 1024)?;
-    let replace_service = if let Some(bytes) = &old_service_registration {
+    let previous_service_id = if let Some(id) = ledger.service_runtime()? {
+        crate::repair::runtime_version(&id)?;
+        Some(id)
+    } else if let Some(bytes) = &old_service_registration {
         let installed: Activation =
             serde_json::from_slice(bytes).map_err(|_| BrokerError::Integrity)?;
         if !safe_runtime_id(&installed.runtime_id) {
@@ -184,14 +187,22 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         }
         let installed_dir = root.join("Runtime").join(&installed.runtime_id);
         assert_protected(&installed_dir)?;
-        let (current, current_id) = manifest::read_manifest(&installed_dir)?;
+        let (_, current_id) = manifest::read_manifest(&installed_dir)?;
         if current_id != installed.runtime_id {
             return Err(BrokerError::Integrity);
         }
-        // One machine-wide service serves several users. Activating an older
-        // portable package must not downgrade another user's service binary.
-        semver::Version::parse(&manifest.version).map_err(|_| BrokerError::VersionMismatch)?
-            >= semver::Version::parse(&current.version).map_err(|_| BrokerError::VersionMismatch)?
+        Some(current_id)
+    } else {
+        None
+    };
+    let previous_service_id =
+        crate::repair::newest_runtime(previous_service_id, ledger.required_service_runtime()?)?;
+    let replace_service = if let Some(installed_id) = &previous_service_id {
+        // The service-owned checkpoint survives damage to the old manifest.
+        semver::Version::parse(&manifest.version)
+            .map_err(|_| BrokerError::VersionMismatch)?
+            .cmp_precedence(&crate::repair::runtime_version(installed_id)?)
+            .is_ge()
     } else {
         if service_path.exists() {
             // A missing registration can be repaired from the same signed
@@ -220,20 +231,14 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     let system_runtime_id = if replace_service {
         runtime_id.clone()
     } else {
-        let installed: Activation = serde_json::from_slice(
-            old_service_registration
-                .as_ref()
-                .ok_or(BrokerError::Integrity)?,
-        )
-        .map_err(|_| BrokerError::Integrity)?;
-        installed.runtime_id
+        previous_service_id.clone().ok_or(BrokerError::Integrity)?
     };
     super::activation::begin(
         &root,
         &super::activation::PendingActivation {
             sid: sid.clone(),
             runtime_id: runtime_id.clone(),
-            system_runtime_id,
+            system_runtime_id: system_runtime_id.clone(),
         },
     )?;
     let result = (|| {
@@ -267,6 +272,8 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
             fs::remove_file(&detached_path).map_err(|_| BrokerError::Storage)?;
         }
         start_service()?;
+        ledger.remember_service_runtime(&system_runtime_id)?;
+        super::repair::write_checkpoint(&root, &ledger)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -275,7 +282,12 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         let mut restored = ledger.restore_registration(&sid, previous).is_ok();
         restored &= restore_optional(&activation_path, old_activation.as_deref()).is_ok();
         restored &= restore_optional(&detached_path, old_detached.as_deref()).is_ok();
-        if ledger.requires_current_service().unwrap_or(true) {
+        if ledger.requires_current_service().unwrap_or(true)
+            || ledger
+                .service_runtime()
+                .map(|id| id != previous_service_id)
+                .unwrap_or(true)
+        {
             // Another owner may have compacted revocations while the new
             // service was starting. Never restore a service that cannot read
             // that committed authority. Reconcile the installed signed service
@@ -397,7 +409,7 @@ fn ensure_relative_parents(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-fn repair_runtime(
+pub(super) fn repair_runtime(
     source: &Path,
     destination: &Path,
     release: &ReleaseManifest,
@@ -534,7 +546,7 @@ fn copy_locked(input: &mut fs::File, target: &Path) -> Result<()> {
     replace(&temporary, target)
 }
 
-fn configure_service(path: &Path) -> Result<()> {
+pub(super) fn configure_service(path: &Path) -> Result<()> {
     configure_named_service(path, SERVICE_NAME, SERVICE_DISPLAY_NAME)
 }
 
@@ -695,7 +707,7 @@ pub fn stop_service() -> Result<()> {
     Err(BrokerError::Busy)
 }
 
-fn start_service() -> Result<()> {
+pub(super) fn start_service() -> Result<()> {
     let handle = service::open_service(SERVICE_START | SERVICE_QUERY_STATUS)?;
     if service::query_status(&handle)?.dwCurrentState == SERVICE_RUNNING {
         return Ok(());

@@ -95,7 +95,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseDraft: true
 
-      - name: Build portable zip
+      - name: Build portable and service repair packages
         env:
           CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
         run: npm run pack:portable
@@ -135,14 +135,16 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml --lib updater::tests
           if ($LASTEXITCODE -ne 0) { throw "Update verifier regressions failed" }
 
-      - name: Upload portable zip and latest.json
+      - name: Upload portable and service repair assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
           $zipFile = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
           $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
-          gh release upload ${{ github.ref_name }} $zipFile $latestJson --clobber
+          $repairZip = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_service-repair.zip"
+          $repairJson = "src-tauri/target/release/bundle/nsis/service-repair.json"
+          gh release upload ${{ github.ref_name }} $zipFile $latestJson $repairZip $repairJson --clobber
 
       - name: Publish release
         env:

@@ -26,3 +26,9 @@ export async function selectBackupImportPath() {
 export async function selectStorageDirectory() {
   return singlePath(await open({ multiple: false, directory: true }));
 }
+
+export async function selectAppBoundRepairPackage() {
+  return singlePath(await open({
+    filters: [{ name: 'CarbonPaper Package', extensions: ['zip'] }], multiple: false, directory: false,
+  }));
+}

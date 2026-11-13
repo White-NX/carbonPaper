@@ -200,17 +200,26 @@ mod tests {
         let sid = identity::current_sid().unwrap();
         provision(&root, &sid).unwrap();
         let target = path(&root, &sid).unwrap();
+        let mut ledger = Ledger::open(&root.join("keys.db")).unwrap();
+        ledger.register_owner(&sid, "runtime", true).unwrap();
         let context = crate::windows::update::CoordinatorContext::new().unwrap();
         context
             .with_permissions(|| {
-                append_at(&root, &sid, &Revocation::RetireOwner).unwrap();
+                assert_eq!(
+                    append_at(&root, &sid, &Revocation::RetireOwner).unwrap(),
+                    Some(())
+                );
+                assert!(std::fs::read_dir(&root).is_err());
+                assert!(std::fs::read_dir(root.join(DIRECTORY)).is_err());
+                assert!(File::open(root.join("keys.db")).is_err());
                 assert!(File::open(&target).is_err());
                 assert!(OpenOptions::new().write(true).open(&target).is_err());
                 assert!(std::fs::remove_file(&target).is_err());
             })
             .unwrap();
-        let mut ledger = Ledger::open(&root.join("keys.db")).unwrap();
-        ledger.register_owner(&sid, "runtime", true).unwrap();
+        let pending = std::fs::read(&target).unwrap();
+        provision(&root, &sid).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), pending);
         drain(&root, &sid, &mut ledger).unwrap();
         assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
     }

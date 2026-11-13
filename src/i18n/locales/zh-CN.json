@@ -314,7 +314,29 @@
     "cancelled": "已取消，当前设置保持不变。",
     "backgroundDisabled": "请先开启后台自动整理。",
     "packageUnavailable": "此构建暂不提供该功能，请使用正式发布的安装包。",
-    "failed": "暂时无法完成操作，请重试或修复后台组件。"
+    "failed": "暂时无法完成操作，请重试或修复后台组件。",
+    "repairFromFile": "从本地包修复",
+    "repairSubtitle": "恢复后台整理能力",
+    "repairHint": "先检查本地文件，仅在需要时下载修复包。",
+    "fullRepairTitle": "下载完整程序包",
+    "fullRepairDownload": "恢复所需的文件需要下载完整程序包。继续下载并修复？",
+    "fullRepairDownloadSize": "恢复所需的文件需要下载完整程序包，预计约 {{size}} MB。继续下载并修复？",
+    "downloadAndRepair": "下载并修复",
+    "repairNetworkDisabled": "联网功能已关闭。你可以选择已下载的官方包进行修复。",
+    "repairDownloadFailed": "修复包下载失败。请重试，或选择已下载的官方包。",
+    "repairPackageInvalid": "所选文件不是可用的官方修复包。请重新下载或选择其他包。",
+    "repairVersionMismatch": "修复包与已安装版本不匹配。请选择对应版本的官方包。",
+    "repairFullRequired": "恢复这些文件需要对应版本的完整便携包。",
+    "repairServiceUnavailable": "后台组件仍无法连接，请稍后重试。",
+    "repairBusy": "后台组件正在维护，请稍后重试。",
+    "repairProgress": {
+      "checking": "正在检查本地文件",
+      "downloading": "正在下载修复文件",
+      "extracting": "正在准备修复文件",
+      "installing": "正在恢复后台组件",
+      "verifying": "正在检查修复结果",
+      "complete": "修复完成"
+    }
   },
   "notifications": {
     "ocr_model_repair": {

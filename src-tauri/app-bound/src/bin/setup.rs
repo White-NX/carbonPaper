@@ -19,6 +19,9 @@ fn run() -> carbonpaper_app_bound::Result<()> {
         windows::install::{self, InstallOptions},
     };
     let launch_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if launch_args.first().is_some_and(|s| s == "--repair-service") {
+        return repair_service(&launch_args[1..]);
+    }
     if launch_args
         .first()
         .is_some_and(|s| s == "--apply-elevated-update")
@@ -94,5 +97,60 @@ fn run() -> carbonpaper_app_bound::Result<()> {
             enable,
         })
         .map(|_| ())
+    }
+}
+
+#[cfg(windows)]
+fn repair_service(args: &[String]) -> carbonpaper_app_bound::Result<()> {
+    use carbonpaper_app_bound::{
+        protocol::BrokerError,
+        windows::repair::{self, RepairError, RepairOptions},
+    };
+    let (mut source, mut runtime_source, mut tool_source, mut pid) = (None, None, None, None);
+    let mut full_runtime = false;
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--source" if source.is_none() => {
+                source = Some(std::path::PathBuf::from(
+                    args.next().ok_or(BrokerError::InvalidRequest)?,
+                ))
+            }
+            "--runtime-source" if runtime_source.is_none() => {
+                runtime_source = Some(std::path::PathBuf::from(
+                    args.next().ok_or(BrokerError::InvalidRequest)?,
+                ))
+            }
+            "--tool-source" if tool_source.is_none() => {
+                tool_source = Some(std::path::PathBuf::from(
+                    args.next().ok_or(BrokerError::InvalidRequest)?,
+                ))
+            }
+            "--caller-pid" if pid.is_none() => {
+                pid = Some(
+                    args.next()
+                        .ok_or(BrokerError::InvalidRequest)?
+                        .parse()
+                        .map_err(|_| BrokerError::InvalidRequest)?,
+                )
+            }
+            "--full-runtime" if !full_runtime => full_runtime = true,
+            _ => return Err(BrokerError::InvalidRequest),
+        }
+    }
+    let options = RepairOptions {
+        source: source.ok_or(BrokerError::InvalidRequest)?,
+        runtime_source: runtime_source.ok_or(BrokerError::InvalidRequest)?,
+        tool_source: tool_source.ok_or(BrokerError::InvalidRequest)?,
+        caller_pid: pid.ok_or(BrokerError::InvalidRequest)?,
+        full_runtime,
+    };
+    match repair::repair(options) {
+        Ok(_) => Ok(()),
+        Err(RepairError::FullRuntimeRequired) => std::process::exit(repair::FULL_RUNTIME_EXIT_CODE),
+        Err(RepairError::Broker(BrokerError::VersionMismatch)) => {
+            std::process::exit(repair::VERSION_EXIT_CODE)
+        }
+        Err(RepairError::Broker(error)) => Err(error),
     }
 }

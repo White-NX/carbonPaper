@@ -358,9 +358,11 @@ pub(crate) fn protect_revocation_inbox(path: &Path, sid: &str) -> Result<()> {
 pub(crate) fn protect_inbox_directory(path: &Path) -> Result<()> {
     // This non-inheriting metadata grant permits checking ownership and DACL;
     // it does not permit listing the directory or reading the SYSTEM ledger.
+    // SYNCHRONIZE is required when Windows opens a directory for metadata.
+    // Keep this grant on the directory itself, without FILE_LIST_DIRECTORY.
     set_path_security(
         path,
-        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x00020080;;;AU)",
+        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x00120080;;;AU)",
     )
 }
 

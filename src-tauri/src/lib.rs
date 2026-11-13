@@ -1131,6 +1131,7 @@ pub fn run() {
             app_bound::app_bound_acknowledge_offer,
             app_bound::app_bound_set_policy,
             app_bound::app_bound_install,
+            app_bound::app_bound_repair,
             app_bound::app_bound_uninstall,
             background_scheduler::background_scheduler_status,
             get_autostart_status,

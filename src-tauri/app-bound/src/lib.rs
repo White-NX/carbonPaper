@@ -9,6 +9,7 @@ pub mod ledger;
 pub mod manifest;
 pub mod payload;
 pub mod protocol;
+pub mod repair;
 pub mod revocation;
 #[cfg(windows)]
 pub mod windows;

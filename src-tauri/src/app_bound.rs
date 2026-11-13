@@ -11,7 +11,10 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+mod repair;
+
 const OFFER_SEEN: &str = "app_bound_offer_seen";
+const PACKAGE_SOURCE: &str = "app_bound_package_source";
 static REPAIR_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static UPGRADE_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REPAIR_OFFER_DISMISSED: std::sync::atomic::AtomicBool =
@@ -25,6 +28,7 @@ pub struct AppBoundStatus {
     pub processing: ProcessingStatus,
     pub offer_enable: bool,
     pub package_available: bool,
+    pub repair_available: bool,
 }
 
 fn executable_directory() -> Result<PathBuf, String> {
@@ -427,7 +431,24 @@ pub async fn app_bound_status(
             && installation_source()
                 .ok()
                 .is_some_and(|dir| manifest::read_manifest(&dir).is_ok());
-        let offer_enable = package_available
+        let repair_available = supported_build()
+            && (processing.installed
+                || launch_repair
+                || identity::current_sid()
+                    .ok()
+                    .and_then(|sid| {
+                        identity::protected_root().ok().map(|root| {
+                            root.join("Activations")
+                                .join(format!("{sid}.json"))
+                                .exists()
+                        })
+                    })
+                    .unwrap_or(false));
+        let offer_enable = ((repair && repair_available)
+            || (upgrade && package_available)
+            || (package_available
+                && !processing.installed
+                && storage.background_processing_enabled()))
             && (((repair || upgrade)
                 && !REPAIR_OFFER_DISMISSED.load(std::sync::atomic::Ordering::Acquire))
                 || (storage.background_processing_enabled()
@@ -436,6 +457,7 @@ pub async fn app_bound_status(
         Ok(AppBoundStatus {
             processing,
             package_available,
+            repair_available,
             offer_enable,
         })
     })
@@ -619,9 +641,75 @@ pub async fn app_bound_install(
     if enable && !credentials.background_processing_enabled() {
         return Err("BACKGROUND_PROCESSING_DISABLED".into());
     }
-    install_runtime(installation_source()?, enable).await?;
+    let source = installation_source()?;
+    install_runtime(source.clone(), enable).await?;
+    if !source.starts_with(identity::protected_root().map_err(|e| e.to_string())?) {
+        if let Err(error) =
+            crate::registry_config::set_string(PACKAGE_SOURCE, &source.to_string_lossy())
+        {
+            tracing::warn!("Failed to remember the local component repair source: {error}");
+        }
+    }
     crate::registry_config::set_bool(OFFER_SEEN, true)?;
     schedule_restart(&app)
+}
+
+#[tauri::command]
+pub async fn app_bound_repair(
+    window: tauri::Window,
+    app: AppHandle,
+    credentials: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage: tauri::State<'_, Arc<StorageState>>,
+    package_path: Option<String>,
+    allow_full_download: Option<bool>,
+) -> Result<repair::RepairOutcome, String> {
+    crate::settings_window::check_settings_ui(&window)?;
+    crate::commands::check_auth_required(&credentials)?;
+    if !supported_build() {
+        return Err("APP_BOUND_PACKAGE_UNAVAILABLE".into());
+    }
+    #[cfg(feature = "app-bound-dev")]
+    {
+        let _ = (package_path, allow_full_download, storage);
+        install_runtime(installation_source()?, false).await?;
+        schedule_restart(&app)?;
+        return Ok(repair::RepairOutcome::Repaired {
+            restart_required: true,
+        });
+    }
+    #[cfg(not(feature = "app-bound-dev"))]
+    {
+        let outcome = tokio::task::spawn_blocking(move || {
+            tauri::async_runtime::block_on(repair::run(
+                &window,
+                package_path.map(PathBuf::from),
+                allow_full_download.unwrap_or(false),
+            ))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if let repair::RepairOutcome::Repaired { restart_required } = &outcome {
+            REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Release);
+            REPAIR_OFFER_DISMISSED.store(true, std::sync::atomic::Ordering::Release);
+            if *restart_required {
+                schedule_restart(&app)?;
+            } else {
+                let storage = storage.inner().clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = storage.processing_stage.refresh();
+                    storage.request_protected_key_publication();
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some(scheduler) =
+                    app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.wake();
+                }
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 #[tauri::command]
