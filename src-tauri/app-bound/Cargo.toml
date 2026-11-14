@@ -9,12 +9,19 @@ name = "carbonpaper_app_bound"
 [features]
 development-runtime = ["dep:runas"]
 
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
+
 # Used only when this standalone crate builds the development service/helpers.
 # The Tauri desktop keeps its ordinary dev profile and hot-reload behavior.
 [profile.dev-service]
 inherits = "dev"
 opt-level = 2
-debug = true
+debug = 1
 debug-assertions = true
 
 [[bin]]

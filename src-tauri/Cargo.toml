@@ -159,11 +159,20 @@ tokio = { version = "1", features = ["test-util"] }
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
 
+# Keep application backtraces useful without retaining full dependency symbols.
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
+
 # Optimize the concrete storage crypto entry point and its primitive callees.
 # Generic AES code instantiated in the desktop crate would still run at opt=0.
 # The desktop's application/session code keeps its ordinary debug profile.
 [profile.dev.package.carbonpaper-app-bound]
 opt-level = 3
+debug = 1
 
 [profile.dev.package.aes-gcm]
 opt-level = 3
