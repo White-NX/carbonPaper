@@ -671,8 +671,9 @@ impl StorageState {
             return Err("query_deadline_exceeded_during_ann_tail".to_string());
         }
         let result = self.with_vector_scan_connection("derived_ann_tail_updates", |conn| {
-            let _deadline = crate::storage::connection::QueryDeadline::install(conn, deadline)
+            let deadline_guard = crate::storage::connection::QueryDeadline::install(conn, deadline)
                 .map_err(|error| error.to_string())?;
+            let conn = &*deadline_guard;
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|error| error.to_string())?;

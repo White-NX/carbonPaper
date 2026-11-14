@@ -1,7 +1,7 @@
 //! Shared SQLCipher connection setup and journal-mode diagnostics.
 
 use rusqlite::{Connection, OptionalExtension, Result};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -13,16 +13,24 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// that have not yielded their first row. Never leave a handler on a reused
 /// connection after returning to its owner.
 pub(super) struct QueryDeadline<'a> {
-    conn: &'a Connection,
+    conn: &'a mut Connection,
     deadline: Option<Instant>,
 }
 
 impl<'a> QueryDeadline<'a> {
-    pub(super) fn install(conn: &'a Connection, deadline: Option<Instant>) -> Result<Self> {
+    pub(super) fn install(conn: &'a mut Connection, deadline: Option<Instant>) -> Result<Self> {
         if let Some(deadline) = deadline {
             conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
         }
         Ok(Self { conn, deadline })
+    }
+}
+
+impl Deref for QueryDeadline<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn
     }
 }
 
@@ -90,13 +98,13 @@ const SYNCHRONOUS_FULL: &str = "FULL";
 
 /// Minimum SQLite version carried by the SQLCipher bundle for this release.
 /// SQLite encodes versions as major * 1_000_000 + minor * 1_000 + patch.
-pub(crate) const MIN_SQLITE_VERSION: &str = "3.51.3";
-pub(crate) const MIN_SQLITE_VERSION_NUMBER: i64 = 3_051_003;
+pub(crate) const MIN_SQLITE_VERSION: &str = "3.54.1";
+pub(crate) const MIN_SQLITE_VERSION_NUMBER: i64 = 3_054_001;
 #[cfg(test)]
-pub(crate) const BUNDLED_SQLCIPHER_VERSION: &str = "4.14.0";
+pub(crate) const BUNDLED_SQLCIPHER_VERSION: &str = "4.20.0";
 #[cfg(test)]
 pub(crate) const BUNDLED_SQLITE_SOURCE_ID: &str =
-    "2026-03-13 10:38:09 737ae4a34738ffa0c3ff7f9bb18df914dd1cad163f28fd6b6e114a344fe6alt1";
+    "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6alt1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SqliteEngineIdentity {
@@ -359,6 +367,14 @@ impl Deref for IndependentReadConnection {
     fn deref(&self) -> &Self::Target {
         self.conn
             .as_ref()
+            .expect("independent connection is present until drop")
+    }
+}
+
+impl DerefMut for IndependentReadConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn
+            .as_mut()
             .expect("independent connection is present until drop")
     }
 }
@@ -1080,12 +1096,12 @@ mod tests {
 
     #[test]
     fn query_deadline_interrupts_sql_and_is_cleared_before_connection_reuse() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000)
                    SELECT sum(x) FROM n";
         {
-            let _guard = QueryDeadline::install(&conn, Some(Instant::now())).unwrap();
-            let error = conn
+            let guard = QueryDeadline::install(&mut conn, Some(Instant::now())).unwrap();
+            let error = guard
                 .query_row(sql, [], |row| row.get::<_, i64>(0))
                 .unwrap_err();
             assert_eq!(

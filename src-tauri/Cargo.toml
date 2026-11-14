@@ -33,18 +33,18 @@ name = "carbonpaper-office"
 path = "src/bin/office.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 walkdir = "2.5.0"
 base64 = "0.22"
 
 [dependencies]
 carbonpaper-app-bound = { path = "app-bound" }
 zeroize = "1"
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-opener = "2"
-tauri-plugin-notification = "2"
-tauri-plugin-single-instance = "2.3.7"
-tauri-plugin-dialog = "2"
+tauri = { version = "2.12.5", features = ["tray-icon"] }
+tauri-plugin-opener = "2.7.3"
+tauri-plugin-notification = "2.8.1"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-dialog = "2.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 indexmap = { version = "2", features = ["serde"] }
@@ -64,7 +64,7 @@ percent-encoding = "2.3.2"
 sysinfo = "0.30"
 walkdir = "2.5.0"
 rand = "0.8"
-rusqlite = { version = "=0.40.2", default-features = false, features = [
+rusqlite = { version = "=0.42.0", default-features = false, features = [
     "cache",
     "hooks",
     "functions",
@@ -92,7 +92,7 @@ flate2 = "1"
 window-vibrancy = "0.5"
 raw-window-handle = "0.6"
 open = "5"
-rapidocr-core = { version = "=0.2.2", path = "vendor/rapidocr-core", default-features = false, features = ["tokio", "directml"] }
+rapidocr-core = { version = "=0.3.0", default-features = false, features = ["download-binaries", "tokio", "directml"] }
 memmap2 = "0.9"
 usearch = { version = "=2.26.0", default-features = false }
 
@@ -149,11 +149,11 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = "2.5.5"
 
 [dev-dependencies]
 tempfile = "3"
-rusqlite = { version = "=0.40.2", default-features = false, features = ["functions"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["functions"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
