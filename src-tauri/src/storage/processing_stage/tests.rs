@@ -38,9 +38,23 @@ struct TestBroker {
     supported_consumers: AtomicU8,
     supported_storage_keys: AtomicBool,
     acquisitions: AtomicUsize,
+    failed_acquisition: Mutex<Option<(String, Consumer)>>,
+    fail_abandon: AtomicBool,
     inspected: Mutex<Vec<String>>,
+    revocations: Mutex<Vec<carbonpaper_app_bound::revocation::Revocation>>,
 }
 impl Broker for TestBroker {
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> carbonpaper_app_bound::protocol::Result<bool> {
+        intent.validate()?;
+        if !self.installed.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.revocations.lock().unwrap().push(intent);
+        Ok(true)
+    }
     fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
         Ok(self.installed.load(Ordering::SeqCst))
     }
@@ -51,8 +65,31 @@ impl Broker for TestBroker {
         if !self.online.load(Ordering::SeqCst) {
             return Err(BrokerError::Unavailable);
         }
+        {
+            let mut intents = self.revocations.lock().unwrap();
+            self.ledger
+                .lock()
+                .unwrap()
+                .apply_revocations(&self.principal.lock().unwrap().sid, &intents)?;
+            intents.clear();
+        }
         if matches!(&request, Request::AcquireTask { .. }) {
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Request::AcquireTask {
+            task_id, consumer, ..
+        } = &request
+        {
+            if self.failed_acquisition.lock().unwrap().as_ref()
+                == Some(&(task_id.clone(), *consumer))
+            {
+                return Err(BrokerError::Protection);
+            }
+        }
+        if matches!(&request, Request::AbandonConsumer { .. })
+            && self.fail_abandon.load(Ordering::SeqCst)
+        {
+            return Err(BrokerError::Unavailable);
         }
         if let Request::InspectTask { task_id } = &request {
             self.inspected.lock().unwrap().push(task_id.clone());
@@ -134,7 +171,10 @@ fn fixture() -> Fixture {
         supported_consumers: AtomicU8::new(Consumer::ALL_MASK),
         supported_storage_keys: AtomicBool::new(true),
         acquisitions: AtomicUsize::new(0),
+        failed_acquisition: Mutex::new(None),
+        fail_abandon: AtomicBool::new(false),
         inspected: Mutex::new(Vec::new()),
+        revocations: Mutex::new(Vec::new()),
     });
     storage.replace_processing_stage_for_tests(ProcessingStaging::with_test_broker(broker.clone()));
     storage
@@ -321,14 +361,14 @@ fn legacy_receipt_upgrade_preserves_pending_results_and_indexes_retained_history
 fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_reads() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    let input = insert_input(&storage, 1, 7);
+    let input = insert_input(storage, 1, 7);
     let bytes = std::fs::read(dir.join(STAGING_FILE)).unwrap();
     assert!(!bytes
         .windows(input.ocr_text.len())
         .any(|w| w == input.ocr_text.as_bytes()));
     let work = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap();
     storage
@@ -336,17 +376,17 @@ fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_read
         .unwrap();
     storage
         .processing_stage
-        .finish(&storage, &work.receipt)
+        .finish(storage, &work.receipt)
         .unwrap();
     restart_stage(dir, storage, broker);
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_none());
     let pending = storage
         .processing_stage
-        .claim(&storage, Consumer::MiniLm)
+        .claim(storage, Consumer::MiniLm)
         .unwrap()
         .unwrap();
     assert_eq!(pending.input.ocr_text, input.ocr_text);
@@ -363,11 +403,11 @@ fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_read
 fn callback_fields_cannot_retarget_an_issued_receipt() {
     let mut fixture = fixture();
     let (dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, 7);
-    insert_input(&storage, 2, 7);
+    insert_input(storage, 1, 7);
+    insert_input(storage, 2, 7);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -406,8 +446,8 @@ fn callback_fields_cannot_retarget_an_issued_receipt() {
             .is_err());
         assert!(storage.processing_stage.release(&changed, true).is_err());
     }
-    assert_eq!(category(&storage, 1), None);
-    assert_eq!(category(&storage, 2), None);
+    assert_eq!(category(storage, 1), None);
+    assert_eq!(category(storage, 2), None);
     storage
         .commit_staged_category(&receipt, Some("Development"), Some(0.9))
         .unwrap();
@@ -417,8 +457,8 @@ fn callback_fields_cannot_retarget_an_issued_receipt() {
 fn malformed_input_does_not_request_a_key_or_block_the_next_task() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
-    insert_input(&storage, 2, 1);
+    insert_input(storage, 1, 1);
+    insert_input(storage, 2, 1);
     Connection::open(dir.join(STAGING_FILE))
         .unwrap()
         .execute(
@@ -428,7 +468,7 @@ fn malformed_input_does_not_request_a_key_or_block_the_next_task() {
         .unwrap();
     let work = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap();
     assert_eq!(work.receipt.screenshot_id, 2);
@@ -439,21 +479,21 @@ fn malformed_input_does_not_request_a_key_or_block_the_next_task() {
 fn deletion_revokes_even_when_the_user_queue_lost_its_task_row() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
+    insert_input(storage, 1, 1);
     let snapshot = std::fs::read(dir.join(STAGING_FILE)).unwrap();
     Connection::open(dir.join(STAGING_FILE))
         .unwrap()
         .execute("DELETE FROM staged_inputs", [])
         .unwrap();
-    sql(&storage, "UPDATE screenshots SET is_deleted=1 WHERE id=1");
+    sql(storage, "UPDATE screenshots SET is_deleted=1 WHERE id=1");
     storage.finish_staged_deletions().unwrap();
-    sql(&storage, "UPDATE screenshots SET is_deleted=0 WHERE id=1");
+    sql(storage, "UPDATE screenshots SET is_deleted=0 WHERE id=1");
     storage.processing_stage.shutdown();
     std::fs::write(dir.join(STAGING_FILE), snapshot).unwrap();
     restart_stage(dir, storage, broker);
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_none());
 }
@@ -462,14 +502,14 @@ fn deletion_revokes_even_when_the_user_queue_lost_its_task_row() {
 fn failed_deletion_keeps_the_outbox_and_blocks_further_key_claims() {
     let mut fixture = fixture();
     let (_dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
-    insert_input(&storage, 2, 1);
-    sql(&storage, "UPDATE screenshots SET is_deleted=1 WHERE id=1");
+    insert_input(storage, 1, 1);
+    insert_input(storage, 2, 1);
+    sql(storage, "UPDATE screenshots SET is_deleted=1 WHERE id=1");
     broker.online.store(false, Ordering::SeqCst);
     assert!(storage.finish_staged_deletions().is_err());
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .is_err());
     let count: i64 = storage
         .db
@@ -488,7 +528,7 @@ fn failed_deletion_keeps_the_outbox_and_blocks_further_key_claims() {
     assert_eq!(
         storage
             .processing_stage
-            .claim(&storage, Consumer::Classification)
+            .claim(storage, Consumer::Classification)
             .unwrap()
             .unwrap()
             .receipt
@@ -498,23 +538,97 @@ fn failed_deletion_keeps_the_outbox_and_blocks_further_key_claims() {
 }
 
 #[test]
+fn offline_deletion_commits_and_revokes_even_if_the_archive_queue_is_restored() {
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    insert_input(storage, 2, Consumer::Classification.bit());
+    broker.online.store(false, Ordering::SeqCst);
+    assert!(storage.delete_screenshot(1).unwrap());
+    assert!(!storage.staged_screenshot_active(1).unwrap());
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM app_bound_revocations", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    // An archive/queue rollback cannot remove the protected inbox obligation.
+    sql(
+        storage,
+        "UPDATE screenshots SET is_deleted=0 WHERE id=1; DELETE FROM app_bound_revocations;",
+    );
+    broker.online.store(true, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
+    assert!(!storage
+        .processing_stage
+        .owns_screenshot(1, Consumer::Classification));
+    assert_eq!(
+        storage
+            .processing_stage
+            .claim(storage, Consumer::Classification)
+            .unwrap()
+            .unwrap()
+            .receipt
+            .screenshot_id,
+        2
+    );
+}
+
+#[test]
+fn offline_retirement_survives_missing_staging_and_a_new_dataset_attachment() {
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    let task = storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
+        .unwrap()
+        .unwrap();
+    storage.processing_stage.shutdown();
+    broker.online.store(false, Ordering::SeqCst);
+    storage.processing_stage.retire_dataset().unwrap();
+    broker.online.store(true, Ordering::SeqCst);
+    broker
+        .call(Request::AttachDataset {
+            dataset_id: carbonpaper_app_bound::protocol::random_id(),
+        })
+        .unwrap();
+    assert!(broker
+        .call(Request::AcquireTask {
+            task_id: task.receipt.task_id,
+            consumer: Consumer::Classification,
+            ciphertext_digest: "a".repeat(64),
+        })
+        .is_err());
+}
+
+#[test]
 fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrite() {
     let mut fixture = fixture();
     let (_dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
+    insert_input(storage, 1, 1);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
-    sql(&storage, "CREATE TRIGGER reject_receipt BEFORE INSERT ON app_bound_receipts BEGIN SELECT RAISE(ABORT,'simulated disk failure'); END");
+    sql(storage, "CREATE TRIGGER reject_receipt BEFORE INSERT ON app_bound_receipts BEGIN SELECT RAISE(ABORT,'simulated disk failure'); END");
     assert!(storage
         .commit_staged_category(&receipt, Some("Development"), Some(0.9))
         .is_err());
-    assert_eq!(category(&storage, 1), None);
+    assert_eq!(category(storage, 1), None);
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
-    sql(&storage, "DROP TRIGGER reject_receipt");
+    sql(storage, "DROP TRIGGER reject_receipt");
     let first_commit = storage
         .commit_staged_category(&receipt, Some("Development"), Some(0.9))
         .unwrap();
@@ -526,7 +640,7 @@ fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrit
             .unwrap(),
         1
     );
-    storage.processing_stage.finish(&storage, &receipt).unwrap();
+    storage.processing_stage.finish(storage, &receipt).unwrap();
     let duplicate_commit = storage
         .commit_staged_category(&receipt, Some("Changed by replay"), Some(1.0))
         .unwrap();
@@ -538,7 +652,7 @@ fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrit
             .unwrap(),
         0
     );
-    assert_eq!(category(&storage, 1).as_deref(), Some("Development"));
+    assert_eq!(category(storage, 1).as_deref(), Some("Development"));
 }
 
 #[test]
@@ -547,11 +661,11 @@ fn weighted_classification_scores_complete_without_exhausting_retries() {
     let (dir, storage, broker) = fixture.parts();
     let stage = Connection::open(dir.join(STAGING_FILE)).unwrap();
     for (id, score, failures) in [(1, 1.2196, 0), (2, 1.1574, 4)] {
-        insert_input(&storage, id, Consumer::Classification.bit());
+        insert_input(storage, id, Consumer::Classification.bit());
         for _ in 0..failures {
             let work = storage
                 .processing_stage
-                .claim(&storage, Consumer::Classification)
+                .claim(storage, Consumer::Classification)
                 .unwrap()
                 .unwrap();
             storage
@@ -568,7 +682,7 @@ fn weighted_classification_scores_complete_without_exhausting_retries() {
         }
         let receipt = storage
             .processing_stage
-            .claim(&storage, Consumer::Classification)
+            .claim(storage, Consumer::Classification)
             .unwrap()
             .unwrap()
             .receipt;
@@ -580,7 +694,7 @@ fn weighted_classification_scores_complete_without_exhausting_retries() {
             storage.pending_staged_receipts().unwrap(),
             vec![receipt.clone()]
         );
-        storage.processing_stage.finish(&storage, &receipt).unwrap();
+        storage.processing_stage.finish(storage, &receipt).unwrap();
 
         let (status, attempts): (String, i64) = stage
             .query_row(
@@ -663,10 +777,10 @@ fn native_staged_classification_keeps_a_newer_user_correction() {
 fn invalid_classification_scores_do_not_commit_or_consume_the_lease() {
     let mut fixture = fixture();
     let (_dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, Consumer::Classification.bit());
+    insert_input(storage, 1, Consumer::Classification.bit());
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -677,14 +791,14 @@ fn invalid_classification_scores_do_not_commit_or_consume_the_lease() {
                 .unwrap_err(),
             "invalid classification result"
         );
-        assert_eq!(category(&storage, 1), None);
+        assert_eq!(category(storage, 1), None);
         assert!(storage.pending_staged_receipts().unwrap().is_empty());
         storage.processing_stage.check_receipt(&receipt).unwrap();
     }
     storage
         .commit_staged_category(&receipt, Some("Unclassified"), Some(0.0))
         .unwrap();
-    storage.processing_stage.finish(&storage, &receipt).unwrap();
+    storage.processing_stage.finish(storage, &receipt).unwrap();
 }
 
 #[test]
@@ -736,10 +850,10 @@ fn reconciliation_reclaims_the_full_staging_vacuum_budget_and_preserves_active_i
 fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 3);
+    insert_input(storage, 1, 3);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -747,22 +861,22 @@ fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
         .commit_staged_category(&receipt, Some("Development"), Some(0.9))
         .unwrap();
     broker.online.store(false, Ordering::SeqCst);
-    assert!(storage.processing_stage.finish(&storage, &receipt).is_err());
+    assert!(storage.processing_stage.finish(storage, &receipt).is_err());
     broker.online.store(true, Ordering::SeqCst);
     broker.principal.lock().unwrap().process_identity = "10:200".into();
     broker.clock.fetch_add(LEASE_TTL_SECS + 1, Ordering::SeqCst);
     restart_stage(dir, storage, broker);
-    storage.processing_stage.reconcile(&storage).unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
-    assert_eq!(category(&storage, 1).as_deref(), Some("Development"));
+    assert_eq!(category(storage, 1).as_deref(), Some("Development"));
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_none());
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::MiniLm)
+        .claim(storage, Consumer::MiniLm)
         .unwrap()
         .is_some());
 }
@@ -771,10 +885,10 @@ fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
 fn recovered_completion_does_not_revoke_other_consumers() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 3);
+    insert_input(storage, 1, 3);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -802,11 +916,11 @@ fn recovered_completion_does_not_revoke_other_consumers() {
         )
         .unwrap();
     restart_stage(dir, storage, broker);
-    storage.processing_stage.reconcile(&storage).unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::MiniLm)
+        .claim(storage, Consumer::MiniLm)
         .unwrap()
         .is_some());
 }
@@ -815,10 +929,10 @@ fn recovered_completion_does_not_revoke_other_consumers() {
 fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants() {
     let mut fixture = fixture();
     let (dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, 3);
+    insert_input(storage, 1, 3);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -826,7 +940,7 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
     conn.execute("UPDATE staged_work SET attempts=4 WHERE consumer=1", [])
         .unwrap();
     storage.processing_stage.release(&receipt, true).unwrap();
-    storage.processing_stage.reconcile(&storage).unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
     let state: String = conn
         .query_row("SELECT state FROM staged_work WHERE consumer=1", [], |r| {
             r.get(0)
@@ -850,19 +964,145 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
     storage
         .set_ocr_postprocess_status(1, "completed", None)
         .unwrap();
-    assert_eq!(category(&storage, 1).as_deref(), Some("Development"));
+    assert_eq!(category(storage, 1).as_deref(), Some("Development"));
     assert!(storage
         .list_pending_ocr_postprocess_ids(10)
         .unwrap()
         .is_empty());
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_none());
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::MiniLm)
+        .claim(storage, Consumer::MiniLm)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn task_dpapi_failures_survive_restart_then_release_only_the_affected_consumer_to_archive_work() {
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
+    insert_input(
+        storage,
+        1,
+        Consumer::Classification.bit() | Consumer::MiniLm.bit(),
+    );
+    insert_input(storage, 2, Consumer::Classification.bit());
+    let connection = Connection::open(dir.join(STAGING_FILE)).unwrap();
+    let task_id: String = connection
+        .query_row(
+            "SELECT task_id FROM staged_inputs WHERE screenshot_id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    *broker.failed_acquisition.lock().unwrap() = Some((task_id.clone(), Consumer::Classification));
+    for attempt in 1..=5 {
+        broker.fail_abandon.store(attempt == 5, Ordering::SeqCst);
+        assert!(storage
+            .processing_stage
+            .claim_screenshot(storage, Consumer::Classification, 1)
+            .unwrap()
+            .is_none());
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT attempts FROM staged_work WHERE task_id=?1 AND consumer=1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, attempt);
+        connection
+            .execute(
+                "UPDATE staged_work SET next_attempt=0 WHERE task_id=?1",
+                [&task_id],
+            )
+            .unwrap();
+        if attempt == 2 {
+            restart_stage(dir, storage, broker);
+        }
+        // Status remains healthy: only acquisition for this task is failing.
+        storage.processing_stage.refresh().unwrap();
+        assert!(storage.processing_stage.available());
+    }
+    assert!(!storage
+        .processing_stage
+        .owns_screenshot(1, Consumer::Classification));
+    assert!(!storage
+        .processing_stage
+        .owned_screenshot_ids(Consumer::Classification)
+        .unwrap()
+        .contains(&1));
+    assert_eq!(storage.recover_incomplete_ocr_postprocess().unwrap(), 2);
+    assert!(storage
+        .list_pending_ocr_postprocess_ids(10)
+        .unwrap()
+        .contains(&1));
+    assert!(storage
+        .update_screenshot_category(1, "Development", Some(0.9))
+        .unwrap());
+    storage
+        .set_ocr_postprocess_status(1, "completed", None)
+        .unwrap();
+    // The persisted abandonment is retried after another process restart.
+    broker.fail_abandon.store(false, Ordering::SeqCst);
+    restart_stage(dir, storage, broker);
+    storage.processing_stage.reconcile(storage).unwrap();
+    let Response::TaskState(state) = broker.call(Request::InspectTask { task_id }).unwrap() else {
+        panic!()
+    };
+    assert_eq!(state.abandoned_consumers, Consumer::Classification.bit());
+    assert!(!state.retired);
+    assert!(storage
+        .processing_stage
+        .claim_screenshot(storage, Consumer::MiniLm, 1)
+        .unwrap()
+        .is_some());
+    assert!(storage
+        .processing_stage
+        .claim_screenshot(storage, Consumer::Classification, 2)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn offline_staging_reclaims_free_pages_without_discarding_live_task_inputs() {
+    let mut fixture = fixture();
+    let (directory, storage, broker) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    let path = directory.join(STAGING_FILE);
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("CREATE TABLE collection_fixture(payload BLOB); INSERT INTO collection_fixture VALUES(zeroblob(4*1024*1024)); DELETE FROM collection_fixture;").unwrap();
+    let free_before: i64 = connection
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap();
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    broker.online.store(false, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap_err();
+    storage.processing_stage.reconcile(storage).unwrap();
+    let free_after: i64 = connection
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap();
+    assert!(free_before - free_after >= 256);
+    assert!(std::fs::metadata(&path).unwrap().len() < size_before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM staged_inputs WHERE state='active' AND payload IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    broker.online.store(true, Ordering::SeqCst);
+    storage.processing_stage.refresh().unwrap();
+    assert!(storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_some());
 }
@@ -871,22 +1111,22 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
 fn source_mutation_and_database_generation_fence_archive_writes() {
     let mut fixture = fixture();
     let (_dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
+    insert_input(storage, 1, 1);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
-    sql(&storage, "DELETE FROM ocr_results WHERE screenshot_id=1");
+    sql(storage, "DELETE FROM ocr_results WHERE screenshot_id=1");
     assert!(!storage.staged_source_is_current(&receipt).unwrap());
     assert!(storage
         .commit_staged_category(&receipt, Some("Stale"), Some(0.9))
         .is_err());
-    insert_input(&storage, 2, 1);
+    insert_input(storage, 2, 1);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -894,14 +1134,14 @@ fn source_mutation_and_database_generation_fence_archive_writes() {
     assert!(storage
         .commit_staged_category(&receipt, Some("Stale"), Some(0.9))
         .is_err());
-    assert_eq!(category(&storage, 2), None);
+    assert_eq!(category(storage, 2), None);
 }
 
 #[test]
 fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
+    insert_input(storage, 1, 1);
     let old_dataset = storage.processing_dataset_id().unwrap();
     let snapshot = std::fs::read(dir.join(STAGING_FILE)).unwrap();
     storage.processing_stage.shutdown();
@@ -926,7 +1166,7 @@ fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
     );
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .is_none());
 }
@@ -935,17 +1175,17 @@ fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
 fn disable_preserves_completed_state_and_uninstall_clears_enabled_status() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 3);
+    insert_input(storage, 1, 3);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
     storage
         .commit_staged_category(&receipt, None, None)
         .unwrap();
-    storage.processing_stage.finish(&storage, &receipt).unwrap();
+    storage.processing_stage.finish(storage, &receipt).unwrap();
     storage
         .processing_stage
         .set_policy(false, Limits::default())
@@ -963,7 +1203,7 @@ fn disable_preserves_completed_state_and_uninstall_clears_enabled_status() {
         .unwrap();
     assert!(storage
         .processing_stage
-        .claim(&storage, Consumer::MiniLm)
+        .claim(storage, Consumer::MiniLm)
         .unwrap()
         .is_none());
     broker.installed.store(false, Ordering::SeqCst);
@@ -977,10 +1217,10 @@ fn maintenance_visits_tasks_beyond_its_first_batch() {
     let mut fixture = fixture();
     let (_dir, storage, broker) = fixture.parts();
     for id in 1..=70 {
-        insert_input(&storage, id, 1);
+        insert_input(storage, id, 1);
     }
-    storage.processing_stage.reconcile(&storage).unwrap();
-    storage.processing_stage.reconcile(&storage).unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
     let mut inspected = broker.inspected.lock().unwrap().clone();
     inspected.sort();
     inspected.dedup();
@@ -991,22 +1231,22 @@ fn maintenance_visits_tasks_beyond_its_first_batch() {
 fn malformed_durable_receipt_does_not_block_valid_completions() {
     let mut fixture = fixture();
     let (_dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
+    insert_input(storage, 1, 1);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
     storage
         .commit_staged_category(&receipt, None, None)
         .unwrap();
-    sql(&storage, "INSERT INTO app_bound_receipts(task_id,consumer,dataset_id,receipt_json) VALUES('bad',1,'bad','{')");
+    sql(storage, "INSERT INTO app_bound_receipts(task_id,consumer,dataset_id,receipt_json) VALUES('bad',1,'bad','{')");
     assert_eq!(
         storage.pending_staged_receipts().unwrap(),
         vec![receipt.clone()]
     );
-    storage.processing_stage.reconcile(&storage).unwrap();
+    storage.processing_stage.reconcile(storage).unwrap();
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
 }
 
@@ -1014,10 +1254,10 @@ fn malformed_durable_receipt_does_not_block_valid_completions() {
 fn missing_local_stage_cannot_skip_dataset_retirement() {
     let mut fixture = fixture();
     let (_dir, storage, broker) = fixture.parts();
-    insert_input(&storage, 1, 1);
+    insert_input(storage, 1, 1);
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::Classification)
+        .claim(storage, Consumer::Classification)
         .unwrap()
         .unwrap()
         .receipt;
@@ -1042,10 +1282,10 @@ fn staged_vector_and_receipt_share_a_transaction_and_an_exact_subject() {
     use crate::storage::{DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind};
     let mut fixture = fixture();
     let (_dir, storage, _broker) = fixture.parts();
-    insert_input(&storage, 1, Consumer::MiniLm.bit());
+    insert_input(storage, 1, Consumer::MiniLm.bit());
     let receipt = storage
         .processing_stage
-        .claim(&storage, Consumer::MiniLm)
+        .claim(storage, Consumer::MiniLm)
         .unwrap()
         .unwrap()
         .receipt;
@@ -1067,14 +1307,14 @@ fn staged_vector_and_receipt_share_a_transaction_and_an_exact_subject() {
     let mut wrong = write.clone();
     wrong.job.subject_key = "2".into();
     assert!(storage.commit_staged_embedding(&wrong, &receipt).is_err());
-    sql(&storage,"CREATE TRIGGER reject_vector_receipt BEFORE INSERT ON app_bound_receipts BEGIN SELECT RAISE(ABORT,'simulated disk failure'); END");
+    sql(storage,"CREATE TRIGGER reject_vector_receipt BEFORE INSERT ON app_bound_receipts BEGIN SELECT RAISE(ABORT,'simulated disk failure'); END");
     assert!(storage.commit_staged_embedding(&write, &receipt).is_err());
     assert!(storage
         .get_query_visible_embedding(spec.index_kind, "1")
         .unwrap()
         .is_none());
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
-    sql(&storage, "DROP TRIGGER reject_vector_receipt");
+    sql(storage, "DROP TRIGGER reject_vector_receipt");
     storage.commit_staged_embedding(&write, &receipt).unwrap();
     assert!(storage
         .get_query_visible_embedding(spec.index_kind, "1")

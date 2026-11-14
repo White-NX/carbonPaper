@@ -118,10 +118,7 @@ pub(crate) async fn verify_user_for_owner(
                 verification??;
 
                 // Run completion work once, even if the original window closes.
-                let key_storage = storage.clone();
-                tokio::task::spawn_blocking(move || key_storage.publish_protected_keys())
-                    .await
-                    .map_err(|e| e.to_string())??;
+                storage.request_protected_key_publication();
                 crate::settings_window::broadcast_auth_state(&app);
                 if let Some(scheduler) =
                     app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
@@ -130,14 +127,16 @@ pub(crate) async fn verify_user_for_owner(
                 }
                 storage.start_lazy_indexer();
                 let recap_app = app.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    crate::ai::recap::protected::sync_after_unlock(&recap_app)
-                })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()))
-                {
-                    tracing::warn!("[RECAP] Protected configuration sync deferred: {}", error);
-                }
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        crate::ai::recap::protected::sync_after_unlock(&recap_app)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                    {
+                        tracing::warn!("[RECAP] Protected configuration sync deferred: {}", error);
+                    }
+                });
                 let mcp_state = app.state::<mcp_server::McpRuntimeState>();
                 if let Err(e) =
                     mcp_server::restore_if_enabled(app.clone(), &credentials, &storage, &mcp_state)
@@ -252,7 +251,7 @@ pub async fn credential_set_background_processing_enabled(
     if let Some(storage) = app.try_state::<Arc<StorageState>>() {
         storage.clear_protected_read_cache();
         if enabled {
-            storage.publish_protected_keys()?;
+            storage.request_protected_key_publication();
         }
     }
     if let Some(ann) = app.try_state::<crate::clip_ann::ClipAnnState>() {

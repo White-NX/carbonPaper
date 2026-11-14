@@ -49,12 +49,23 @@ impl Ledger {
         Self::from_connection(db(Connection::open(path))?)
     }
 
+    /// Teardown must never recreate a database removed by another collector.
+    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+        Self::from_connection(db(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ))?)
+    }
+
     fn from_connection(conn: Connection) -> Result<Self> {
         db(conn.busy_timeout(std::time::Duration::from_secs(3)))?;
-        db(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE;
+        db(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA auto_vacuum=INCREMENTAL;
             PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS broker_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
             INSERT OR IGNORE INTO broker_metadata VALUES ('schema', 1);
+            CREATE TABLE IF NOT EXISTS installed_service (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), runtime_id TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS owners (
                 sid TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, enabled INTEGER NOT NULL,
                 retention_days INTEGER NOT NULL, capacity_bytes INTEGER NOT NULL,
@@ -84,12 +95,22 @@ impl Ledger {
             [],
             |r| r.get(0),
         ))?;
-        if schema != 1 {
+        if !matches!(schema, 1 | 2) {
             return Err(BrokerError::VersionMismatch);
         }
         Self::init_recap(&conn)?;
         Self::init_storage_keys(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Compacted revocations cannot be interpreted by the original service.
+    /// Keep this fence after owner removal, just like retained key authority.
+    pub(crate) fn requires_current_service(&self) -> Result<bool> {
+        db(self.conn.query_row(
+            "SELECT value>=2 FROM broker_metadata WHERE key='schema'",
+            [],
+            |row| row.get(0),
+        ))
     }
 
     /// Installer-only: caller SID is obtained from the unelevated requesting
@@ -118,6 +139,8 @@ impl Ledger {
         let tx = db(self.conn.transaction())?;
         db(tx.execute("DELETE FROM recap_objects WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM recap_revoked_sources WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revoked_ranges WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revocation_budgets WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM tasks WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_keys WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_public_keys WHERE owner=?1", [sid]))?;
@@ -129,6 +152,45 @@ impl Ledger {
         db(self.conn.query_row("SELECT COUNT(*) FROM owners", [], |r| {
             r.get::<_, i64>(0).map(|v| v as u64)
         }))
+    }
+
+    pub fn registered_owner_sids(&self) -> Result<Vec<String>> {
+        let mut statement = db(self.conn.prepare("SELECT sid FROM owners"))?;
+        let rows = db(statement.query_map([], |row| row.get(0)))?;
+        db(rows.collect())
+    }
+
+    pub fn apply_revocations(
+        &mut self,
+        sid: &str,
+        intents: &[crate::revocation::Revocation],
+    ) -> Result<()> {
+        if self.registered_runtime(sid)?.is_none() {
+            // A removed owner has no grants; stale inbox entries cannot bind
+            // a later, independent registration or prevent its installation.
+            return Ok(());
+        }
+        let tx = db(self.conn.transaction())?;
+        for intent in intents {
+            intent.validate()?;
+            match intent {
+                crate::revocation::Revocation::RetireOwner => {
+                    Self::retire_where(&tx, sid, None)?;
+                    db(tx.execute("UPDATE owners SET dataset_id=NULL WHERE sid=?1", [sid]))?;
+                }
+                crate::revocation::Revocation::Screenshots {
+                    dataset_id,
+                    screenshot_ids,
+                } => {
+                    for id in screenshot_ids {
+                        Self::revoke_recap_source(&tx, sid, dataset_id, *id)?;
+                        db(tx.execute("UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3", params![sid, dataset_id, id]))?;
+                        db(tx.execute("DELETE FROM leases WHERE task IN (SELECT id FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)", params![sid, dataset_id, id]))?;
+                    }
+                }
+            }
+        }
+        db(tx.commit())
     }
 
     pub fn registered_runtime(&self, sid: &str) -> Result<Option<String>> {
@@ -149,6 +211,48 @@ impl Ledger {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional())
+    }
+
+    /// One machine-wide, service-owned checkpoint. Readable launch pointers and
+    /// runtime manifests may be repaired without losing this version authority.
+    pub fn service_runtime(&self) -> Result<Option<String>> {
+        db(self
+            .conn
+            .query_row(
+                "SELECT runtime_id FROM installed_service WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional())
+    }
+
+    /// Committed owners also establish a minimum after interrupted installation.
+    /// Removing one never rewinds the independently retained service floor.
+    pub fn required_service_runtime(&self) -> Result<Option<String>> {
+        let mut required = self.service_runtime()?;
+        for sid in self.registered_owner_sids()? {
+            let id = self
+                .registered_runtime(&sid)?
+                .ok_or(BrokerError::Integrity)?;
+            required = crate::repair::newest_runtime(required, Some(id))?;
+        }
+        Ok(required)
+    }
+
+    pub(crate) fn remember_service_runtime(&self, runtime_id: &str) -> Result<()> {
+        let incoming = crate::repair::runtime_version(runtime_id)?;
+        if let Some(previous) = self.required_service_runtime()? {
+            let previous = crate::repair::runtime_version(&previous)?;
+            if incoming.cmp_precedence(&previous).is_lt() {
+                return Err(BrokerError::VersionMismatch);
+            }
+        }
+        db(self.conn.execute(
+            "INSERT INTO installed_service VALUES(1,?1)
+             ON CONFLICT(singleton) DO UPDATE SET runtime_id=excluded.runtime_id",
+            [runtime_id],
+        ))?;
+        Ok(())
     }
 
     pub fn restore_registration(
@@ -214,6 +318,10 @@ impl Ledger {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Separates the authenticated principal, policy, dataset and key protector at dispatch."
+    )]
     fn dispatch(
         conn: &Connection,
         who: &Principal,
@@ -591,7 +699,8 @@ impl Ledger {
         if !valid_id(id) {
             return Err(BrokerError::InvalidRequest);
         }
-        let row: Option<(String,String,u8,u8,Option<Vec<u8>>,Option<String>,i64)> = db(conn.query_row(
+        type StoredTaskRow = (String, String, u8, u8, Option<Vec<u8>>, Option<String>, i64);
+        let row: Option<StoredTaskRow> = db(conn.query_row(
             "SELECT binding,state,done,abandoned,key_blob,digest,expires FROM tasks WHERE id=?1 AND owner=?2", params![id,who.sid],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional())?;
         let Some((binding, state, done, abandoned, key, digest, expires)) = row else {
@@ -691,7 +800,34 @@ impl Ledger {
                 },
             )?;
         }
-        db(tx.commit())
+        db(tx.commit())?;
+        // Drain the pragma's result rows: stepping only once reclaims one page,
+        // regardless of the requested budget. Immutable grant pins stay intact.
+        let mut vacuum = db(self.conn.prepare("PRAGMA incremental_vacuum(256)"))?;
+        let mut rows = db(vacuum.query([]))?;
+        while db(rows.next())?.is_some() {}
+        Ok(())
+    }
+
+    /// Elevated install/uninstall runs this after stopping the service. Existing
+    /// databases need one VACUUM to enable future paced incremental reclamation.
+    pub fn enable_reclamation(&self) -> Result<()> {
+        let mode: i64 = db(self
+            .conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0)))?;
+        if mode == 0 {
+            db(self
+                .conn
+                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"))?;
+        }
+        Ok(())
+    }
+
+    pub fn compact_if_empty(&self) -> Result<()> {
+        if self.registered_owners()? == 0 {
+            db(self.conn.execute_batch("VACUUM"))?;
+        }
+        Ok(())
     }
 
     fn make_room(conn: &Connection, sid: &str, incoming: u64, capacity: u64) -> Result<()> {
@@ -735,6 +871,57 @@ mod recap_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_version_checkpoint_is_bounded_monotonic_and_survives_owner_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        let mut ledger = Ledger::open(&path).unwrap();
+        let old = "1.2.3-0123456789abcdef";
+        let new = "1.2.4-0123456789abcdef";
+        ledger.register_owner("owner", old, false).unwrap();
+        ledger.remember_service_runtime(old).unwrap();
+        ledger.register_owner("other-owner", new, false).unwrap();
+        assert_eq!(
+            ledger.required_service_runtime().unwrap().as_deref(),
+            Some(new)
+        );
+        assert_eq!(
+            ledger.remember_service_runtime(old),
+            Err(BrokerError::VersionMismatch)
+        );
+        ledger.remember_service_runtime(new).unwrap();
+        ledger.unregister_owner("other-owner").unwrap();
+        assert_eq!(
+            ledger.remember_service_runtime(old),
+            Err(BrokerError::VersionMismatch)
+        );
+        ledger
+            .restore_registration("owner", Some((old.into(), false)))
+            .unwrap();
+        assert_eq!(
+            ledger.owner_registration("owner").unwrap(),
+            Some((old.into(), false))
+        );
+        assert_eq!(ledger.service_runtime().unwrap().as_deref(), Some(new));
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM installed_service", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(ledger);
+        assert_eq!(
+            Ledger::open(&path)
+                .unwrap()
+                .service_runtime()
+                .unwrap()
+                .as_deref(),
+            Some(new)
+        );
+    }
 
     #[test]
     fn legacy_ledger_indexes_keep_retained_history_out_of_request_scans() {
@@ -855,6 +1042,86 @@ mod tests {
             )
             .unwrap();
         (ledger, who, dataset)
+    }
+
+    #[test]
+    fn cleanup_cannot_recreate_a_removed_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        let ledger = Ledger::open(&path).unwrap();
+        drop(ledger);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            Ledger::open_existing(&path),
+            Err(BrokerError::Storage)
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn maintenance_reclaims_file_pages_without_deleting_live_grants_or_retained_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        // Exercise an older database without pointer-map pages too.
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE previous_layout(value BLOB); INSERT INTO previous_layout VALUES(zeroblob(1024));").unwrap();
+        drop(connection);
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger.enable_reclamation().unwrap();
+        assert_eq!(
+            ledger
+                .conn
+                .pragma_query_value(None, "auto_vacuum", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let who = Principal {
+            sid: "test-user".into(),
+            runtime_id: "test-release".into(),
+            process_identity: "10:100".into(),
+        };
+        ledger
+            .register_owner(&who.sid, &who.runtime_id, true)
+            .unwrap();
+        let dataset = random_id();
+        ledger
+            .handle(
+                &who,
+                Request::AttachDataset {
+                    dataset_id: dataset.clone(),
+                },
+                100,
+                &TestProtection,
+            )
+            .unwrap();
+        let task = prepare(&mut ledger, &who, &dataset, 1, Consumer::MiniLm.bit());
+        ledger.conn.execute_batch("CREATE TABLE reclamation_fixture(payload BLOB); INSERT INTO reclamation_fixture VALUES(zeroblob(4*1024*1024)); DELETE FROM reclamation_fixture;").unwrap();
+        let free_before = ledger
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        assert!(free_before > 256);
+        ledger.maintenance(102).unwrap();
+        let free_after = ledger
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(free_before - free_after >= 256);
+        assert!(std::fs::metadata(&path).unwrap().len() < size_before);
+        assert!(acquire(&mut ledger, &who, &task.task.task_id, Consumer::MiniLm, 103).is_ok());
+        ledger.maintenance(100 + 100 * DAY_SECS).unwrap();
+        assert_eq!(
+            acquire(
+                &mut ledger,
+                &who,
+                &task.task.task_id,
+                Consumer::MiniLm,
+                100 + 100 * DAY_SECS
+            )
+            .unwrap_err(),
+            BrokerError::Retired
+        );
     }
     pub(super) fn prepare(
         ledger: &mut Ledger,

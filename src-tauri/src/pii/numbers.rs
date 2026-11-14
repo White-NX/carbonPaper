@@ -258,12 +258,11 @@ fn build_group(chars: &[(usize, char)], i: usize, j: usize) -> Option<Group> {
         mapped: 0,
         noise: 0,
     };
-    for k in a..b {
-        let c = chars[k].1;
+    for (offset, &(_, c)) in chars[a..b].iter().enumerate() {
         if let Some(d) = ascii_digit(c) {
             group.canon.push(d);
             group.digits += 1;
-        } else if k == b - 1 && is_check_letter(c) {
+        } else if offset + 1 == b - a && is_check_letter(c) {
             group.canon.push(b'X');
         } else if let Some(d) = confusable_digit(c) {
             group.canon.push(d);
@@ -338,11 +337,10 @@ fn is_mobile(w: &Window, context: Context) -> bool {
         return true;
     }
     // "138 1234 5678" with one digit lost or added in one of its groups.
-    let slipped = match (len, w.lens.as_slice()) {
-        (10, [2, 4, 4] | [3, 3, 4] | [3, 4, 3]) => true,
-        (12, [3, 5, 4] | [3, 4, 5]) => true,
-        _ => false,
-    };
+    let slipped = matches!(
+        (len, w.lens.as_slice()),
+        (10, [2, 4, 4] | [3, 3, 4] | [3, 4, 3]) | (12, [3, 5, 4] | [3, 4, 5])
+    );
     if slipped && prefix && w.noise == 0 && w.mapped <= 1 {
         return true;
     }

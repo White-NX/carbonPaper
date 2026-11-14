@@ -17,6 +17,10 @@ $version = [string]$tauriConfig.version
 $bundleDir = Join-Path $RootDir "src-tauri\target\release\bundle\nsis"
 $portableZip = Join-Path $bundleDir "carbonpaper_${version}_x64_portable.zip"
 $installer = Join-Path $bundleDir "carbonpaper_${version}_x64-setup.exe"
+$repairZip = Join-Path $bundleDir "carbonpaper_${version}_x64_service-repair.zip"
+& (Join-Path $PSScriptRoot 'verify-service-repair.ps1') -Zip $repairZip `
+    -Metadata (Join-Path $bundleDir 'service-repair.json') `
+    -PublicKey (Join-Path $RootDir 'src-tauri\update-public-key.txt') -Version $version
 $manifest = Get-Content -LiteralPath (Join-Path $RootDir "scripts\release-assets\ocr-models.json") -Raw | ConvertFrom-Json
 $semanticManifest = Get-Content -LiteralPath (Join-Path $RootDir "scripts\release-assets\onnxruntime-directml.json") -Raw | ConvertFrom-Json
 
@@ -223,4 +227,4 @@ try {
     }
 }
 
-Write-Host "Portable and NSIS protected runtime signatures, files and native imports verified."
+Write-Host "Portable, NSIS and service repair signatures, files and native imports verified."

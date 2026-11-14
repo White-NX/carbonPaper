@@ -148,6 +148,10 @@ fn snapshot_connection(
     Ok((directory, conn))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keeps archive inputs, wrapping keys, cancellation and progress explicit."
+)]
 pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
     snapshot: &DatabaseSnapshot,
     data_directory: &Path,

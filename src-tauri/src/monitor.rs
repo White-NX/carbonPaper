@@ -112,7 +112,7 @@ impl MonitorState {
     /// lifecycle alone, so it cannot end a session claimed in the meantime.
     fn take_over_for_stop(&self) -> bool {
         self.lifecycle
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 (current != LIFECYCLE_IDLE).then_some(LIFECYCLE_DRAINING)
             })
             .is_ok()
@@ -293,6 +293,10 @@ fn dispatch_typed_monitor_command(
     Ok(serde_json::json!({ "status": "success" }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn monitor_search_nl(
     app: tauri::AppHandle,
@@ -442,25 +446,23 @@ pub async fn monitor_nl_cluster_query(
         crate::semantic_query::try_rust_nl_query(&app, &query, n_results).await
     };
     match outcome {
-        crate::semantic_query::RustQueryOutcome::Served(response) => return Ok(response),
+        crate::semantic_query::RustQueryOutcome::Served(response) => Ok(response),
         crate::semantic_query::RustQueryOutcome::Unavailable(reason) => {
-            return Err(format!("Semantic retrieval unavailable: {reason}"));
+            Err(format!("Semantic retrieval unavailable: {reason}"))
         }
         // The user stopped it.
         //
         // Returned as a success with `cancelled` set rather than as an error:
         // the view has to tell "you stopped this" apart from "this broke", and
         // an `Err` is rendered as a failure by every caller of this command.
-        crate::semantic_query::RustQueryOutcome::Cancelled => {
-            return Ok(serde_json::json!({
-                "status": "cancelled",
-                "cancelled": true,
-                "results": [],
-                "reranked": false,
-                "rerank_variant": null,
-                "backend": "rust",
-            }));
-        }
+        crate::semantic_query::RustQueryOutcome::Cancelled => Ok(serde_json::json!({
+            "status": "cancelled",
+            "cancelled": true,
+            "results": [],
+            "reranked": false,
+            "rerank_variant": null,
+            "backend": "rust",
+        })),
     }
 }
 
@@ -769,8 +771,8 @@ async fn start_capture(app: &AppHandle, initially_paused: bool) -> Result<String
         return Ok("Monitor is already running".into());
     };
     state.stopping.store(false, Ordering::SeqCst);
-    spawn_capture_loop(&app, session, initially_paused);
-    crate::refresh_tray_menu(&app);
+    spawn_capture_loop(app, session, initially_paused);
+    crate::refresh_tray_menu(app);
     Ok("Monitor started".into())
 }
 
@@ -1005,12 +1007,12 @@ async fn stop_capture(app: &AppHandle) -> Result<String, String> {
         }
     }
 
-    drain_capture_session(&app, &capture_state, "stop_monitor").await;
+    drain_capture_session(app, &capture_state, "stop_monitor").await;
 
     if took_over {
         state.finish_drain();
     }
-    crate::refresh_tray_menu(&app);
+    crate::refresh_tray_menu(app);
     let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": true}));
 
     Ok("Monitor stopped".into())

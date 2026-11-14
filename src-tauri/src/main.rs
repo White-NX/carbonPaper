@@ -8,6 +8,19 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args
         .get(1)
+        .is_some_and(|arg| arg == "--uninstall-protected-component")
+    {
+        if args.len() != 2 {
+            std::process::exit(2);
+        }
+        if let Err(error) = carbonpaper_lib::uninstall_protected_component() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args
+        .get(1)
         .is_some_and(|arg| arg == "--verify-update-manifest")
     {
         if args.len() != 3 {

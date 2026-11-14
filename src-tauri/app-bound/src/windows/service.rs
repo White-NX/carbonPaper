@@ -104,6 +104,8 @@ fn mark_timing(timing: &Option<SharedTiming>, mark: impl FnOnce(&mut ConnectionT
 pub struct ServiceHandle(pub SC_HANDLE);
 impl Drop for ServiceHandle {
     fn drop(&mut self) {
+        // SAFETY: this uniquely owned SCM handle came from a successful open
+        // or create call; Drop closes it exactly once after its final use.
         unsafe {
             let _ = CloseServiceHandle(self.0);
         }
@@ -126,6 +128,9 @@ pub fn try_open_service(access: u32) -> Result<Option<ServiceHandle>> {
         match OpenServiceW(manager.0, PCWSTR(name.as_ptr()), access) {
             Ok(handle) => Ok(Some(ServiceHandle(handle))),
             Err(error) if error.code() == windows::core::HRESULT::from_win32(1060) => Ok(None),
+            Err(error) if error.code() == windows::core::HRESULT::from_win32(1072) => {
+                Err(BrokerError::Busy)
+            }
             Err(_) => Err(BrokerError::AccessDenied),
         }
     }
@@ -153,6 +158,24 @@ pub fn running_pid() -> Result<u32> {
         return Err(BrokerError::Unavailable);
     }
     Ok(status.dwProcessId)
+}
+
+pub(super) fn ensure_started() -> Result<()> {
+    let Some(handle) = try_open_service(SERVICE_QUERY_STATUS | SERVICE_START)? else {
+        return Err(BrokerError::Unavailable);
+    };
+    if query_status(&handle)?.dwCurrentState == SERVICE_STOPPED {
+        // SAFETY: only the registered fixed-name service can be started. SCM
+        // verifies permissions and retains its administrator-owned command.
+        unsafe {
+            if let Err(error) = StartServiceW(handle.0, None) {
+                if error.code() != windows::core::HRESULT::from_win32(1056) {
+                    return Err(BrokerError::Unavailable);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn run() -> Result<()> {
@@ -223,10 +246,43 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         }
         let directory = identity::state_root()?;
         diagnostics::init(&directory);
+        let _watchdog = super::watchdog::start()?;
+        let startup = super::watchdog::begin_work();
         diagnostics::event("info", "service_starting", "startup", None);
         allow_peer_identity_queries()?;
         identity::assert_protected(&directory)?;
-        let ledger = Arc::new(LedgerLock::new(Ledger::open(&directory.join("keys.db"))?));
+        let opened = Ledger::open(&directory.join("keys.db"))?;
+        #[cfg(not(test))]
+        let opened = {
+            let mut opened = opened;
+            if let Err(error) =
+                super::repair::remember_installed_service(&identity::protected_root()?, &opened)
+            {
+                diagnostics::event(
+                    "warn",
+                    "service_checkpoint_deferred",
+                    "startup",
+                    Some(error),
+                );
+            }
+            if let Err(error) = super::activation::reconcile_after_interruption(
+                &identity::protected_root()?,
+                &opened,
+            ) {
+                diagnostics::event(
+                    "warn",
+                    "activation_recovery_deferred",
+                    "startup",
+                    Some(error),
+                );
+            }
+            super::revocation::drain_all(&directory, &mut opened)?;
+            if super::collection::retire_unused_service(&identity::protected_root()?, &opened)? {
+                return Ok(());
+            }
+            opened
+        };
+        let ledger = Arc::new(LedgerLock::new(opened));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             // Authority work is synchronous by design. Keep it on a bounded
@@ -235,6 +291,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
             .enable_all()
             .build()
             .map_err(|_| BrokerError::Unavailable)?;
+        drop(startup);
         let serve_result = runtime.block_on(serve(ledger));
         // Tokio cannot cancel a blocking task after it has started. Bound runtime
         // shutdown so a stuck DPAPI or SQLite call cannot prevent service stop.
@@ -273,6 +330,8 @@ fn allow_peer_identity_queries() -> Result<()> {
     // Standard-user clients must verify the actual SYSTEM process token. Give
     // them only QUERY_LIMITED_INFORMATION on the process and TOKEN_QUERY on its
     // token, never VM access, handle duplication, token duplication or mutation.
+    // SAFETY: the current-process pseudo handle stays live; the token output
+    // is initialized and its owned handle is retained while its DACL is updated.
     unsafe {
         let process = windows::Win32::System::Threading::GetCurrentProcess();
         set_query_dacl(process, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x1000;;;AU)")?;
@@ -383,6 +442,7 @@ async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
     report(SERVICE_RUNNING, 0);
     diagnostics::event("info", "service_ready", "serve", None);
     let result = loop {
+        super::watchdog::poll();
         if STOP.load(Ordering::SeqCst) {
             break Ok(());
         }
@@ -459,7 +519,23 @@ async fn maintenance_loop(ledger: Arc<LedgerLock>) -> Result<()> {
         }
         run_ledger_blocking(
             ledger.clone(),
-            |ledger| ledger.maintenance(now_secs()),
+            |ledger| {
+                #[cfg(not(test))]
+                super::revocation::drain_all(&identity::state_root()?, ledger)?;
+                ledger.maintenance(now_secs())?;
+                #[cfg(not(test))]
+                if let Err(error) =
+                    super::collection::maintenance(&identity::protected_root()?, ledger)
+                {
+                    diagnostics::event(
+                        "warn",
+                        "runtime_collection_deferred",
+                        "maintenance",
+                        Some(error),
+                    );
+                }
+                Ok(())
+            },
             None,
             None,
         )
@@ -559,6 +635,7 @@ where
     // cancelled after this starts, the blocking closure still owns the ledger
     // and releases it only after the synchronous operation finishes.
     let handle = tokio::task::spawn_blocking(move || {
+        let _work = super::watchdog::begin_work();
         mark_timing(&timing, |timing| {
             timing.worker_started = Some(Instant::now())
         });
@@ -582,6 +659,7 @@ async fn verify_caller_blocking(
     // drop the async future, but DPAPI/identity code must never observe a
     // handle that was closed by that cancellation.
     let handle = tokio::task::spawn_blocking(move || {
+        let _work = super::watchdog::begin_work();
         let handle = HANDLE(pipe.as_raw_handle());
         let mut pid = 0;
         // SAFETY: pipe owns this handle; PID comes from the kernel.
@@ -642,6 +720,10 @@ async fn run_request_blocking(
                 pipe: HANDLE(pipe.as_raw_handle()),
                 sid: &caller.principal.sid,
             };
+            #[cfg(not(test))]
+            if ledger.registered_runtime(&caller.principal.sid)?.is_some() {
+                super::revocation::drain(&identity::state_root()?, &caller.principal.sid, ledger)?;
+            }
             let response = ledger
                 .handle(&caller.principal, request, now_secs(), &protector)
                 .unwrap_or_else(Response::Error);
@@ -768,12 +850,16 @@ async fn handle_connection_inner(
 struct Impersonation;
 impl Impersonation {
     fn begin(pipe: HANDLE, expected_sid: &str) -> Result<Self> {
+        // SAFETY: the caller retains this connected server pipe; impersonation
+        // stays on this thread and the guard always balances it with a revert.
         unsafe {
             ImpersonateNamedPipeClient(pipe).map_err(|_| BrokerError::AccessDenied)?;
         }
         let guard = Self;
         // Verify the pipe token as well as the client process token. SQOS must
         // permit impersonation, and another user's token is never accepted.
+        // SAFETY: the guard keeps this thread impersonating the client; the
+        // token output is initialized and its owned handle outlives SID copying.
         unsafe {
             let mut token = HANDLE::default();
             windows::Win32::System::Threading::OpenThreadToken(
@@ -794,6 +880,8 @@ impl Impersonation {
 impl Drop for Impersonation {
     fn drop(&mut self) {
         // Continuing on a pooled thread after a failed revert is unsafe.
+        // SAFETY: Drop runs on the impersonating thread and reverts its own
+        // token without passing pointers or transferring handle ownership.
         if unsafe { Security::RevertToSelf() }.is_err() {
             std::process::abort();
         }

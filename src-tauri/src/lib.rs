@@ -48,7 +48,6 @@ mod mcp_token;
 mod minilm_contract;
 mod minilm_index;
 #[allow(dead_code)]
-#[allow(dead_code)]
 mod ml_protocol;
 mod ml_runtime;
 mod model_management;
@@ -65,6 +64,7 @@ mod power;
 mod processing_stage;
 mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
+pub use app_bound::uninstall_for_package as uninstall_protected_component;
 mod registry_config;
 mod rerank;
 mod resource_utils;
@@ -242,6 +242,12 @@ pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) {
 pub struct LightweightModeState {
     pub is_lightweight: Mutex<bool>,
     pub auto_switch_timer: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl Default for LightweightModeState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LightweightModeState {
@@ -519,7 +525,7 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
                     .notification()
                     .builder()
                     .title("CarbonPaper")
-                    .body(&format!("{}: {}", texts.open_error, e))
+                    .body(format!("{}: {}", texts.open_error, e))
                     .show();
             }
         }
@@ -910,7 +916,6 @@ pub fn run() {
         .on_page_load(main_window::on_page_load)
         .setup({
             let data_dir = data_dir.clone();
-            let start_hidden = start_hidden;
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
@@ -1130,6 +1135,7 @@ pub fn run() {
             app_bound::app_bound_acknowledge_offer,
             app_bound::app_bound_set_policy,
             app_bound::app_bound_install,
+            app_bound::app_bound_repair,
             app_bound::app_bound_uninstall,
             background_scheduler::background_scheduler_status,
             get_autostart_status,
@@ -1236,6 +1242,41 @@ fn apply_startup_window_policy(
     }
 }
 
+pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {
+    use std::process::exit;
+
+    let file_data = match std::fs::read(key_file_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read master key file: {}", e);
+            exit(1);
+        }
+    };
+
+    let ciphertext = match credential_manager::decode_master_key_file(&file_data) {
+        Ok(ct) => ct,
+        Err(e) => {
+            eprintln!("Failed to decode master key file: {}", e);
+            exit(1);
+        }
+    };
+
+    match credential_manager::decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd) {
+        Ok(master_key) => {
+            print!("{}", hex::encode(&master_key));
+            exit(0);
+        }
+        Err(credential_manager::CredentialError::UserCancelled) => {
+            eprintln!("UserCancelled");
+            exit(2);
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            exit(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,40 +1312,5 @@ mod tests {
             MouseButton::Right,
             MouseButtonState::Up
         ));
-    }
-}
-
-pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {
-    use std::process::exit;
-
-    let file_data = match std::fs::read(key_file_path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("Failed to read master key file: {}", e);
-            exit(1);
-        }
-    };
-
-    let ciphertext = match credential_manager::decode_master_key_file(&file_data) {
-        Ok(ct) => ct,
-        Err(e) => {
-            eprintln!("Failed to decode master key file: {}", e);
-            exit(1);
-        }
-    };
-
-    match credential_manager::decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd) {
-        Ok(master_key) => {
-            print!("{}", hex::encode(&master_key));
-            exit(0);
-        }
-        Err(credential_manager::CredentialError::UserCancelled) => {
-            eprintln!("UserCancelled");
-            exit(2);
-        }
-        Err(e) => {
-            eprintln!("{}", e);
-            exit(1);
-        }
     }
 }

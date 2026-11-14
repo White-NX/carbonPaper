@@ -273,6 +273,10 @@ impl StorageState {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keeps date and millisecond bounds, privacy policy and process filters explicit."
+    )]
     pub(crate) fn recap_keyword_candidates<T: DeserializeOwned + Send>(
         &self,
         query: &str,

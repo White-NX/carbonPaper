@@ -148,7 +148,7 @@ impl StorageState {
         {
             // Windows paths are case-insensitive even when the spelling from
             // the picker differs from the registry value.
-            return PathBuf::from(canonical.to_string_lossy().to_ascii_lowercase());
+            PathBuf::from(canonical.to_string_lossy().to_ascii_lowercase())
         }
         #[cfg(not(windows))]
         {
@@ -339,7 +339,7 @@ impl StorageState {
                 }
             };
             if let Err(error) = database_snapshot::validate_database_snapshot(
-                &staging.path(),
+                staging.path(),
                 &manifest,
                 database_key.as_deref().unwrap_or_default(),
             ) {

@@ -383,9 +383,7 @@ impl SensitiveFilterState {
         // string replacing masked chars with '█'.
         let mut masked = vec![false; text.len()];
         for m in &matches {
-            for i in m.start()..m.end() {
-                masked[i] = true;
-            }
+            masked[m.start()..m.end()].fill(true);
         }
 
         let mut result = String::with_capacity(text.len());

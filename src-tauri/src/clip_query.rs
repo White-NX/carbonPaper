@@ -1016,41 +1016,6 @@ fn paginate<T>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     rows.into_iter().skip(offset).take(limit).collect()
 }
 
-/// The fixture uses the production SQL/CNG readers. `legacy` reproduces the
-/// pre-scalability metadata reads for an unfiltered request, after the #233 fix.
-#[cfg(test)]
-pub(crate) fn benchmark_hydration(
-    storage: &StorageState,
-    scored: Vec<ScoredSubject>,
-    offset: usize,
-    limit: usize,
-    include_ocr: bool,
-    legacy: bool,
-) -> Result<Vec<serde_json::Value>, String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut filter = ClipCandidateFilter::new(offset + limit, &[], None, None, deadline);
-    let mut hits = filter.filter(scored, |keys| {
-        if legacy {
-            load_candidate_summaries(storage, keys, deadline)
-        } else {
-            storage.clip_candidate_metadata(keys, deadline)
-        }
-    })?;
-    if legacy {
-        for hit in &mut hits {
-            hit.summary_complete = true;
-        }
-    }
-    let page = resolve_page_metadata(paginate(hits, offset, limit), |ids| {
-        storage
-            .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
-            .map_err(|error| error.to_string())
-    })?;
-    hydrate_page(page, 0, limit, deadline, |ids| {
-        load_page_texts(storage, ids, deadline, include_ocr)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

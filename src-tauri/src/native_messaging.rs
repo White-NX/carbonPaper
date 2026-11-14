@@ -371,7 +371,7 @@ fn open_browser_extensions_page(browser: &str, url: &str) {
 
     // Fallback: try exe name directly (may be in PATH)
     for exe in exe_names {
-        if let Ok(_) = std::process::Command::new(exe).arg(url).spawn() {
+        if std::process::Command::new(exe).arg(url).spawn().is_ok() {
             tracing::info!("Opened {} via PATH with {}", url, exe);
             return;
         }

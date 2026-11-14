@@ -156,16 +156,10 @@ impl StorageState {
                 tracing::warn!("Processing staging is unavailable: {error}");
             }
         }
-        if let Err(error) = self.publish_protected_keys() {
-            self.processing_stage.shutdown();
-            *self.db.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            self.protected.reset();
-            return Err(error);
-        }
-
-        // Publish readiness only after the protected write keys and staging
-        // boundary are settled, so capture cannot enter a half-open archive.
+        // The validated local write keys are ready. Optional service grants
+        // are published on their own lane and cannot undo archive readiness.
         self.initialized.store(true, Ordering::Release);
+        self.request_protected_key_publication();
 
         tracing::info!(
             "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?}, protected_content={:?})",

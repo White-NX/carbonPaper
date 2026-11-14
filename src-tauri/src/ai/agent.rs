@@ -506,7 +506,9 @@ mod tests {
             }
             let retained = turns.len() / 2;
             for (pair, expected) in turns
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .zip(&history[length - retained..length])
             {
                 assert!(matches!(&pair[0], Message::User(s) if s == &expected.question));

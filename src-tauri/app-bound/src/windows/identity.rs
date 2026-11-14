@@ -29,6 +29,8 @@ pub struct OwnedHandle(pub HANDLE);
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
+            // SAFETY: this wrapper owns the valid kernel handle and closes it
+            // exactly once after its final use.
             unsafe {
                 let _ = CloseHandle(self.0);
             }
@@ -133,6 +135,8 @@ pub fn token_sid(token: HANDLE) -> Result<String> {
 }
 
 pub fn current_sid() -> Result<String> {
+    // SAFETY: the current-process pseudo handle is always live and is only
+    // borrowed while querying its token; no owner attempts to close it.
     unsafe { process_sid(GetCurrentProcess()) }
 }
 
@@ -210,17 +214,25 @@ fn trusted_sid(sid: &str) -> bool {
 /// Reject mutable ownership, null DACLs, unsupported ACE forms, and any write
 /// grant outside SYSTEM, Administrators and Windows TrustedInstaller.
 pub fn assert_protected(path: &Path) -> Result<()> {
-    assert_path_protected(path, false)
+    assert_path_protected(path, false, None)
 }
 
 /// Ordinary installer directories can retain Windows' standard CREATOR OWNER
 /// inheritance template. It does not grant access to the directory itself;
 /// its current owner and every other write grant must still be trusted.
 pub fn assert_ordinary_installation(path: &Path) -> Result<()> {
-    assert_path_protected(path, true)
+    assert_path_protected(path, true, None)
 }
 
-fn assert_path_protected(path: &Path, ordinary_installation: bool) -> Result<()> {
+pub(crate) fn assert_revocation_inbox(path: &Path, sid: &str) -> Result<()> {
+    assert_path_protected(path, false, Some(sid))
+}
+
+fn assert_path_protected(
+    path: &Path,
+    ordinary_installation: bool,
+    append_sid: Option<&str>,
+) -> Result<()> {
     no_reparse(path)?;
     let allow_creator_owner_inheritance = ordinary_installation
         && std::fs::symlink_metadata(path)
@@ -245,7 +257,12 @@ fn assert_path_protected(path: &Path, ordinary_installation: bool) -> Result<()>
         )
         .ok()
         .map_err(|_| BrokerError::AccessDenied)?;
-        let result = validate_protected_acl(owner, acl, allow_creator_owner_inheritance);
+        let result = validate_protected_acl_with_append(
+            owner,
+            acl,
+            allow_creator_owner_inheritance,
+            append_sid,
+        );
         LocalFree(HLOCAL(descriptor.0));
         result
     }
@@ -254,10 +271,21 @@ fn assert_path_protected(path: &Path, ordinary_installation: bool) -> Result<()>
 /// # Safety
 /// The owner and ACL must belong to a valid Windows security descriptor that
 /// stays live until this function returns. A null DACL is rejected.
+#[cfg(all(test, not(feature = "development-runtime")))]
 unsafe fn validate_protected_acl(
     owner: PSID,
     acl: *const Security::ACL,
     allow_creator_owner_inheritance: bool,
+) -> Result<()> {
+    // SAFETY: forwarded pointers have the same lifetime as this call.
+    unsafe { validate_protected_acl_with_append(owner, acl, allow_creator_owner_inheritance, None) }
+}
+
+unsafe fn validate_protected_acl_with_append(
+    owner: PSID,
+    acl: *const Security::ACL,
+    allow_creator_owner_inheritance: bool,
+    append_sid: Option<&str>,
 ) -> Result<()> {
     // SAFETY: the caller retains the OS-provided descriptor containing the
     // owner, ACL and every ACE inspected here; GetAce bounds-checks each entry.
@@ -287,13 +315,26 @@ unsafe fn validate_protected_acl(
                 return Err(BrokerError::AccessDenied);
             }
             let allowed = &*ace.cast::<Security::ACCESS_ALLOWED_ACE>();
+            if let Some(expected) = append_sid {
+                let sid = sid_string(PSID((&allowed.SidStart as *const u32).cast_mut().cast()))?;
+                if !trusted_sid(&sid)
+                    && (sid != expected || allowed.Mask & !0x0012_0084 != 0 || header.AceFlags != 0)
+                {
+                    return Err(BrokerError::AccessDenied);
+                }
+            }
             if allowed.Mask & WRITE_RIGHTS != 0 {
                 let sid = PSID((&allowed.SidStart as *const u32).cast_mut().cast());
                 let sid = sid_string(sid)?;
                 let creator_owner_template = allow_creator_owner_inheritance
                     && u32::from(header.AceFlags) & Security::INHERIT_ONLY_ACE.0 != 0
                     && sid == "S-1-3-0";
-                if !trusted_sid(&sid) && !creator_owner_template {
+                // The inbox permits only appending and inspecting its size.
+                // It never grants overwrite, read-data, delete or DACL rights.
+                let append_only = append_sid == Some(sid.as_str())
+                    && allowed.Mask & !0x0012_0084 == 0
+                    && header.AceFlags == 0;
+                if !trusted_sid(&sid) && !creator_owner_template && !append_only {
                     return Err(BrokerError::AccessDenied);
                 }
             }
@@ -310,6 +351,27 @@ pub fn protect_path(path: &Path, readable: bool) -> Result<()> {
     } else {
         "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
     };
+    set_path_security(path, sddl)
+}
+
+pub(crate) fn protect_revocation_inbox(path: &Path, sid: &str) -> Result<()> {
+    let sddl = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x00120084;;;{sid})");
+    set_path_security(path, &sddl)
+}
+
+pub(crate) fn protect_inbox_directory(path: &Path) -> Result<()> {
+    // This non-inheriting metadata grant permits checking ownership and DACL;
+    // it does not permit listing the directory or reading the SYSTEM ledger.
+    // SYNCHRONIZE is required when Windows opens a directory for metadata.
+    // Keep this grant on the directory itself, without FILE_LIST_DIRECTORY.
+    set_path_security(
+        path,
+        "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x00120080;;;AU)",
+    )
+}
+
+fn set_path_security(path: &Path, sddl: &str) -> Result<()> {
+    no_reparse(path)?;
     let text = wide(sddl.as_ref());
     let name = wide(path.as_os_str());
     // SAFETY: the SDDL conversion owns the returned descriptor; extracted owner
@@ -522,6 +584,14 @@ pub fn safe_runtime_id(value: &str) -> bool {
         && !value.ends_with('.')
 }
 
+pub(super) fn safe_sid(value: &str) -> bool {
+    value.starts_with("S-1-")
+        && value.len() <= 184
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'S')
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Activation {
@@ -535,6 +605,7 @@ pub fn active_runtime() -> Result<Option<PathBuf>> {
 /// The SID comes from an OS process token, never an IPC request.
 pub(crate) fn active_runtime_for_sid(sid: &str) -> Result<Option<PathBuf>> {
     let root = protected_root()?;
+    super::activation::wait_for_projection(&root, sid)?;
     let path = root.join("Activations").join(format!("{sid}.json"));
     if !path.exists() {
         return Ok(None);
@@ -574,7 +645,7 @@ mod tests {
                 None,
             )
             .expect("valid ACL regression fixture");
-            let result = (|| {
+            let result = {
                 let mut owner = PSID::default();
                 let mut defaulted = BOOL::default();
                 Security::GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted)
@@ -589,7 +660,7 @@ mod tests {
                 )
                 .expect("ACL regression fixture has a DACL");
                 validate_protected_acl(owner, acl, ordinary_directory)
-            })();
+            };
             LocalFree(HLOCAL(descriptor.0));
             result
         }

@@ -451,7 +451,7 @@ impl StorageState {
                 let token_hash = Self::compute_hmac_hash(&token, hmac_key);
                 batch_tokens
                     .entry(token_hash)
-                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .or_default()
                     .insert(*ocr_id as u32);
             }
         }
@@ -592,7 +592,7 @@ impl StorageState {
                 let token_hash = Self::compute_hmac_hash(&token, hmac_key);
                 batch_tokens
                     .entry(token_hash)
-                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .or_default()
                     .insert(*ocr_id as u32);
             }
         }

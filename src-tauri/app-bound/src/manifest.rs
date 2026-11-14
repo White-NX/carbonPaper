@@ -136,6 +136,12 @@ pub fn read_manifest(directory: &Path) -> Result<(ReleaseManifest, String)> {
     Ok((manifest, id))
 }
 
+pub fn compare_versions(candidate: &str, installed: &str) -> Result<std::cmp::Ordering> {
+    let candidate = semver::Version::parse(candidate).map_err(|_| BrokerError::VersionMismatch)?;
+    let installed = semver::Version::parse(installed).map_err(|_| BrokerError::VersionMismatch)?;
+    Ok(candidate.cmp_precedence(&installed))
+}
+
 pub fn safe_relative_path(value: &str) -> Result<PathBuf> {
     // Validate using Windows rules on all test hosts, including ADS and device names.
     if value.is_empty()

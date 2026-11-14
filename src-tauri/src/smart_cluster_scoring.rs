@@ -272,7 +272,7 @@ impl SmartClusterWorkerState {
             .drain_progress
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let progress_before = progress.clone();
+        let progress_before = *progress;
         *progress = SmartClusterDrainProgress {
             phase: SmartClusterDrainPhase::Queued,
             total: pending_count,
@@ -418,10 +418,10 @@ impl SmartClusterWorkerState {
     }
 
     pub fn progress(&self) -> SmartClusterDrainProgress {
-        self.drain_progress
+        *self
+            .drain_progress
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clone()
     }
 
     pub(crate) fn emit_progress(&self, app: &AppHandle) {
@@ -1559,7 +1559,7 @@ fn reusable_anchor_vector<'a>(
     let matches = cached.source_hash == anchor_hash
         && cached.model_id == descriptor.model_id
         && cached.model_revision == descriptor.revision;
-    matches.then(|| cached.vector.as_slice())
+    matches.then_some(cached.vector.as_slice())
 }
 
 /// Get each cluster's anchor vector, encoding only the ones that need it.

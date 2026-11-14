@@ -11,12 +11,29 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
+#[cfg(not(feature = "app-bound-dev"))]
+mod repair;
+
 const OFFER_SEEN: &str = "app_bound_offer_seen";
+const PACKAGE_SOURCE: &str = "app_bound_package_source";
 static REPAIR_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UPGRADE_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REPAIR_OFFER_DISMISSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static PROTECTED_ENVIRONMENT_READY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RepairOutcome {
+    Repaired {
+        restart_required: bool,
+    },
+    #[cfg(not(feature = "app-bound-dev"))]
+    DownloadRequired {
+        size_bytes: Option<u64>,
+    },
+}
 
 #[derive(serde::Serialize)]
 pub struct AppBoundStatus {
@@ -24,6 +41,7 @@ pub struct AppBoundStatus {
     pub processing: ProcessingStatus,
     pub offer_enable: bool,
     pub package_available: bool,
+    pub repair_available: bool,
 }
 
 fn executable_directory() -> Result<PathBuf, String> {
@@ -40,6 +58,59 @@ fn executable_directory() -> Result<PathBuf, String> {
 
 pub(crate) fn supported_build() -> bool {
     !cfg!(debug_assertions) || cfg!(feature = "app-bound-dev")
+}
+
+/// Package uninstall runs before the desktop or delegation starts. The helper
+/// validates this signed caller again after elevation and removes only its SID.
+pub fn uninstall_for_package() -> Result<(), String> {
+    if !supported_build() {
+        return Ok(());
+    }
+    let root = identity::protected_root().map_err(|e| e.to_string())?;
+    if !root.exists() {
+        return Ok(());
+    }
+    let sid = identity::current_sid().map_err(|e| e.to_string())?;
+    let needs_removal = [
+        root.join("Activations").join(format!("{sid}.json")),
+        root.join("Detached").join(format!("{sid}.json")),
+        root.join("System/activation.pending.json"),
+    ]
+    .into_iter()
+    .map(|path| path.try_exists().map_err(|error| error.to_string()))
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .any(|exists| exists);
+    if !needs_removal {
+        return Ok(());
+    }
+    let directory = executable_directory()?;
+    let (release, _) = manifest::read_manifest(&directory).map_err(|e| e.to_string())?;
+    let helper = directory.join("carbonpaper-protected-setup.exe");
+    let mut locked = identity::locked_file(&helper).map_err(|e| e.to_string())?;
+    identity::verify_file(
+        &mut locked,
+        release
+            .files
+            .get("carbonpaper-protected-setup.exe")
+            .ok_or("Installer is missing")?,
+    )
+    .map_err(|e| e.to_string())?;
+    carbonpaper_app_bound::privileged::verify_loader_policy(&mut locked)
+        .map_err(|e| e.to_string())?;
+    let status = runas::Command::new(&helper)
+        .arg("--uninstall")
+        .arg("--remove-runtime")
+        .arg("--caller-pid")
+        .arg(std::process::id().to_string())
+        .gui(true)
+        .show(false)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("APP_BOUND_UNINSTALL_FAILED".into());
+    }
+    Ok(())
 }
 
 fn installation_source() -> Result<PathBuf, String> {
@@ -105,7 +176,7 @@ pub(crate) fn protected_resource(relative: &str) -> Result<Option<PathBuf>, Stri
 }
 
 /// Called before the single-instance plugin: movable portable and installer
-/// copies remain launchers for the registered protected runtime.
+/// copies launch the registered runtime unless this package is newer.
 pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
     #[cfg(feature = "app-bound-dev")]
     {
@@ -120,7 +191,7 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
                 }
             }
         }
-        return Ok(false);
+        Ok(false)
     }
     #[cfg(not(feature = "app-bound-dev"))]
     {
@@ -181,6 +252,25 @@ fn try_delegate_startup(args: &[String], directory: &Path) -> Result<bool, Strin
         return Ok(false);
     }
     let (release, _) = manifest::read_manifest(&active).map_err(|e| e.to_string())?;
+    if package_is_newer(env!("CARGO_PKG_VERSION"), &release.version)? {
+        // A manual package update must run the new UI rather than silently
+        // delegating to an older protected copy. Activation remains an explicit
+        // authenticated action; an ordinary login never starts a UAC prompt.
+        UPGRADE_NEEDED.store(true, std::sync::atomic::Ordering::Release);
+        if existing_desktop_instance() {
+            // The single-instance plugin would otherwise raise the old UI and
+            // discard this new process. Ask for an ordinary exit before it can
+            // touch the shared archive; background launches remain silent.
+            if !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--hidden" | "--autostart"))
+            {
+                show_old_version_running();
+            }
+            return Ok(true);
+        }
+        return Ok(false);
+    }
     let executable = active.join("carbonpaper.exe");
     let mut locked = identity::locked_file(&executable).map_err(|e| e.to_string())?;
     identity::verify_file(
@@ -212,6 +302,78 @@ fn try_delegate_startup(args: &[String], directory: &Path) -> Result<bool, Strin
         return Err("Protected application could not start".into());
     }
     Ok(true)
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn package_is_newer(candidate: &str, active: &str) -> Result<bool, String> {
+    manifest::compare_versions(candidate, active)
+        .map(|order| order.is_gt())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn existing_desktop_instance() -> bool {
+    use windows::{
+        core::PCWSTR,
+        Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId},
+    };
+    let class = identity::wide(std::ffi::OsStr::new("com.eyling.carbonpaper-sic"));
+    let name = identity::wide(std::ffi::OsStr::new("com.eyling.carbonpaper-siw"));
+    // SAFETY: this queries the plugin's fixed local window. Its owner is
+    // checked against the OS token; it is never used as an IPC authority.
+    unsafe {
+        let Ok(window) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR(name.as_ptr())) else {
+            return false;
+        };
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        let Ok(process) = identity::inspect_process(pid) else {
+            return true;
+        };
+        if identity::current_sid().is_ok_and(|sid| sid != process.principal.sid) {
+            return false;
+        }
+        // Another copy of this newer UI may already be offering activation.
+        // Its normal single-instance handoff is safe and needs no exit prompt.
+        if process
+            .image
+            .parent()
+            .and_then(|dir| manifest::read_manifest(dir).ok())
+            .is_some_and(|(release, _)| {
+                package_is_newer(env!("CARGO_PKG_VERSION"), &release.version) == Ok(false)
+            })
+        {
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn show_old_version_running() {
+    use windows::{
+        core::PCWSTR,
+        Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK},
+    };
+    let locale = crate::registry_config::get_string("language").unwrap_or_default();
+    let text = identity::wide(std::ffi::OsStr::new(&crate::i18n::t(
+        &locale,
+        "appBound.closeOldVersion",
+    )));
+    let title = identity::wide(std::ffi::OsStr::new("CarbonPaper"));
+    // SAFETY: this informational dialog has no privileged action or shared
+    // application state and both strings remain valid until it closes.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 #[cfg(not(feature = "app-bound-dev"))]
@@ -256,35 +418,84 @@ pub async fn app_bound_status(
     crate::settings_window::check_settings_ui(&window)?;
     let storage = storage.inner().clone();
     tokio::task::spawn_blocking(move || {
-        if storage.background_processing_enabled() {
+        let upgrade = UPGRADE_NEEDED.load(std::sync::atomic::Ordering::Acquire);
+        let launch_repair = REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire);
+        if !upgrade && !launch_repair && storage.background_processing_enabled() {
             let _ = storage.processing_stage.refresh();
-        } else {
+        } else if !upgrade && !launch_repair {
             let _ = storage.processing_stage.disable_if_installed();
         }
         let mut processing = storage.processing_stage.status();
-        let repair = REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire);
-        if repair {
+        if processing.installed && !processing.available {
+            processing.reason = status_reason(processing.reason.as_deref()).map(str::to_string);
+        }
+        let repair = launch_repair || processing.reason.as_deref() == Some("repair_required");
+        if repair || upgrade {
             processing.installed = true;
             processing.available = false;
-            processing.reason = Some("repair_required".into());
+            processing.reason = Some(
+                if upgrade {
+                    "upgrade_required"
+                } else {
+                    "repair_required"
+                }
+                .into(),
+            );
         }
         let package_available = supported_build()
             && installation_source()
                 .ok()
                 .is_some_and(|dir| manifest::read_manifest(&dir).is_ok());
-        let offer_enable = package_available
-            && ((repair && !REPAIR_OFFER_DISMISSED.load(std::sync::atomic::Ordering::Acquire))
+        let repair_available = supported_build()
+            && (processing.installed
+                || launch_repair
+                || identity::current_sid()
+                    .ok()
+                    .and_then(|sid| {
+                        identity::protected_root().ok().map(|root| {
+                            root.join("Activations")
+                                .join(format!("{sid}.json"))
+                                .exists()
+                        })
+                    })
+                    .unwrap_or(false));
+        let offer_enable = ((repair && repair_available)
+            || (upgrade && package_available)
+            || (package_available
+                && !processing.installed
+                && storage.background_processing_enabled()))
+            && (((repair || upgrade)
+                && !REPAIR_OFFER_DISMISSED.load(std::sync::atomic::Ordering::Acquire))
                 || (storage.background_processing_enabled()
                     && !processing.installed
                     && !crate::registry_config::get_bool(OFFER_SEEN).unwrap_or(false)));
         Ok(AppBoundStatus {
             processing,
             package_available,
+            repair_available,
             offer_enable,
         })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn status_reason(reason: Option<&str>) -> Option<&str> {
+    match reason {
+        Some(
+            "app_bound_unavailable"
+            | "app_bound_task_busy"
+            | "app_bound_storage_failure"
+            | "app_bound_protection_failure",
+        ) => Some("service_unavailable"),
+        Some(
+            "app_bound_access_denied"
+            | "app_bound_integrity_failure"
+            | "app_bound_dataset_mismatch"
+            | "app_bound_version_mismatch",
+        ) => Some("repair_required"),
+        other => other,
+    }
 }
 
 #[tauri::command]
@@ -324,7 +535,7 @@ pub async fn app_bound_set_policy(
             if !was_enabled {
                 storage.rotate_protected_write_keys()?;
             }
-            storage.publish_protected_keys()?;
+            storage.request_protected_key_publication();
             crate::ai::recap::protected::sync_after_unlock(&recap_app)?;
         }
         storage.processing_stage.reconcile(&storage)
@@ -367,6 +578,8 @@ pub(crate) async fn install_runtime(source: PathBuf, enable: bool) -> Result<(),
                 .ok_or("Installer is missing")?,
         )
         .map_err(|e| e.to_string())?;
+        carbonpaper_app_bound::privileged::verify_loader_policy(&mut executable)
+            .map_err(|e| e.to_string())?;
         let mut command = runas::Command::new(&setup);
         command
             .arg("--source")
@@ -445,9 +658,106 @@ pub async fn app_bound_install(
     if enable && !credentials.background_processing_enabled() {
         return Err("BACKGROUND_PROCESSING_DISABLED".into());
     }
-    install_runtime(installation_source()?, enable).await?;
+    let source = installation_source()?;
+    install_runtime(source.clone(), enable).await?;
+    if !source.starts_with(identity::protected_root().map_err(|e| e.to_string())?) {
+        if let Err(error) =
+            crate::registry_config::set_string(PACKAGE_SOURCE, &source.to_string_lossy())
+        {
+            tracing::warn!("Failed to remember the local component repair source: {error}");
+        }
+    }
     crate::registry_config::set_bool(OFFER_SEEN, true)?;
     schedule_restart(&app)
+}
+
+#[cfg(not(feature = "app-bound-dev"))]
+fn repaired_client_restart_required(
+    staging: &crate::processing_stage::ProcessingStaging,
+    runtime_restart: bool,
+) -> Result<bool, String> {
+    // A component repair does not reauthorize a quarantined client. Resume with
+    // a fresh process, retaining the integrity latch until that process exits.
+    if runtime_restart || staging.broker_quarantined() {
+        return Ok(true);
+    }
+    staging
+        .refresh()
+        .map_err(|_| "APP_BOUND_REPAIR_SERVICE_UNAVAILABLE".to_string())?;
+    Ok(false)
+}
+
+/// Repair the registered protected runtime from verified local or release sources.
+/// Requires a main/settings window and an authenticated session. `package_path`
+/// selects an optional ZIP; `allow_full_download` opts into a complete package.
+/// Returns a status-tagged outcome with `restart_required` or `size_bytes`.
+/// Frontend: `lib/app_bound_api.js` (`repairAppBound`).
+#[tauri::command]
+pub async fn app_bound_repair(
+    window: tauri::Window,
+    app: AppHandle,
+    credentials: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage: tauri::State<'_, Arc<StorageState>>,
+    package_path: Option<String>,
+    allow_full_download: Option<bool>,
+) -> Result<RepairOutcome, String> {
+    crate::settings_window::check_settings_ui(&window)?;
+    crate::commands::check_auth_required(&credentials)?;
+    if !supported_build() {
+        return Err("APP_BOUND_PACKAGE_UNAVAILABLE".into());
+    }
+    #[cfg(feature = "app-bound-dev")]
+    {
+        let _ = (package_path, allow_full_download);
+        install_runtime(installation_source()?, false).await?;
+        if storage.processing_stage.broker_quarantined() {
+            crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
+            app.request_restart();
+        } else {
+            schedule_restart(&app)?;
+        }
+        Ok(RepairOutcome::Repaired {
+            restart_required: true,
+        })
+    }
+    #[cfg(not(feature = "app-bound-dev"))]
+    {
+        let mut outcome = tokio::task::spawn_blocking(move || {
+            tauri::async_runtime::block_on(repair::run(
+                &window,
+                package_path.map(PathBuf::from),
+                allow_full_download.unwrap_or(false),
+            ))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if let RepairOutcome::Repaired { restart_required } = &mut outcome {
+            let storage = storage.inner().clone();
+            let runtime_restart = *restart_required;
+            *restart_required = tokio::task::spawn_blocking(move || {
+                let restart =
+                    repaired_client_restart_required(&storage.processing_stage, runtime_restart)?;
+                if !restart {
+                    storage.request_protected_key_publication();
+                }
+                Ok::<_, String>(restart)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            if *restart_required {
+                schedule_restart(&app)?;
+            } else {
+                if let Some(scheduler) =
+                    app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.wake();
+                }
+            }
+            REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Release);
+            REPAIR_OFFER_DISMISSED.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(outcome)
+    }
 }
 
 #[tauri::command]
@@ -474,6 +784,8 @@ pub async fn app_bound_uninstall(
                 .ok_or("Installer is missing")?,
         )
         .map_err(|e| e.to_string())?;
+        carbonpaper_app_bound::privileged::verify_loader_policy(&mut locked)
+            .map_err(|e| e.to_string())?;
         let status = runas::Command::new(&helper)
             .arg("--uninstall")
             .arg("--caller-pid")
@@ -491,7 +803,11 @@ pub async fn app_bound_uninstall(
         if !status.success() {
             return Err("APP_BOUND_INSTALL_FAILED".into());
         }
-        storage.processing_stage.discard_revoked_inputs()?;
+        if let Err(error) = storage.processing_stage.discard_revoked_inputs() {
+            tracing::warn!(
+                "[APP_BOUND] Local staging cleanup deferred after component removal: {error}"
+            );
+        }
         let _ = storage.processing_stage.refresh();
         Ok(())
     })

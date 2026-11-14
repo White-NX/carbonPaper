@@ -954,6 +954,10 @@ fn repair_request(
 /// Continue the exact first request when it fits. Only the new evidence and
 /// validation feedback are appended; never rewrite the cached system or the
 /// original evidence directory. Tight budgets retain the bounded fallback.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keeps evidence sets, provider capabilities and request budgets explicit."
+)]
 fn followup_request(
     first: &ChatRequest,
     response: &ChatResponse,
@@ -1483,7 +1487,7 @@ async fn generate_inner(
         evidence: Arc::new(tokio::sync::OnceCell::new()),
     };
     ctx.check()?;
-    if ctx.protected.is_some() {
+    if let Some(protected) = &ctx.protected {
         let recovered = ctx.read_day()?;
         for batch in &recovered.batches {
             if batch.status != "pending" {
@@ -1492,25 +1496,13 @@ async fn generate_inner(
                     continue;
                 };
                 storage.recap_commit_protected(
-                    ctx.protected.as_ref().unwrap(),
-                    "batch",
-                    &key,
-                    &date,
-                    revision,
-                    generation,
-                    &raw,
+                    protected, "batch", &key, &date, revision, generation, &raw,
                 )?;
                 if let Some(summary) =
                     ctx.read::<summary::CachedSummary>("summary", &key, Some(revision))?
                 {
                     storage.recap_commit_protected(
-                        ctx.protected.as_ref().unwrap(),
-                        "summary",
-                        &key,
-                        &date,
-                        revision,
-                        generation,
-                        &summary,
+                        protected, "summary", &key, &date, revision, generation, &summary,
                     )?;
                 }
             }

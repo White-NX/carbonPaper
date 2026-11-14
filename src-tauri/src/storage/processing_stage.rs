@@ -34,7 +34,8 @@ impl StorageState {
             WHEN NEW.is_deleted=1 AND OLD.is_deleted=0 BEGIN
                 INSERT OR IGNORE INTO app_bound_revocations(screenshot_id) VALUES(NEW.id);
             END;
-            CREATE TRIGGER IF NOT EXISTS app_bound_screenshot_removed AFTER DELETE ON screenshots BEGIN
+            DROP TRIGGER IF EXISTS app_bound_screenshot_removed;
+            CREATE TRIGGER app_bound_screenshot_removed AFTER DELETE ON screenshots WHEN OLD.is_deleted=0 BEGIN
                 INSERT OR IGNORE INTO app_bound_revocations(screenshot_id) VALUES(OLD.id);
             END;
             CREATE TRIGGER IF NOT EXISTS app_bound_ocr_insert AFTER INSERT ON ocr_results BEGIN
@@ -159,6 +160,39 @@ impl StorageState {
             }
             tx.commit().map_err(|e| e.to_string())?;
         }
+    }
+
+    pub(super) fn persist_staged_deletions_on_conn(
+        &self,
+        conn: &Connection,
+        ids: &[i64],
+    ) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let dataset: String = conn
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key=?1",
+                [DATASET_KEY],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.processing_stage
+            .persist_screenshot_revocations(&dataset, ids)?;
+        // The protected inbox (or a legacy online broker) already owns these
+        // obligations. Keeping another copy until service recovery would grow
+        // the archive outbox throughout an outage or disabled installation.
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            conn.execute(
+                &format!(
+                    "DELETE FROM app_bound_revocations WHERE screenshot_id IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(chunk),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn staged_source_revision(&self, id: i64) -> Result<i64, String> {

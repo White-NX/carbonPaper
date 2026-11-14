@@ -203,16 +203,13 @@ impl Session {
                         self.flat_map = Some(flat);
                     }
                 }
-                if self.header.is_some() {
+                if let Some(header) = &self.header {
                     if self.read_path.is_some() {
                         self.phase = Phase::ReadCheckpoint;
                     } else {
                         let index = self.new_index()?;
                         index
-                            .reserve_capacity_and_threads(
-                                self.header.as_ref().unwrap().row_count as usize,
-                                1,
-                            )
+                            .reserve_capacity_and_threads(header.row_count as usize, 1)
                             .map_err(|e| e.to_string())?;
                         self.index = Some(index);
                         self.phase = Phase::Build;

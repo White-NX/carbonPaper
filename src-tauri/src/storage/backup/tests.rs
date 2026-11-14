@@ -49,6 +49,26 @@ impl crate::processing_stage::Broker for OfflineBroker {
 }
 
 struct RetirementFailureBroker(AtomicBool);
+
+struct QueuedOfflineBroker(std::sync::Mutex<Vec<carbonpaper_app_bound::revocation::Revocation>>);
+impl crate::processing_stage::Broker for QueuedOfflineBroker {
+    fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
+        Ok(true)
+    }
+    fn supported(&self) -> bool {
+        true
+    }
+    fn call(&self, _: Request) -> carbonpaper_app_bound::protocol::Result<Response> {
+        Err(BrokerError::Unavailable)
+    }
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> carbonpaper_app_bound::protocol::Result<bool> {
+        self.0.lock().unwrap().push(intent);
+        Ok(true)
+    }
+}
 impl crate::processing_stage::Broker for RetirementFailureBroker {
     fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
         if self.0.swap(false, Ordering::SeqCst) {
@@ -720,6 +740,36 @@ fn retirement_failure_reopens_the_original_content_with_new_processing_authority
     assert_eq!(
         destination.list_smart_clusters().unwrap()[0].anchor_text,
         "Keep this local topic"
+    );
+}
+
+#[test]
+fn protected_retirement_inbox_allows_backup_import_while_the_service_is_offline() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("portable.cpbackup");
+    let source = storage(&root.path().join("source"));
+    populate(&source, false);
+    export(&source, &archive);
+    let mut destination = storage(&root.path().join("destination"));
+    let previous_processing = destination.processing_dataset_id().unwrap();
+    let prepared = prepare(&destination, &archive, root.path());
+    let broker = Arc::new(QueuedOfflineBroker(std::sync::Mutex::new(Vec::new())));
+    destination.replace_processing_stage_for_tests(
+        crate::processing_stage::ProcessingStaging::with_test_broker(broker.clone()),
+    );
+    let _operation = destination.backup.begin();
+    {
+        let _maintenance = destination.database_maintenance("test offline backup import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    assert!(destination.is_initialized());
+    assert_ne!(
+        destination.processing_dataset_id().unwrap(),
+        previous_processing
+    );
+    assert_eq!(
+        *broker.0.lock().unwrap(),
+        vec![carbonpaper_app_bound::revocation::Revocation::RetireOwner]
     );
 }
 

@@ -280,10 +280,12 @@ fn nearest_left(blocks: &[(&str, Option<Bounds>)], i: usize, b: Bounds) -> Optio
         let overlap = b.bottom.min(o.bottom) - b.top.max(o.top);
         let same_line = overlap >= 0.5 * b.height().min(o.height());
         let gap = b.left - o.right;
-        if same_line && gap >= -0.5 * scale && gap <= 30.0 * scale {
-            if best.is_none_or(|(_, right)| o.right > right) {
-                best = Some((j, o.right));
-            }
+        if same_line
+            && gap >= -0.5 * scale
+            && gap <= 30.0 * scale
+            && best.is_none_or(|(_, right)| o.right > right)
+        {
+            best = Some((j, o.right));
         }
     }
     best.map(|(j, _)| j)
@@ -299,10 +301,12 @@ fn nearest_above(blocks: &[(&str, Option<Bounds>)], i: usize, b: Bounds) -> Opti
         let gap = b.top - o.bottom;
         let overlaps = o.left < b.right && b.left < o.right;
         let aligned = (o.left - b.left).abs() <= 2.0 * scale;
-        if gap >= -0.3 * scale && gap <= 1.5 * scale && (overlaps || aligned) {
-            if best.is_none_or(|(_, best_gap)| gap < best_gap) {
-                best = Some((j, gap));
-            }
+        if gap >= -0.3 * scale
+            && gap <= 1.5 * scale
+            && (overlaps || aligned)
+            && best.is_none_or(|(_, best_gap)| gap < best_gap)
+        {
+            best = Some((j, gap));
         }
     }
     best.map(|(j, _)| j)

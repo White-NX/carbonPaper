@@ -1,10 +1,12 @@
 use super::*;
 
-fn fixture() -> (
+type MigrationFixture = (
     tempfile::TempDir,
     StorageState,
     Vec<(i64, Vec<u8>, Vec<u8>)>,
-) {
+);
+
+fn fixture() -> MigrationFixture {
     let temp = tempfile::tempdir().unwrap();
     let credentials = crate::credential_manager::cng_tests::storage_credentials(temp.path());
     let storage = StorageState::new(temp.path().into(), credentials);

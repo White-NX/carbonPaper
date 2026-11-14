@@ -5,12 +5,15 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync,
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { inflateRawSync } from 'node:zlib';
+import { fileURLToPath } from 'node:url';
 import { manifestName, signatureName, signingContext, safeRuntimePath, signProtectedRuntime, verifyProtectedRuntime } from './protected-runtime.mjs';
 import { verifyPrivilegedImports } from './privileged-imports.mjs';
+import { packServiceRepair, repairEntries, verifyRepairRelease, verifyServiceRepairBundle } from './service-repair.mjs';
 
 const binaries = ['carbonpaper.exe', 'carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe'];
 
-function testPe(importedDll = 'kernel32.dll') {
+function testPe(importedDll = 'kernel32.dll', dependentLoadFlags = 0x800) {
   const bytes = Buffer.alloc(1024);
   bytes.writeUInt16LE(0x5a4d); bytes.writeUInt32LE(0x80, 0x3c);
   bytes.writeUInt32LE(0x4550, 0x80); bytes.writeUInt16LE(0x8664, 0x84);
@@ -19,6 +22,8 @@ function testPe(importedDll = 'kernel32.dll') {
   bytes.writeUInt32LE(0x1000, 0x98 + 120); bytes.writeUInt32LE(40, 0x98 + 124);
   bytes.writeUInt32LE(0x1000, 0x188 + 12); bytes.writeUInt32LE(0x200, 0x188 + 16); bytes.writeUInt32LE(0x200, 0x188 + 20);
   bytes.writeUInt32LE(0x1040, 0x200 + 12); bytes.write(importedDll, 0x240, 'ascii');
+  bytes.writeUInt32LE(0x1080, 0x98 + 112 + 10 * 8); bytes.writeUInt32LE(80, 0x98 + 116 + 10 * 8);
+  bytes.writeUInt32LE(80, 0x280); bytes.writeUInt16LE(dependentLoadFlags, 0x280 + 78);
   return bytes;
 }
 
@@ -109,6 +114,9 @@ test('NSIS packages a fresh signature after Tauri patches the executable and abo
   const script = path.join(compilerDirectory, 'installer.nsi');
   writeFileSync(script, [
     'Unicode true',
+    '!include "LogicLib.nsh"',
+    'Var UpdateMode',
+    'Var DeleteAppDataCheckboxState',
     `!include "${path.join(f.root, 'src-tauri', 'nsis_hooks.nsh')}"`,
     'Name "Protected runtime regression"',
     `OutFile "${installer}"`,
@@ -118,6 +126,9 @@ test('NSIS packages a fresh signature after Tauri patches the executable and abo
     'SetOutPath $INSTDIR',
     ...binaries.map(name => `File "${path.join(f.release, name)}"`),
     `File /r "${f.prebundle}\\*"`,
+    'SectionEnd',
+    'Section "Uninstall"',
+    '!insertmacro NSIS_HOOK_PREUNINSTALL',
     'SectionEnd',
     '',
   ].join('\n'));
@@ -228,4 +239,86 @@ test('privileged helper imports reject a private CRT and malformed PE headers', 
   await assert.rejects(signProtectedRuntime(f.root, f.signingKey), /non-system DLL/);
   writeFileSync(helper, Buffer.from('invalid PE'));
   assert.throws(() => verifyPrivilegedImports(helper), /privileged PE/);
+});
+
+test('privileged helpers restrict allowed DLLs to System32 before their entry point', async (t) => {
+  const f = await fixture(t);
+  const helper = path.join(f.prebundle, 'carbonpaper-protected-setup.exe');
+  writeFileSync(helper, testPe('bcrypt.dll'));
+  assert.deepEqual(verifyPrivilegedImports(helper), ['bcrypt.dll']);
+  for (const flags of [0, 0x200, 0xa00]) {
+    writeFileSync(helper, testPe('bcrypt.dll', flags));
+    await assert.rejects(signProtectedRuntime(f.root, f.signingKey), /System32/);
+  }
+  const missing = testPe('bcrypt.dll');
+  missing.writeUInt32LE(0, 0x98 + 112 + 10 * 8);
+  writeFileSync(helper, missing);
+  assert.throws(() => verifyPrivilegedImports(helper), /load config/);
+});
+
+test('service repair packages contain only the signed components and bind their version, size and archive', async (t) => {
+  const f = await fixture(t);
+  const files = [...repairEntries, 'carbonpaper-semantic-worker.exe'].map(dest => ({ dest, src: path.join(f.packaged, dest) }));
+  const output = path.join(f.root, 'repair output');
+  const { zipPath, release } = await packServiceRepair(files, output, f.trustedKey, f.signingKey);
+  const archive = readFileSync(zipPath);
+  const extracted = path.join(f.root, 'repair extracted');
+  mkdirSync(extracted);
+  const names = [];
+  let offset = 0;
+  // Decode the small ZIP independently of the writer and compare actual bytes.
+  while (archive.readUInt32LE(offset) === 0x04034b50) {
+    assert.equal(archive.readUInt16LE(offset + 8), 8);
+    const size = archive.readUInt32LE(offset + 18);
+    const nameLength = archive.readUInt16LE(offset + 26);
+    const extraLength = archive.readUInt16LE(offset + 28);
+    const name = archive.subarray(offset + 30, offset + 30 + nameLength).toString('utf8');
+    assert.ok(repairEntries.includes(name));
+    const start = offset + 30 + nameLength + extraLength;
+    const contents = inflateRawSync(archive.subarray(start, start + size));
+    assert.deepEqual(contents, readFileSync(path.join(f.packaged, name)));
+    writeFileSync(path.join(extracted, name), contents);
+    names.push(name);
+    offset = start + size;
+  }
+  assert.equal(archive.readUInt32LE(offset), 0x02014b50);
+  assert.deepEqual(names.sort(), [...repairEntries].sort());
+  const metadataPath = path.join(output, 'service-repair.json');
+  assert.deepEqual(verifyServiceRepairBundle(extracted, zipPath, metadataPath, f.trustedKey, f.manifest.version), release);
+  assert.ok(!existsSync(path.join(extracted, 'carbonpaper-semantic-worker.exe')));
+  assert.throws(() => verifyRepairRelease(release, '0.8.4', f.trustedKey), /Unsupported/);
+  for (const changed of [
+    { ...release, size_bytes: release.size_bytes + 1 },
+    { ...release, runtime_id: `${release.version}-0123456789abcdef` },
+    { ...release, sha256: 'a'.repeat(64) },
+  ]) assert.throws(() => verifyRepairRelease(changed, f.manifest.version, f.trustedKey), /signature/);
+  const changedArchive = Buffer.from(archive);
+  changedArchive[40] ^= 1;
+  writeFileSync(zipPath, changedArchive);
+  assert.throws(() => verifyServiceRepairBundle(extracted, zipPath, metadataPath, f.trustedKey, f.manifest.version), /checksum/);
+});
+
+test('service repair packaging rejects incomplete sources and changed signed components', async (t) => {
+  const f = await fixture(t);
+  const files = repairEntries.map(dest => ({ dest, src: path.join(f.packaged, dest) }));
+  const output = path.join(f.root, 'repair output');
+  await assert.rejects(packServiceRepair(files.slice(1), output, f.trustedKey, f.signingKey), /Missing repair entry/);
+  writeFileSync(path.join(f.packaged, 'carbonpaper-key-service.exe'), testPe('user32.dll'));
+  await assert.rejects(packServiceRepair(files, output, f.trustedKey, f.signingKey), /checksum mismatch/);
+});
+
+test('Windows independently extracts and verifies the generated service repair release', {
+  skip: process.platform !== 'win32' && 'Requires Windows ZIP extraction',
+}, async (t) => {
+  const f = await fixture(t);
+  const files = repairEntries.map(dest => ({ dest, src: path.join(f.packaged, dest) }));
+  const output = path.join(f.root, 'repair output');
+  const { zipPath } = await packServiceRepair(files, output, f.trustedKey, f.signingKey);
+  const result = spawnSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+    fileURLToPath(new URL('verify-service-repair.ps1', import.meta.url)),
+    '-Zip', zipPath, '-Metadata', path.join(output, 'service-repair.json'),
+    '-PublicKey', path.join(f.root, 'src-tauri', 'update-public-key.txt'), '-Version', f.manifest.version,
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
 });

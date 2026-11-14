@@ -2,7 +2,7 @@ import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ProtectedProcessingCard from './ProtectedProcessingCard';
-import { getAppBoundStatus, installAppBound, setAppBoundPolicy, uninstallAppBound } from '../../../lib/app_bound_api';
+import { getAppBoundStatus, installAppBound, repairAppBound, setAppBoundPolicy, uninstallAppBound } from '../../../lib/app_bound_api';
 
 vi.mock('react-i18next', async () => {
   const { createInstance } = await import('i18next');
@@ -13,8 +13,9 @@ vi.mock('react-i18next', async () => {
   return { useTranslation: () => ({ t }) };
 });
 vi.mock('../../../lib/app_bound_api', async (importOriginal) => ({
-  ...await importOriginal(), getAppBoundStatus: vi.fn(), installAppBound: vi.fn(), setAppBoundPolicy: vi.fn(), uninstallAppBound: vi.fn(),
+  ...await importOriginal(), getAppBoundStatus: vi.fn(), installAppBound: vi.fn(), repairAppBound: vi.fn(), setAppBoundPolicy: vi.fn(), uninstallAppBound: vi.fn(),
 }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 
 const active = { installed: true, supported: true, package_available: true, enabled: true, available: true,
   limits: { retention_days: 30, capacity_bytes: 4096 * 1024 * 1024 } };
@@ -24,6 +25,7 @@ beforeEach(() => {
   getAppBoundStatus.mockResolvedValue(active);
   setAppBoundPolicy.mockResolvedValue(undefined);
   installAppBound.mockResolvedValue(undefined);
+  repairAppBound.mockResolvedValue({ status: 'repaired', restart_required: false });
   uninstallAppBound.mockResolvedValue(undefined);
 });
 
@@ -51,13 +53,17 @@ describe('ProtectedProcessingCard', () => {
     await waitFor(() => expect(setAppBoundPolicy).toHaveBeenCalledWith(false, 30, 4096));
   });
 
-  it('repairs a disabled component while the background master switch is off', async () => {
-    getAppBoundStatus.mockResolvedValue({ ...active, enabled: false, available: false, reason: 'repair_required' });
+  it.each([
+    { installed: true, package_available: true },
+    { installed: false, package_available: false, repair_available: true },
+  ])('repairs a disabled component while the background master switch is off (%j)', async (availability) => {
+    getAppBoundStatus.mockResolvedValue({ ...active, ...availability, enabled: false, available: false, reason: 'repair_required' });
     render(<ProtectedProcessingCard backgroundEnabled={false} />);
     const repair = await screen.findByRole('button', { name: '修复组件' });
     expect(repair).toBeEnabled();
     fireEvent.click(repair);
-    await waitFor(() => expect(installAppBound).toHaveBeenCalledWith(false));
+    await waitFor(() => expect(repairAppBound).toHaveBeenCalledWith({}));
+    expect(installAppBound).not.toHaveBeenCalled();
     expect(setAppBoundPolicy).not.toHaveBeenCalled();
   });
 
@@ -68,11 +74,32 @@ describe('ProtectedProcessingCard', () => {
     expect(screen.getByRole('button', { name: '启用' })).toBeDisabled();
   });
 
+  it('updates a manually installed package before attempting broker policy changes', async () => {
+    getAppBoundStatus.mockResolvedValue({ ...active, enabled: false, available: false, reason: 'upgrade_required' });
+    render(<ProtectedProcessingCard backgroundEnabled={false} />);
+    const upgrade = await screen.findByRole('button', { name: '更新后台组件' });
+    expect(upgrade).toBeEnabled();
+    expect(screen.getByRole('button', { name: '保存限制' })).toBeDisabled();
+    fireEvent.click(upgrade);
+    await waitFor(() => expect(installAppBound).toHaveBeenCalledWith(false));
+    expect(setAppBoundPolicy).not.toHaveBeenCalled();
+  });
+
   it('keeps current status after cancelled removal', async () => {
     uninstallAppBound.mockRejectedValue('APP_BOUND_CANCELLED');
     render(<ProtectedProcessingCard />);
     fireEvent.click(await screen.findByRole('button', { name: '移除后台组件' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('已取消');
     expect(screen.getByRole('status')).toHaveTextContent('已开启');
+  });
+
+  it('reports an unresponsive installed service even before its enabled policy is known', async () => {
+    getAppBoundStatus.mockResolvedValue({ ...active, enabled: false, available: false, reason: 'service_unavailable' });
+    render(<ProtectedProcessingCard />);
+    expect(await screen.findByRole('status')).toHaveTextContent('后台组件正在恢复');
+    fireEvent.click(screen.getByRole('button', { name: '修复组件' }));
+    await waitFor(() => expect(repairAppBound).toHaveBeenCalledWith({}));
+    expect(installAppBound).not.toHaveBeenCalled();
+    expect(setAppBoundPolicy).not.toHaveBeenCalled();
   });
 });

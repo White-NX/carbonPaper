@@ -13,7 +13,11 @@ Main and settings are separate WebViews. Each owns its DOM and focus stack.
 Both provide `DialogVisibilityContext` from their authenticated session, so
 protected dialogs disappear on lock without discarding their owner's state.
 In the main window, ordinary dialogs also yield while any startup overlay
-holds the coordinator. The settings discard-and-close confirmation explicitly
+holds the coordinator. A child `ConfirmDialog` can name its `ownerOverlay`
+to remain visible while that startup prompt owns the slot; it still requires
+authentication and yields to other startup overlays. The protected-processing
+repair prompt uses this for its complete-package download decision.
+The settings discard-and-close confirmation explicitly
 uses `allowWhenLocked`; it may appear above the lock but never above maintenance
 or a fatal surface.
 
@@ -179,8 +183,9 @@ same keys and that every literal key used in the source exists.
 
 ## Native file selection
 
-`src/lib/native_dialogs.js` owns the three current file-picker workflows:
-backup export destination, backup import archive, and storage directory.
+`src/lib/native_dialogs.js` owns the current file-picker workflows:
+backup export destination, backup import archive, storage directory, and the
+official ZIP source for protected-processing repair.
 Production code imports its named helpers instead of the Tauri dialog plugin.
 They preserve archive filters, request a single selection, and normalize an
 empty result to `null`. Invalid results and native failures reject for the
@@ -233,6 +238,7 @@ does not start elevation.
 | Entry point | Elevation and cancellation |
 |---|---|
 | `app_bound_install` (enable or repair) | Verifies the packaged setup executable, then uses `runas` in `app_bound.rs`. Windows cancellation maps to `APP_BOUND_CANCELLED`; the caller remains available for an explicit retry. |
+| `app_bound_repair` | Checks local sources and the component cache before downloading. A complete-package download requires its own `ConfirmDialog` decision. After verification, a clean setup helper requests UAC; cancellation leaves repair available. |
 | `app_bound_uninstall` | Verifies the installed setup helper, then uses the same UAC/cancellation contract. |
 | `updater_install` for a protected installation | Installs through `app_bound::install_runtime` before stopping capture. Cancelling UAC keeps the current application and monitor running. |
 | `updater_install` for an ordinary installation | A native helper prepares signed files before capture stops and waits for the requesting process to exit before replacement. An administrator-owned installation requests UAC when directory permissions are insufficient; cancellation leaves the application and capture running. The application restarts with the original user's ordinary permissions. Unsupported package metadata or mutable installation ownership offers the official installer. |

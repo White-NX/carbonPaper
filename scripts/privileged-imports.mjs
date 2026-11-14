@@ -42,6 +42,17 @@ export function verifyPrivilegedImports(file) {
     if (!section) throw new Error('Invalid privileged PE import address');
     return ensure(section.raw + rva - section.rva, length);
   };
+  // IMAGE_LOAD_CONFIG_DIRECTORY64.DependentLoadFlags is applied by the loader
+  // before the entry point, including for allowed DLLs absent from KnownDLLs.
+  const loadConfigEntry = optional + 112 + 10 * 8;
+  const loadConfigRva = u32(loadConfigEntry);
+  const loadConfigSize = u32(loadConfigEntry + 4);
+  if (!loadConfigRva || loadConfigSize < 80) throw new Error('Missing privileged PE load config');
+  const loadConfig = fileOffset(loadConfigRva, 80);
+  if (u32(loadConfig) < 80 || u32(loadConfig) > loadConfigSize) throw new Error('Invalid privileged PE load config');
+  if (u16(loadConfig + 78) !== 0x800) {
+    throw new Error('Privileged helpers must restrict dependent DLL loading to System32');
+  }
   const dllName = (rva) => {
     const offset = fileOffset(rva, 1);
     const end = bytes.indexOf(0, offset);

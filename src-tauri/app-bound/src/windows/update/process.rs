@@ -45,8 +45,9 @@ impl LocalSid {
 
 impl Drop for LocalSid {
     fn drop(&mut self) {
-        // SAFETY: this SID was allocated by ConvertStringSidToSidW.
         let sid = self.0;
+        // SAFETY: this uniquely owned SID came from ConvertStringSidToSidW;
+        // Drop releases its LocalAlloc allocation exactly once.
         unsafe { LocalFree(HLOCAL(sid.0)) };
     }
 }
@@ -90,6 +91,8 @@ fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<Ve
         return Err(BrokerError::AccessDenied);
     }
     let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: the caller retains the token; initialized aligned storage has
+    // at least the queried capacity and stays live through the synchronous fill.
     unsafe {
         GetTokenInformation(
             token,

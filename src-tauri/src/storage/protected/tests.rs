@@ -10,6 +10,125 @@ use carbonpaper_app_bound::payload::is_sealed;
 
 struct OfflineBroker;
 
+struct GatedPublicationBroker {
+    release: (Mutex<bool>, std::sync::Condvar),
+    entered: std::sync::mpsc::Sender<()>,
+    registrations: std::sync::atomic::AtomicUsize,
+    status_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::processing_stage::Broker for GatedPublicationBroker {
+    fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
+        Ok(true)
+    }
+    fn supported(&self) -> bool {
+        true
+    }
+    fn call(&self, request: Request) -> carbonpaper_app_bound::protocol::Result<Response> {
+        use carbonpaper_app_bound::protocol::{BrokerStatus, Limits};
+        match request {
+            Request::Status {} => {
+                self.status_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::Status(BrokerStatus {
+                    enabled: true,
+                    limits: Limits::default(),
+                    dataset_id: None,
+                    active_tasks: 0,
+                    active_bytes: 0,
+                    runtime_id: "test-runtime".into(),
+                    supported_consumers: 0x1f,
+                    supported_storage_keys: true,
+                }))
+            }
+            Request::AttachDataset { .. } => Ok(Response::Ok),
+            Request::RegisterStorageKey { .. } => {
+                self.registrations.fetch_add(1, Ordering::SeqCst);
+                let _ = self.entered.send(());
+                let guard = self.release.0.lock().unwrap();
+                let _ = self
+                    .release
+                    .1
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(5), |released| {
+                        !*released
+                    })
+                    .unwrap();
+                Err(BrokerError::Integrity)
+            }
+            _ => Ok(Response::Ok),
+        }
+    }
+}
+
+#[test]
+fn blocked_or_rejected_background_publication_cannot_delay_readiness_or_authenticated_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let credentials = crate::credential_manager::cng_tests::storage_credentials(directory.path());
+    credentials.background_enabled_for_tests(true);
+    let mut storage = StorageState::new(directory.path().into(), credentials);
+    let (entered, events) = std::sync::mpsc::channel();
+    let broker = Arc::new(GatedPublicationBroker {
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+        entered,
+        registrations: std::sync::atomic::AtomicUsize::new(0),
+        status_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    storage.replace_processing_stage_for_tests(
+        crate::processing_stage::ProcessingStaging::with_test_broker(broker.clone()),
+    );
+    storage
+        .protected
+        .automatic_publication_for_tests
+        .store(true, Ordering::Release);
+    storage.initialize().unwrap();
+    assert!(storage.initialized.load(Ordering::Acquire));
+    events
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    // Initialization returned while the broker operation remains blocked.
+    assert!(!*broker.release.0.lock().unwrap());
+    let id = screenshot(&storage, "publication-outage", "Editor.exe");
+    let expected = vector(&storage, id);
+    assert_eq!(
+        storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, &id.to_string())
+            .unwrap()
+            .unwrap()
+            .vector,
+        expected
+    );
+    for _ in 0..10 {
+        storage.request_protected_key_publication();
+    }
+    assert_eq!(broker.registrations.load(Ordering::SeqCst), 1);
+    *broker.release.0.lock().unwrap() = true;
+    broker.release.1.notify_all();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while storage
+        .protected
+        .publication_running
+        .load(Ordering::Acquire)
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(storage.initialized.load(Ordering::Acquire));
+    assert!(!storage.processing_stage.available());
+    assert_eq!(
+        storage.processing_stage.refresh().unwrap_err(),
+        BrokerError::Integrity.to_string()
+    );
+    assert_eq!(
+        storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, &id.to_string())
+            .unwrap()
+            .unwrap()
+            .vector,
+        expected
+    );
+    assert_eq!(broker.status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(broker.registrations.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn manual_compaction_preserves_primary_memory_projections() {
     let (_directory, storage) = fixture();
@@ -189,8 +308,10 @@ fn resetting_background_dataset_preserves_content_identity_and_encrypted_history
         [first.to_string()], |r| r.get(0),
     ).unwrap();
     let decoded = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     assert_eq!(decoded, expected);
 }
@@ -520,7 +641,7 @@ fn interrupted_legacy_migration_preserves_rows_and_revisions_then_retires_plaint
     let (directory, storage) = fixture();
     let credentials = storage.credential_state.clone();
     let original_dataset = storage.processing_dataset_id().unwrap();
-    let vector = vec![0.1234567f32, 0.7654321, 0.2345678];
+    let vector = [0.1234567f32, 0.7654321, 0.2345678];
     let vector_bytes = vector
         .iter()
         .flat_map(|value| value.to_le_bytes())

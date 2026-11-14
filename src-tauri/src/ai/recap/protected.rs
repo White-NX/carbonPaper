@@ -184,6 +184,10 @@ fn payload_slot(date: &str, kind: &str, key: &str) -> String {
     format!("day:{date}:payload:{kind}:{}", digest(key))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors the recap commit envelope and its source authorization."
+)]
 pub(crate) fn mirror<T: Serialize>(
     storage: &StorageState,
     date: &str,
@@ -212,6 +216,10 @@ pub(crate) fn mirror<T: Serialize>(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Adds the correction revision fence to the same recap commit envelope."
+)]
 fn mirror_with_correction_version<T: Serialize>(
     storage: &StorageState,
     date: &str,
@@ -276,10 +284,10 @@ fn filter_capture(
         Ok::<_, crate::mcp_server::Rejected>(Evidence {
             id,
             timestamp_ms: input.timestamp_ms,
-            process_name: crate::mcp_server::filter_identity(&filter, mode, &input.process_name)?,
-            window_title: crate::mcp_server::filter_identity(&filter, mode, &input.window_title)?,
-            page_url: crate::mcp_server::filter_url(&filter, mode, &capture.page_url)?,
-            text: crate::mcp_server::filter_ocr_blocks(&filter, mode, blocks)?
+            process_name: crate::mcp_server::filter_identity(filter, mode, &input.process_name)?,
+            window_title: crate::mcp_server::filter_identity(filter, mode, &input.window_title)?,
+            page_url: crate::mcp_server::filter_url(filter, mode, &capture.page_url)?,
+            text: crate::mcp_server::filter_ocr_blocks(filter, mode, blocks)?
                 .into_iter()
                 .map(|b| b.text)
                 .collect::<Vec<_>>()
@@ -400,12 +408,12 @@ pub(crate) fn prepare_with_filter(
     storage.processing_stage.reconcile_recap()?;
     let Some(config) = storage
         .processing_stage
-        .get_recap::<RecapConfig>(&storage, "config")?
+        .get_recap::<RecapConfig>(storage, "config")?
     else {
         return Ok(None);
     };
     if !config.settings.enabled
-        || recap::ai_hash(&AiSettings::load(&storage)?)? != config.ai_hash
+        || recap::ai_hash(&AiSettings::load(storage)?)? != config.ai_hash
         || storage.recap_config_revision()? != config.revision
     {
         return Ok(None);
@@ -424,13 +432,13 @@ pub(crate) fn prepare_with_filter(
     {
         if let Some(mut saved) = storage
             .processing_stage
-            .get_recap::<SavedEvidence>(&storage, &slot)?
+            .get_recap::<SavedEvidence>(storage, &slot)?
         {
             if storage.recap_sources_current(std::slice::from_ref(&saved.source))? {
                 input_ids.insert(saved.source.id);
                 input_sources.push(saved.source.clone());
                 if let Some(metadata) = storage.processing_stage.get_recap::<CaptureMetadata>(
-                    &storage,
+                    storage,
                     &format!("metadata:{}", saved.source.id),
                 )? {
                     saved.capture.page_url = metadata.page_url;
@@ -467,7 +475,7 @@ pub(crate) fn prepare_with_filter(
     {
         if let Some(saved) = storage
             .processing_stage
-            .get_recap::<Payload>(&storage, &slot)?
+            .get_recap::<Payload>(storage, &slot)?
         {
             if saved.privacy == privacy.as_str() && storage.recap_sources_current(&saved.sources)? {
                 sources.extend(saved.sources.into_iter().map(|s| (s.id, s)));

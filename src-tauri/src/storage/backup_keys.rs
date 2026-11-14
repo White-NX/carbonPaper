@@ -451,7 +451,7 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
                 .and_then(|_| writer.write_all(&key))
                 .map_err(|e| e.to_string())?;
             completed += 1;
-            if completed % 20 == 0 || completed == count {
+            if completed.is_multiple_of(20) || completed == count {
                 progress(completed, count);
             }
         }
@@ -552,7 +552,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
                 let checked = Zeroizing::new(
                     unwrap_storage_domain_key(credentials, &wrapping).map_err(|e| e.to_string())?,
                 );
-                if &*checked != key {
+                if *checked != key {
                     return Err("Restored content key verification failed".into());
                 }
                 tx.execute(
@@ -561,7 +561,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
                 )
                 .map_err(|e| e.to_string())?;
                 completed += 1;
-                if completed % 20 == 0 || completed == bundle.count {
+                if completed.is_multiple_of(20) || completed == bundle.count {
                     progress(completed, bundle.count);
                 }
             }

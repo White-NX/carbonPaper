@@ -548,10 +548,12 @@ fn engine_compatibility_error(message: String) -> rusqlite::Error {
 /// shutting down the primary connection.
 pub(crate) fn preserve_wal_sidecars_on_close(conn: &Connection) -> Result<(), String> {
     let mut enabled = 1i32;
+    // SAFETY: `conn` keeps its SQLite handle live on this thread. This documented
+    // file control synchronously reads/writes the correctly typed i32 argument.
     let result = unsafe {
         rusqlite::ffi::sqlite3_file_control(
             conn.handle(),
-            b"main\0".as_ptr().cast(),
+            c"main".as_ptr(),
             rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
             (&mut enabled as *mut i32).cast(),
         )
@@ -633,7 +635,7 @@ mod tests {
         let result = unsafe {
             rusqlite::ffi::sqlite3_file_control(
                 conn.handle(),
-                b"vacuum_probe\0".as_ptr().cast(),
+                c"vacuum_probe".as_ptr(),
                 rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER,
                 (&mut file as *mut *mut rusqlite::ffi::sqlite3_file).cast(),
             )

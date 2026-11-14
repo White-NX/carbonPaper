@@ -398,7 +398,7 @@ fn assert_readable_ocr_delete_queue_drains(chunked: bool) {
             let posting = index.read(token_hash, chunked).unwrap().unwrap();
             assert_eq!(posting.bitmap, expected, "only the deleted row is unlinked");
             let probe = index
-                .probe(&[token_hash.clone()])
+                .probe(std::slice::from_ref(token_hash))
                 .unwrap()
                 .postings
                 .remove(0);

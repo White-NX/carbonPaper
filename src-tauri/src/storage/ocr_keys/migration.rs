@@ -153,8 +153,8 @@ impl StorageState {
                 );
                 continue;
             }
-            if !keys.contains_key(&row.screenshot) {
-                keys.insert(row.screenshot, self.new_ocr_write_key()?);
+            if let std::collections::hash_map::Entry::Vacant(e) = keys.entry(row.screenshot) {
+                e.insert(self.new_ocr_write_key()?);
             }
             let encrypted =
                 keys[&row.screenshot].encrypt(&dataset, row.screenshot, row.id, &plain)?;

@@ -28,6 +28,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const STAGING_FILE: &str = "processing-staging.db";
 const CLIP_SIZE: u32 = 224;
 const MAX_ATTEMPTS: i64 = 5;
+const ABANDON_PROTECTION_PENDING: &str = "abandon_protection_pending";
 
 pub(crate) mod recap;
 
@@ -35,9 +36,63 @@ pub(crate) trait Broker: Send + Sync {
     fn call(&self, request: Request) -> protocol::Result<Response>;
     fn installed(&self) -> protocol::Result<bool>;
     fn supported(&self) -> bool;
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> protocol::Result<bool> {
+        persist_revocation_through_pipe(self, intent)
+    }
+}
+
+fn persist_revocation_through_pipe<B: Broker + ?Sized>(
+    broker: &B,
+    intent: carbonpaper_app_bound::revocation::Revocation,
+) -> protocol::Result<bool> {
+    use carbonpaper_app_bound::revocation::Revocation;
+    if !broker.supported() || !broker.installed()? {
+        return Ok(false);
+    }
+    intent.validate()?;
+    match intent {
+        Revocation::RetireOwner => {
+            let Response::Status(status) = broker.call(Request::Status {})? else {
+                return Err(BrokerError::Integrity);
+            };
+            if let Some(dataset_id) = status.dataset_id {
+                broker.call(Request::RetireDataset { dataset_id })?;
+            }
+        }
+        Revocation::Screenshots {
+            dataset_id,
+            screenshot_ids,
+        } => {
+            broker.call(Request::RevokeScreenshots {
+                dataset_id,
+                screenshot_ids,
+            })?;
+        }
+    }
+    Ok(true)
 }
 struct NativeBroker;
 impl Broker for NativeBroker {
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> protocol::Result<bool> {
+        if !self.supported() {
+            return Ok(false);
+        }
+        if carbonpaper_app_bound::windows::revocation::append(
+            &carbonpaper_app_bound::windows::identity::current_sid()?,
+            &intent,
+        )?
+        .is_some()
+        {
+            return Ok(true);
+        }
+        persist_revocation_through_pipe(self, intent)
+    }
     fn installed(&self) -> protocol::Result<bool> {
         carbonpaper_app_bound::windows::identity::active_runtime().map(|runtime| runtime.is_some())
     }
@@ -142,6 +197,7 @@ pub(crate) struct ProcessingStaging {
     available: AtomicBool,
     supported_consumers: AtomicU8,
     supported_storage_keys: AtomicBool,
+    fatal_broker_error: Mutex<Option<BrokerError>>,
     broker: Arc<dyn Broker>,
     // Only receipts issued by this process can authorize a new archive write.
     // Python and user-writable SQLite rows cannot change their screenshot scope.
@@ -159,6 +215,7 @@ impl ProcessingStaging {
             available: AtomicBool::new(false),
             supported_consumers: AtomicU8::new(Consumer::LEGACY_MASK),
             supported_storage_keys: AtomicBool::new(false),
+            fatal_broker_error: Mutex::new(None),
             broker: Arc::new(NativeBroker),
             issued: Mutex::new(HashMap::new()),
             scan_cursor: Mutex::new(String::new()),
@@ -297,8 +354,12 @@ impl ProcessingStaging {
         ) {
             return Err(BrokerError::InvalidRequest);
         }
-        if !self.available() {
-            self.refresh().map_err(|_| BrokerError::Unavailable)?;
+        if let Some(error) = *self
+            .fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Err(error);
         }
         if !self.available() {
             return Err(BrokerError::Disabled);
@@ -309,7 +370,34 @@ impl ProcessingStaging {
         self.call_broker_logged(request, None)
     }
 
+    pub(crate) fn quarantine_broker(&self, error: BrokerError) {
+        *self
+            .fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(error);
+        self.available.store(false, Ordering::Release);
+        self.supported_storage_keys.store(false, Ordering::Release);
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status.installed = true;
+        status.available = false;
+        status.reason = Some(error.to_string());
+    }
+
+    pub(crate) fn broker_quarantined(&self) -> bool {
+        self.fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     pub fn refresh(&self) -> Result<(), String> {
+        if let Some(error) = *self
+            .fatal_broker_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return Err(error.to_string());
+        }
         let supported = self.broker.supported();
         let installed = match self.broker.installed() {
             Ok(value) => value,
@@ -361,6 +449,13 @@ impl ProcessingStaging {
         })();
         match result {
             Ok(broker) => {
+                let fault = self
+                    .fatal_broker_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(error) = *fault {
+                    return Err(error.to_string());
+                }
                 self.supported_storage_keys
                     .store(broker.supported_storage_keys, Ordering::Release);
                 self.supported_consumers.store(
@@ -450,21 +545,39 @@ impl ProcessingStaging {
 
     pub fn retire_dataset(&self) -> Result<(), String> {
         self.available.store(false, Ordering::Release);
-        if self.broker.supported() && self.broker.installed().map_err(|e| e.to_string())? {
-            // Restore/switch must retire the service's actual dataset even if
-            // the local staging DB is corrupt, absent, or from an old backup.
-            let Response::Status(status) = self
-                .call_broker_logged(Request::Status {}, None)
-                .map_err(|e| e.to_string())?
-            else {
-                return Err(BrokerError::Integrity.to_string());
-            };
-            if let Some(dataset_id) = status.dataset_id {
-                self.call_broker_logged(Request::RetireDataset { dataset_id }, None)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        self.issued
+            .lock()
+            .map_err(|_| "staging lock poisoned")?
+            .clear();
+        // The protected inbox survives archive replacement, directory switches
+        // and lost local staging. The service drains it before any new grant.
+        self.broker
+            .persist_revocation(carbonpaper_app_bound::revocation::Revocation::RetireOwner)
+            .map_err(|e| e.to_string())?;
         self.discard_revoked_inputs()
+    }
+
+    pub(crate) fn persist_screenshot_revocations(
+        &self,
+        dataset_id: &str,
+        ids: &[i64],
+    ) -> Result<(), String> {
+        for screenshot_ids in ids.chunks(128) {
+            self.broker
+                .persist_revocation(carbonpaper_app_bound::revocation::Revocation::Screenshots {
+                    dataset_id: dataset_id.into(),
+                    screenshot_ids: screenshot_ids.to_vec(),
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_screenshot_receipts(&self, ids: &[i64]) {
+        self.issued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, receipt| !ids.contains(&receipt.receipt.screenshot_id));
     }
 
     pub fn stage(
@@ -831,6 +944,28 @@ impl ProcessingStaging {
         consumer: Consumer,
         error: BrokerError,
     ) -> Result<(), String> {
+        if error == BrokerError::Protection {
+            let exhausted = self.with_store(|s| {
+                let attempts: i64 = s.connection.query_row(
+                    "SELECT attempts FROM staged_work WHERE task_id=?1 AND consumer=?2",
+                    params![id, consumer.bit()], |row| row.get(0)).map_err(|e| e.to_string())?;
+                let attempts = attempts.saturating_add(1).min(MAX_ATTEMPTS);
+                let exhausted = attempts >= MAX_ATTEMPTS;
+                // Relinquish local ownership before trying the broker cleanup.
+                // An outage during abandonment cannot keep archive work blocked.
+                s.connection.execute("UPDATE staged_work SET state=?3,attempts=?4,lease_id=NULL,deadline=0,next_attempt=?5,error_code=?6
+                    WHERE task_id=?1 AND consumer=?2 AND state!='completed'",
+                    params![id, consumer.bit(), if exhausted { "waiting_for_auth" } else { "pending" }, attempts,
+                        protocol::now_secs() + 30 * (1i64 << attempts.min(5)),
+                        if exhausted { ABANDON_PROTECTION_PENDING } else { "app_bound_protection_failure" }])
+                    .map_err(|e| e.to_string())?;
+                Ok(exhausted)
+            })?;
+            if exhausted {
+                let _ = self.abandon_protection_failure(id, consumer)?;
+            }
+            return Ok(());
+        }
         if error == BrokerError::Retired {
             if let Ok(Response::TaskState(state)) =
                 self.call_broker_logged(Request::InspectTask { task_id: id.into() }, Some(consumer))
@@ -857,6 +992,74 @@ impl ProcessingStaging {
         })?;
         if terminal {
             self.retire_task(id)?;
+        }
+        Ok(())
+    }
+
+    fn abandon_protection_failure(&self, id: &str, consumer: Consumer) -> Result<bool, String> {
+        let result = self.call_broker_logged(
+            Request::AbandonConsumer {
+                task_id: id.into(),
+                consumer,
+            },
+            Some(consumer),
+        );
+        let acknowledged = matches!(
+            result,
+            Ok(Response::Ok) | Err(BrokerError::Retired | BrokerError::DatasetMismatch)
+        );
+        self.with_store(|s| {
+            s.connection
+                .execute(
+                    "UPDATE staged_work SET next_attempt=?3,error_code=?4
+                WHERE task_id=?1 AND consumer=?2 AND state='waiting_for_auth' AND error_code=?5",
+                    params![
+                        id,
+                        consumer.bit(),
+                        protocol::now_secs() + 30,
+                        if acknowledged {
+                            "app_bound_protection_failure"
+                        } else {
+                            ABANDON_PROTECTION_PENDING
+                        },
+                        ABANDON_PROTECTION_PENDING
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })?;
+        Ok(acknowledged)
+    }
+
+    fn reconcile_protection_failures(&self) -> Result<(), String> {
+        let pending = self.with_store(|s| {
+            let mut statement = s
+                .connection
+                .prepare(
+                    "SELECT task_id,consumer FROM staged_work
+                WHERE state='waiting_for_auth' AND error_code=?1 AND next_attempt<=?2
+                ORDER BY next_attempt,task_id LIMIT 32",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map(
+                    params![ABANDON_PROTECTION_PENDING, protocol::now_secs()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u8>(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())
+        })?;
+        for (id, bit) in pending {
+            let Some(consumer) = Consumer::ALL
+                .into_iter()
+                .find(|consumer| consumer.bit() == bit)
+            else {
+                continue;
+            };
+            if !self.abandon_protection_failure(&id, consumer)? {
+                break;
+            }
         }
         Ok(())
     }
@@ -981,7 +1184,7 @@ impl ProcessingStaging {
         if self.initialized() {
             self.with_store(|s| {
                 s.connection
-                    .execute_batch("DELETE FROM staged_inputs; DELETE FROM recap_objects;")
+                    .execute_batch("DELETE FROM staged_inputs; DELETE FROM recap_objects; PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             })?;
@@ -1125,10 +1328,12 @@ impl ProcessingStaging {
 
     pub fn reconcile(&self, storage: &StorageState) -> Result<u64, String> {
         if !self.available() {
+            self.reclaim_local_pages()?;
             return Ok(0);
         }
         let mut processed = 0u64;
         storage.finish_staged_deletions()?;
+        self.reconcile_protection_failures()?;
         self.reconcile_recap()?;
         self.renew_live_leases()?;
         let preparing = self.with_store(|s| {
@@ -1294,14 +1499,27 @@ impl ProcessingStaging {
         self.with_store(|s| {
             s.connection.execute("UPDATE staged_work SET state='pending',lease_id=NULL WHERE state='processing' AND deadline<=?1",[protocol::now_secs()]).map_err(|e|e.to_string())?;
             s.connection.execute("DELETE FROM staged_inputs WHERE state='retired' AND expires<?1",[protocol::now_secs()-60*protocol::DAY_SECS]).map_err(|e|e.to_string())?;
-            // Each incremental-vacuum result advances one page. execute_batch
-            // steps only once, so drain the results to honor the page budget.
-            let mut vacuum = s.connection.prepare("PRAGMA incremental_vacuum(256)").map_err(|e|e.to_string())?;
-            let mut rows = vacuum.query([]).map_err(|e|e.to_string())?;
-            while rows.next().map_err(|e|e.to_string())?.is_some() {}
             Ok(())
         })?;
+        self.reclaim_local_pages()?;
         Ok(processed)
+    }
+
+    fn reclaim_local_pages(&self) -> Result<(), String> {
+        if !self.initialized() {
+            return Ok(());
+        }
+        self.with_store(|store| {
+            let mut vacuum = store
+                .connection
+                .prepare("PRAGMA incremental_vacuum(256)")
+                .map_err(|e| e.to_string())?;
+            let mut rows = vacuum.query([]).map_err(|e| e.to_string())?;
+            // This local page budget runs even while a service is unavailable;
+            // it never changes a live input or depends on a broker grant.
+            while rows.next().map_err(|e| e.to_string())?.is_some() {}
+            Ok(())
+        })
     }
 }
 
@@ -1372,6 +1590,10 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Constructs the protocol capture binding from screenshot metadata and pixels."
+)]
 pub(crate) fn captured_input(
     screenshot_id: i64,
     storage: &StorageState,

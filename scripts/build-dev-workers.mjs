@@ -57,6 +57,7 @@ function walkRustFiles(directory) {
 
 function rootInputFiles() {
   return [
+    path.join(root, 'rust-toolchain.toml'),
     path.join(tauriDir, 'Cargo.toml'),
     path.join(tauriDir, 'Cargo.lock'),
     path.join(tauriDir, 'build.rs'),
@@ -82,11 +83,14 @@ function rootInputFiles() {
     ...walkRustFiles(path.join(tauriDir, 'app-bound', 'src')),
     path.join(tauriDir, 'app-bound', 'Cargo.toml'),
     path.join(tauriDir, 'app-bound', 'build.rs'),
+    path.join(tauriDir, 'vendor', 'rapidocr-core', 'Cargo.toml'),
+    ...walkRustFiles(path.join(tauriDir, 'vendor', 'rapidocr-core', 'src')),
   ].sort();
 }
 
 function semanticInputFiles() {
   return [
+    path.join(root, 'rust-toolchain.toml'),
     path.join(tauriDir, 'semantic-worker', 'Cargo.toml'),
     path.join(tauriDir, 'semantic-worker', 'Cargo.lock'),
     path.join(root, 'scripts', 'build-semantic-ml.mjs'),

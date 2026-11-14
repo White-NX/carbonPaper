@@ -246,10 +246,8 @@ impl StorageState {
     ) -> Self {
         let screenshot_dir = data_dir.join("screenshots");
         let processing_stage = Arc::new(crate::processing_stage::ProcessingStaging::new());
-        let protected = Arc::new(protected::ProtectedStorage::new(
-            credential_state.clone(),
-            processing_stage.clone(),
-        ));
+        let protected =
+            protected::ProtectedStorage::new(credential_state.clone(), processing_stage.clone());
 
         Self {
             backup: backup::Control::default(),

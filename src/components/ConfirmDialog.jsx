@@ -17,10 +17,11 @@ export function ConfirmDialog({
   loading = false,
   loadingLabel = 'Processing…',
   allowWhenLocked = false,
+  ownerOverlay = null,
 }) {
   const titleId = useId();
   const messageId = useId();
-  const visible = useDialogVisibility(isOpen, allowWhenLocked);
+  const visible = useDialogVisibility(isOpen, allowWhenLocked, ownerOverlay);
   const dialogRef = useDialogFocus(visible, onCancel, loading, { layer: allowWhenLocked ? 'lockedAction' : 'confirmation' });
 
   if (!visible) return null;
@@ -92,6 +93,7 @@ ConfirmDialog.propTypes = {
   loading: PropTypes.bool,
   loadingLabel: PropTypes.string,
   allowWhenLocked: PropTypes.bool,
+  ownerOverlay: PropTypes.string,
 };
 
 export default ConfirmDialog;

@@ -488,7 +488,13 @@ mod tests {
             span_ms: 0,
             screening: Default::default(),
         };
-        assert!(validate(unknown.clone(), activities, &[source.clone()], &day.date).is_ok());
+        assert!(validate(
+            unknown.clone(),
+            activities,
+            std::slice::from_ref(&source),
+            &day.date
+        )
+        .is_ok());
         assert!(validate(
             unknown,
             activities,

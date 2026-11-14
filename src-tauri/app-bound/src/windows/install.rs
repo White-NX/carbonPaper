@@ -34,6 +34,7 @@ pub struct InstallOptions {
 /// Unelevated restart helper. It can only launch this user's registered main
 /// executable and accepts no executable path, DLL path or arbitrary arguments.
 pub fn launch_after(pid: u32) -> Result<()> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
@@ -44,6 +45,8 @@ pub fn launch_after(pid: u32) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let mut exit_code = 0;
+            // SAFETY: ProcessIdentity owns this query-capable process handle;
+            // the initialized exit-code output stays live during the call.
             unsafe {
                 windows::Win32::System::Threading::GetExitCodeProcess(
                     process.handle.0,
@@ -79,6 +82,7 @@ pub fn launch_after(pid: u32) -> Result<()> {
 }
 
 pub fn install(options: InstallOptions) -> Result<PathBuf> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
@@ -117,6 +121,7 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         root.join("System"),
         root.join("Runtime"),
         root.join("Activations"),
+        root.join("Detached"),
     ] {
         ensure_directory(&path, true)?;
     }
@@ -153,24 +158,32 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         repair_runtime(&source, &destination, &manifest, &runtime_id)?;
     }
     let mut ledger = Ledger::open(&state.join("keys.db"))?;
+    super::revocation::provision(&state, &sid)?;
+    super::revocation::drain(&state, &sid, &mut ledger)?;
+    super::activation::reconcile(&root, &ledger)?;
     let previous = ledger.owner_registration(&sid)?;
     if let Some((old_id, _)) = &previous {
-        let old_root = root.join("Runtime").join(old_id);
-        let (old_manifest, _) = manifest::read_manifest(&old_root)?;
-        if semver::Version::parse(&manifest.version).map_err(|_| BrokerError::VersionMismatch)?
-            < semver::Version::parse(&old_manifest.version)
-                .map_err(|_| BrokerError::VersionMismatch)?
+        let old_version = crate::repair::runtime_version(old_id)?;
+        if semver::Version::parse(&manifest.version)
+            .map_err(|_| BrokerError::VersionMismatch)?
+            .cmp_precedence(&old_version)
+            .is_lt()
         {
             return Err(BrokerError::VersionMismatch);
         }
     }
     let activation_path = root.join("Activations").join(format!("{sid}.json"));
     let old_activation = read_optional(&activation_path, 1024)?;
+    let detached_path = root.join("Detached").join(format!("{sid}.json"));
+    let old_detached = read_optional(&detached_path, 1024)?;
     let service_path = root.join("System").join("carbonpaper-key-service.exe");
     let setup_path = root.join("System").join("carbonpaper-protected-setup.exe");
     let service_registration = root.join("System").join("runtime.json");
     let old_service_registration = read_optional(&service_registration, 1024)?;
-    let replace_service = if let Some(bytes) = &old_service_registration {
+    let previous_service_id = if let Some(id) = ledger.service_runtime()? {
+        crate::repair::runtime_version(&id)?;
+        Some(id)
+    } else if let Some(bytes) = &old_service_registration {
         let installed: Activation =
             serde_json::from_slice(bytes).map_err(|_| BrokerError::Integrity)?;
         if !safe_runtime_id(&installed.runtime_id) {
@@ -178,14 +191,22 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         }
         let installed_dir = root.join("Runtime").join(&installed.runtime_id);
         assert_protected(&installed_dir)?;
-        let (current, current_id) = manifest::read_manifest(&installed_dir)?;
+        let (_, current_id) = manifest::read_manifest(&installed_dir)?;
         if current_id != installed.runtime_id {
             return Err(BrokerError::Integrity);
         }
-        // One machine-wide service serves several users. Activating an older
-        // portable package must not downgrade another user's service binary.
-        semver::Version::parse(&manifest.version).map_err(|_| BrokerError::VersionMismatch)?
-            >= semver::Version::parse(&current.version).map_err(|_| BrokerError::VersionMismatch)?
+        Some(current_id)
+    } else {
+        None
+    };
+    let previous_service_id =
+        crate::repair::newest_runtime(previous_service_id, ledger.required_service_runtime()?)?;
+    let replace_service = if let Some(installed_id) = &previous_service_id {
+        // The service-owned checkpoint survives damage to the old manifest.
+        semver::Version::parse(&manifest.version)
+            .map_err(|_| BrokerError::VersionMismatch)?
+            .cmp_precedence(&crate::repair::runtime_version(installed_id)?)
+            .is_ge()
     } else {
         if service_path.exists() {
             // A missing registration can be repaired from the same signed
@@ -211,8 +232,23 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         copy_trusted(&setup_path, backup)?;
     }
     let service_existed = service::try_open_service(SERVICE_QUERY_STATUS)?.is_some();
+    let system_runtime_id = if replace_service {
+        runtime_id.clone()
+    } else {
+        previous_service_id.clone().ok_or(BrokerError::Integrity)?
+    };
+    let mut maintenance = ServiceMaintenance::prepare()?;
+    super::activation::begin(
+        &root,
+        &super::activation::PendingActivation {
+            sid: sid.clone(),
+            runtime_id: runtime_id.clone(),
+            system_runtime_id: system_runtime_id.clone(),
+        },
+    )?;
     let result = (|| {
-        stop_service()?;
+        maintenance.pause()?;
+        ledger.enable_reclamation()?;
         if replace_service {
             copy_trusted(
                 &destination.join("carbonpaper-key-service.exe"),
@@ -237,32 +273,71 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
         })
         .map_err(|_| BrokerError::Storage)?;
         atomic_write(&activation_path, &activation)?;
-        start_service()?;
+        if detached_path.exists() {
+            fs::remove_file(&detached_path).map_err(|_| BrokerError::Storage)?;
+        }
+        maintenance.start()?;
+        ledger.remember_service_runtime(&system_runtime_id)?;
+        super::repair::write_checkpoint(&root, &ledger)?;
         Ok(())
     })();
     if let Err(error) = result {
         // Restore registration only, never rewind the task/key database.
-        let _ = stop_service();
-        let _ = ledger.restore_registration(&sid, previous);
-        let _ = restore_optional(&activation_path, old_activation.as_deref());
-        let _ = restore_optional(&service_registration, old_service_registration.as_deref());
-        if let Some(backup) = &old_service {
-            let _ = copy_trusted(backup, &service_path);
+        let mut restored = maintenance.pause().is_ok();
+        restored &= ledger.restore_registration(&sid, previous).is_ok();
+        restored &= restore_optional(&activation_path, old_activation.as_deref()).is_ok();
+        restored &= restore_optional(&detached_path, old_detached.as_deref()).is_ok();
+        if ledger.requires_current_service().unwrap_or(true)
+            || ledger
+                .service_runtime()
+                .map(|id| id != previous_service_id)
+                .unwrap_or(true)
+        {
+            // Another owner may have compacted revocations while the new
+            // service was starting. Never restore a service that cannot read
+            // that committed authority. Reconcile the installed signed service
+            // and its companion while projecting the restored registrations.
+            if restored {
+                restored = super::activation::reconcile(&root, &ledger).is_ok();
+            }
+        } else if restored {
+            restored &=
+                restore_optional(&service_registration, old_service_registration.as_deref())
+                    .is_ok();
+            if let Some(backup) = &old_service {
+                restored &= copy_trusted(backup, &service_path).is_ok();
+            }
+            if let Some(backup) = &old_setup {
+                restored &= copy_trusted(backup, &setup_path).is_ok();
+            }
         }
-        if let Some(backup) = &old_setup {
-            let _ = copy_trusted(backup, &setup_path);
+        if restored {
+            let _ = super::activation::finish(&root);
         }
         if service_existed {
-            let _ = start_service();
+            let _ = maintenance.restart_after_failure();
         } else if let Ok(Some(handle)) = service::try_open_service(0x0001_0000) {
+            // SAFETY: the newly created service's owned SCM handle has DELETE
+            // access and remains live while rollback marks it for removal.
             unsafe {
                 let _ = DeleteService(handle.0);
             }
         }
         return Err(error);
     }
+    super::activation::finish(&root)?;
+    maintenance.commit();
+    drop(maintenance);
     for backup in [old_service, old_setup].into_iter().flatten() {
         let _ = fs::remove_file(backup);
+    }
+    if let Err(error) = super::collection::schedule_after(&root, options.caller_pid) {
+        super::diagnostics::event(
+            "warn",
+            "runtime_collection_deferred",
+            "install",
+            Some(error),
+        );
     }
     Ok(destination)
 }
@@ -343,7 +418,7 @@ fn ensure_relative_parents(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-fn repair_runtime(
+pub(super) fn repair_runtime(
     source: &Path,
     destination: &Path,
     release: &ReleaseManifest,
@@ -451,26 +526,57 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     replace(&temporary, path)
 }
 
-fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
+pub(super) fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
     assert_protected(source)?;
-    let temporary = target.with_extension(format!("tmp-{}", &random_id()[..16]));
+    copy_locked(&mut locked_file(source)?, target)
+}
+
+pub(super) fn copy_verified(source: &Path, target: &Path, expected: &str) -> Result<()> {
     let mut input = locked_file(source)?;
+    verify_file(&mut input, expected)?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| BrokerError::Storage)?;
+    copy_locked(&mut input, target)?;
+    assert_protected(target)?;
+    verify_file(&mut locked_file(target)?, expected)
+}
+
+fn copy_locked(input: &mut fs::File, target: &Path) -> Result<()> {
+    let temporary = target.with_extension(format!("tmp-{}", &random_id()[..16]));
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(|_| BrokerError::Storage)?;
-    std::io::copy(&mut input, &mut output).map_err(|_| BrokerError::Storage)?;
+    std::io::copy(input, &mut output).map_err(|_| BrokerError::Storage)?;
     output.sync_all().map_err(|_| BrokerError::Storage)?;
     drop(output);
     replace(&temporary, target)
 }
 
-fn configure_service(path: &Path) -> Result<()> {
-    configure_named_service(path, SERVICE_NAME, SERVICE_DISPLAY_NAME)
+pub(super) fn configure_service(path: &Path) -> Result<()> {
+    // The installation lock does not serialize SCM starts. Keep even a newly
+    // created service disabled until its files and registration are committed.
+    configure_named_service_with_start_type(
+        path,
+        SERVICE_NAME,
+        SERVICE_DISPLAY_NAME,
+        SERVICE_DISABLED,
+    )
 }
 
+#[cfg(test)]
 fn configure_named_service(path: &Path, service_name: &str, display_name: &str) -> Result<()> {
+    configure_named_service_with_start_type(path, service_name, display_name, SERVICE_AUTO_START)
+}
+
+fn configure_named_service_with_start_type(
+    path: &Path,
+    service_name: &str,
+    display_name: &str,
+    start_type: SERVICE_START_TYPE,
+) -> Result<()> {
     let name = wide(service_name.as_ref());
     let display = wide(display_name.as_ref());
     let quoted = wide(format!("\"{}\"", path.display()).as_ref());
@@ -491,14 +597,14 @@ fn configure_named_service(path: &Path, service_name: &str, display_name: &str) 
         let service = match OpenServiceW(
             manager.0,
             PCWSTR(name.as_ptr()),
-            SERVICE_CHANGE_CONFIG | SERVICE_START,
+            SERVICE_CHANGE_CONFIG | SERVICE_START | 0x0004_0000,
         ) {
             Ok(handle) => {
                 let handle = ServiceHandle(handle);
                 ChangeServiceConfigW(
                     handle.0,
                     SERVICE_WIN32_OWN_PROCESS,
-                    SERVICE_AUTO_START,
+                    start_type,
                     SERVICE_ERROR_NORMAL,
                     PCWSTR(quoted.as_ptr()),
                     PCWSTR::null(),
@@ -519,7 +625,7 @@ fn configure_named_service(path: &Path, service_name: &str, display_name: &str) 
                         PCWSTR(display.as_ptr()),
                         SERVICE_ALL_ACCESS,
                         SERVICE_WIN32_OWN_PROCESS,
-                        SERVICE_AUTO_START,
+                        start_type,
                         SERVICE_ERROR_NORMAL,
                         PCWSTR(quoted.as_ptr()),
                         PCWSTR::null(),
@@ -534,8 +640,41 @@ fn configure_named_service(path: &Path, service_name: &str, display_name: &str) 
             Err(_) => return Err(BrokerError::AccessDenied),
         };
         configure_failure_actions(&service)?;
+        configure_start_permissions(&service)?;
     }
     Ok(())
+}
+
+fn configure_start_permissions(handle: &ServiceHandle) -> Result<()> {
+    use windows::Win32::{
+        Foundation::{LocalFree, HLOCAL},
+        Security::{
+            self, Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            PSECURITY_DESCRIPTOR,
+        },
+    };
+    // Ordinary clients can start/query this fixed service, but cannot stop it,
+    // replace its command line or change the service's access policy.
+    let sddl = wide(std::ffi::OsStr::new(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0014;;;AU)",
+    ));
+    // SAFETY: SCM copies the allocated descriptor into this owned service;
+    // LocalFree releases it only after that synchronous call returns.
+    unsafe {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|_| BrokerError::AccessDenied)?;
+        let result =
+            SetServiceObjectSecurity(handle.0, Security::DACL_SECURITY_INFORMATION, descriptor)
+                .map_err(|_| BrokerError::AccessDenied);
+        LocalFree(HLOCAL(descriptor.0));
+        result
+    }
 }
 
 fn configure_failure_actions(handle: &ServiceHandle) -> Result<()> {
@@ -572,39 +711,185 @@ fn configure_failure_actions(handle: &ServiceHandle) -> Result<()> {
     }
 }
 
+const MAINTENANCE_ACCESS: u32 = SERVICE_QUERY_CONFIG
+    | SERVICE_CHANGE_CONFIG
+    | SERVICE_START
+    | SERVICE_STOP
+    | SERVICE_QUERY_STATUS;
+
+/// SCM checks the disabled start type even on handles opened before maintenance.
+/// The setup lock remains the authority for coordinating file/ledger changes.
+pub(super) struct ServiceMaintenance {
+    handle: Option<ServiceHandle>,
+    original_start_type: Option<SERVICE_START_TYPE>,
+}
+
+impl ServiceMaintenance {
+    pub(super) fn prepare() -> Result<Self> {
+        let Some(handle) = service::try_open_service(MAINTENANCE_ACCESS)? else {
+            return Ok(Self {
+                handle: None,
+                original_start_type: None,
+            });
+        };
+        Self::from_handle(handle)
+    }
+
+    fn from_handle(handle: ServiceHandle) -> Result<Self> {
+        let original_start_type = service_start_type(&handle)?;
+        Ok(Self {
+            handle: Some(handle),
+            original_start_type: Some(original_start_type),
+        })
+    }
+
+    pub(super) fn stop() -> Result<Self> {
+        let mut guard = Self::prepare()?;
+        guard.pause()?;
+        Ok(guard)
+    }
+
+    fn open_if_present(&mut self) -> Result<()> {
+        if self.handle.is_none() {
+            self.handle = service::try_open_service(MAINTENANCE_ACCESS)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn pause(&mut self) -> Result<()> {
+        self.open_if_present()?;
+        if let Some(handle) = &self.handle {
+            set_service_start_type(handle, SERVICE_DISABLED)?;
+            stop_named_service(handle)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn start(&mut self) -> Result<()> {
+        self.open_if_present()?;
+        let handle = self.handle.as_ref().ok_or(BrokerError::Unavailable)?;
+        set_service_start_type(handle, SERVICE_AUTO_START)?;
+        start_named_service(handle)
+    }
+
+    pub(super) fn restart_after_failure(&mut self) -> Result<()> {
+        self.open_if_present()?;
+        let Some(handle) = &self.handle else {
+            return Ok(());
+        };
+        let start_type = self.original_start_type.unwrap_or(SERVICE_AUTO_START);
+        set_service_start_type(handle, start_type)?;
+        if start_type != SERVICE_DISABLED {
+            start_named_service(handle)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit(&mut self) {
+        self.original_start_type = None;
+    }
+}
+
+impl Drop for ServiceMaintenance {
+    fn drop(&mut self) {
+        if let (Some(handle), Some(start_type)) = (&self.handle, self.original_start_type) {
+            if let Err(error) = set_service_start_type(handle, start_type) {
+                super::diagnostics::event(
+                    "warn",
+                    "service_start_config_restore_failed",
+                    "maintenance",
+                    Some(error),
+                );
+            }
+        }
+    }
+}
+
+fn service_start_type(handle: &ServiceHandle) -> Result<SERVICE_START_TYPE> {
+    let mut needed = 0;
+    // SAFETY: the first query obtains the size only. The second uses aligned,
+    // initialized storage that remains live while reading the fixed header.
+    unsafe {
+        let _ = QueryServiceConfigW(handle.0, None, 0, &mut needed);
+        if needed < std::mem::size_of::<QUERY_SERVICE_CONFIGW>() as u32 || needed > 64 * 1024 {
+            return Err(BrokerError::Storage);
+        }
+        let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        QueryServiceConfigW(
+            handle.0,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .map_err(|_| BrokerError::AccessDenied)?;
+        Ok((*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType)
+    }
+}
+
+fn set_service_start_type(handle: &ServiceHandle, start_type: SERVICE_START_TYPE) -> Result<()> {
+    // SAFETY: SCM copies this fixed start type; null optional strings preserve
+    // the signed image, account, arguments, dependencies and display name.
+    unsafe {
+        ChangeServiceConfigW(
+            handle.0,
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            start_type,
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
+        .map_err(|_| BrokerError::AccessDenied)
+    }
+}
+
 pub fn stop_service() -> Result<()> {
     let Some(handle) = service::try_open_service(SERVICE_STOP | SERVICE_QUERY_STATUS)? else {
         return Ok(());
     };
-    if service::query_status(&handle)?.dwCurrentState == SERVICE_STOPPED {
-        return Ok(());
-    }
-    // SAFETY: SCM handle and status output are live and valid.
-    unsafe {
-        let mut status = SERVICE_STATUS::default();
-        let _ = ControlService(handle.0, SERVICE_CONTROL_STOP, &mut status);
-    }
+    stop_named_service(&handle)
+}
+
+fn stop_named_service(handle: &ServiceHandle) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if service::query_status(&handle)?.dwCurrentState == SERVICE_STOPPED {
+        let state = service::query_status(handle)?.dwCurrentState;
+        if state == SERVICE_STOPPED {
             return Ok(());
+        }
+        if state != SERVICE_START_PENDING && state != SERVICE_STOP_PENDING {
+            // SAFETY: the owned SCM handle has STOP access and the output is
+            // initialized. Retry after a start/control transition settles.
+            unsafe {
+                let mut status = SERVICE_STATUS::default();
+                let _ = ControlService(handle.0, SERVICE_CONTROL_STOP, &mut status);
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(BrokerError::Busy)
 }
 
-fn start_service() -> Result<()> {
-    let handle = service::open_service(SERVICE_START | SERVICE_QUERY_STATUS)?;
-    if service::query_status(&handle)?.dwCurrentState == SERVICE_RUNNING {
+fn start_named_service(handle: &ServiceHandle) -> Result<()> {
+    if service::query_status(handle)?.dwCurrentState == SERVICE_RUNNING {
         return Ok(());
     }
+    // SAFETY: the caller retains an SCM handle with START access. No argument
+    // strings or borrowed buffers are passed to the synchronous start request.
     unsafe {
-        StartServiceW(handle.0, None).map_err(|_| BrokerError::Unavailable)?;
+        if let Err(error) = StartServiceW(handle.0, None) {
+            if error.code() != windows::core::HRESULT::from_win32(1056) {
+                return Err(BrokerError::Unavailable);
+            }
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        let status = service::query_status(&handle)?;
+        let status = service::query_status(handle)?;
         if status.dwCurrentState == SERVICE_RUNNING {
             return Ok(());
         }
@@ -617,12 +902,25 @@ fn start_service() -> Result<()> {
 }
 
 pub fn uninstall(caller_pid: u32) -> Result<()> {
+    uninstall_owner(caller_pid, false)
+}
+
+pub fn uninstall_owner(caller_pid: u32, remove_runtime: bool) -> Result<()> {
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
     if !unsafe { IsUserAnAdmin() }.as_bool() {
         return Err(BrokerError::AccessDenied);
     }
-    let caller = verify_main(inspect_process(caller_pid)?)?;
+    let caller = verify_uninstall_caller(caller_pid)?;
     let root = protected_root()?;
     let state = state_root()?;
+    if !root.try_exists().map_err(|_| BrokerError::Storage)?
+        || !state
+            .join("keys.db")
+            .try_exists()
+            .map_err(|_| BrokerError::Storage)?
+    {
+        return Ok(());
+    }
     assert_protected(&root)?;
     assert_protected(&state)?;
     let _lock = fs::OpenOptions::new()
@@ -633,27 +931,149 @@ pub fn uninstall(caller_pid: u32) -> Result<()> {
         .share_mode(0)
         .open(root.join("System/setup.lock"))
         .map_err(|_| BrokerError::Busy)?;
-    stop_service()?;
-    let mut ledger = Ledger::open(&state.join("keys.db"))?;
-    ledger.unregister_owner(&caller.principal.sid)?;
+    if !state
+        .join("keys.db")
+        .try_exists()
+        .map_err(|_| BrokerError::Storage)?
+    {
+        return Ok(());
+    }
+    let mut ledger = Ledger::open_existing(&state.join("keys.db"))?;
     let activation = root
         .join("Activations")
         .join(format!("{}.json", caller.principal.sid));
+    let detached_root = root.join("Detached");
+    let detached = detached_root.join(format!("{}.json", caller.principal.sid));
+    let registered = ledger.registered_runtime(&caller.principal.sid)?;
+    let pending = super::activation::read_pending(&root)?;
+    if registered.is_none()
+        && !activation.try_exists().map_err(|_| BrokerError::Storage)?
+        && (!remove_runtime || !detached.try_exists().map_err(|_| BrokerError::Storage)?)
+        && pending
+            .as_ref()
+            .is_none_or(|pending| pending.sid != caller.principal.sid)
+    {
+        // Other users may own the machine-wide service. Repeated removal of
+        // this user's package does not stop it or create new empty authority.
+        if remove_runtime && ledger.registered_owners()? == 0 {
+            if let Err(error) = super::collection::schedule_after(&root, caller_pid) {
+                super::diagnostics::event(
+                    "warn",
+                    "runtime_collection_deferred",
+                    "uninstall",
+                    Some(error),
+                );
+            }
+        }
+        return Ok(());
+    }
+    let mut maintenance = ServiceMaintenance::stop()?;
+    // Recover a prior interrupted registration before replacing its fence with
+    // removal. The installed service may already differ from its old marker.
+    super::activation::reconcile(&root, &ledger)?;
+    ledger.enable_reclamation()?;
+    let service_marker = root.join("System/runtime.json");
+    assert_protected(&service_marker)?;
+    let system: Activation =
+        serde_json::from_slice(&manifest::read_bounded(&service_marker, 1024)?)
+            .map_err(|_| BrokerError::Integrity)?;
+    let runtime_id = registered
+        .clone()
+        .unwrap_or_else(|| caller.principal.runtime_id.clone());
+    super::activation::begin(
+        &root,
+        &super::activation::PendingActivation {
+            sid: caller.principal.sid.clone(),
+            runtime_id,
+            system_runtime_id: system.runtime_id,
+        },
+    )?;
+    ensure_directory(&detached_root, true)?;
+    if remove_runtime {
+        if detached.exists() {
+            fs::remove_file(&detached).map_err(|_| BrokerError::Storage)?;
+        }
+    } else if let Some(runtime_id) = registered {
+        // Component removal leaves the application's current binaries and
+        // native-messaging path available. Keep at most one detached copy per SID.
+        atomic_write(
+            &detached,
+            &serde_json::to_vec(&Activation { runtime_id }).map_err(|_| BrokerError::Storage)?,
+        )?;
+    }
+    ledger.unregister_owner(&caller.principal.sid)?;
     if activation.exists() {
         fs::remove_file(activation).map_err(|_| BrokerError::Storage)?;
     }
+    super::activation::finish(&root)?;
+    if let Err(error) = super::revocation::remove(&state, &caller.principal.sid) {
+        super::diagnostics::event(
+            "warn",
+            "revocation_cleanup_deferred",
+            "uninstall",
+            Some(error),
+        );
+    }
     if ledger.registered_owners()? == 0 {
         if let Some(handle) = service::try_open_service(0x0001_0000)? {
+            // SAFETY: this stopped service's owned SCM handle has DELETE
+            // access and is retained until SCM accepts the removal request.
             unsafe {
                 DeleteService(handle.0).map_err(|_| BrokerError::AccessDenied)?;
             }
         }
     } else {
-        start_service()?;
+        maintenance.start()?;
     }
-    // Runtime files may still be mapped by this user's application. They are
-    // retained for safe removal after exit; no user archive paths are touched.
+    maintenance.commit();
+    drop(maintenance);
+    // Cleanup uses a verified private helper in System and waits for the caller
+    // to exit, so current executable locks cannot strand every old release.
+    if let Err(error) = super::collection::schedule_after(&root, caller_pid) {
+        super::diagnostics::event(
+            "warn",
+            "runtime_collection_deferred",
+            "uninstall",
+            Some(error),
+        );
+    }
     Ok(())
+}
+
+fn verify_uninstall_caller(pid: u32) -> Result<VerifiedCaller> {
+    if let Ok(caller) = verify_main(inspect_process(pid)?) {
+        return Ok(caller);
+    }
+    #[cfg(feature = "development-runtime")]
+    return Err(BrokerError::AccessDenied);
+    #[cfg(not(feature = "development-runtime"))]
+    {
+        let mut process = inspect_process(pid)?;
+        if process
+            .image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.eq_ignore_ascii_case("carbonpaper.exe"))
+        {
+            return Err(BrokerError::AccessDenied);
+        }
+        let directory = process.image.parent().ok_or(BrokerError::Integrity)?;
+        let (release, id) = manifest::read_manifest(directory)?;
+        let mut image = locked_file(&process.image)?;
+        verify_file(
+            &mut image,
+            release
+                .files
+                .get("carbonpaper.exe")
+                .ok_or(BrokerError::Integrity)?,
+        )?;
+        process.principal.runtime_id = id;
+        Ok(VerifiedCaller::new(process, image))
+    }
+}
+
+pub fn collect_after(pid: u32) -> Result<()> {
+    super::collection::run_after(pid)
 }
 
 fn remove_runtime_tree(root: &Path, target: &Path) -> Result<()> {

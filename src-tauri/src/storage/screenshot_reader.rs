@@ -17,6 +17,7 @@ impl<'a> ScreenshotReader<'a> {
 
     /// Returns the earliest records in the range, with an optional SQL limit.
     /// Timestamps at this boundary are Unix seconds.
+    #[cfg(test)]
     pub(crate) fn in_time_range(
         &self,
         start_ts: f64,

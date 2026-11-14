@@ -232,3 +232,74 @@ fn protected_runtime_location_matches_the_service_directory_layout() {
         assert!(!protected_runtime_directory(Path::new(directory), root));
     }
 }
+
+#[test]
+fn manually_updated_packages_run_the_newer_version_without_downgrading_activation() {
+    assert!(package_is_newer("0.9.2", "0.9.1").unwrap());
+    assert!(package_is_newer("0.10.0", "0.9.9").unwrap());
+    assert!(package_is_newer("0.9.2", "0.9.2-rc.1").unwrap());
+    assert!(!package_is_newer("0.9.1", "0.9.2").unwrap());
+    assert!(!package_is_newer("0.9.2-rc.1", "0.9.2").unwrap());
+    assert!(!package_is_newer("0.9.2+repack", "0.9.2").unwrap());
+    assert!(package_is_newer("0.9", "0.9.2").is_err());
+}
+
+#[test]
+fn broker_status_distinguishes_recovery_from_disabled_policy_and_registration_damage() {
+    assert_eq!(
+        status_reason(Some("app_bound_unavailable")),
+        Some("service_unavailable")
+    );
+    assert_eq!(
+        status_reason(Some("app_bound_task_busy")),
+        Some("service_unavailable")
+    );
+    assert_eq!(
+        status_reason(Some("app_bound_integrity_failure")),
+        Some("repair_required")
+    );
+    assert_eq!(
+        status_reason(Some("app_bound_access_denied")),
+        Some("repair_required")
+    );
+    assert_eq!(status_reason(Some("disabled")), Some("disabled"));
+    assert_eq!(status_reason(None), None);
+}
+
+#[test]
+fn component_repair_requires_restart_for_a_quarantined_client_and_preserves_the_latch() {
+    use carbonpaper_app_bound::protocol::BrokerError;
+    let staging = crate::processing_stage::ProcessingStaging::new();
+    staging.quarantine_broker(BrokerError::Integrity);
+    assert!(repaired_client_restart_required(&staging, false).unwrap());
+    assert!(staging.broker_quarantined());
+    assert!(!staging.available());
+    assert_eq!(
+        staging.refresh().unwrap_err(),
+        BrokerError::Integrity.to_string()
+    );
+}
+
+#[test]
+fn component_repair_cannot_report_success_when_client_refresh_fails() {
+    use carbonpaper_app_bound::protocol::{BrokerError, Request, Response};
+    struct UnavailableBroker;
+    impl crate::processing_stage::Broker for UnavailableBroker {
+        fn installed(&self) -> carbonpaper_app_bound::Result<bool> {
+            Ok(true)
+        }
+        fn supported(&self) -> bool {
+            true
+        }
+        fn call(&self, _: Request) -> carbonpaper_app_bound::Result<Response> {
+            Err(BrokerError::Unavailable)
+        }
+    }
+    let staging =
+        crate::processing_stage::ProcessingStaging::with_test_broker(Arc::new(UnavailableBroker));
+    assert_eq!(
+        repaired_client_restart_required(&staging, false),
+        Err("APP_BOUND_REPAIR_SERVICE_UNAVAILABLE".into())
+    );
+    assert!(!staging.available());
+}

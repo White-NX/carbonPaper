@@ -9,6 +9,7 @@ use crate::semantic_models::{
 use crate::semantic_session_cache::SessionCache;
 use image::RgbImage;
 use ort::{
+    environment::Environment,
     ep,
     session::{builder::GraphOptimizationLevel, RunOptions, Session},
     value::Tensor,
@@ -41,6 +42,7 @@ pub struct SemanticTokenization {
 }
 
 pub struct SemanticEngine {
+    environment: Environment,
     provider: MlProvider,
     dml_device_id: i32,
     models_root: PathBuf,
@@ -83,12 +85,14 @@ struct TokenizedBatch {
 
 impl SemanticEngine {
     pub fn new(
+        environment: Environment,
         provider: MlProvider,
         dml_device_id: i32,
         models_root: PathBuf,
         onnx_models_root: PathBuf,
     ) -> Self {
         Self {
+            environment,
             provider,
             dml_device_id,
             models_root,
@@ -334,7 +338,12 @@ impl SemanticEngine {
             .flatten()
             .map(load_clip_preprocessor)
             .transpose()?;
-        let session = load_session(&resolved, self.provider, self.dml_device_id)?;
+        let session = load_session(
+            &self.environment,
+            &resolved,
+            self.provider,
+            self.dml_device_id,
+        )?;
         self.check_request()?;
         validate_session_layout(&session, &resolved, kind)?;
         self.sessions.insert(
@@ -563,6 +572,7 @@ fn threads_for_cores(cores: usize) -> usize {
 }
 
 fn load_session(
+    environment: &Environment,
     resolved: &ResolvedSemanticModel,
     provider: MlProvider,
     dml_device_id: i32,
@@ -594,7 +604,7 @@ fn load_session(
             ep::CPU::default().with_arena_allocator(false).build(),
         ],
     };
-    let builder = Session::builder().map_err(|error| {
+    let builder = Session::builder(environment).map_err(|error| {
         MlError::new(
             MlErrorKind::ProviderUnavailable,
             format!("failed to create ONNX session: {error}"),
@@ -635,15 +645,20 @@ fn load_session(
         )
     })?;
     // Completed requests must release CPU before their job cap is restored.
-    let builder = builder
-        .with_config_entry("session.intra_op.allow_spinning", "0")
-        .and_then(|builder| builder.with_config_entry("session.inter_op.allow_spinning", "0"))
-        .map_err(|error| {
-            MlError::new(
-                MlErrorKind::ProviderUnavailable,
-                format!("failed to disable pool spinning: {error}"),
-            )
-        })?;
+    let mut builder = builder;
+    for config_entry in [
+        "session.intra_op.allow_spinning",
+        "session.inter_op.allow_spinning",
+    ] {
+        builder = builder
+            .with_config_entry(config_entry, "0")
+            .map_err(|error| {
+                MlError::new(
+                    MlErrorKind::ProviderUnavailable,
+                    format!("failed to disable pool spinning: {error}"),
+                )
+            })?;
+    }
     let builder = builder
         .with_config_entry("session.use_device_allocator_for_initializers", "0")
         .map_err(|error| {
