@@ -65,17 +65,18 @@ fn run() -> Result<(), String> {
     let config = cache
         .config_for(model_set)
         .with_pipeline(pipeline)
-        .with_inference_options(InferenceOptions {
-            intra_threads: args.threads,
-            inter_threads: 1,
-            parallel_execution: false,
-            enable_cpu_mem_arena: false,
-            execution_provider: if args.directml {
-                ExecutionProvider::DirectMl
-            } else {
-                ExecutionProvider::Cpu
-            },
-        });
+        .with_inference_options(
+            InferenceOptions::new()
+                .with_intra_threads(args.threads)
+                .with_inter_threads(1)
+                .with_parallel_execution(false)
+                .with_cpu_mem_arena(false)
+                .with_execution_provider(if args.directml {
+                    ExecutionProvider::DirectMl
+                } else {
+                    ExecutionProvider::Cpu
+                }),
+        );
 
     eprintln!(
         "[ML] loading model={} provider={:?} intra_threads={} arena=false",
@@ -108,7 +109,7 @@ fn run() -> Result<(), String> {
         &MlResponse::Ready {
             protocol_version: ML_PROTOCOL_VERSION,
             worker_version: env!("CARGO_PKG_VERSION").to_string(),
-            rapidocr_core_version: "0.2.2".to_string(),
+            rapidocr_core_version: "0.3.0".to_string(),
             provider,
             model_id: MODEL_ID.to_string(),
         },
@@ -199,6 +200,7 @@ fn run() -> Result<(), String> {
                             TokioOcrError::WorkerPanicked => "worker_panic",
                             TokioOcrError::WorkerStopped => "worker_stopped",
                             TokioOcrError::Ocr(_) => "ocr",
+                            _ => "ocr",
                         };
                         eprintln!(
                             "[ML] OCR failed request_id={} kind={} error={}",

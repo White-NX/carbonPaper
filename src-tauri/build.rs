@@ -178,10 +178,10 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ai/tokenizer/LICENSE-CODE");
 
     copy_file_if_needed(
-        Path::new("vendor/rapidocr-core/LICENSE"),
+        Path::new("licenses/rapidocr-core.txt"),
         Path::new("pre-bundle/licenses/rapidocr-core.txt"),
     );
-    println!("cargo:rerun-if-changed=vendor/rapidocr-core/LICENSE");
+    println!("cargo:rerun-if-changed=licenses/rapidocr-core.txt");
 
     // --- 2. Bundle only the five reviewed, encrypted dictionaries. ---
     // Local plaintext and curation artifacts must never enter a release, even

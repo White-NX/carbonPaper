@@ -119,7 +119,10 @@ fn legacy_sqlcipher_3453_database_survives_new_runtime_snapshot_and_reopen() {
     let connection = Connection::open(&database).unwrap();
     let status = connection::configure_sqlcipher_connection(&connection, &key).unwrap();
     assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
-    assert_eq!(status.engine.cipher_version, "4.14.0 community");
+    assert_eq!(
+        status.engine.cipher_version,
+        format!("{} community", connection::BUNDLED_SQLCIPHER_VERSION)
+    );
     let legacy_value: String = connection
         .query_row(
             "SELECT value FROM legacy_records ORDER BY rowid LIMIT 1",

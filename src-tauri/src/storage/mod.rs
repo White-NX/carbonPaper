@@ -531,20 +531,21 @@ impl StorageState {
 
     /// Run a read without holding the primary connection's mutex. The
     /// independent connection also participates in the maintenance gate.
+    /// Mutable access permits callback registration on the read-only handle.
     pub(super) fn with_read_connection_named<T>(
         &self,
         caller: &'static str,
-        operation: impl FnOnce(&Connection) -> Result<T, String>,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
         // In-memory unit fixtures have no file to open. Initialized, file-backed
         // tests exercise the same independent connection as production.
         #[cfg(test)]
         if !self.is_initialized() {
-            let guard = self.get_connection_named(caller)?;
-            return operation(guard.as_ref().ok_or("Database not initialized")?);
+            let mut guard = self.get_connection_named(caller)?;
+            return operation(guard.as_mut().ok_or("Database not initialized")?);
         }
-        let conn = self.open_read_connection_named(caller)?;
-        operation(&conn)
+        let mut conn = self.open_read_connection_named(caller)?;
+        operation(&mut conn)
     }
 
     /// Returns whether the current credential session is unlocked/valid.

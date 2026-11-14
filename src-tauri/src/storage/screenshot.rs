@@ -1481,8 +1481,9 @@ impl StorageState {
             return Ok(std::collections::HashMap::new());
         }
         let result = self.with_vector_scan_connection("clip_candidate_metadata", |conn| {
-            let _deadline = super::connection::QueryDeadline::install(conn, Some(deadline))
+            let deadline_guard = super::connection::QueryDeadline::install(conn, Some(deadline))
                 .map_err(|error| error.to_string())?;
+            let conn = &*deadline_guard;
             let mut result = std::collections::HashMap::new();
             for chunk in hashes.chunks(500) {
                 check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;

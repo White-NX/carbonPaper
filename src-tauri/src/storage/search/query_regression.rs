@@ -300,7 +300,9 @@ fn write_report(name: &str, reports: Vec<serde_json::Value>) {
 fn compare_snapshot_queries() {
     let path = std::env::var("CARBONPAPER_OCR_BENCH_DB").expect("set snapshot path");
     let before = std::fs::metadata(&path).unwrap();
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut connection =
+        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let conn = &connection;
     // The database page key is derived from the public key by the production
     // connection policy. This optional path reads only metadata and encrypted
     // payloads; it never opens a private key or unwraps any field encryption.
@@ -317,11 +319,12 @@ fn compare_snapshot_queries() {
         };
     conn.execute_batch("PRAGMA query_only = ON; PRAGMA cache_size = -2048;")
         .unwrap();
-    let _deadline = super::super::connection::QueryDeadline::install(
-        &conn,
+    let deadline_guard = super::super::connection::QueryDeadline::install(
+        &mut connection,
         Some(Instant::now() + Duration::from_secs(300)),
     )
     .unwrap();
+    let conn = &*deadline_guard;
     let (blocks, max_id): (i64, i64) = conn
         .query_row("SELECT count(*), max(id) FROM ocr_results", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -365,8 +368,8 @@ fn compare_snapshot_queries() {
             }),
         ));
     }
-    drop(_deadline);
-    drop(conn);
+    drop(deadline_guard);
+    drop(connection);
     let after = std::fs::metadata(path).unwrap();
     assert_eq!(before.len(), after.len());
     assert_eq!(before.modified().unwrap(), after.modified().unwrap());

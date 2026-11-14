@@ -699,7 +699,7 @@ impl StorageState {
     pub(super) fn with_vector_scan_connection<T>(
         &self,
         caller: &'static str,
-        operation: impl FnOnce(&Connection) -> Result<T, String>,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
         self.with_read_connection_named(caller, operation)
     }

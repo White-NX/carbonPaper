@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -123,18 +124,18 @@ impl StorageState {
             check()?;
             let raw = {
                 let opening = Instant::now();
-                let conn = self.open_read_connection_named("get_timeline_records")?;
+                let mut conn = self.open_read_connection_named("get_timeline_records")?;
                 timings.read_open = opening.elapsed();
                 check()?;
                 let stop = Arc::clone(cancelled);
                 let credentials = Arc::clone(&self.credential_state);
-                let _cancellation = SqlCancellation::install(&conn, move || {
+                let cancellation = SqlCancellation::install(&mut conn, move || {
                     stop.load(Ordering::Acquire)
                         || !credentials.is_session_valid()
                         || credentials.silent_read_auth_required()
                         || credentials.session_marker() != admitted_session
                 })?;
-                let result = read(&conn, &check, &mut timings);
+                let result = read(&cancellation, &check, &mut timings);
                 // SQLite reports SQLITE_INTERRUPT; preserve the public cancel
                 // or auth error instead of exposing a generic database failure.
                 check()?;
@@ -203,16 +204,24 @@ impl StorageState {
 
 /// The callback also runs inside sqlite3_step, before the first grouped/sorted
 /// row is returned. Removing it on every exit prevents poisoning later reads.
-struct SqlCancellation<'a>(&'a Connection);
+struct SqlCancellation<'a>(&'a mut Connection);
 
 impl<'a> SqlCancellation<'a> {
     fn install(
-        conn: &'a Connection,
+        conn: &'a mut Connection,
         stop: impl FnMut() -> bool + Send + 'static,
     ) -> Result<Self, String> {
         conn.progress_handler(1000, Some(stop))
             .map_err(|error| error.to_string())?;
         Ok(Self(conn))
+    }
+}
+
+impl Deref for SqlCancellation<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
     }
 }
 
