@@ -510,7 +510,6 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
                     .is_lightweight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = false;
-                tracing::info!("Window recreated from lightweight mode");
                 refresh_tray_menu(&app_handle);
                 if show_ocr_model_repair {
                     let _ = app_handle.emit("show-ocr-model-repair", ());
@@ -703,29 +702,33 @@ pub fn get_data_dir() -> std::path::PathBuf {
         .join("data")
 }
 
-// 动态创建主窗口
+// 动态创建主窗口，复用并显示并发请求已创建的窗口
 pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::WebviewWindowBuilder;
 
-    tracing::info!("Creating main window");
+    let state = app.state::<main_window::MainWindowPresentationState>();
+    let created = state.create_if_missing(
+        || app.get_webview_window("main").is_some(),
+        |generation| -> Result<(), Box<dyn std::error::Error>> {
+            tracing::info!("Creating main window");
+            let url = format!("index.html?startup={generation}");
+            let window = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+                .title("carbonpaper")
+                .inner_size(1300.0, 750.0)
+                .decorations(false)
+                .transparent(true)
+                .visible(false)
+                .build()?;
 
-    let generation = app
-        .state::<main_window::MainWindowPresentationState>()
-        .begin_creation();
-    let url = format!("index.html?startup={generation}");
-
-    let window = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
-        .title("carbonpaper")
-        .inner_size(1300.0, 750.0)
-        .decorations(false)
-        .transparent(true)
-        .visible(false)
-        .build()?;
-
-    // 应用 Acrylic 效果
-    let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
-
-    tracing::info!("Main window created successfully");
+            // 应用 Acrylic 效果
+            let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+            tracing::info!("Main window created successfully");
+            Ok(())
+        },
+    )?;
+    if !created {
+        main_window::request_show(app)?;
+    }
     Ok(())
 }
 

@@ -453,12 +453,7 @@ pub async fn switch_to_standard_mode(
         timer.abort();
     }
 
-    // Refuse to create a duplicate main window.
-    if app.get_webview_window("main").is_some() {
-        return Err("Window already exists".to_string());
-    }
-
-    // Recreate the standard UI.
+    // Recreate the standard UI, or present the window another open created.
     crate::create_main_window(&app).map_err(|e| e.to_string())?;
 
     if let Some(credential_state) =
