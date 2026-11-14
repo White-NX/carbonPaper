@@ -2319,7 +2319,7 @@ impl StorageState {
         if ocr_marked > 0 {
             let _ = self
                 .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(ocr_marked as u64))
                 });
         }
@@ -2447,7 +2447,7 @@ impl StorageState {
         if ocr_marked > 0 {
             let _ = self
                 .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(ocr_marked as u64))
                 });
         }

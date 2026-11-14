@@ -308,8 +308,10 @@ fn resetting_background_dataset_preserves_content_identity_and_encrypted_history
         [first.to_string()], |r| r.get(0),
     ).unwrap();
     let decoded = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     assert_eq!(decoded, expected);
 }

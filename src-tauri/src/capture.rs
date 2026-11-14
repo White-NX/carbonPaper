@@ -213,11 +213,12 @@ impl Drop for OcrTaskGuard {
 fn release_ocr_slot(capture_state: &CaptureState) {
     // Saturating subtraction avoids wrapping to u32::MAX if an old task
     // finishes after a monitor restart reset the counter to zero.
-    let _ = capture_state.in_flight_ocr_count.fetch_update(
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-        |count| Some(count.saturating_sub(1)),
-    );
+    let _ =
+        capture_state
+            .in_flight_ocr_count
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            });
 }
 
 impl Default for CaptureState {

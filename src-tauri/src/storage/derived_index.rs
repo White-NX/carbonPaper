@@ -2144,8 +2144,8 @@ pub(super) fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>,
         ));
     }
     let mut vector = Vec::with_capacity(dimensions);
-    for chunk in bytes.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in bytes.as_chunks::<4>().0 {
+        let value = f32::from_le_bytes(*chunk);
         if !value.is_finite() {
             return Err("Stored embedding contains a non-finite value".to_string());
         }

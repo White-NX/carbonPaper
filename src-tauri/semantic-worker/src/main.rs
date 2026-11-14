@@ -48,7 +48,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = Args::parse()?;
-    let committed = ort::init_from(&args.ort_dylib)
+    let environment = ort::init_from(&args.ort_dylib)
         .map_err(|error| {
             format!(
                 "provider_unavailable: failed to open ONNX Runtime {}: {error}",
@@ -56,16 +56,17 @@ fn run() -> Result<(), String> {
             )
         })?
         .with_name("carbonpaper-semantic")
-        .commit();
-    if !committed {
-        return Err("provider_unavailable: ONNX Runtime was already initialized".to_string());
-    }
+        .build()
+        .map_err(|error| {
+            format!("provider_unavailable: failed to initialize ONNX environment: {error}")
+        })?;
     let provider = if args.directml {
         MlProvider::DirectMl
     } else {
         MlProvider::Cpu
     };
     let mut engine = semantic_engine::SemanticEngine::new(
+        environment,
         provider,
         args.dml_device_id,
         args.models_root,

@@ -117,7 +117,7 @@ impl Painter {
         let make_mark = |dark| -> Result<ID2D1Bitmap> {
             let color = Palette::new(dark).muted;
             let mut pixels = mark.clone().into_raw();
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 let alpha = f32::from(pixel[3]);
                 pixel[0] = (color.b * alpha).round() as u8;
                 pixel[1] = (color.g * alpha).round() as u8;

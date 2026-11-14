@@ -184,20 +184,16 @@ impl<T> TopK<T> {
 /// accumulator forces the compiler to keep the loop scalar.
 fn dot_product_wide(query: &[f32], row: &[f32]) -> f32 {
     let mut acc = [0.0f32; 4];
-    let mut query_chunks = query.chunks_exact(4);
-    let mut row_chunks = row.chunks_exact(4);
-    for (q, r) in query_chunks.by_ref().zip(row_chunks.by_ref()) {
+    let (query_chunks, query_remainder) = query.as_chunks::<4>();
+    let (row_chunks, row_remainder) = row.as_chunks::<4>();
+    for (q, r) in query_chunks.iter().zip(row_chunks) {
         acc[0] += q[0] * r[0];
         acc[1] += q[1] * r[1];
         acc[2] += q[2] * r[2];
         acc[3] += q[3] * r[3];
     }
     let mut total = acc[0] + acc[1] + acc[2] + acc[3];
-    for (q, r) in query_chunks
-        .remainder()
-        .iter()
-        .zip(row_chunks.remainder().iter())
-    {
+    for (q, r) in query_remainder.iter().zip(row_remainder) {
         total += q * r;
     }
     total

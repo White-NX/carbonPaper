@@ -19,8 +19,10 @@ jobs:
         with:
           node-version: 22.18.0
 
-      - name: Install Rust stable
+      - name: Install Rust 1.100.0
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
 
       - name: Verify update signing secrets
         shell: pwsh

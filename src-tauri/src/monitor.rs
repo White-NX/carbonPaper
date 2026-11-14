@@ -112,7 +112,7 @@ impl MonitorState {
     /// lifecycle alone, so it cannot end a session claimed in the meantime.
     fn take_over_for_stop(&self) -> bool {
         self.lifecycle
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 (current != LIFECYCLE_IDLE).then_some(LIFECYCLE_DRAINING)
             })
             .is_ok()
