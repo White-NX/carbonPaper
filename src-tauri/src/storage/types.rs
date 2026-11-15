@@ -233,6 +233,7 @@ pub struct EditedScreenshotResponse {
     pub screenshot_id: i64,
     pub image_path: String,
     pub image_hash: String,
+    pub ocr_status: String,
 }
 
 /// Response after saving a new capture, contains the assigned ID and dedup counts.

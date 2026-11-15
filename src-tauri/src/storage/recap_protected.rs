@@ -26,16 +26,14 @@ impl StorageState {
     }
 
     pub(crate) fn recap_config_revision(&self) -> Result<i64, String> {
-        let guard = self.get_connection_named("recap_config_revision")?;
-        guard
-            .as_ref()
-            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
-            .query_row(
+        self.with_read_connection_named("recap_config_revision", |conn| {
+            conn.query_row(
                 "SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key='recap_config_revision'",
                 [],
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())
+        })
     }
 
     pub(crate) fn recap_correction_version(&self, date: &str) -> Result<i64, String> {

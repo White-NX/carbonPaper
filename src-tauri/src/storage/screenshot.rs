@@ -2604,24 +2604,23 @@ impl StorageState {
 
     /// Fetch pending counts in delete queues.
     pub fn get_delete_queue_status(&self) -> Result<DeleteQueueStatus, String> {
-        let guard = self.get_connection_named("get_delete_queue_status")?;
-        let conn = guard.as_ref().unwrap();
+        self.with_read_connection_named("get_delete_queue_status", |conn| {
+            let pending_screenshots: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
+            let pending_ocr: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
 
-        let pending_screenshots: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
-                row.get(0)
+            Ok(DeleteQueueStatus {
+                pending_screenshots,
+                pending_ocr,
+                running: pending_screenshots > 0 || pending_ocr > 0,
             })
-            .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
-        let pending_ocr: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
-
-        Ok(DeleteQueueStatus {
-            pending_screenshots,
-            pending_ocr,
-            running: pending_screenshots > 0 || pending_ocr > 0,
         })
     }
 

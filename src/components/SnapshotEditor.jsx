@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { CircleCheck, Loader2, Pencil, RotateCw, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useSnapshotEditor } from '../hooks/useSnapshotEditor';
+import { retryEditedScreenshotOcr } from '../lib/monitor_api';
 import {
   clamp, cloneScene, constrainObject, eraseScene, hitObject, objectBounds, renderScene,
   resizeObject, TEXT_FONT, TEXT_LEADING, TEXT_PADDING, textErasureMask,
@@ -30,6 +31,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const textRef = useRef(null);
   const gestureRef = useRef(null);
   const spacePressedRef = useRef(false);
+  const loadedImageIdRef = useRef(null);
   const [image, setImage] = useState(null);
   const [imageError, setImageError] = useState(false);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
@@ -39,6 +41,8 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const [spacePressed, setSpacePressed] = useState(false);
   const [hoveringObject, setHoveringObject] = useState(false);
   const [interacting, setInteracting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState(false);
   const editor = useSnapshotEditor({ image, screenshotId: selectedEvent.id,
     imageHash: selectedDetails?.record?.image_hash,
     enabled: isAuthenticated && selectedDetails?.record?.status === 'committed',
@@ -57,12 +61,13 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
       setImage(original);
       setImageError(false);
       setAnimateView(false);
-      setView({ scale: 1, x: 0, y: 0 });
+      if (loadedImageIdRef.current !== selectedEvent.id) setView({ scale: 1, x: 0, y: 0 });
+      loadedImageIdRef.current = selectedEvent.id;
     };
     original.onerror = () => { if (!disposed) setImageError(true); };
     original.src = imageSrc;
     return () => { disposed = true; original.onload = null; original.onerror = null; };
-  }, [imageSrc]);
+  }, [imageSrc, selectedEvent.id]);
 
   useLayoutEffect(() => {
     const element = viewportRef.current;
@@ -75,7 +80,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
 
   useLayoutEffect(() => {
     if (!image || !canvasRef.current) return;
-    renderScene(canvasRef.current, image, editor.scene, { editingId: editor.editingId });
+    renderScene(canvasRef.current, editor.baseImage || image, editor.scene, { editingId: editor.editingId });
     const gesture = gestureRef.current;
     if (gesture?.type === 'create') {
       const node = gesture.node;
@@ -86,7 +91,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
       context.strokeRect(node.cx - node.w / 2, node.cy - node.h / 2, node.w, node.h);
       context.setLineDash([]);
     }
-  }, [image, editor.revision, editor.scene, editor.editingId]);
+  }, [image, editor.baseImage, editor.revision, editor.scene, editor.editingId]);
 
   useLayoutEffect(() => {
     if (editor.editingId) {
@@ -375,6 +380,17 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const contextX = selected ? viewport.width / 2 + view.x + (selected.cx - width / 2) * actualScale : 0;
   const contextY = selected ? viewport.height / 2 + view.y + (selected.cy + bounds.hy - height / 2) * actualScale + 12 : 0;
   const inverseScale = 1 / actualScale;
+  const recognitionStatus = selectedDetails?.edit_ocr?.image_hash === selectedDetails?.record?.image_hash
+    ? selectedDetails?.edit_ocr?.status : null;
+  const recognizing = ['pending', 'processing', 'waiting_for_auth'].includes(recognitionStatus);
+  const recognitionFailed = recognitionStatus === 'failed' || retryError;
+  const retryRecognition = async () => {
+    setRetrying(true);
+    setRetryError(false);
+    try { await retryEditedScreenshotOcr(selectedEvent.id, selectedDetails.record.image_hash); }
+    catch { setRetryError(true); }
+    finally { setRetrying(false); }
+  };
   const cursor = panning ? 'grabbing' : spacePressed || !editor.editing ? 'grab'
     : hoveringObject && ['select', 'text', 'mosaic'].includes(editor.tool) ? 'move'
     : editor.tool === 'select' ? 'grab' : editor.tool === 'text' ? 'text' : 'crosshair';
@@ -453,10 +469,18 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
         onZoomOut={() => changeZoom((scale) => scale / 1.5)} onScaleChange={changeZoom}
         onReset={resetZoom} viewportRef={rootRef} />
       {editor.dirty && <span className="snapshot-editor-dirty"><span />{t('snapshotEditor.unsaved')}</span>}
-      {(editor.error || editor.savedNotice) && (
-        <div className={'snapshot-editor-notice preview-action-bar ' + (editor.error ? 'text-ide-error' : 'text-ide-text')} role={editor.error ? 'alert' : 'status'}>
-          {!editor.error && <CircleCheck size={15} className="text-ide-success" aria-hidden="true" />}
-          {editor.error ? t('snapshotEditor.saveFailed', { error: editor.error }) : t('snapshotEditor.saved')}
+      {(editor.error || editor.savedNotice || recognizing || recognitionFailed) && (
+        <div className={'snapshot-editor-notice preview-action-bar ' + (editor.error || recognitionFailed ? 'text-ide-error' : 'text-ide-text')}
+          role={editor.error || recognitionFailed ? 'alert' : 'status'}>
+          {recognizing ? <Loader2 size={15} className="animate-spin" aria-hidden="true" />
+            : !editor.error && !recognitionFailed && <CircleCheck size={15} className="text-ide-success" aria-hidden="true" />}
+          {editor.error ? t('snapshotEditor.saveFailed', { error: editor.error })
+            : recognitionFailed ? t('snapshotEditor.recognitionFailed')
+            : recognitionStatus === 'waiting_for_auth' ? t('snapshotEditor.waitingForUnlock')
+            : recognizing ? t('snapshotEditor.savedRecognizing')
+            : recognitionStatus === 'completed' ? t('snapshotEditor.recognized') : t('snapshotEditor.saved')}
+          {recognitionFailed && <Button variant="ghost" size="xs" icon={RotateCw} loading={retrying}
+            disabled={!isAuthenticated || editor.busy} onClick={retryRecognition}>{t('snapshotEditor.retryRecognition')}</Button>}
         </div>
       )}
       <PreviewActionBar selectedEvent={selectedEvent} selectedDetails={selectedDetails} {...actionBarProps} editor={editor} />

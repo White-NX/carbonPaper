@@ -364,13 +364,12 @@ impl StorageState {
             return Err("AUTH_REQUIRED".into());
         }
         let generation = self.db_generation();
-        let row: Option<(Vec<u8>, Vec<u8>)> = {
-            let guard = self.get_connection_named("recap_read")?;
-            guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?.query_row(
+        let row: Option<(Vec<u8>, Vec<u8>)> = self.with_read_connection_named("recap_read", |conn| {
+            conn.query_row(
                 "SELECT data,row_key FROM recap_payloads WHERE kind=?1 AND key=?2 AND (?3 IS NULL OR revision=?3)",
                 params![kind,key,revision], |r| Ok((r.get(0)?,r.get(1)?))
-            ).optional().map_err(|e| e.to_string())?
-        };
+            ).optional().map_err(|e| e.to_string())
+        })?;
         let Some((data, key)) = row else {
             return Ok(None);
         };
@@ -520,10 +519,8 @@ impl StorageState {
     }
 
     pub(crate) fn recap_list_days(&self) -> Result<Vec<String>, String> {
-        let guard = self.get_connection_named("recap_list_days")?;
-        let mut stmt = guard
-            .as_ref()
-            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
+        self.with_read_connection_named("recap_list_days", |conn| {
+        let mut stmt = conn
             .prepare("SELECT day FROM recap_days WHERE day NOT IN (SELECT day FROM recap_deleted_days) ORDER BY day DESC LIMIT 730")
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -532,6 +529,7 @@ impl StorageState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string());
         rows
+        })
     }
 
     pub(crate) fn recap_delete_day(&self, day: &str, generation: u64) -> Result<(), String> {

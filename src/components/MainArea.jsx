@@ -94,14 +94,17 @@ function OcrContentPanel({ selectedDetails, onClose, onCopyText }) {
       </div>
       <div className="flex-1 overflow-hidden">
         {/* 当 record.status 为 pending 时显示斜体文案 */}
-        {selectedDetails?.record?.status === 'pending' ? (
-          <div className="w-full h-full flex items-center justify-center text-sm italic text-ide-muted p-3">{t('snapshotPreview.loadingOcr')}</div>
+        {selectedDetails?.record?.status === 'pending' || ['pending', 'processing', 'waiting_for_auth'].includes(selectedDetails?.edit_ocr?.status) ? (
+          <div className="w-full h-full flex items-center justify-center text-sm italic text-ide-muted p-3">
+            {t(selectedDetails?.edit_ocr?.status === 'waiting_for_auth' ? 'snapshotEditor.waitingForUnlock' : 'snapshotPreview.loadingOcr')}
+          </div>
         ) : (
           <textarea
             className="w-full h-full bg-ide-bg p-3 text-xs font-mono text-ide-text resize-none focus:outline-none leading-relaxed"
             readOnly
             value={ocrText}
-            placeholder={t(selectedDetails ? 'snapshotPreview.noOcr' : 'snapshotPreview.loadingOcr')}
+            placeholder={t(selectedDetails?.edit_ocr?.status === 'failed' ? 'snapshotEditor.recognitionFailed'
+              : selectedDetails ? 'snapshotPreview.noOcr' : 'snapshotPreview.loadingOcr')}
           />
         )}
       </div>
@@ -329,9 +332,8 @@ export default function MainArea({
     onDeleteRecord, onDeleteNearbyRecords, onOpenUrl: handleOpenUrl, onShowMore: handleShowMore,
     onOpenFloatingPreview: openCurrentPreviewInDock, showOcrPanel,
   };
-  const handleSnapshotSaved = useCallback(async (result) => {
-    await onSnapshotSaved?.(result);
-    setShowOcrPanel(true);
+  const handleSnapshotSaved = useCallback((result, imageSrc) => {
+    return onSnapshotSaved?.(result, imageSrc);
   }, [onSnapshotSaved]);
 
   return (

@@ -282,6 +282,28 @@ impl StorageState {
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
             );
 
+            -- Edits publish their image before recognition. The image hash and
+            -- lease fence late OCR results, and the queue survives UI/process exit.
+            CREATE TABLE IF NOT EXISTS screenshot_edit_ocr_jobs (
+                screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+                image_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','processing','waiting_for_auth','completed','failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NOT NULL DEFAULT 0,
+                lease TEXT,
+                error TEXT,
+                queued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_screenshot_edit_ocr_ready
+                ON screenshot_edit_ocr_jobs(status,next_retry_at,queued_at);
+            CREATE TRIGGER IF NOT EXISTS screenshot_edit_ocr_source_changed
+            AFTER UPDATE OF image_hash,is_deleted ON screenshots
+            WHEN NEW.is_deleted=1 OR NEW.image_hash IS NOT OLD.image_hash BEGIN
+                DELETE FROM screenshot_edit_ocr_jobs WHERE screenshot_id=NEW.id;
+            END;
+
             -- Document references use their own row key so delayed native
             -- discovery never has to unwrap or rewrite screenshot metadata.
             CREATE TABLE IF NOT EXISTS screenshot_document_refs (

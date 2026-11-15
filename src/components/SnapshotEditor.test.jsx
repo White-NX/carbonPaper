@@ -4,11 +4,17 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SnapshotEditor from './SnapshotEditor';
 import { renderScene } from '../lib/snapshot_editor';
+import { saveEditedScreenshot, retryEditedScreenshotOcr } from '../lib/monitor_api';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
 vi.mock('../lib/snapshot_editor', async (importOriginal) => ({ ...(await importOriginal()), renderScene: vi.fn() }));
+vi.mock('../lib/monitor_api', async (importOriginal) => ({
+  ...(await importOriginal()), saveEditedScreenshot: vi.fn(), retryEditedScreenshotOcr: vi.fn(),
+}));
 
 beforeEach(() => {
+  saveEditedScreenshot.mockReset();
+  retryEditedScreenshotOcr.mockReset();
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   vi.stubGlobal('matchMedia', () => ({ matches: false }));
   vi.stubGlobal('Image', class {
@@ -31,11 +37,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function renderEditor() {
+async function renderEditor(overrides = {}) {
   let rendered;
   await act(async () => { rendered = render(<SnapshotEditor imageSrc="preview.png" selectedEvent={{ id: 42 }}
     selectedDetails={{ record: { id: 42, status: 'committed', image_hash: 'original' } }}
-    isAuthenticated actionBarProps={{}} />); });
+    isAuthenticated actionBarProps={{}} {...overrides} />); });
   const image = screen.getByRole('img').parentElement;
   const viewport = image.parentElement;
   vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: viewport.clientWidth, height: viewport.clientHeight });
@@ -129,6 +135,36 @@ describe('snapshot editor zoom and pointer handoff', () => {
     expect(viewport.style.cursor).toBe('grab');
     expect(screen.queryByText('snapshotEditor.unsaved')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'snapshotEditor.undo' })).toBeDisabled();
+  });
+});
+
+describe('snapshot editor background recognition', () => {
+  it('closes editing after saving while the surrounding refresh is still pending', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG5n');
+    saveEditedScreenshot.mockResolvedValueOnce({ screenshot_id: 42, image_hash: 'saved', ocr_status: 'pending' });
+    const onSaved = vi.fn(() => new Promise(() => {}));
+    const { viewport } = await renderEditor({ onSaved });
+    createMosaic(viewport);
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.save' })));
+    expect(viewport.parentElement).toHaveAttribute('data-editing', 'false');
+    expect(screen.getByRole('button', { name: 'snapshotEditor.edit' })).toBeEnabled();
+    expect(saveEditedScreenshot).toHaveBeenCalledWith(42, 'original', 'cG5n');
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ ocr_status: 'pending' }), 'data:image/png;base64,cG5n');
+  });
+
+  it('allows another edit while recognition retry is in flight', async () => {
+    let finish;
+    retryEditedScreenshotOcr.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const { viewport } = await renderEditor({ selectedDetails: {
+      record: { id: 42, status: 'committed', image_hash: 'original' },
+      edit_ocr: { screenshot_id: 42, image_hash: 'original', status: 'failed' },
+    } });
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.retryRecognition' }));
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.edit' }));
+    expect(viewport.parentElement).toHaveAttribute('data-editing', 'true');
+    expect(screen.getByRole('button', { name: 'snapshotEditor.tools.brush' })).toBeEnabled();
+    expect(retryEditedScreenshotOcr).toHaveBeenCalledWith(42, 'original');
+    await act(async () => finish({ status: 'pending' }));
   });
 });
 

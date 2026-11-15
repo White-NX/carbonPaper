@@ -884,6 +884,7 @@ pub fn run() {
         .manage(Arc::new(SensitiveFilterState::default()))
         .manage(credential_state)
         .manage(storage_state)
+        .manage(Arc::new(screenshot_editor::ScreenshotEditRuntime::default()))
         .manage(Arc::new(storage_startup::StorageStartupState::new()))
         .manage(Arc::new(commands::migration::HmacMigrationRuntime::default()))
         .manage(main_window::MainWindowPresentationState::new(!start_hidden))
@@ -1050,6 +1051,7 @@ pub fn run() {
             commands::storage::storage_cancel_thumbnail_warmup,
             commands::storage::storage_get_screenshot_details,
             commands::storage::storage_save_edited_screenshot,
+            commands::storage::storage_retry_edited_screenshot_ocr,
             commands::storage::storage_delete_screenshot,
             commands::storage::storage_delete_by_time_range,
             commands::storage::storage_list_processes,

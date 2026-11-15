@@ -417,22 +417,22 @@ export default function SnapshotPreviewDock({
 
   useEffect(() => {
     let disposed = false;
-    let unlisten;
-    listen('screenshot-edited', (event) => {
+    const invalidate = (event, imageChanged) => {
       const keys = new Set((tabs || []).filter((tab) => getTargetId(tab) === event.payload?.screenshot_id).map(getPreviewKey));
       if (!keys.size || disposed) return;
       if (keys.has(resolvedActiveKey)) requestIdRef.current += 1;
       const clear = (cache) => Object.fromEntries(Object.entries(cache).filter(([key]) => !keys.has(key)));
-      setImageCache(clear);
+      if (imageChanged) setImageCache(clear);
       setDetailsCache(clear);
       setErrorMap(clear);
-      imageOrderRef.current = imageOrderRef.current.filter((key) => !keys.has(key));
+      if (imageChanged) imageOrderRef.current = imageOrderRef.current.filter((key) => !keys.has(key));
       detailsOrderRef.current = detailsOrderRef.current.filter((key) => !keys.has(key));
-    }).then((dispose) => {
-      if (disposed) dispose();
-      else unlisten = dispose;
-    });
-    return () => { disposed = true; unlisten?.(); };
+    };
+    const subscriptions = Promise.all([
+      listen('screenshot-edited', (event) => invalidate(event, true)),
+      listen('screenshot-ocr-updated', (event) => invalidate(event, false)),
+    ]);
+    return () => { disposed = true; subscriptions.then((unlisten) => unlisten.forEach((dispose) => dispose())); };
   }, [tabs, resolvedActiveKey]);
 
   useEffect(() => {
@@ -838,7 +838,10 @@ export default function SnapshotPreviewDock({
                 readOnly
                 value={ocrText}
                 className="min-h-0 flex-1 resize-none bg-ide-bg p-3 font-mono text-xs leading-relaxed text-ide-text outline-none placeholder:text-ide-muted"
-                placeholder={isLoading ? t('snapshotPreview.loadingOcr') : t('snapshotPreview.noOcr')}
+                placeholder={t(activeDetails?.edit_ocr?.status === 'waiting_for_auth' ? 'snapshotEditor.waitingForUnlock'
+                  : activeDetails?.edit_ocr?.status === 'failed' ? 'snapshotEditor.recognitionFailed'
+                  : isLoading || ['pending', 'processing'].includes(activeDetails?.edit_ocr?.status)
+                    ? 'snapshotPreview.loadingOcr' : 'snapshotPreview.noOcr')}
               />
             )}
           </div>

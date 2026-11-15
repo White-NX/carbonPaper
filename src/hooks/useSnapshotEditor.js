@@ -8,14 +8,15 @@ import {
 export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onSaved, onNavigationGuardChange, placeholder }) {
   const [revision, refresh] = useReducer((value) => value + 1, 0);
   const optionsRef = useRef(null);
-  optionsRef.current = { image, screenshotId, enabled, onSaved, placeholder };
   const stateRef = useRef({
     editing: false, tool: 'select', scene: [], saved: [], undo: [], redo: [],
     selectedId: null, editingId: null, textBefore: null, propertyBefore: null,
     color: '#e04e55', brushSize: 4, eraseSize: 28, fontSize: 24, blocks: 14,
     busy: false, error: null, savedNotice: false, confirmLeave: false, imageHash: null,
+    baseImage: null, baseSource: null,
   });
   const state = stateRef.current;
+  optionsRef.current = { image: state.baseImage || image, sourceImage: image, screenshotId, enabled, onSaved, placeholder };
   if (!state.imageHash && imageHash) state.imageHash = imageHash;
   const pendingActionRef = useRef(null);
   const mountedRef = useRef(true);
@@ -25,6 +26,14 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
   }, []);
 
   const notify = useCallback(() => { if (mountedRef.current) refresh(); }, []);
+  useEffect(() => {
+    const current = stateRef.current;
+    if (current.baseImage && image && image !== current.baseSource && imageHash === current.imageHash) {
+      current.baseImage = null;
+      current.baseSource = null;
+      notify();
+    }
+  }, [image, imageHash, notify]);
   const record = useCallback((before) => {
     const current = stateRef.current;
     if (!scenesEqual(before, current.scene)) {
@@ -188,7 +197,10 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
 
   const requestLeave = useCallback((action) => {
     const current = stateRef.current;
-    if (current.busy) return;
+    if (current.busy) {
+      if (action) pendingActionRef.current = action;
+      return;
+    }
     commitText();
     commitProperty();
     pendingActionRef.current = action || null;
@@ -211,7 +223,7 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
     }
   }, [requestLeave, notify]);
 
-  const save = useCallback(async (leave = false) => {
+  const save = useCallback(async (leave = true) => {
     const current = stateRef.current;
     if (current.busy || !optionsRef.current.enabled) return false;
     commitText();
@@ -221,7 +233,7 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
       return true;
     }
     const savedScene = cloneScene(current.scene);
-    const { image: original, screenshotId: id, onSaved: savedCallback } = optionsRef.current;
+    const { image: original, sourceImage, screenshotId: id, onSaved: savedCallback } = optionsRef.current;
     current.busy = true;
     current.error = null;
     current.selectedId = null;
@@ -229,18 +241,29 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
     try {
       const canvas = document.createElement('canvas');
       renderScene(canvas, original, savedScene);
-      const imageData = canvas.toDataURL('image/png').split(',')[1];
+      const imageSrc = canvas.toDataURL('image/png');
+      const imageData = imageSrc.split(',')[1];
       if (!imageData) throw new Error('Unable to encode the edited image');
       const result = await saveEditedScreenshot(id, current.imageHash, imageData);
       if (!mountedRef.current) return true;
-      current.saved = savedScene;
+      // Keep the saved raster visible while its replacement image decodes.
+      current.baseImage = canvas;
+      current.baseSource = sourceImage;
+      current.scene = [];
+      current.saved = [];
+      current.undo = [];
+      current.redo = [];
       current.imageHash = result.image_hash;
       current.savedNotice = true;
       current.confirmLeave = false;
       current.tool = 'select';
       // Refreshing the surrounding view must not turn a successful durable save
       // into a reported failure or restore the old dirty state.
-      try { await savedCallback?.(result); }
+      try {
+        Promise.resolve(savedCallback?.(result, imageSrc)).catch((error) => {
+          console.warn('Failed to refresh the saved snapshot:', error);
+        });
+      }
       catch (error) { console.warn('Failed to refresh the saved snapshot:', error); }
       current.busy = false;
       if (leave) exit();

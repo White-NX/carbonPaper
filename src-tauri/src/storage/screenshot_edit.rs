@@ -1,8 +1,7 @@
-//! Transactional publication of an edited screenshot and its new OCR evidence.
+//! Durable image publication, invalidation of old evidence and OCR enqueueing.
 
 use super::derived_index::read_derived_data_epoch;
-use super::ocr_keys::{self, WriteKey};
-use super::{DerivedIndexKind, EditedScreenshotResponse, OcrResultInput, StorageState};
+use super::{DerivedIndexKind, EditedScreenshotResponse, StorageState};
 use crate::credential_manager::{decrypt_row_key_with_cng_silent, encrypt_with_master_key};
 use image::RgbImage;
 use md5::{Digest, Md5};
@@ -17,14 +16,9 @@ struct Publication<'a> {
     expected_hash: &'a str,
     image_hash: &'a str,
     image_path: &'a str,
-    results: &'a [OcrResultInput],
-    key: Option<&'a WriteKey>,
 }
 
 fn publish(conn: &mut Connection, edit: &Publication<'_>) -> Result<usize, String> {
-    for result in edit.results {
-        super::screenshot::validate_ocr_result(result)?;
-    }
     let tx = conn.transaction().map_err(|error| error.to_string())?;
     let updated = tx
         .execute(
@@ -56,39 +50,6 @@ fn publish(conn: &mut Connection, edit: &Publication<'_>) -> Result<usize, Strin
             [edit.id],
         )
         .map_err(|error| error.to_string())?;
-    let dataset = ocr_keys::dataset(&tx)?;
-    let mut row_id = ocr_keys::next_row_id(&tx)?;
-    if let Some(key) = edit.key {
-        key.insert(&tx, &dataset, edit.id)?;
-    }
-    for result in edit.results {
-        let key = edit.key.ok_or("Missing fresh OCR encryption key")?;
-        let text = key.encrypt(&dataset, edit.id, row_id, result.text.as_bytes())?;
-        tx.execute(
-            "INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,ocr_key_id,confidence,
-            box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
-            VALUES(?1,?2,'',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                row_id,
-                edit.id,
-                text,
-                key.id,
-                result.confidence,
-                result.box_coords[0][0],
-                result.box_coords[0][1],
-                result.box_coords[1][0],
-                result.box_coords[1][1],
-                result.box_coords[2][0],
-                result.box_coords[2][1],
-                result.box_coords[3][0],
-                result.box_coords[3][1]
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        row_id = row_id
-            .checked_add(1)
-            .ok_or("OCR row ID capacity exhausted")?;
-    }
 
     for table in ["derived_embeddings", "derived_index_jobs"] {
         tx.execute(&format!("DELETE FROM {table} WHERE (index_kind='semantic_text' AND subject_key=CAST(?1 AS TEXT))
@@ -107,9 +68,14 @@ fn publish(conn: &mut Connection, edit: &Publication<'_>) -> Result<usize, Strin
     )
     .map_err(|error| error.to_string())?;
     tx.execute("INSERT INTO screenshot_ocr_status(screenshot_id,status,postprocess_status,postprocess_attempts)
-        VALUES(?1,'completed','pending',0) ON CONFLICT(screenshot_id) DO UPDATE SET status='completed',
-        error=NULL,postprocess_status='pending',postprocess_error=NULL,postprocess_attempts=0,postprocess_next_retry_at=NULL,postprocess_lease=NULL",
+        VALUES(?1,'pending','none',0) ON CONFLICT(screenshot_id) DO UPDATE SET status='pending',
+        engine=NULL,model_id=NULL,execution_provider=NULL,elapsed_ms=NULL,error=NULL,
+        postprocess_status='none',postprocess_error=NULL,postprocess_attempts=0,postprocess_next_retry_at=NULL,postprocess_lease=NULL",
         [edit.id]).map_err(|error| error.to_string())?;
+    tx.execute("INSERT INTO screenshot_edit_ocr_jobs(screenshot_id,image_hash) VALUES(?1,?2)
+        ON CONFLICT(screenshot_id) DO UPDATE SET image_hash=excluded.image_hash,status='pending',
+        attempts=0,next_retry_at=0,lease=NULL,error=NULL,queued_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP",
+        params![edit.id,edit.image_hash]).map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())?;
     Ok(removed)
 }
@@ -127,16 +93,14 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 impl StorageState {
     pub(crate) fn screenshot_status(&self, id: i64) -> Result<String, String> {
-        let guard = self.get_connection_named("screenshot_status")?;
-        guard
-            .as_ref()
-            .ok_or("Database not initialized")?
-            .query_row(
+        self.with_read_connection_named("screenshot_status", |conn| {
+            conn.query_row(
                 "SELECT status FROM screenshots WHERE id=?1 AND is_deleted=0",
                 [id],
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())
+        })
     }
 
     pub(crate) fn check_screenshot_edit(&self, id: i64, expected_hash: &str) -> Result<(), String> {
@@ -155,14 +119,13 @@ impl StorageState {
         }
     }
 
-    pub(crate) fn replace_edited_screenshot(
+    pub(crate) fn save_edited_screenshot_image(
         &self,
         id: i64,
         expected_hash: &str,
         generation: u64,
         bytes: &[u8],
         pixels: &RgbImage,
-        results: &[OcrResultInput],
     ) -> Result<EditedScreenshotResponse, String> {
         let _activity = self.foreground_db_read();
         let (old_path, wrapped_key) = {
@@ -224,11 +187,6 @@ impl StorageState {
             )
             .map_err(|error| error.to_string())?;
             write_new_file(&thumb_path, &encrypted_thumb)?;
-            let key = if results.is_empty() {
-                None
-            } else {
-                Some(self.new_ocr_write_key()?)
-            };
             let mut guard = self.get_connection_named("replace_edited_screenshot.publish")?;
             if self.db_generation() != generation {
                 return Err("Database changed while editing the snapshot".into());
@@ -246,8 +204,6 @@ impl StorageState {
                     expected_hash,
                     image_hash: &image_hash,
                     image_path: &relative_path,
-                    results,
-                    key: key.as_ref(),
                 },
             )?;
             // Everything after publish is best effort: propagating an error
@@ -277,11 +233,7 @@ impl StorageState {
             let _ = self
                 .ocr_row_count
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    Some(
-                        value
-                            .saturating_sub(removed as u64)
-                            .saturating_add(results.len() as u64),
-                    )
+                    Some(value.saturating_sub(removed as u64))
                 });
             self.processing_stage.invalidate_screenshot_receipts(&[id]);
             Ok(())
@@ -292,6 +244,7 @@ impl StorageState {
             }
             return Err(error);
         }
+        self.clear_search_order_cache();
         // Keep the old files through the commit. A cleanup failure cannot turn
         // a completed save into a reported failure or remove the new image.
         if remove_old_files {
@@ -304,6 +257,7 @@ impl StorageState {
             screenshot_id: id,
             image_path: relative_path,
             image_hash,
+            ocr_status: "pending".into(),
         })
     }
 }
@@ -317,7 +271,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = StorageState::new(
             directory.path().to_path_buf(),
-            Arc::new(CredentialManagerState::new(directory.path().to_path_buf())),
+            std::sync::Arc::new(CredentialManagerState::new(directory.path().to_path_buf())),
         );
         let conn = Connection::open_in_memory().unwrap();
         storage.init_tables(&conn).unwrap();
@@ -327,42 +281,26 @@ mod tests {
             INSERT INTO ocr_results(id,screenshot_id,text,text_hash) VALUES(10,1,'old private text','old-text'),(11,2,'other text','other-text');
             INSERT INTO derived_index_jobs(index_kind,subject_key,status,model_id,model_revision,embedding_version,source_fingerprint,lease_token) VALUES
             ('semantic_text','1','processing','test','r1',1,'old','old-worker'),('clip_image','old','completed','test','r1',1,'old',NULL),
-            ('semantic_text','2','completed','test','r1',1,'other',NULL);") .unwrap();
+            ('semantic_text','2','completed','test','r1',1,'other',NULL);").unwrap();
         (directory, storage, conn)
     }
 
-    use std::sync::Arc;
+    fn edit(expected_hash: &str) -> Publication<'_> {
+        Publication {
+            id: 1,
+            expected_hash,
+            image_hash: "new",
+            image_path: "new.enc",
+        }
+    }
 
     #[test]
-    fn edit_replaces_ocr_and_invalidates_only_its_derived_jobs_without_changing_capture_identity() {
+    fn edit_publishes_image_and_invalidates_evidence_before_recognition() {
         let (_directory, _storage, mut conn) = fixture();
-        let key = WriteKey::new(|bytes| Ok(bytes.to_vec())).unwrap();
-        let results = vec![OcrResultInput {
-            text: "new redacted text".into(),
-            confidence: 0.9,
-            box_coords: vec![
-                vec![1.0, 2.0],
-                vec![3.0, 2.0],
-                vec![3.0, 4.0],
-                vec![1.0, 4.0],
-            ],
-        }];
-        let removed = publish(
-            &mut conn,
-            &Publication {
-                id: 1,
-                expected_hash: "old",
-                image_hash: "new",
-                image_path: "new.enc",
-                results: &results,
-                key: Some(&key),
-            },
-        )
-        .unwrap();
-        assert_eq!(removed, 1);
-        let identity: (String, String, String, i64) = conn
+        assert_eq!(publish(&mut conn, &edit("old")).unwrap(), 1);
+        let identity: (String, String, String, String) = conn
             .query_row(
-                "SELECT image_path,image_hash,created_at,is_deleted FROM screenshots WHERE id=1",
+                "SELECT image_path,image_hash,created_at,status FROM screenshots WHERE id=1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -373,12 +311,21 @@ mod tests {
                 "new.enc".into(),
                 "new".into(),
                 "2026-11-13 12:00:00".into(),
-                0
+                "committed".into()
             )
         );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM ocr_results WHERE screenshot_id=1 AND is_deleted=0",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ocr_results WHERE screenshot_id=2 AND is_deleted=0",
                 [],
                 |row| row.get::<_, i64>(0)
             )
@@ -400,62 +347,48 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM ocr_results WHERE screenshot_id=2 AND is_deleted=0",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        let (plain, encrypted): (Option<String>, Vec<u8>) = conn
+        let job: (String, String, String) = conn
             .query_row(
-                "SELECT text,text_enc FROM ocr_results WHERE screenshot_id=1 AND is_deleted=0",
+                "SELECT j.image_hash,j.status,o.postprocess_status FROM screenshot_edit_ocr_jobs j
+             JOIN screenshot_ocr_status o USING(screenshot_id) WHERE j.screenshot_id=1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert!(plain.is_none());
-        assert!(!encrypted
-            .windows(results[0].text.len())
-            .any(|bytes| bytes == results[0].text.as_bytes()));
+        assert_eq!(job, ("new".into(), "pending".into(), "none".into()));
+
+        // Physically removing obsolete evidence must not invalidate a later
+        // recognition/classification lease for the edited image.
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM screenshot_processing_revisions WHERE screenshot_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute("DELETE FROM ocr_results WHERE id=10", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT revision FROM screenshot_processing_revisions WHERE screenshot_id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            revision
+        );
     }
 
     #[test]
-    fn stale_edits_and_ocr_insert_failure_leave_original_image_and_text_published() {
+    fn stale_edits_and_queue_write_failure_leave_the_original_image_and_text() {
         let (_directory, _storage, mut conn) = fixture();
-        assert!(publish(
-            &mut conn,
-            &Publication {
-                id: 1,
-                expected_hash: "stale",
-                image_hash: "new",
-                image_path: "new.enc",
-                results: &[],
-                key: None
-            }
+        assert!(publish(&mut conn, &edit("stale")).is_err());
+        conn.execute_batch(
+            "CREATE TRIGGER reject_edit_queue BEFORE INSERT ON screenshot_edit_ocr_jobs
+            BEGIN SELECT RAISE(ABORT,'test queue publication failure'); END;",
         )
-        .is_err());
-        conn.execute_batch("CREATE TRIGGER reject_new_ocr BEFORE INSERT ON ocr_results BEGIN SELECT RAISE(ABORT,'test publication failure'); END;").unwrap();
-        let key = WriteKey::new(|bytes| Ok(bytes.to_vec())).unwrap();
-        let results = vec![OcrResultInput {
-            text: "replacement".into(),
-            confidence: 1.0,
-            box_coords: vec![vec![0.0, 0.0]; 4],
-        }];
-        assert!(publish(
-            &mut conn,
-            &Publication {
-                id: 1,
-                expected_hash: "old",
-                image_hash: "new",
-                image_path: "new.enc",
-                results: &results,
-                key: Some(&key)
-            }
-        )
-        .is_err());
+        .unwrap();
+        assert!(publish(&mut conn, &edit("old")).is_err());
         assert_eq!(
             conn.query_row("SELECT image_path FROM screenshots WHERE id=1", [], |row| {
                 row.get::<_, String>(0)
@@ -477,6 +410,19 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM screenshot_edit_ocr_jobs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM derived_index_jobs", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
         );
     }
 }

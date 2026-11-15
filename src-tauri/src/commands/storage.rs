@@ -12,12 +12,13 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tauri::Manager;
 
 mod timeline_requests;
 static TIMELINE_REQUESTS: Lazy<timeline_requests::TimelineRequests> =
     Lazy::new(timeline_requests::TimelineRequests::default);
 
-/// Replaces a snapshot and its OCR atomically after local recognition succeeds.
+/// Publishes an edited image, invalidates old evidence and queues recognition.
 /// Authentication: required, main window only. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_save_edited_screenshot(
@@ -43,6 +44,32 @@ pub async fn storage_save_edited_screenshot(
     use tauri::Emitter;
     let _ = app.emit("screenshot-edited", &saved);
     Ok(saved)
+}
+
+/// Retries recognition of the current saved edit without rewriting the image.
+/// Authentication: required, main window only. Frontend: `lib/monitor_api.js`.
+#[tauri::command]
+pub async fn storage_retry_edited_screenshot_ocr(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    screenshot_id: i64,
+    expected_image_hash: String,
+) -> Result<storage::EditOcrStatus, String> {
+    check_auth_required(&credential_state)?;
+    super::check_main_window(&window)?;
+    let state = state.inner().clone();
+    let status = tokio::task::spawn_blocking(move || {
+        state.retry_edited_ocr_job(screenshot_id, &expected_image_hash)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    app.state::<Arc<crate::screenshot_editor::ScreenshotEditRuntime>>()
+        .wake();
+    use tauri::Emitter;
+    let _ = app.emit("screenshot-ocr-updated", &status);
+    Ok(status)
 }
 
 /// Authentication: required. Fuses screenshot keywords and recap retrieval.
@@ -761,6 +788,7 @@ pub async fn storage_get_screenshot_details(
                 let mut record = serde_json::to_value(r).map_err(|error| error.to_string())?;
                 record["status"] = serde_json::json!(state.screenshot_status(r.id)?);
                 let ocr_results = state.get_screenshot_ocr_results(r.id)?;
+                let edit_ocr = state.edited_ocr_status(r.id)?;
                 let document_ref = match state.get_screenshot_document_ref(r.id) {
                     Ok(reference) => reference.map(|reference| reference.public_view()),
                     Err(error) => {
@@ -776,6 +804,7 @@ pub async fn storage_get_screenshot_details(
                     "status": "success",
                     "record": record,
                     "ocr_results": ocr_results,
+                    "edit_ocr": edit_ocr,
                     "document_ref": document_ref
                 }))
             }

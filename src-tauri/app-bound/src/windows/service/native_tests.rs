@@ -93,6 +93,7 @@ impl NativeBrokerFixture {
             .request(Request::PrepareTask {
                 dataset_id: self.dataset.clone(),
                 screenshot_id: 1,
+                source_revision: 0,
                 consumers: Consumer::ALL_MASK,
                 payload_bytes: plaintext.len() as u64 + 28,
             })
@@ -441,6 +442,7 @@ async fn native_dpapi_rejects_a_different_pipe_token_sid() {
                             Request::PrepareTask {
                                 dataset_id: dataset,
                                 screenshot_id: 1,
+                                source_revision: 0,
                                 consumers: 1,
                                 payload_bytes: 40
                             },

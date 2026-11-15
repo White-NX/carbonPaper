@@ -261,6 +261,46 @@ fn category(storage: &StorageState, id: i64) -> Option<String> {
 }
 
 #[test]
+fn a_new_image_revision_replaces_staged_input_and_rejects_inflight_old_results() {
+    let mut fixture = fixture();
+    let (_dir, storage, _broker) = fixture.parts();
+    let original = insert_input(storage, 7, Consumer::Classification.bit());
+    let old = storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
+        .unwrap()
+        .unwrap();
+    sql(
+        storage,
+        "UPDATE screenshots SET image_hash='edited-seven' WHERE id=7;
+        UPDATE ocr_results SET is_deleted=1 WHERE screenshot_id=7;",
+    );
+    let mut revised = original;
+    revised.image_hash = "edited-seven".into();
+    revised.ocr_text = "edited captured input".into();
+    revised.source_revision = storage.staged_source_revision(7).unwrap();
+    assert!(storage
+        .processing_stage
+        .stage(7, &revised, Consumer::Classification.bit())
+        .unwrap());
+    assert!(storage
+        .commit_staged_category(&old.receipt, Some("Old category"), Some(0.9))
+        .is_err());
+    let latest = storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
+        .unwrap()
+        .unwrap();
+    assert_ne!(old.receipt.task_id, latest.receipt.task_id);
+    assert_eq!(latest.input.ocr_text, revised.ocr_text);
+    assert_eq!(latest.receipt.source_revision, revised.source_revision);
+    storage
+        .commit_staged_category(&latest.receipt, Some("New category"), Some(0.9))
+        .unwrap();
+    assert_eq!(category(storage, 7).as_deref(), Some("New category"));
+}
+
+#[test]
 fn legacy_receipt_upgrade_preserves_pending_results_and_indexes_retained_history() {
     let mut fixture = fixture();
     let (_, storage, _) = fixture.parts();

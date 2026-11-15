@@ -2139,6 +2139,7 @@ pub(crate) async fn process_ocr_inner(
         process_name,
         timestamp_ms,
         &ocr_results,
+        storage.db_generation(),
     )
     .await
 }
@@ -2158,7 +2159,20 @@ pub(crate) async fn finish_ocr_processing(
     process_name: &str,
     timestamp_ms: i64,
     ocr_results: &[OcrResultInput],
+    expected_generation: u64,
 ) -> Result<(), String> {
+    let runtime = app
+        .state::<Arc<crate::screenshot_editor::ScreenshotEditRuntime>>()
+        .inner()
+        .clone();
+    let gate = runtime.snapshot_gate(screenshot_id);
+    let _publication = gate.lock().await;
+    let _archive = storage.background_db_read();
+    if storage.db_generation() != expected_generation
+        || !storage.screenshot_image_is_current(screenshot_id, image_hash)?
+    {
+        return Ok(());
+    }
     if let Err(error) = storage.set_ocr_postprocess_status(screenshot_id, "pending", None) {
         tracing::warn!(
             "Rust OCR data was committed but postprocess status initialization failed screenshot_id={}: {}",
