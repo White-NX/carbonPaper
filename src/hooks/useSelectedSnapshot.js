@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
 
@@ -53,6 +53,8 @@ export function useSelectedSnapshot() {
   const [highlightedEventId, setHighlightedEventId] = useState(null);
   const [timelineJump, setTimelineJump] = useState(null);
   const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
+  const selectedIdRef = useRef(null);
+  selectedIdRef.current = selectedEvent?.id ?? null;
 
   useEffect(() => {
     if (!selectedEvent) {
@@ -185,6 +187,15 @@ export function useSelectedSnapshot() {
     setTimelineRefreshKey((prev) => prev + 1);
   }, []);
 
+  const refreshEditedSnapshot = useCallback(async (result) => {
+    setTimelineRefreshKey((previous) => previous + 1);
+    if (selectedIdRef.current !== result.screenshot_id) return;
+    const details = await getScreenshotDetails(result.screenshot_id);
+    if (selectedIdRef.current === result.screenshot_id && details?.record && !details.error) {
+      setSelectedDetails(details);
+    }
+  }, []);
+
   return {
     selectedEvent,
     setSelectedEvent,
@@ -200,5 +211,6 @@ export function useSelectedSnapshot() {
     ocrBoxes,
     clearSelection,
     bumpTimelineRefresh,
+    refreshEditedSnapshot,
   };
 }

@@ -295,7 +295,7 @@ pub(super) fn ocr_postprocess_retry_decision(
     }
 }
 
-fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
+pub(super) fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
     if result.box_coords.len() != 4 || result.box_coords.iter().any(|point| point.len() != 2) {
         return Err("OCR box must contain exactly four 2D points".to_string());
     }

@@ -541,6 +541,10 @@ export const getScreenshotDetails = async (id, path = null) => {
     }
 };
 
+export const saveEditedScreenshot = (screenshotId, expectedImageHash, imageData) => withAuth(
+    () => invoke('storage_save_edited_screenshot', { screenshotId, expectedImageHash, imageData })
+);
+
 export const resumeOfficeDocument = async (screenshotId) => {
     if (!screenshotId) throw new Error('A screenshot id is required');
     return withAuth(() => invoke('office_resume_document', { screenshotId }));

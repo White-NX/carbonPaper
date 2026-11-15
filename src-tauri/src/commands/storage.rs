@@ -17,6 +17,34 @@ mod timeline_requests;
 static TIMELINE_REQUESTS: Lazy<timeline_requests::TimelineRequests> =
     Lazy::new(timeline_requests::TimelineRequests::default);
 
+/// Replaces a snapshot and its OCR atomically after local recognition succeeds.
+/// Authentication: required, main window only. Frontend: `lib/monitor_api.js`.
+#[tauri::command]
+pub async fn storage_save_edited_screenshot(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    screenshot_id: i64,
+    expected_image_hash: String,
+    image_data: String,
+) -> Result<storage::EditedScreenshotResponse, String> {
+    check_auth_required(&credential_state)?;
+    super::check_main_window(&window)?;
+    let saved = crate::screenshot_editor::save(
+        app.clone(),
+        state.inner().clone(),
+        credential_state.inner().clone(),
+        screenshot_id,
+        expected_image_hash,
+        image_data,
+    )
+    .await?;
+    use tauri::Emitter;
+    let _ = app.emit("screenshot-edited", &saved);
+    Ok(saved)
+}
+
 /// Authentication: required. Fuses screenshot keywords and recap retrieval.
 #[tauri::command]
 pub async fn storage_search_unified(
@@ -730,6 +758,8 @@ pub async fn storage_get_screenshot_details(
 
         match &record {
             Some(r) => {
+                let mut record = serde_json::to_value(r).map_err(|error| error.to_string())?;
+                record["status"] = serde_json::json!(state.screenshot_status(r.id)?);
                 let ocr_results = state.get_screenshot_ocr_results(r.id)?;
                 let document_ref = match state.get_screenshot_document_ref(r.id) {
                     Ok(reference) => reference.map(|reference| reference.public_view()),

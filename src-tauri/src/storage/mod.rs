@@ -39,6 +39,7 @@ mod recap_search;
 mod rewrite_budget;
 mod schema;
 mod screenshot;
+mod screenshot_edit;
 mod screenshot_reader;
 mod search;
 pub(crate) mod search_plan;

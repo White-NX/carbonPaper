@@ -416,6 +416,26 @@ export default function SnapshotPreviewDock({
   }, [clampOcrHeight]);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten;
+    listen('screenshot-edited', (event) => {
+      const keys = new Set((tabs || []).filter((tab) => getTargetId(tab) === event.payload?.screenshot_id).map(getPreviewKey));
+      if (!keys.size || disposed) return;
+      if (keys.has(resolvedActiveKey)) requestIdRef.current += 1;
+      const clear = (cache) => Object.fromEntries(Object.entries(cache).filter(([key]) => !keys.has(key)));
+      setImageCache(clear);
+      setDetailsCache(clear);
+      setErrorMap(clear);
+      imageOrderRef.current = imageOrderRef.current.filter((key) => !keys.has(key));
+      detailsOrderRef.current = detailsOrderRef.current.filter((key) => !keys.has(key));
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    });
+    return () => { disposed = true; unlisten?.(); };
+  }, [tabs, resolvedActiveKey]);
+
+  useEffect(() => {
     if (!activeTab || !resolvedActiveKey) return undefined;
 
     const hasImage = Boolean(imageCache[resolvedActiveKey]);

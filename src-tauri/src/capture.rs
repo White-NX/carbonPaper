@@ -2129,6 +2129,36 @@ pub(crate) async fn process_ocr_inner(
             error
         );
     }
+    finish_ocr_processing(
+        app,
+        storage,
+        screenshot_id,
+        clip_pixels,
+        image_hash,
+        window_title,
+        process_name,
+        timestamp_ms,
+        &ocr_results,
+    )
+    .await
+}
+
+/// Reuse capture's durable indexing and protected-processing path after an edit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Carries the original capture identity and new OCR evidence."
+)]
+pub(crate) async fn finish_ocr_processing(
+    app: &tauri::AppHandle,
+    storage: &StorageState,
+    screenshot_id: i64,
+    clip_pixels: Arc<RgbImage>,
+    image_hash: &str,
+    window_title: &str,
+    process_name: &str,
+    timestamp_ms: i64,
+    ocr_results: &[OcrResultInput],
+) -> Result<(), String> {
     if let Err(error) = storage.set_ocr_postprocess_status(screenshot_id, "pending", None) {
         tracing::warn!(
             "Rust OCR data was committed but postprocess status initialization failed screenshot_id={}: {}",
@@ -2173,7 +2203,7 @@ pub(crate) async fn process_ocr_inner(
     let stage_hash = image_hash.to_string();
     let stage_title = window_title.to_string();
     let stage_process = process_name.to_string();
-    let stage_blocks = crate::processing_stage::recap::CaptureEvidence::from_blocks(&ocr_results);
+    let stage_blocks = crate::processing_stage::recap::CaptureEvidence::from_blocks(ocr_results);
     let stage_app = app.clone();
     let staged = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         if !stage_storage.background_processing_enabled() {
@@ -2315,7 +2345,7 @@ pub(crate) async fn process_ocr_inner(
         window_title,
         process_name,
         timestamp_ms,
-        &ocr_results,
+        ocr_results,
     )
     .await
     {
@@ -2337,7 +2367,7 @@ pub(crate) async fn process_ocr_inner(
     Ok(())
 }
 
-fn convert_ml_ocr_blocks(
+pub(crate) fn convert_ml_ocr_blocks(
     blocks: Vec<crate::ml_protocol::MlOcrBlock>,
 ) -> Result<Vec<OcrResultInput>, String> {
     const MAX_BLOCKS: usize = 10_000;

@@ -62,6 +62,7 @@ mod onboarding;
 mod pii;
 mod power;
 mod processing_stage;
+mod screenshot_editor;
 mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
 pub use app_bound::uninstall_for_package as uninstall_protected_component;
@@ -1048,6 +1049,7 @@ pub fn run() {
             commands::storage::storage_get_thumbnail_warmup_status,
             commands::storage::storage_cancel_thumbnail_warmup,
             commands::storage::storage_get_screenshot_details,
+            commands::storage::storage_save_edited_screenshot,
             commands::storage::storage_delete_screenshot,
             commands::storage::storage_delete_by_time_range,
             commands::storage::storage_list_processes,

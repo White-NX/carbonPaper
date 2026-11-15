@@ -11,6 +11,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
 import PreviewActionBar from './PreviewActionBar';
+import SnapshotEditor from './SnapshotEditor';
 import EmptyPreview from './EmptyPreview';
 import { captureDateOf } from '../lib/search_grouping';
 import {
@@ -76,14 +77,16 @@ function SnapshotPreviewFloatButton({ tabs, activeKey, onOpen, onClear }) {
 
 // OCR Content Panel Component
 function OcrContentPanel({ selectedDetails, onClose, onCopyText }) {
+  const { t } = useTranslation();
   const ocrText = selectedDetails?.ocr_results?.map(r => r.text).join('\n') || '';
   
   return (
-    <div className="absolute right-0 top-0 bottom-0 w-64 bg-ide-panel border-l border-ide-border flex flex-col z-20 shadow-xl">
+    <div className="absolute right-4 top-16 bottom-40 w-72 max-w-[calc(100%-2rem)] bg-ide-panel border border-ide-border rounded-xl overflow-hidden flex flex-col z-20 shadow-xl">
       <div className="flex items-center justify-between px-3 py-2 border-b border-ide-border bg-ide-bg shrink-0">
-        <span className="text-xs font-medium">OCR Content</span>
+        <span className="text-xs font-medium">{t('snapshotEditor.recognizedText')}</span>
         <button
           onClick={onClose}
+          aria-label={t('common.close')}
           className="p-1 hover:bg-ide-hover rounded transition-colors"
         >
           <X className="w-3.5 h-3.5" />
@@ -92,13 +95,13 @@ function OcrContentPanel({ selectedDetails, onClose, onCopyText }) {
       <div className="flex-1 overflow-hidden">
         {/* 当 record.status 为 pending 时显示斜体文案 */}
         {selectedDetails?.record?.status === 'pending' ? (
-          <div className="w-full h-full flex items-center justify-center text-sm italic text-ide-muted p-3">OCR Processing…</div>
+          <div className="w-full h-full flex items-center justify-center text-sm italic text-ide-muted p-3">{t('snapshotPreview.loadingOcr')}</div>
         ) : (
           <textarea
             className="w-full h-full bg-ide-bg p-3 text-xs font-mono text-ide-text resize-none focus:outline-none leading-relaxed"
             readOnly
             value={ocrText}
-            placeholder={selectedDetails ? "No text detected" : "Select an image to view OCR content"}
+            placeholder={t(selectedDetails ? 'snapshotPreview.noOcr' : 'snapshotPreview.loadingOcr')}
           />
         )}
       </div>
@@ -108,7 +111,7 @@ function OcrContentPanel({ selectedDetails, onClose, onCopyText }) {
             onClick={() => onCopyText(ocrText)}
             className="flex items-center gap-2 px-3 py-1.5 bg-ide-bg hover:bg-ide-hover border border-ide-border rounded text-xs transition-colors"
           >
-            <Copy size={12} /> Copy All
+            <Copy size={12} /> {t('snapshotPreview.copyOcr')}
           </button>
         </div>
       )}
@@ -133,6 +136,8 @@ export default function MainArea({
   onCopyText,
   isAuthenticated,
   onTimelineSearchChange,
+  onSnapshotSaved,
+  onNavigationGuardChange,
 }) {
   const { t } = useTranslation();
   const [showOcrPanel, setShowOcrPanel] = useState(false);
@@ -319,6 +324,16 @@ export default function MainArea({
     });
   }, [openSnapshotPreview, selectedDetails, selectedEvent, t]);
 
+  const hasEditor = Boolean(selectedImageSrc && selectedEvent?.id > 0);
+  const actionBarProps = {
+    onDeleteRecord, onDeleteNearbyRecords, onOpenUrl: handleOpenUrl, onShowMore: handleShowMore,
+    onOpenFloatingPreview: openCurrentPreviewInDock, showOcrPanel,
+  };
+  const handleSnapshotSaved = useCallback(async (result) => {
+    await onSnapshotSaved?.(result);
+    setShowOcrPanel(true);
+  }, [onSnapshotSaved]);
+
   return (
     <section className="flex flex-col bg-ide-bg overflow-hidden relative flex-1">
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -329,12 +344,23 @@ export default function MainArea({
 
           {selectedImageSrc ? (
             <div className="absolute inset-0 z-10 w-full h-full">
-              <InspectorImage
+              {hasEditor ? <SnapshotEditor
+                key={selectedEvent.id}
+                imageSrc={selectedImageSrc}
+                selectedEvent={selectedEvent}
+                selectedDetails={selectedDetails}
+                overlayBoxes={ocrBoxes}
+                onBoxClick={onInspectorBoxClick}
+                actionBarProps={actionBarProps}
+                isAuthenticated={isAuthenticated}
+                onSaved={handleSnapshotSaved}
+                onNavigationGuardChange={onNavigationGuardChange}
+              /> : <InspectorImage
                 item={{ imageUrl: selectedImageSrc }}
                 overlayBoxes={ocrBoxes}
                 onBoxClick={onInspectorBoxClick}
                 className="w-full h-full rounded-none border-none bg-transparent"
-              />
+              />}
             </div>
           ) : (
             <div className="text-ide-muted text-sm flex flex-col items-center gap-2">
@@ -357,7 +383,7 @@ export default function MainArea({
           )}
 
           {/* Preview Action Bar */}
-          {activeTab === 'preview' && selectedEvent && (
+          {activeTab === 'preview' && selectedEvent && !hasEditor && (
             <PreviewActionBar
               selectedEvent={selectedEvent}
               selectedDetails={selectedDetails}
