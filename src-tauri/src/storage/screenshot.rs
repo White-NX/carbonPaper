@@ -2667,14 +2667,24 @@ impl StorageState {
         let rows: Vec<OcrDeleteQueueRow> = {
             let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
             let conn = guard.as_ref().unwrap();
+            // A LEFT JOIN directly to ocr_results_read can materialize its
+            // nested key join for the entire corpus before applying LIMIT.
+            // Bound both queue membership and view reads before joining them,
+            // including queue entries whose OCR row is already gone.
             let mut read_stmt = conn
                 .prepare(
-                    "SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
+                    "WITH batch AS MATERIALIZED (
+                         SELECT id, failure_count FROM delete_queue_ocr
+                         ORDER BY id ASC LIMIT ?1
+                     ), evidence AS MATERIALIZED (
+                         SELECT id, text, text_hash, text_enc, text_key_ref
+                         FROM ocr_results_read WHERE id IN (SELECT id FROM batch)
+                     )
+                     SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
                             o.text_enc, o.text_key_ref
-                     FROM delete_queue_ocr q
-                     LEFT JOIN ocr_results_read o ON o.id = q.id
-                     ORDER BY q.id ASC
-                     LIMIT ?1",
+                     FROM batch q
+                     LEFT JOIN evidence o ON o.id = q.id
+                     ORDER BY q.id ASC",
                 )
                 .map_err(|e| format!("Failed to prepare OCR queue read: {}", e))?;
 
