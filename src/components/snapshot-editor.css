@@ -50,6 +50,8 @@
 .snapshot-editor-handle[data-corner='ne'] { left: 100%; top: 0; cursor: nesw-resize; }
 .snapshot-editor-handle[data-corner='se'] { left: 100%; top: 100%; cursor: nwse-resize; }
 .snapshot-editor-handle[data-corner='sw'] { left: 0; top: 100%; cursor: nesw-resize; }
+.snapshot-editor[data-pan-ready='true'] :is(.snapshot-editor-object, .snapshot-editor-rotate, .snapshot-editor-handle) { cursor: grab; }
+.snapshot-editor[data-panning='true'] :is(.snapshot-editor-object, .snapshot-editor-rotate, .snapshot-editor-handle) { cursor: grabbing; }
 .snapshot-editor-object-actions { position: absolute; display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--ide-border); border-radius: 999px; box-shadow: 0 3px 12px #0002; }
 .snapshot-editor-dirty { position: absolute; left: 16px; top: 50px; display: flex; align-items: center; gap: 5px; color: var(--ide-muted); font-size: 12px; }
 .snapshot-editor-dirty > span { width: 5px; height: 5px; border-radius: 50%; background: var(--ide-accent); }

@@ -14,6 +14,8 @@ import { Button } from './ui/Button';
 import './snapshot-editor.css';
 
 let nextObjectId = 0;
+const PAN_THRESHOLD = 4;
+const EDITABLE_TARGETS = 'input,textarea,select,[contenteditable="true"]';
 const CORNER_LABELS = { nw: 'snapshotEditor.corners.nw', ne: 'snapshotEditor.corners.ne',
   se: 'snapshotEditor.corners.se', sw: 'snapshotEditor.corners.sw' };
 
@@ -27,12 +29,15 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const renderScaleRef = useRef(1);
   const textRef = useRef(null);
   const gestureRef = useRef(null);
+  const spacePressedRef = useRef(false);
   const [image, setImage] = useState(null);
   const [imageError, setImageError] = useState(false);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [view, setView] = useState({ scale: 1, x: 0, y: 0 });
   const [animateView, setAnimateView] = useState(false);
   const [panning, setPanning] = useState(false);
+  const [spacePressed, setSpacePressed] = useState(false);
+  const [hoveringObject, setHoveringObject] = useState(false);
   const [interacting, setInteracting] = useState(false);
   const editor = useSnapshotEditor({ image, screenshotId: selectedEvent.id,
     imageHash: selectedDetails?.record?.image_hash,
@@ -145,7 +150,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     if (!editor.editing || !isAuthenticated) return undefined;
     const handleKey = (event) => {
       if (editor.stateRef.current.busy || document.querySelector('[role="dialog"][aria-modal="true"]')) return;
-      if (event.target.closest('input,textarea,select,[contenteditable="true"]')) {
+      if (event.target.closest(EDITABLE_TARGETS)) {
         if (event.key === 'Escape' && event.target === textRef.current) {
           event.preventDefault();
           editor.commitText();
@@ -176,8 +181,14 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     viewportRef.current.setPointerCapture(event.pointerId);
   };
 
+  const beginPan = (event, displayed) => {
+    event.stopPropagation();
+    setHoveringObject(false);
+    capturePointer(event, { type: 'pan', start: [event.clientX, event.clientY], original: displayed, moved: false });
+  };
+
   const beginTransform = (event, type, corner = null) => {
-    if (editor.busy || event.button !== 0) return;
+    if (editor.busy || gestureRef.current || event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     editor.commitText();
@@ -192,27 +203,31 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
 
   const pointerDown = (event) => {
     if (!image || editor.busy || gestureRef.current || ![0, 1].includes(event.button)) return;
-    if (event.target.closest('[data-editor-control],.cursor-pointer')) return;
+    if (event.target.closest(EDITABLE_TARGETS)) return;
+    const forcePan = event.button === 1 || event.altKey || spacePressedRef.current;
+    if (event.target.closest('[data-editor-control]')
+      && !(forcePan && event.target.closest('.snapshot-editor-object'))) return;
+    if (event.target.closest('.cursor-pointer') && !forcePan) return;
     event.preventDefault();
     viewportRef.current.focus({ preventScroll: true });
     editor.commitText();
     const current = editor.stateRef.current;
     const displayed = freezeView();
-    if (!current.editing || event.button === 1 || event.altKey) {
-      setPanning(true);
-      capturePointer(event, { type: 'pan', start: [event.clientX, event.clientY], original: displayed });
+    if (!current.editing || forcePan) {
+      beginPan(event, displayed);
       return;
     }
     const point = pointAt(event);
-    if (point[0] < 0 || point[1] < 0 || point[0] > width || point[1] > height) { editor.select(null); return; }
-    const hit = ['select', 'text', 'mosaic'].includes(current.tool) && hitObject(current.scene, point);
+    const inside = point[0] >= 0 && point[1] >= 0 && point[0] <= width && point[1] <= height;
+    const hit = inside && ['select', 'text', 'mosaic'].includes(current.tool) && hitObject(current.scene, point);
     if (hit) {
       editor.select(hit.id);
       capturePointer(event, { type: 'move', start: point, original: structuredClone(hit), before: cloneScene(current.scene), nodeId: hit.id });
       return;
     }
     editor.select(null);
-    if (current.tool === 'select') return;
+    if (current.tool === 'select') { beginPan(event, displayed); return; }
+    if (!inside) return;
     const before = cloneScene(current.scene);
     const node = { id: 'annotation-' + (++nextObjectId), kind: current.tool };
     if (['brush', 'erase'].includes(current.tool)) {
@@ -228,11 +243,22 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
 
   const pointerMove = (event) => {
     const gesture = gestureRef.current;
-    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    if (!gesture) {
+      const current = editor.stateRef.current;
+      setHoveringObject(Boolean(image && current.editing && ['select', 'text', 'mosaic'].includes(current.tool)
+        && hitObject(current.scene, pointAt(event))));
+      return;
+    }
+    if (gesture.pointerId !== event.pointerId) return;
     if (gesture.type === 'pan') {
+      const dx = event.clientX - gesture.start[0];
+      const dy = event.clientY - gesture.start[1];
+      if (!gesture.moved && Math.hypot(dx, dy) < PAN_THRESHOLD) return;
+      gesture.moved = true;
+      setPanning(true);
       setView({ ...gesture.original,
-        x: clamp(gesture.original.x + event.clientX - gesture.start[0], -width * actualScale, width * actualScale),
-        y: clamp(gesture.original.y + event.clientY - gesture.start[1], -height * actualScale, height * actualScale) });
+        x: clamp(gesture.original.x + dx, -width * actualScale, width * actualScale),
+        y: clamp(gesture.original.y + dy, -height * actualScale, height * actualScale) });
       return;
     }
     const point = pointAt(event).map((value, index) => clamp(value, 0, index ? height : width));
@@ -264,15 +290,28 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     }
   };
 
+  const releaseGesture = useCallback(() => {
+    const gesture = gestureRef.current;
+    if (!gesture) return null;
+    gestureRef.current = null;
+    const element = viewportRef.current;
+    if (element?.hasPointerCapture(gesture.pointerId)) element.releasePointerCapture(gesture.pointerId);
+    setPanning(false);
+    setInteracting(false);
+    return gesture;
+  }, []);
+
+  const cancelGesture = useCallback(() => {
+    const gesture = releaseGesture();
+    if (gesture && gesture.type !== 'pan') editor.publish(gesture.before);
+  }, [editor.publish, releaseGesture]);
+
   const finishGesture = (event, cancelled = false) => {
     const gesture = gestureRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
-    gestureRef.current = null;
-    if (viewportRef.current.hasPointerCapture(event.pointerId)) viewportRef.current.releasePointerCapture(event.pointerId);
-    setPanning(false);
-    setInteracting(false);
+    if (cancelled) { cancelGesture(); return; }
+    releaseGesture();
     if (gesture.type === 'pan') return;
-    if (cancelled) { editor.publish(gesture.before); return; }
     if (gesture.type === 'create') {
       const node = gesture.node;
       if (node.kind === 'text') {
@@ -294,6 +333,41 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     editor.record(gesture.before);
   };
 
+  const clearSpace = useCallback(() => {
+    spacePressedRef.current = false;
+    setSpacePressed(false);
+  }, []);
+
+  useEffect(() => {
+    if (!editor.editing || !isAuthenticated) return undefined;
+    const keyDown = (event) => {
+      if (event.code !== 'Space' && event.key !== ' ') return;
+      if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing || editor.stateRef.current.busy
+        || document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      if (!rootRef.current.contains(event.target) || event.target.closest(EDITABLE_TARGETS)) return;
+      if (gestureRef.current && gestureRef.current.type !== 'pan') return;
+      spacePressedRef.current = true;
+      setSpacePressed(true);
+      // Buttons retain keyboard activation. A subsequent canvas drag takes
+      // focus before keyup, so Space also works just after choosing a tool.
+      if (!event.target.closest('button,a[href],[role="button"]')) event.preventDefault();
+    };
+    const keyUp = (event) => { if (event.code === 'Space' || event.key === ' ') clearSpace(); };
+    document.addEventListener('keydown', keyDown);
+    document.addEventListener('keyup', keyUp);
+    return () => {
+      document.removeEventListener('keydown', keyDown);
+      document.removeEventListener('keyup', keyUp);
+      clearSpace();
+    };
+  }, [clearSpace, editor.editing, editor.stateRef, isAuthenticated]);
+
+  useEffect(() => {
+    const blur = () => { clearSpace(); cancelGesture(); };
+    window.addEventListener('blur', blur);
+    return () => window.removeEventListener('blur', blur);
+  }, [cancelGesture, clearSpace]);
+
   const selected = editor.selected;
   const maskKey = selected?.kind === 'text' ? JSON.stringify([selected.w, selected.h, selected.fontSize, selected.erasures]) : '';
   const textMask = useMemo(() => selected?.kind === 'text' ? textErasureMask(selected) : undefined, [maskKey]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -301,15 +375,21 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const contextX = selected ? viewport.width / 2 + view.x + (selected.cx - width / 2) * actualScale : 0;
   const contextY = selected ? viewport.height / 2 + view.y + (selected.cy + bounds.hy - height / 2) * actualScale + 12 : 0;
   const inverseScale = 1 / actualScale;
+  const cursor = panning ? 'grabbing' : spacePressed || !editor.editing ? 'grab'
+    : hoveringObject && ['select', 'text', 'mosaic'].includes(editor.tool) ? 'move'
+    : editor.tool === 'select' ? 'grab' : editor.tool === 'text' ? 'text' : 'crosshair';
 
   return (
-    <div ref={rootRef} className="snapshot-editor absolute inset-0 z-10" data-editing={editor.editing} data-tool={editor.tool} data-interacting={interacting}>
+    <div ref={rootRef} className="snapshot-editor absolute inset-0 z-10" data-editing={editor.editing} data-tool={editor.tool}
+      data-interacting={interacting} data-pan-ready={spacePressed} data-panning={panning}>
       <div ref={viewportRef} className="snapshot-editor-viewport" tabIndex={0} role="group" aria-label={t('snapshotEditor.canvas')}
-        style={{ cursor: panning ? 'grabbing' : !editor.editing ? 'grab' : editor.tool === 'text' ? 'text' : ['brush', 'erase', 'mosaic'].includes(editor.tool) ? 'crosshair' : 'default' }}
-        onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={finishGesture}
+        style={{ cursor }}
+        onPointerDownCapture={pointerDown} onPointerMove={pointerMove} onPointerUp={finishGesture}
+        onPointerLeave={() => setHoveringObject(false)}
         onPointerCancel={(event) => finishGesture(event, true)}
+        onLostPointerCapture={(event) => finishGesture(event, true)}
         onDoubleClick={(event) => {
-          if (event.target.closest('[data-editor-control]') || editor.busy) return;
+          if (event.target.closest('[data-editor-control]') || editor.busy || spacePressedRef.current || event.altKey) return;
           const hit = editor.editing && hitObject(editor.scene, pointAt(event));
           if (hit?.kind === 'text') editor.beginText(hit);
           else if (!editor.editing) resetZoom();
@@ -325,7 +405,10 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
                 top: selected.cy - selected.h / 2, width: selected.w, height: selected.h,
                 transform: 'rotate(' + selected.angle + 'deg)', outlineWidth: inverseScale }}
                 onPointerDown={(event) => beginTransform(event, 'move')}
-                onDoubleClick={(event) => { event.stopPropagation(); if (selected.kind === 'text') editor.beginText(selected); }}>
+                onDoubleClick={(event) => {
+                  event.stopPropagation();
+                  if (selected.kind === 'text' && !spacePressedRef.current && !event.altKey) editor.beginText(selected);
+                }}>
                 {editor.editingId === selected.id && (
                   <textarea ref={textRef} className="snapshot-editor-text" aria-label={t('snapshotEditor.editText')}
                     value={selected.text} placeholder={t('snapshotEditor.placeholder')} maxLength={16_384}
