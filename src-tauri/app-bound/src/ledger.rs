@@ -512,6 +512,11 @@ impl Ledger {
                 if dataset.as_deref() != Some(&dataset_id) {
                     return Err(BrokerError::DatasetMismatch);
                 }
+                // A source revision can replace a processing grant, but cannot
+                // restore authorization after the screenshot itself was deleted.
+                if Self::source_is_revoked(conn, &who.sid, &dataset_id, screenshot_id)? {
+                    return Err(BrokerError::Retired);
+                }
                 let previous: Option<(String,i64)> = db(conn.query_row(
                     "SELECT id,source_revision FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3",
                     params![who.sid,dataset_id,screenshot_id], |row| Ok((row.get(0)?,row.get(1)?)),
@@ -1236,6 +1241,60 @@ mod tests {
                 BrokerError::Retired
             );
         }
+    }
+
+    #[test]
+    fn screenshot_revocation_denies_new_revisions_after_task_history_is_pruned() {
+        let (mut ledger, who, dataset) = fixture();
+        let old = prepare(&mut ledger, &who, &dataset, 8, Consumer::Clip.bit());
+        ledger
+            .handle(
+                &who,
+                Request::RevokeScreenshots {
+                    dataset_id: dataset.clone(),
+                    screenshot_ids: vec![8, 9],
+                },
+                102,
+                &TestProtection,
+            )
+            .unwrap();
+        assert_eq!(
+            acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 103).unwrap_err(),
+            BrokerError::Retired
+        );
+        for now in [104, 100 + 100 * DAY_SECS] {
+            ledger.maintenance(now).unwrap();
+            // Deny both replacement of an existing grant and a deleted source
+            // that never had a task. The permanent fence outlives task history.
+            for screenshot_id in [8, 9] {
+                for source_revision in [0, 1, i64::MAX] {
+                    assert_eq!(
+                        ledger
+                            .handle(
+                                &who,
+                                Request::PrepareTask {
+                                    dataset_id: dataset.clone(),
+                                    screenshot_id,
+                                    source_revision,
+                                    consumers: Consumer::Clip.bit(),
+                                    payload_bytes: 40,
+                                },
+                                now,
+                                &TestProtection,
+                            )
+                            .unwrap_err(),
+                        BrokerError::Retired
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
     pub(super) fn acquire(
         ledger: &mut Ledger,

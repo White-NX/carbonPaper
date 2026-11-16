@@ -88,6 +88,25 @@ fn recap_revocation_compaction_stays_bounded_and_never_restores_sources_or_exist
         "SELECT (SELECT COUNT(*) FROM recap_revoked_sources),(SELECT COUNT(*) FROM recap_revoked_ranges),
             (SELECT entries FROM recap_revocation_budgets WHERE owner=?1)", [&who.sid], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
     assert_eq!((exact, ranges, budget), (0, 1, 1));
+    for screenshot_id in [1, 2, 9] {
+        assert_eq!(
+            ledger
+                .handle(
+                    &who,
+                    Request::PrepareTask {
+                        dataset_id: dataset.clone(),
+                        screenshot_id,
+                        source_revision: 1,
+                        consumers: Consumer::MiniLm.bit(),
+                        payload_bytes: 40,
+                    },
+                    104,
+                    &TestProtection,
+                )
+                .unwrap_err(),
+            BrokerError::Retired
+        );
+    }
     assert!(ledger.requires_current_service().unwrap());
     assert_eq!(
         acquire_object(&mut ledger, &who, &context, 104).unwrap_err(),
@@ -225,6 +244,23 @@ fn a_saturated_revocation_budget_keeps_deletion_available_and_preserves_its_fail
         )
         .unwrap();
     assert_eq!((entries, fenced), (0, true));
+    assert_eq!(
+        ledger
+            .handle(
+                &who,
+                Request::PrepareTask {
+                    dataset_id: dataset.clone(),
+                    screenshot_id: 3,
+                    source_revision: 1,
+                    consumers: Consumer::MiniLm.bit(),
+                    payload_bytes: 40,
+                },
+                105,
+                &TestProtection,
+            )
+            .unwrap_err(),
+        BrokerError::Retired
+    );
     assert!(ledger.requires_current_service().unwrap());
     ledger
         .register_owner(&who.sid, "updated-release", false)
