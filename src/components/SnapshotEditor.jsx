@@ -16,6 +16,7 @@ import './snapshot-editor.css';
 
 let nextObjectId = 0;
 const PAN_THRESHOLD = 4;
+const SUCCESS_NOTICE_MS = 2000;
 const EDITABLE_TARGETS = 'input,textarea,select,[contenteditable="true"]';
 const CORNER_LABELS = { nw: 'snapshotEditor.corners.nw', ne: 'snapshotEditor.corners.ne',
   se: 'snapshotEditor.corners.se', sw: 'snapshotEditor.corners.sw' };
@@ -391,6 +392,11 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     ? selectedDetails?.edit_ocr?.status : null;
   const recognizing = ['pending', 'processing', 'waiting_for_auth'].includes(recognitionStatus);
   const recognitionFailed = recognitionStatus === 'failed' || retryError;
+  useEffect(() => {
+    if (!editor.savedNotice || editor.error || recognizing || recognitionFailed) return undefined;
+    const timer = setTimeout(editor.dismissSavedNotice, SUCCESS_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [editor.dismissSavedNotice, editor.savedNotice, editor.error, recognizing, recognitionFailed, recognitionStatus]);
   const retryRecognition = async () => {
     setRetrying(true);
     setRetryError(false);

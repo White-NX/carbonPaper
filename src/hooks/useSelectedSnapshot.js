@@ -143,7 +143,7 @@ export function useSelectedSnapshot() {
     listen('office-document-ref-updated', async (event) => {
       if (event.payload?.screenshot_id !== targetId) return;
       const version = ++detailsVersionRef.current;
-      const details = await getScreenshotDetails(targetId, selectedEvent.path || selectedEvent.image_path);
+      const details = await getScreenshotDetails(targetId, selectedEvent.path || selectedEvent.image_path, { fresh: true });
       if (!disposed && version === detailsVersionRef.current && details && !details.error) {
         detailsRef.current = details;
         setSelectedDetails(details);
@@ -159,7 +159,7 @@ export function useSelectedSnapshot() {
   }, [selectedEvent]);
 
   const refreshDetails = useCallback(async (id, imageHash, version) => {
-    const details = await getScreenshotDetails(id);
+    const details = await getScreenshotDetails(id, null, { fresh: true });
     if (selectedIdRef.current === id && detailsVersionRef.current === version
       && details?.record?.image_hash === imageHash && !details.error) {
       detailsRef.current = details;

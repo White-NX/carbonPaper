@@ -33,6 +33,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -139,6 +140,44 @@ describe('snapshot editor zoom and pointer handoff', () => {
 });
 
 describe('snapshot editor background recognition', () => {
+  it('dismisses a successful save notice after a short delay', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG5n');
+    saveEditedScreenshot.mockResolvedValueOnce({ screenshot_id: 42, image_hash: 'saved' });
+    const { viewport } = await renderEditor();
+    vi.useFakeTimers();
+    createMosaic(viewport);
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.save' })));
+    expect(screen.getByText('snapshotEditor.saved')).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(screen.queryByText('snapshotEditor.saved')).not.toBeInTheDocument();
+  });
+
+  it('keeps pending and failed recognition visible but dismisses completion without extending it on detail refresh', async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG5n');
+    saveEditedScreenshot.mockResolvedValueOnce({ screenshot_id: 42, image_hash: 'saved', ocr_status: 'pending' });
+    let view;
+    const renderStatus = (status) => view.rerender(<SnapshotEditor imageSrc="saved.png" selectedEvent={{ id: 42 }}
+      selectedDetails={{ record: { id: 42, status: 'committed', image_hash: 'saved' },
+        edit_ocr: { screenshot_id: 42, image_hash: 'saved', status } }}
+      isAuthenticated actionBarProps={{}} onSaved={onSaved} />);
+    const onSaved = () => renderStatus('pending');
+    view = await renderEditor({ onSaved });
+    vi.useFakeTimers();
+    createMosaic(view.viewport);
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.save' })));
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(screen.getByText('snapshotEditor.savedRecognizing')).toBeInTheDocument();
+    await act(async () => renderStatus('failed'));
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(screen.getByText('snapshotEditor.recognitionFailed')).toBeInTheDocument();
+    await act(async () => renderStatus('completed'));
+    expect(screen.getByText('snapshotEditor.recognized')).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    await act(async () => renderStatus('completed'));
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(screen.queryByText('snapshotEditor.recognized')).not.toBeInTheDocument();
+  });
+
   it('closes editing after saving while the surrounding refresh is still pending', async () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG5n');
     saveEditedScreenshot.mockResolvedValueOnce({ screenshot_id: 42, image_hash: 'saved', ocr_status: 'pending' });

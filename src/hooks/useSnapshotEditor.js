@@ -294,6 +294,11 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
     notify();
   }, [notify]);
 
+  const dismissSavedNotice = useCallback(() => {
+    stateRef.current.savedNotice = false;
+    notify();
+  }, [notify]);
+
   useEffect(() => {
     onNavigationGuardChange?.(state.editing || state.busy ? requestLeave : null);
     return () => onNavigationGuardChange?.(null);
@@ -306,6 +311,6 @@ export function useSnapshotEditor({ image, screenshotId, imageHash, enabled, onS
     publish, record, notify, measure, fit, commitText, beginText, updateText, select,
     chooseTool, removeSelected, beginProperty, setOption, commitProperty,
     undoAction: () => changeHistory(), redoAction: () => changeHistory(true),
-    toggleEditing, requestLeave, save, discard, continueEditing,
+    toggleEditing, requestLeave, save, discard, continueEditing, dismissSavedNotice,
   };
 }
