@@ -100,7 +100,6 @@
 .snapshot-editor-delete .snapshot-editor-action { min-height: 30px; padding: 6px 9px; }
 .snapshot-editor-delete-arrow { width: 25px; min-height: 30px; padding: 6px 5px; border-left: 1px solid var(--ide-border); border-radius: 0 999px 999px 0; }
 .snapshot-editor-delete-menu { position: absolute; bottom: calc(100% + 12px); right: 0; z-index: 5; display: flex; flex-direction: column; width: 220px; max-width: calc(100vw - 48px); padding: 5px; border: 1px solid var(--ide-border); border-radius: 10px; background: var(--ide-panel); box-shadow: 0 5px 22px #0002; }
-.snapshot-editor-dock[data-editing='true'] .snapshot-editor-delete-menu { right: auto; left: 0; }
 .snapshot-editor-delete-menu > button { justify-content: flex-start; white-space: normal; text-align: left; }
 .snapshot-editor-save { padding-inline: 12px; }
 .snapshot-editor-collapse { position: absolute; bottom: 0; left: 50%; opacity: 1; visibility: visible; pointer-events: auto; transform: translateX(-50%) scale(1); transition: opacity 300ms ease, transform 300ms ease, visibility 0s linear; }

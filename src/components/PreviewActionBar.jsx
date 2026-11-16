@@ -61,8 +61,8 @@ export default function PreviewActionBar({ selectedEvent, selectedDetails, onDel
     return () => observer.disconnect();
   }, []);
 
-  // Keep existing controls in place while the capsule changes width and the
-  // delete group moves to the front. Only its background stretches.
+  // Keep existing controls in place while the capsule changes width and
+  // newly revealed controls enter. Only its background stretches.
   useLayoutEffect(() => {
     const bar = barRef.current;
     if (!bar || !expanded) { rectsRef.current = null; return; }
@@ -130,7 +130,7 @@ export default function PreviewActionBar({ selectedEvent, selectedDetails, onDel
       </div>
       <div ref={barRef} className="snapshot-editor-mainbar" data-wrapped={wrapped} role="toolbar" aria-label={t('snapshotEditor.actions')} aria-hidden={!expanded}>
         <div className="snapshot-editor-bar-chrome preview-action-bar" aria-hidden="true" />
-        <div className="snapshot-editor-legacy" role="group" aria-label={t('snapshotEditor.snapshotActions')} style={{ order: editing ? 2 : 0 }}>
+        <div className="snapshot-editor-legacy" role="group" aria-label={t('snapshotEditor.snapshotActions')}>
           <Button data-editor-flip icon={PencilLine} variant="ghost" size="xs" className={buttonClass}
             disabled={!editor?.canEdit || busy} aria-pressed={editing} title={t(editing ? 'snapshotEditor.exit' : 'snapshotEditor.edit')}
             onClick={editor?.toggleEditing}>{t('snapshotEditor.edit')}</Button>
@@ -143,7 +143,26 @@ export default function PreviewActionBar({ selectedEvent, selectedDetails, onDel
           <Button data-editor-flip icon={TextSelect} variant="ghost" size="xs" className={buttonClass} disabled={busy}
             onClick={onShowMore} aria-pressed={showOcrPanel} title={t('previewAction.showOcr')}>{t('snapshotEditor.recognizedText')}</Button>
         </div>
-        <div ref={deleteRef} data-editor-flip className="snapshot-editor-delete" style={{ order: editing ? 0 : 1 }}>
+        <div className="snapshot-editor-tools" data-editor-enter role="group" aria-label={t('snapshotEditor.toolsLabel')} hidden={!editing}>
+          <span className="snapshot-editor-divider" aria-hidden="true" />
+          {TOOLS.map(([name, Icon]) => (
+            <Button key={name} variant="ghost" size="xs" icon={Icon} className="snapshot-editor-action snapshot-editor-icon border-0"
+              disabled={busy} aria-pressed={editor?.tool === name} aria-label={t(EDITOR_TOOL_LABELS[name])}
+              title={t(EDITOR_TOOL_LABELS[name])} onClick={() => editor.chooseTool(name)} />
+          ))}
+        </div>
+        <div className="snapshot-editor-session" data-editor-enter role="group" aria-label={t('snapshotEditor.history')} hidden={!editing}>
+          <span className="snapshot-editor-divider" aria-hidden="true" />
+          <Button variant="ghost" size="xs" icon={Undo2} className="snapshot-editor-action snapshot-editor-icon border-0"
+            disabled={busy || !editor?.undo.length} aria-label={t('snapshotEditor.undo')} title={t('snapshotEditor.undo')}
+            onClick={editor?.undoAction} />
+          <Button variant="ghost" size="xs" icon={Redo2} className="snapshot-editor-action snapshot-editor-icon border-0"
+            disabled={busy || !editor?.redo.length} aria-label={t('snapshotEditor.redo')} title={t('snapshotEditor.redo')}
+            onClick={editor?.redoAction} />
+          <Button variant="primary" size="xs" icon={ScanText} className="snapshot-editor-action snapshot-editor-save"
+            disabled={!editor?.dirty} loading={editor?.busy} onClick={() => editor.save()}>{t(editor?.busy ? 'snapshotEditor.saving' : 'snapshotEditor.save')}</Button>
+        </div>
+        <div ref={deleteRef} data-editor-flip className="snapshot-editor-delete">
           <Button icon={Trash2} variant="ghost" size="xs" className={buttonClass} onClick={() => guarded(deleteRecord)}
             disabled={busy} title={t('previewAction.deleteNowTitle')}>{t('previewAction.delete')}</Button>
           <Button variant="ghost" size="xs" className="snapshot-editor-delete-arrow border-0" disabled={busy}
@@ -160,26 +179,6 @@ export default function PreviewActionBar({ selectedEvent, selectedDetails, onDel
                 onClick={() => guarded(deleteNearby)}>{t('previewAction.deleteNearby5min')}</Button>
             </div>
           )}
-        </div>
-        <div className="snapshot-editor-tools" data-editor-enter role="group" aria-label={t('snapshotEditor.toolsLabel')} hidden={!editing} style={{ order: 1 }}>
-          <span className="snapshot-editor-divider" aria-hidden="true" />
-          {TOOLS.map(([name, Icon]) => (
-            <Button key={name} variant="ghost" size="xs" icon={Icon} className="snapshot-editor-action snapshot-editor-icon border-0"
-              disabled={busy} aria-pressed={editor?.tool === name} aria-label={t(EDITOR_TOOL_LABELS[name])}
-              title={t(EDITOR_TOOL_LABELS[name])} onClick={() => editor.chooseTool(name)} />
-          ))}
-          <span className="snapshot-editor-divider" aria-hidden="true" />
-        </div>
-        <div className="snapshot-editor-session" data-editor-enter role="group" aria-label={t('snapshotEditor.history')} hidden={!editing} style={{ order: 3 }}>
-          <span className="snapshot-editor-divider" aria-hidden="true" />
-          <Button variant="ghost" size="xs" icon={Undo2} className="snapshot-editor-action snapshot-editor-icon border-0"
-            disabled={busy || !editor?.undo.length} aria-label={t('snapshotEditor.undo')} title={t('snapshotEditor.undo')}
-            onClick={editor?.undoAction} />
-          <Button variant="ghost" size="xs" icon={Redo2} className="snapshot-editor-action snapshot-editor-icon border-0"
-            disabled={busy || !editor?.redo.length} aria-label={t('snapshotEditor.redo')} title={t('snapshotEditor.redo')}
-            onClick={editor?.redoAction} />
-          <Button variant="primary" size="xs" icon={ScanText} className="snapshot-editor-action snapshot-editor-save"
-            disabled={!editor?.dirty} loading={editor?.busy} onClick={() => editor.save()}>{t(editor?.busy ? 'snapshotEditor.saving' : 'snapshotEditor.save')}</Button>
         </div>
       </div>
       <div ref={collapseRef} className="snapshot-editor-collapse" aria-hidden={Boolean(expanded)}>

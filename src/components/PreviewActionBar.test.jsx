@@ -54,4 +54,40 @@ describe('preview action bar reveal', () => {
     act(() => document.activeElement.blur());
     expect(bar.inert).toBe(true);
   });
+
+  it('keeps delete controls placed after preview and editing controls in both modes', () => {
+    const editor = {
+      editing: false,
+      tool: 'select',
+      undo: [],
+      redo: [],
+      canEdit: true,
+      toggleEditing: vi.fn(),
+    };
+    const { rerender } = render(<PreviewActionBar selectedEvent={{ id: 42 }} editor={editor} />);
+    const bar = screen.getByRole('toolbar');
+    const getOrder = () => [...bar.children].map((node) => node.className);
+
+    const nonEditingClasses = getOrder();
+    const legacyIndexNonEditing = nonEditingClasses.findIndex((c) => c.includes('snapshot-editor-legacy'));
+    const deleteIndexNonEditing = nonEditingClasses.findIndex((c) => c.includes('snapshot-editor-delete'));
+    expect(legacyIndexNonEditing).toBeGreaterThan(-1);
+    expect(deleteIndexNonEditing).toBeGreaterThan(legacyIndexNonEditing);
+
+    rerender(<PreviewActionBar selectedEvent={{ id: 42 }} editor={{ ...editor, editing: true }} />);
+    const editingClasses = getOrder();
+    const legacyIndexEditing = editingClasses.findIndex((c) => c.includes('snapshot-editor-legacy'));
+    const toolsIndexEditing = editingClasses.findIndex((c) => c.includes('snapshot-editor-tools'));
+    const sessionIndexEditing = editingClasses.findIndex((c) => c.includes('snapshot-editor-session'));
+    const deleteIndexEditing = editingClasses.findIndex((c) => c.includes('snapshot-editor-delete'));
+
+    expect(toolsIndexEditing).toBeGreaterThan(legacyIndexEditing);
+    expect(sessionIndexEditing).toBeGreaterThan(toolsIndexEditing);
+    expect(deleteIndexEditing).toBeGreaterThan(sessionIndexEditing);
+
+    const deleteGroup = bar.querySelector('.snapshot-editor-delete');
+    const legacyGroup = bar.querySelector('.snapshot-editor-legacy');
+    expect(deleteGroup.style.order).toBe('');
+    expect(legacyGroup.style.order).toBe('');
+  });
 });
