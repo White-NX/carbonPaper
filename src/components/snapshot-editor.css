@@ -11,6 +11,7 @@
 .snapshot-editor-image { position: absolute; transform-origin: 0 0; transition: transform 100ms ease-out; }
 .snapshot-editor[data-interacting='true'] .snapshot-editor-image { transition: none; }
 .snapshot-editor-image > canvas { display: block; width: 100%; height: 100%; border-radius: 6px; box-shadow: 0 8px 28px #0002; }
+.snapshot-editor-eraser-preview { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
 .snapshot-editor-object { position: absolute; outline: 1px solid var(--ide-accent); transform-origin: center; cursor: move; touch-action: none; }
 .snapshot-editor-text {
   display: block;

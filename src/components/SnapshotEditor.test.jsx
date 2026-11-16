@@ -169,6 +169,53 @@ describe('snapshot editor background recognition', () => {
 });
 
 describe('snapshot editor canvas and annotation dragging', () => {
+  it('previews the eraser diameter at the pointer and updates its range without changing the image', async () => {
+    const { viewport, image } = await renderEditor();
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.tools.erase' }));
+    const renders = renderScene.mock.calls.length;
+    fireEvent.pointerMove(viewport, { clientX: 160, clientY: 180, pointerId: 1 });
+    const circle = image.querySelector('.snapshot-editor-eraser-preview circle');
+    expect(circle).toHaveAttribute('cx', '160');
+    expect(circle).toHaveAttribute('cy', '180');
+    expect(circle).toHaveAttribute('r', '14');
+    expect(circle).toHaveAttribute('stroke', '#458ee8');
+    expect(circle).toHaveAttribute('stroke-dasharray', '4 3');
+    expect(circle.parentElement).toHaveAttribute('aria-hidden', 'true');
+    expect(renderScene).toHaveBeenCalledTimes(renders);
+
+    fireEvent.change(screen.getByRole('slider', { name: 'snapshotEditor.eraseRange' }), { target: { value: '60' } });
+    expect(circle).toHaveAttribute('r', '30');
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotPreview.zoomIn' }));
+    expect(image.style.transform).toContain('scale(1.5)');
+    expect(circle).toHaveAttribute('r', '30');
+    expect(circle).toHaveAttribute('stroke-width', '1');
+    expect(lastScene()).toEqual([]);
+    expect(screen.queryByText('snapshotEditor.unsaved')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'snapshotEditor.undo' })).toBeDisabled();
+  });
+
+  it('hides the eraser preview outside the image and during temporary canvas panning', async () => {
+    const { viewport, image } = await renderEditor();
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'snapshotEditor.tools.erase' }));
+    const preview = () => image.querySelector('.snapshot-editor-eraser-preview');
+    fireEvent.pointerMove(viewport, { clientX: 160, clientY: 180, pointerId: 1 });
+    expect(preview()).not.toBeNull();
+    fireEvent.keyDown(viewport, { code: 'Space', key: ' ' });
+    expect(preview()).toBeNull();
+    fireEvent.keyUp(viewport, { code: 'Space', key: ' ' });
+    expect(preview()).not.toBeNull();
+    fireEvent.pointerDown(viewport, { button: 1, clientX: 160, clientY: 180, pointerId: 1 });
+    expect(preview()).toBeNull();
+    fireEvent.pointerUp(viewport, { button: 1, clientX: 160, clientY: 180, pointerId: 1 });
+    fireEvent.pointerMove(viewport, { clientX: 900, clientY: 180, pointerId: 1 });
+    expect(preview()).toBeNull();
+    fireEvent.pointerMove(viewport, { clientX: 160, clientY: 180, pointerId: 1 });
+    fireEvent.pointerLeave(viewport);
+    expect(preview()).toBeNull();
+  });
+
   it('moves a hit annotation instead of panning the canvas in selection mode', async () => {
     const { image, viewport } = await renderEditor();
     createMosaic(viewport);

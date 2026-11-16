@@ -40,6 +40,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const [panning, setPanning] = useState(false);
   const [spacePressed, setSpacePressed] = useState(false);
   const [hoveringObject, setHoveringObject] = useState(false);
+  const [pointerPosition, setPointerPosition] = useState(null);
   const [interacting, setInteracting] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState(false);
@@ -224,6 +225,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     }
     const point = pointAt(event);
     const inside = point[0] >= 0 && point[1] >= 0 && point[0] <= width && point[1] <= height;
+    setPointerPosition(current.tool === 'erase' && inside ? point : null);
     const hit = inside && ['select', 'text', 'mosaic'].includes(current.tool) && hitObject(current.scene, point);
     if (hit) {
       editor.select(hit.id);
@@ -248,13 +250,16 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
 
   const pointerMove = (event) => {
     const gesture = gestureRef.current;
+    if (!image || (gesture && gesture.pointerId !== event.pointerId)) return;
+    const current = editor.stateRef.current;
+    const rawPoint = pointAt(event);
+    const inside = rawPoint[0] >= 0 && rawPoint[1] >= 0 && rawPoint[0] <= width && rawPoint[1] <= height;
+    if (current.editing && current.tool === 'erase') setPointerPosition(inside && !event.altKey ? rawPoint : null);
     if (!gesture) {
-      const current = editor.stateRef.current;
       setHoveringObject(Boolean(image && current.editing && ['select', 'text', 'mosaic'].includes(current.tool)
-        && hitObject(current.scene, pointAt(event))));
+        && hitObject(current.scene, rawPoint)));
       return;
     }
-    if (gesture.pointerId !== event.pointerId) return;
     if (gesture.type === 'pan') {
       const dx = event.clientX - gesture.start[0];
       const dy = event.clientY - gesture.start[1];
@@ -266,7 +271,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
         y: clamp(gesture.original.y + dy, -height * actualScale, height * actualScale) });
       return;
     }
-    const point = pointAt(event).map((value, index) => clamp(value, 0, index ? height : width));
+    const point = rawPoint.map((value, index) => clamp(value, 0, index ? height : width));
     if (gesture.type === 'stroke') {
       const last = gesture.node.points[gesture.node.points.length - 1];
       if (Math.hypot(point[0] - last[0], point[1] - last[1]) < 0.5 || gesture.node.points.length >= 10_000) return;
@@ -368,7 +373,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   }, [clearSpace, editor.editing, editor.stateRef, isAuthenticated]);
 
   useEffect(() => {
-    const blur = () => { clearSpace(); cancelGesture(); };
+    const blur = () => { clearSpace(); cancelGesture(); setPointerPosition(null); };
     window.addEventListener('blur', blur);
     return () => window.removeEventListener('blur', blur);
   }, [cancelGesture, clearSpace]);
@@ -380,6 +385,8 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const contextX = selected ? viewport.width / 2 + view.x + (selected.cx - width / 2) * actualScale : 0;
   const contextY = selected ? viewport.height / 2 + view.y + (selected.cy + bounds.hy - height / 2) * actualScale + 12 : 0;
   const inverseScale = 1 / actualScale;
+  const showEraserPreview = editor.editing && editor.tool === 'erase' && pointerPosition
+    && !editor.busy && isAuthenticated && !spacePressed && gestureRef.current?.type !== 'pan';
   const recognitionStatus = selectedDetails?.edit_ocr?.image_hash === selectedDetails?.record?.image_hash
     ? selectedDetails?.edit_ocr?.status : null;
   const recognizing = ['pending', 'processing', 'waiting_for_auth'].includes(recognitionStatus);
@@ -401,7 +408,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
       <div ref={viewportRef} className="snapshot-editor-viewport" tabIndex={0} role="group" aria-label={t('snapshotEditor.canvas')}
         style={{ cursor }}
         onPointerDownCapture={pointerDown} onPointerMove={pointerMove} onPointerUp={finishGesture}
-        onPointerLeave={() => setHoveringObject(false)}
+        onPointerLeave={() => { setHoveringObject(false); setPointerPosition(null); }}
         onPointerCancel={(event) => finishGesture(event, true)}
         onLostPointerCapture={(event) => finishGesture(event, true)}
         onDoubleClick={(event) => {
@@ -414,6 +421,12 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
           <div ref={imageRef} className="snapshot-editor-image" style={{ width, height, transition: animateView ? undefined : 'none',
             transform: 'translate(' + (viewport.width / 2 + view.x) + 'px,' + (viewport.height / 2 + view.y) + 'px) scale(' + actualScale + ') translate(-50%,-50%)' }}>
             <canvas ref={canvasRef} role="img" aria-label={t('snapshotEditor.image')} />
+            {showEraserPreview && (
+              <svg className="snapshot-editor-eraser-preview" width={width} height={height} aria-hidden="true">
+                <circle cx={pointerPosition[0]} cy={pointerPosition[1]} r={editor.eraseSize / 2} fill="none"
+                  stroke="#458ee8" strokeWidth={1.5 * inverseScale} strokeDasharray={`${4 * inverseScale} ${3 * inverseScale}`} />
+              </svg>
+            )}
             {!editor.editing && <InspectorOverlay boxes={overlayBoxes} metrics={{ renderWidth: width, renderHeight: height, offsetX: 0, offsetY: 0 }}
               naturalSize={{ width, height }} onBoxClick={onBoxClick} />}
             {editor.editing && selected && !editor.busy && (

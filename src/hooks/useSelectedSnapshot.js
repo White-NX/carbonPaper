@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
+import { invalidateTimelineImage } from '../lib/timeline_image_cache';
 
 /**
  * 把后端给的时间统一换算成毫秒。
@@ -228,6 +229,7 @@ export function useSelectedSnapshot() {
   }, []);
 
   const refreshEditedSnapshot = useCallback((result, imageSrc) => {
+    invalidateTimelineImage(result.screenshot_id);
     setTimelineRefreshKey((previous) => previous + 1);
     if (selectedIdRef.current !== result.screenshot_id) return;
     const version = ++detailsVersionRef.current;
