@@ -197,6 +197,7 @@ pub(crate) struct ProcessingStaging {
     available: AtomicBool,
     supported_consumers: AtomicU8,
     supported_storage_keys: AtomicBool,
+    supported_task_revisions: AtomicBool,
     fatal_broker_error: Mutex<Option<BrokerError>>,
     broker: Arc<dyn Broker>,
     // Only receipts issued by this process can authorize a new archive write.
@@ -215,6 +216,7 @@ impl ProcessingStaging {
             available: AtomicBool::new(false),
             supported_consumers: AtomicU8::new(Consumer::LEGACY_MASK),
             supported_storage_keys: AtomicBool::new(false),
+            supported_task_revisions: AtomicBool::new(false),
             fatal_broker_error: Mutex::new(None),
             broker: Arc::new(NativeBroker),
             issued: Mutex::new(HashMap::new()),
@@ -458,6 +460,8 @@ impl ProcessingStaging {
                 }
                 self.supported_storage_keys
                     .store(broker.supported_storage_keys, Ordering::Release);
+                self.supported_task_revisions
+                    .store(broker.supported_task_revisions, Ordering::Release);
                 self.supported_consumers.store(
                     broker.supported_consumers & Consumer::ALL_MASK,
                     Ordering::Release,
@@ -604,11 +608,17 @@ impl ProcessingStaging {
             return Err(BrokerError::LimitExceeded.to_string());
         }
         self.make_local_room(bytes.len() as u64 + 28)?;
+        let source_revision = if self.supported_task_revisions.load(Ordering::Acquire) {
+            input.source_revision
+        } else {
+            0
+        };
         let Response::Prepared(prepared) = self
             .call_broker_logged(
                 Request::PrepareTask {
                     dataset_id: dataset.clone(),
                     screenshot_id,
+                    source_revision,
                     consumers,
                     payload_bytes: bytes.len() as u64 + 28,
                 },
@@ -618,6 +628,12 @@ impl ProcessingStaging {
         else {
             return Err(BrokerError::Integrity.to_string());
         };
+        if prepared.task.dataset_id != dataset
+            || prepared.task.screenshot_id != screenshot_id
+            || prepared.task.source_revision != source_revision
+        {
+            return Err(BrokerError::Integrity.to_string());
+        }
         let encrypted = crypto::encrypt_input(&prepared.key, &prepared.task, &bytes)
             .map_err(|e| e.to_string())?;
         let digest = crypto::digest(&encrypted);
@@ -625,6 +641,7 @@ impl ProcessingStaging {
         let stored=self.with_store(|s| {
             if s.generation!=generation || s.dataset_id!=dataset { return Err("staging dataset changed".into()); }
             let tx=s.connection.unchecked_transaction().map_err(|e|e.to_string())?;
+            tx.execute("DELETE FROM staged_inputs WHERE dataset_id=?1 AND screenshot_id=?2",params![dataset,screenshot_id]).map_err(|e|e.to_string())?;
             tx.execute("INSERT INTO staged_inputs(task_id,dataset_id,screenshot_id,binding,payload,digest,expires,state,created)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,'preparing',?8)",params![prepared.task.task_id,dataset,screenshot_id,binding,encrypted,digest,prepared.task.expires_at,protocol::now_secs()]).map_err(|e|e.to_string())?;
             for consumer in Consumer::ALL { if consumers&consumer.bit()!=0 {
@@ -643,6 +660,7 @@ impl ProcessingStaging {
         }
         // A durable prepare can be activated again after an interrupted reply.
         // Keep it owned by staging so the legacy queue does not duplicate work.
+        self.invalidate_screenshot_receipts(&[screenshot_id]);
         let _ = self.activate(&prepared.task.task_id, &digest);
         Ok(true)
     }
@@ -873,8 +891,14 @@ impl ProcessingStaging {
                     return Err(BrokerError::Integrity);
                 }
                 let bytes = crypto::decrypt_input(&lease.key, &lease.task, &encrypted)?;
-                serde_json::from_slice::<ProcessingInput>(&bytes)
-                    .map_err(|_| BrokerError::Integrity)
+                let input = serde_json::from_slice::<ProcessingInput>(&bytes)
+                    .map_err(|_| BrokerError::Integrity)?;
+                if lease.task.source_revision != 0
+                    && lease.task.source_revision != input.source_revision
+                {
+                    return Err(BrokerError::Integrity);
+                }
+                Ok(input)
             })();
             let input = match decoded {
                 Ok(input) => input,

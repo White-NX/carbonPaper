@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
-import { EyeOff, ZoomIn, ZoomOut, Maximize } from 'lucide-react';
+import { EyeOff } from 'lucide-react';
 import { cn } from '../lib/utils';
+import PreviewZoomControls from './PreviewZoomControls';
 
 export const DetectionLabels = ({ detections }) => {
   if (!detections?.length) return null;
@@ -193,6 +194,7 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
   }, []);
 
   const handleWheel = useCallback((e) => {
+    if (e.target.closest('[data-preview-zoom-controls]')) return;
     e.preventDefault();
     setTransform(prev => {
       const scaleAdjust = e.deltaY * -0.0015;
@@ -234,22 +236,10 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
     setTransform({ scale: 1, x: 0, y: 0 });
   }, []);
 
-  const zoomIn = useCallback(() => {
+  const setZoom = useCallback((scale) => {
     setTransform(prev => {
-      const newScale = Math.min(prev.scale * 1.5, 10);
-      const containerEl = containerRef.current;
-      const rect = containerEl ? containerEl.getBoundingClientRect() : { width: 0, height: 0 };
-      const centerX = rect.width / 2;
-      const centerY = rect.height / 2;
-      const newX = centerX - (centerX - prev.x) * (newScale / prev.scale);
-      const newY = centerY - (centerY - prev.y) * (newScale / prev.scale);
-      return { scale: newScale, ...constrainPan(newX, newY, newScale) };
-    });
-  }, [constrainPan]);
-
-  const zoomOut = useCallback(() => {
-    setTransform(prev => {
-      const newScale = Math.max(prev.scale / 1.5, 0.2);
+      const requestedScale = typeof scale === 'function' ? scale(prev.scale) : scale;
+      const newScale = Math.min(Math.max(requestedScale, 0.2), 10);
       const containerEl = containerRef.current;
       const rect = containerEl ? containerEl.getBoundingClientRect() : { width: 0, height: 0 };
       const centerX = rect.width / 2;
@@ -316,41 +306,14 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
         />
       </div>
 
-      {/* Zoom Controls */}
-      <div
-        className="absolute top-4 right-4 flex items-center gap-1 px-2 py-1.5 preview-action-bar border border-ide-border rounded-full z-20"
-        onPointerDown={(event) => event.stopPropagation()}
-      >
-        <button
-          onClick={zoomOut}
-          className="p-1.5 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors"
-          title="Zoom Out"
-        >
-          <ZoomOut size={16} />
-        </button>
-        <button
-          onClick={resetZoom}
-          className="px-2 py-1 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors font-mono text-[11px]"
-          title="Reset Zoom"
-        >
-          {Math.round(transform.scale * 100)}%
-        </button>
-        <button
-          onClick={zoomIn}
-          className="p-1.5 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors"
-          title="Zoom In"
-        >
-          <ZoomIn size={16} />
-        </button>
-        <div className="w-px h-5 bg-ide-border/50 mx-0.5"></div>
-        <button
-          onClick={resetZoom}
-          className="p-1.5 hover:bg-ide-hover rounded-full text-ide-muted hover:text-ide-text transition-colors"
-          title="Fit to Window"
-        >
-          <Maximize size={16} />
-        </button>
-      </div>
+      <PreviewZoomControls
+        scale={transform.scale}
+        onZoomIn={() => setZoom(scale => scale * 1.5)}
+        onZoomOut={() => setZoom(scale => scale / 1.5)}
+        onScaleChange={setZoom}
+        onReset={resetZoom}
+        viewportRef={containerRef}
+      />
     </div>
   );
 };

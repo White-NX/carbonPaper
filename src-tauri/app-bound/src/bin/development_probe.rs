@@ -92,6 +92,7 @@ fn exercise(package: &std::path::Path) -> std::result::Result<(), String> {
     let Response::Prepared(prepared) = call(Request::PrepareTask {
         dataset_id,
         screenshot_id: 1,
+        source_revision: 0,
         consumers: Consumer::ALL_MASK,
         payload_bytes: plaintext.len() as u64 + 28,
     })?

@@ -164,16 +164,12 @@ impl Ledger {
                 if screenshot_ids.len() > 128 || screenshot_ids.iter().any(|id| *id <= 0) {
                     return Err(BrokerError::InvalidRequest);
                 }
-                let (_, state, _, _, _) = Self::recap_object(conn, who, object_id, dataset)?;
+                let (binding, state, _, _, _) = Self::recap_object(conn, who, object_id, dataset)?;
                 if state != "prepared" {
                     return Err(BrokerError::Retired);
                 }
                 for id in screenshot_ids {
-                    let revoked:bool=db(conn.query_row("SELECT
-                        EXISTS(SELECT 1 FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)
-                        OR EXISTS(SELECT 1 FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2 AND ?3 BETWEEN first_id AND last_id)
-                        OR EXISTS(SELECT 1 FROM recap_revocation_budgets WHERE owner=?1 AND deny_all=1)",params![who.sid,dataset,id],|r|r.get(0)))?;
-                    if revoked {
+                    if Self::source_is_revoked(conn, &who.sid, &binding.dataset_id, *id)? {
                         return Err(BrokerError::Retired);
                     }
                     db(conn.execute(
@@ -244,6 +240,22 @@ impl Ledger {
             return Err(BrokerError::DatasetMismatch);
         }
         Ok((binding, state, key, digest, expires))
+    }
+
+    pub(super) fn source_is_revoked(
+        conn: &Connection,
+        sid: &str,
+        dataset: &str,
+        id: i64,
+    ) -> Result<bool> {
+        db(conn.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM recap_revoked_sources WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)
+                OR EXISTS(SELECT 1 FROM recap_revoked_ranges WHERE owner=?1 AND dataset=?2 AND ?3 BETWEEN first_id AND last_id)
+                OR EXISTS(SELECT 1 FROM recap_revocation_budgets WHERE owner=?1 AND deny_all=1)",
+            params![sid, dataset, id],
+            |row| row.get(0),
+        ))
     }
 
     pub(super) fn revoke_recap_source(

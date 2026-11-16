@@ -29,6 +29,7 @@ import CompactTimeline from './timeline/CompactTimeline';
 import { getSearchMarkerFitRange } from '../lib/timeline_search';
 import { createTimelineRequestQueue } from '../lib/timeline_requests';
 import { createTimelineBatchQueue } from '../lib/timeline_batch_queue';
+import { setTimelineImageCache, subscribeTimelineImageInvalidation, timelineImageCache } from '../lib/timeline_image_cache';
 
 const MINUTE = 60000;
 const HOUR = 3600000;
@@ -99,18 +100,6 @@ const WHEEL_ZOOM_STEP = 1.2;
 /** Local timezone offset relative to UTC in milliseconds. */
 function localBucketOffsetMs() {
   return -new Date().getTimezoneOffset() * MINUTE;
-}
-
-const TIMELINE_IMAGE_CACHE_LIMIT = 800;
-const timelineImageCache = new Map();
-
-function setTimelineImageCache(key, dataUrl) {
-  if (key === null || key === undefined || !dataUrl) return;
-  if (!timelineImageCache.has(key) && timelineImageCache.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
-    const oldestKey = timelineImageCache.keys().next().value;
-    timelineImageCache.delete(oldestKey);
-  }
-  timelineImageCache.set(key, dataUrl);
 }
 
 function getTickStep(zoom) {
@@ -246,6 +235,11 @@ const Timeline = ({
     onError: (error) => console.error('[Timeline] Batch thumbnail load error:', error),
     onSettled: () => syncLoadersRef.current?.(),
   }), []);
+
+  useEffect(() => subscribeTimelineImageInvalidation(() => {
+    imageQueue.reset();
+    setImageEpoch((previous) => previous + 1);
+  }), [imageQueue]);
 
   const detailsQueue = useMemo(() => createTimelineBatchQueue(getTimelineDetails, {
     batchSize: 12,

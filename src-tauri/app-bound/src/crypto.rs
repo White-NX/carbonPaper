@@ -204,6 +204,7 @@ mod tests {
             task_id: crate::protocol::random_id(),
             dataset_id: crate::protocol::random_id(),
             screenshot_id: 7,
+            source_revision: 0,
             input_version: 1,
             consumers: 7,
             payload_bytes: 34,
@@ -214,6 +215,9 @@ mod tests {
             &**decrypt_input(&key, &task, &encrypted).unwrap(),
             b"secret"
         );
+        task.source_revision = 1;
+        assert!(decrypt_input(&key, &task, &encrypted).is_err());
+        task.source_revision = 0;
         task.screenshot_id = 8;
         assert!(decrypt_input(&key, &task, &encrypted).is_err());
         task.screenshot_id = 7;

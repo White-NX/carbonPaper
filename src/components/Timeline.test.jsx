@@ -3,13 +3,16 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Timeline from './Timeline';
 import WorkspaceTimelines from './WorkspaceTimelines';
+import { useSelectedSnapshot } from '../hooks/useSelectedSnapshot';
 import { fetchThumbnailBatch, getTimeline, getTimelineDetails, getTimelineDensity } from '../lib/monitor_api';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n: { language: 'en' } }) }));
 vi.mock('../lib/monitor_api', () => ({
   getTimeline: vi.fn(), getTimelineDetails: vi.fn(async () => []),
   getTimelineDensity: vi.fn(async () => []), fetchThumbnailBatch: vi.fn(async () => ({})),
+  fetchImage: vi.fn(), getScreenshotDetails: vi.fn(),
 }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => vi.fn()) }));
 vi.mock('../hooks/useTimelineCamera', async () => {
   const { useEffect, useMemo, useRef } = await import('react');
   return { default: function useCamera({ width, center, zoom, onCommit, onFrame }) {
@@ -73,6 +76,63 @@ afterEach(() => {
 
 const record = (title) => [{ id: 1, timestamp: 1767225600, process_name: 'app', window_title: title }];
 const advance = () => act(async () => { await vi.advanceTimersByTimeAsync(350); });
+
+function EditableTimeline({ screenshotId }) {
+  const snapshot = useSelectedSnapshot();
+  return <>
+    <button onClick={() => snapshot.refreshEditedSnapshot({ screenshot_id: screenshotId, image_hash: 'edited' })}>Save edit</button>
+    <Timeline refreshKey={snapshot.timelineRefreshKey} />
+  </>;
+}
+
+it('reloads an edited thumbnail while preserving cached peer images', async () => {
+  const thumbnails = [];
+  fetchThumbnailBatch.mockImplementation((ids, { signal }) => new Promise((resolve) => {
+    thumbnails.push({ ids, signal, resolve });
+  }));
+  const headers = [901, 902].map((id) => ({ id, timestamp: 1767225600 }));
+  const view = render(<EditableTimeline screenshotId={901} />);
+  await advance();
+  await act(async () => reads[0].resolve(headers));
+  await act(async () => thumbnails[0].resolve({
+    901: 'data:image/jpeg;base64,original', 902: 'data:image/jpeg;base64,peer',
+  }));
+  expect(screen.getByTestId('events').querySelector('img')).toHaveAttribute('src', 'data:image/jpeg;base64,original');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Save edit' }));
+  await advance();
+  await act(async () => reads[1].resolve(headers));
+  expect(thumbnails).toHaveLength(2);
+  expect(thumbnails[1].ids).toEqual([901]);
+  expect(screen.getByTestId('events').querySelector('img')).toHaveAttribute('src', 'data:image/jpeg;base64,peer');
+  await act(async () => thumbnails[1].resolve({ 901: 'data:image/jpeg;base64,edited' }));
+  expect([...screen.getByTestId('events').querySelectorAll('img')].map((img) => img.src)).toEqual([
+    'data:image/jpeg;base64,edited', 'data:image/jpeg;base64,peer',
+  ]);
+  view.unmount();
+});
+
+it('discards a thumbnail batch started before saving instead of restoring the old image', async () => {
+  const thumbnails = [];
+  fetchThumbnailBatch.mockImplementation((ids, { signal }) => new Promise((resolve) => {
+    thumbnails.push({ ids, signal, resolve });
+  }));
+  const headers = [{ id: 910, timestamp: 1767225600 }];
+  const view = render(<EditableTimeline screenshotId={910} />);
+  await advance();
+  await act(async () => reads[0].resolve(headers));
+  fireEvent.click(screen.getByRole('button', { name: 'Save edit' }));
+  expect(thumbnails[0].signal.aborted).toBe(true);
+  await advance();
+  await act(async () => reads[1].resolve(headers));
+  expect(thumbnails).toHaveLength(1);
+  await act(async () => thumbnails[0].resolve({ 910: 'data:image/jpeg;base64,stale' }));
+  expect(screen.getByTestId('events').querySelector('img')).toBeNull();
+  expect(thumbnails).toHaveLength(2);
+  await act(async () => thumbnails[1].resolve({ 910: 'data:image/jpeg;base64,edited' }));
+  expect(screen.getByTestId('events').querySelector('img')).toHaveAttribute('src', 'data:image/jpeg;base64,edited');
+  view.unmount();
+});
 
 it('discards a reset read and loads the same viewport again after cancellation settles', async () => {
   const view = render(<StrictMode><Timeline /></StrictMode>);

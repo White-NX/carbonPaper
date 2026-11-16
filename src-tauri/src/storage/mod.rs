@@ -39,6 +39,8 @@ mod recap_search;
 mod rewrite_budget;
 mod schema;
 mod screenshot;
+mod screenshot_edit;
+mod screenshot_edit_ocr;
 mod screenshot_reader;
 mod search;
 pub(crate) mod search_plan;
@@ -65,6 +67,8 @@ pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub(crate) use initialization::{InitializationPhase, InitializationProgress};
 pub(crate) use mode::database_mode_policy_from_environment;
 pub(crate) use policy::disk_totals_for_path;
+pub(crate) use screenshot_edit_ocr::EditOcrJob;
+pub use screenshot_edit_ocr::EditOcrStatus;
 pub(crate) use screenshot_reader::ScreenshotReader;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
@@ -844,6 +848,11 @@ mod tests {
         ] {
             let (_temp, storage) = initialized_read_storage(policy);
             let mut primary = storage.get_connection_named("held_primary_writer").unwrap();
+            primary
+                .as_ref()
+                .unwrap()
+                .execute("UPDATE screenshots SET status='committed' WHERE id=3", [])
+                .unwrap();
             let tx = primary
                 .as_mut()
                 .unwrap()
@@ -861,6 +870,28 @@ mod tests {
                 // All three application entry points must finish before the
                 // writer releases its mutex, and see only committed records.
                 assert_read_fixture(&reader_storage, "Browser");
+                assert_eq!(
+                    reader_storage
+                        .screenshots()
+                        .by_id(3)
+                        .unwrap()
+                        .unwrap()
+                        .process_name
+                        .as_deref(),
+                    Some("Browser")
+                );
+                assert!(reader_storage
+                    .screenshots()
+                    .recent(10)
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.screenshot_id == 3));
+                assert_eq!(reader_storage.screenshot_status(3).unwrap(), "committed");
+                assert!(reader_storage.get_delete_queue_status().is_ok());
+                assert!(reader_storage.count_smart_cluster_pending().is_ok());
+                assert!(reader_storage.edited_ocr_status(3).unwrap().is_none());
+                assert!(reader_storage.recap_config_revision().is_ok());
+                assert!(reader_storage.recap_list_days().is_ok());
                 finished_tx.send(()).unwrap();
             });
             let finished = finished_rx.recv_timeout(THREAD_TIMEOUT);

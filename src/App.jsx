@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import WorkspaceTimelines from './components/WorkspaceTimelines';
@@ -62,6 +62,17 @@ function App() {
 
   const [showOcrModelRepair, setShowOcrModelRepair] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
+  const previewNavigationGuardRef = useRef(null);
+  const navigate = useCallback((action) => {
+    if (previewNavigationGuardRef.current) previewNavigationGuardRef.current(action);
+    else action();
+  }, []);
+  const handleNavigationGuardChange = useCallback((guard) => {
+    previewNavigationGuardRef.current = guard;
+  }, []);
+  const handleTabChange = useCallback((tab) => {
+    if (tab !== activeTab) navigate(() => setActiveTab(tab));
+  }, [activeTab, navigate]);
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', refreshKey: Date.now() });
   const [timelineSearch, setTimelineSearch] = useState(null);
@@ -165,8 +176,9 @@ function App() {
     ocrBoxes,
     clearSelection,
     bumpTimelineRefresh,
+    refreshEditedSnapshot,
   } = useSelectedSnapshot();
-  const handleTrayNavigation = useCallback((intent) => {
+  const handleTrayNavigation = useCallback((intent) => navigate(() => {
     if (intent.kind === 'search' && typeof intent.query === 'string') {
       setActiveTab('advanced-search');
       setAdvancedSearchParams({ query: intent.query, refreshKey: Date.now() });
@@ -178,7 +190,7 @@ function App() {
     } else if (intent.kind === 'timeline') {
       setActiveTab('preview');
     }
-  }, [setSelectedEvent, setHighlightedEventId, setTimelineJump]);
+  }), [navigate, setSelectedEvent, setHighlightedEventId, setTimelineJump]);
   useTrayNavigation({ enabled: isAuthenticated && initialization.ready, onNavigate: handleTrayNavigation });
   const { showSettings, openSettings } = useSettingsHost({
     onRecordsChanged: bumpTimelineRefresh,
@@ -212,7 +224,7 @@ function App() {
     }
   }, [highlightedEventId, setHighlightedEventId]);
 
-  const selectSearchResult = useCallback((res) => {
+  const selectSearchResult = useCallback((res) => navigate(() => {
     const event = searchResultToSnapshotEvent(res);
     if (event) {
       setSelectedEvent(event);
@@ -222,11 +234,13 @@ function App() {
       }
     }
     setActiveTab('preview');
-  }, [setHighlightedEventId, setSelectedEvent, setTimelineJump]);
+  }), [navigate, setHighlightedEventId, setSelectedEvent, setTimelineJump]);
 
   const handleSearchSubmit = ({ query }) => {
-    setActiveTab('advanced-search');
-    setAdvancedSearchParams({ query, refreshKey: Date.now() });
+    navigate(() => {
+      setActiveTab('advanced-search');
+      setAdvancedSearchParams({ query, refreshKey: Date.now() });
+    });
   };
 
   return (
@@ -319,7 +333,7 @@ function App() {
         <main className="flex-1 min-h-0 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
           <ActivityBar
             activeTab={activeTab}
-            setActiveTab={setActiveTab}
+            setActiveTab={handleTabChange}
             expanded={sidebarExpanded}
             onToggleExpand={() => setSidebarExpanded((prev) => !prev)}
           />
@@ -329,8 +343,11 @@ function App() {
             <WorkspaceTimelines
               activeTab={activeTab}
               onSelectEvent={(evt) => {
-                setSelectedEvent(evt);
-                setHighlightedEventId(evt?.id ?? null);
+                if (evt?.id === selectedEvent?.id) return;
+                navigate(() => {
+                  setSelectedEvent(evt);
+                  setHighlightedEventId(evt?.id ?? null);
+                });
               }}
               onClearHighlight={() => setHighlightedEventId(null)}
               jumpTimestamp={timelineJump}
@@ -343,7 +360,7 @@ function App() {
 
             <MainArea
               activeTab={activeTab}
-              setActiveTab={setActiveTab}
+              setActiveTab={handleTabChange}
               selectedImageSrc={selectedImageSrc}
               isLoadingDetails={isLoadingDetails}
               selectedEvent={selectedEvent}
@@ -377,6 +394,8 @@ function App() {
                 }
               }}
               onCopyText={handleCopyText}
+              onSnapshotSaved={refreshEditedSnapshot}
+              onNavigationGuardChange={handleNavigationGuardChange}
             />
             </>}
           </div>

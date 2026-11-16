@@ -295,7 +295,7 @@ pub(super) fn ocr_postprocess_retry_decision(
     }
 }
 
-fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
+pub(super) fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
     if result.box_coords.len() != 4 || result.box_coords.iter().any(|point| point.len() != 2) {
         return Err("OCR box must contain exactly four 2D points".to_string());
     }
@@ -2604,24 +2604,23 @@ impl StorageState {
 
     /// Fetch pending counts in delete queues.
     pub fn get_delete_queue_status(&self) -> Result<DeleteQueueStatus, String> {
-        let guard = self.get_connection_named("get_delete_queue_status")?;
-        let conn = guard.as_ref().unwrap();
+        self.with_read_connection_named("get_delete_queue_status", |conn| {
+            let pending_screenshots: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
+            let pending_ocr: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
 
-        let pending_screenshots: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
-                row.get(0)
+            Ok(DeleteQueueStatus {
+                pending_screenshots,
+                pending_ocr,
+                running: pending_screenshots > 0 || pending_ocr > 0,
             })
-            .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
-        let pending_ocr: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
-
-        Ok(DeleteQueueStatus {
-            pending_screenshots,
-            pending_ocr,
-            running: pending_screenshots > 0 || pending_ocr > 0,
         })
     }
 
@@ -2667,14 +2666,24 @@ impl StorageState {
         let rows: Vec<OcrDeleteQueueRow> = {
             let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
             let conn = guard.as_ref().unwrap();
+            // A LEFT JOIN directly to ocr_results_read can materialize its
+            // nested key join for the entire corpus before applying LIMIT.
+            // Bound both queue membership and view reads before joining them,
+            // including queue entries whose OCR row is already gone.
             let mut read_stmt = conn
                 .prepare(
-                    "SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
+                    "WITH batch AS MATERIALIZED (
+                         SELECT id, failure_count FROM delete_queue_ocr
+                         ORDER BY id ASC LIMIT ?1
+                     ), evidence AS MATERIALIZED (
+                         SELECT id, text, text_hash, text_enc, text_key_ref
+                         FROM ocr_results_read WHERE id IN (SELECT id FROM batch)
+                     )
+                     SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
                             o.text_enc, o.text_key_ref
-                     FROM delete_queue_ocr q
-                     LEFT JOIN ocr_results_read o ON o.id = q.id
-                     ORDER BY q.id ASC
-                     LIMIT ?1",
+                     FROM batch q
+                     LEFT JOIN evidence o ON o.id = q.id
+                     ORDER BY q.id ASC",
                 )
                 .map_err(|e| format!("Failed to prepare OCR queue read: {}", e))?;
 

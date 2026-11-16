@@ -227,6 +227,16 @@ pub struct OcrResultInput {
 }
 
 /// Response after saving a screenshot, contains the assigned ID and dedup counts.
+#[derive(Debug, Clone, Serialize)]
+pub struct EditedScreenshotResponse {
+    pub status: String,
+    pub screenshot_id: i64,
+    pub image_path: String,
+    pub image_hash: String,
+    pub ocr_status: String,
+}
+
+/// Response after saving a new capture, contains the assigned ID and dedup counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotResponse {
     pub status: String,
