@@ -306,6 +306,69 @@ fn ocr_delete_queue_drains_readable_rows_and_unblocks_screenshots() {
 }
 
 #[test]
+fn ocr_delete_queue_reads_only_the_bounded_batch_and_preserves_stale_entries() {
+    use rusqlite::functions::FunctionFlags;
+    use std::sync::atomic::AtomicUsize;
+
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+    credentials.set_foreground_state(true);
+    credentials.update_auth_time();
+    let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+    let connection = Connection::open_in_memory().unwrap();
+    storage.init_tables(&connection).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO screenshots(id,image_path,image_hash) VALUES(1,'one.enc','one');
+         WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000)
+         INSERT INTO ocr_results(id,screenshot_id,text_hash,is_deleted)
+         SELECT id,1,'',CASE WHEN id IN (10,20) THEN 1 ELSE 0 END FROM ids;
+         INSERT INTO delete_queue_ocr(id) VALUES(10),(20),(10001);",
+        )
+        .unwrap();
+
+    // These legacy rows have no key reference. Count view evaluations rather
+    // than wall time so the regression detects a corpus scan on any machine.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed = reads.clone();
+    connection
+        .create_scalar_function(
+            "cp_ocr_key_ref",
+            8,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok(None::<Vec<u8>>)
+            },
+        )
+        .unwrap();
+    *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+
+    let first = storage.process_ocr_delete_queue_batch(2).unwrap();
+    assert_eq!(first.queue_rows, 2);
+    assert_eq!(first.deleted_rows, 2);
+    assert!(!first.queue_empty);
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+    let second = storage.process_ocr_delete_queue_batch(2).unwrap();
+    assert_eq!(second.stale_queue_rows, 1);
+    assert!(second.queue_empty);
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+    let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        guard
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ocr_results", [], |row| row
+                .get::<_, i64>(0),)
+            .unwrap(),
+        9998
+    );
+}
+
+#[test]
 fn ocr_delete_queue_preserves_other_ids_in_chunked_postings() {
     assert_readable_ocr_delete_queue_drains(true);
 }

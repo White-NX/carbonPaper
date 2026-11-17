@@ -74,6 +74,7 @@ impl Ledger {
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES owners(sid),
                 dataset TEXT NOT NULL, screenshot_id INTEGER NOT NULL, binding TEXT NOT NULL,
+                source_revision INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL CHECK(state IN ('prepared','active','retired')),
                 done INTEGER NOT NULL DEFAULT 0, abandoned INTEGER NOT NULL DEFAULT 0, key_blob BLOB, digest TEXT,
                 created INTEGER NOT NULL, expires INTEGER NOT NULL, prepared_until INTEGER NOT NULL,
@@ -97,6 +98,17 @@ impl Ledger {
         ))?;
         if !matches!(schema, 1 | 2) {
             return Err(BrokerError::VersionMismatch);
+        }
+        let has_revision: bool = db(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='source_revision')",
+            [],
+            |row| row.get(0),
+        ))?;
+        if !has_revision {
+            db(conn.execute(
+                "ALTER TABLE tasks ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0",
+                [],
+            ))?;
         }
         Self::init_recap(&conn)?;
         Self::init_storage_keys(&conn)?;
@@ -484,11 +496,13 @@ impl Ledger {
             Request::PrepareTask {
                 dataset_id,
                 screenshot_id,
+                source_revision,
                 consumers,
                 payload_bytes,
             } => {
                 if !valid_id(&dataset_id)
                     || screenshot_id <= 0
+                    || source_revision < 0
                     || consumers == 0
                     || consumers & !Consumer::ALL_MASK != 0
                     || !(28..=MAX_INPUT_BYTES + 28).contains(&payload_bytes)
@@ -498,20 +512,38 @@ impl Ledger {
                 if dataset.as_deref() != Some(&dataset_id) {
                     return Err(BrokerError::DatasetMismatch);
                 }
-                let already: bool = db(conn.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)",
-                    params![who.sid,dataset_id,screenshot_id], |r| r.get(0)))?;
-                if already {
+                // A source revision can replace a processing grant, but cannot
+                // restore authorization after the screenshot itself was deleted.
+                if Self::source_is_revoked(conn, &who.sid, &dataset_id, screenshot_id)? {
+                    return Err(BrokerError::Retired);
+                }
+                let previous: Option<(String,i64)> = db(conn.query_row(
+                    "SELECT id,source_revision FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3",
+                    params![who.sid,dataset_id,screenshot_id], |row| Ok((row.get(0)?,row.get(1)?)),
+                ).optional())?;
+                if previous
+                    .as_ref()
+                    .is_some_and(|(_, revision)| source_revision <= *revision)
+                {
                     return Err(BrokerError::Retired);
                 }
                 let key = new_key();
                 // Protect before changing state so an OS failure cannot orphan
                 // an unprotected record or consume another task's capacity.
                 let sealed = protector.protect(&key)?;
+                // A newer immutable source may replace the slot. Old task IDs
+                // and leases become unusable, while the latest revision keeps
+                // same/older input grants from being recreated after retirement.
+                if let Some((previous_id, _)) = previous {
+                    db(conn.execute("DELETE FROM leases WHERE task=?1", [&previous_id]))?;
+                    db(conn.execute("DELETE FROM tasks WHERE id=?1", [&previous_id]))?;
+                }
                 Self::make_room(conn, &who.sid, payload_bytes, limits.capacity_bytes)?;
                 let task = TaskBinding {
                     task_id: random_id(),
                     dataset_id,
                     screenshot_id,
+                    source_revision,
                     input_version: INPUT_VERSION,
                     consumers,
                     payload_bytes,
@@ -519,9 +551,9 @@ impl Ledger {
                 };
                 let binding =
                     serde_json::to_string(&task).map_err(|_| BrokerError::InvalidRequest)?;
-                db(conn.execute("INSERT INTO tasks(id,owner,dataset,screenshot_id,binding,state,key_blob,created,expires,prepared_until,bytes)
-                    VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10)", params![task.task_id,who.sid,task.dataset_id,
-                    screenshot_id,binding,sealed,now,task.expires_at,now.saturating_add(PREPARE_TTL_SECS),payload_bytes as i64]))?;
+                db(conn.execute("INSERT INTO tasks(id,owner,dataset,screenshot_id,binding,state,key_blob,created,expires,prepared_until,bytes,source_revision)
+                    VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10,?11)", params![task.task_id,who.sid,task.dataset_id,
+                    screenshot_id,binding,sealed,now,task.expires_at,now.saturating_add(PREPARE_TTL_SECS),payload_bytes as i64,source_revision]))?;
                 Ok(Response::Prepared(PreparedTask { task, key }))
             }
             Request::ActivateTask {
@@ -742,6 +774,7 @@ impl Ledger {
             runtime_id: who.runtime_id.clone(),
             supported_consumers: Consumer::ALL_MASK,
             supported_storage_keys: true,
+            supported_task_revisions: true,
         })
     }
 
@@ -1136,6 +1169,7 @@ mod tests {
                 Request::PrepareTask {
                     dataset_id: dataset.into(),
                     screenshot_id: id,
+                    source_revision: 0,
                     consumers: mask,
                     payload_bytes: 40,
                 },
@@ -1158,6 +1192,109 @@ mod tests {
             )
             .unwrap();
         prepared
+    }
+
+    #[test]
+    fn a_new_source_revision_replaces_old_grants_without_replaying_retired_inputs() {
+        let (mut ledger, who, dataset) = fixture();
+        let old = prepare(&mut ledger, &who, &dataset, 7, Consumer::Clip.bit());
+        let old_lease = acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 102).unwrap();
+        let request = |source_revision| Request::PrepareTask {
+            dataset_id: dataset.clone(),
+            screenshot_id: 7,
+            source_revision,
+            consumers: Consumer::Clip.bit(),
+            payload_bytes: 40,
+        };
+        let Response::Prepared(new) = ledger
+            .handle(&who, request(1), 103, &TestProtection)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_ne!(old.task.task_id, new.task.task_id);
+        assert_eq!(new.task.source_revision, 1);
+        assert_eq!(
+            acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 104).unwrap_err(),
+            BrokerError::Retired
+        );
+        assert_eq!(
+            ledger
+                .handle(
+                    &who,
+                    Request::ReleaseLease {
+                        task_id: old.task.task_id,
+                        consumer: Consumer::Clip,
+                        lease_id: old_lease.lease_id,
+                    },
+                    104,
+                    &TestProtection
+                )
+                .unwrap_err(),
+            BrokerError::Retired
+        );
+        for revision in [0, 1] {
+            assert_eq!(
+                ledger
+                    .handle(&who, request(revision), 105, &TestProtection)
+                    .unwrap_err(),
+                BrokerError::Retired
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_revocation_denies_new_revisions_after_task_history_is_pruned() {
+        let (mut ledger, who, dataset) = fixture();
+        let old = prepare(&mut ledger, &who, &dataset, 8, Consumer::Clip.bit());
+        ledger
+            .handle(
+                &who,
+                Request::RevokeScreenshots {
+                    dataset_id: dataset.clone(),
+                    screenshot_ids: vec![8, 9],
+                },
+                102,
+                &TestProtection,
+            )
+            .unwrap();
+        assert_eq!(
+            acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 103).unwrap_err(),
+            BrokerError::Retired
+        );
+        for now in [104, 100 + 100 * DAY_SECS] {
+            ledger.maintenance(now).unwrap();
+            // Deny both replacement of an existing grant and a deleted source
+            // that never had a task. The permanent fence outlives task history.
+            for screenshot_id in [8, 9] {
+                for source_revision in [0, 1, i64::MAX] {
+                    assert_eq!(
+                        ledger
+                            .handle(
+                                &who,
+                                Request::PrepareTask {
+                                    dataset_id: dataset.clone(),
+                                    screenshot_id,
+                                    source_revision,
+                                    consumers: Consumer::Clip.bit(),
+                                    payload_bytes: 40,
+                                },
+                                now,
+                                &TestProtection,
+                            )
+                            .unwrap_err(),
+                        BrokerError::Retired
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
     pub(super) fn acquire(
         ledger: &mut Ledger,
@@ -1274,6 +1411,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds,
                         screenshot_id: 2,
+                        source_revision: 0,
                         consumers: 32,
                         payload_bytes: 100,
                     },
@@ -1543,6 +1681,7 @@ mod tests {
                 Request::PrepareTask {
                     dataset_id: ds,
                     screenshot_id: 7,
+                    source_revision: 0,
                     consumers: 1,
                     payload_bytes: 40,
                 },
@@ -1605,6 +1744,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds.clone(),
                         screenshot_id: id,
+                        source_revision: 0,
                         consumers: 1,
                         payload_bytes: 8 * 1024 * 1024,
                     },
@@ -1752,6 +1892,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds,
                         screenshot_id: 12,
+                        source_revision: 0,
                         consumers: 1,
                         payload_bytes: 40
                     },

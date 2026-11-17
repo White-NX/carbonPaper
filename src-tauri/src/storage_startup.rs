@@ -200,6 +200,10 @@ fn start_storage_services(app: &tauri::AppHandle, storage: &Arc<StorageState>) {
     tauri::async_runtime::spawn(async move {
         crate::ml_runtime::run_postprocess_retry_loop(postprocess_app).await;
     });
+    let edit_ocr_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::screenshot_editor::run_edit_ocr_loop(edit_ocr_app).await;
+    });
     let cache_storage = storage.clone();
     let cache_app = app.clone();
     tauri::async_runtime::spawn(async move {

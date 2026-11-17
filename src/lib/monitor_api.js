@@ -525,8 +525,10 @@ export const getSoftDeleteQueueStatus = async () => {
     }
 };
 
-export const getScreenshotDetails = async (id, path = null) => {
-    const key = imageRequestKey('detail', id, path);
+export const getScreenshotDetails = async (id, path = null, { fresh = false } = {}) => {
+    // Mutation events must not reuse a read started before the change. Leave
+    // fresh reads unkeyed so they also cannot replace ordinary dedupe entries.
+    const key = fresh ? null : imageRequestKey('detail', id, path);
     try {
         const response = await detailQueue.enqueue(
             () => withAuth(() => invoke('storage_get_screenshot_details', { id, path })),
@@ -542,6 +544,14 @@ export const getScreenshotDetails = async (id, path = null) => {
         return { error: e.toString() };
     }
 };
+
+export const saveEditedScreenshot = (screenshotId, expectedImageHash, imageData) => withAuth(
+    () => invoke('storage_save_edited_screenshot', { screenshotId, expectedImageHash, imageData })
+);
+
+export const retryEditedScreenshotOcr = (screenshotId, expectedImageHash) => withAuth(
+    () => invoke('storage_retry_edited_screenshot_ocr', { screenshotId, expectedImageHash })
+);
 
 export const resumeOfficeDocument = async (screenshotId) => {
     if (!screenshotId) throw new Error('A screenshot id is required');

@@ -1352,19 +1352,17 @@ impl StorageState {
     }
 
     pub fn count_smart_cluster_pending(&self) -> Result<i64, String> {
-        let guard = self.get_connection_named("count_smart_cluster_pending")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database connection is None".to_string())?;
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM smart_cluster_pending \
+        self.with_read_connection_named("count_smart_cluster_pending", |conn| {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM smart_cluster_pending \
                  WHERE queued_at >= datetime('now', '-' || ? || ' days')",
-                params![Self::SMART_CLUSTER_PENDING_TTL_DAYS],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to count pending: {}", e))?;
-        Ok(n)
+                    params![Self::SMART_CLUSTER_PENDING_TTL_DAYS],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count pending: {}", e))?;
+            Ok(n)
+        })
     }
 }
 

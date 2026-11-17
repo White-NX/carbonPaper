@@ -18,6 +18,7 @@ export function ConfirmDialog({
   loadingLabel = 'Processing…',
   allowWhenLocked = false,
   ownerOverlay = null,
+  extraAction = null,
 }) {
   const titleId = useId();
   const messageId = useId();
@@ -52,7 +53,7 @@ export function ConfirmDialog({
             {message}
           </p>
         )}
-        <div className="flex justify-end gap-2">
+        <div className="flex flex-wrap justify-end gap-2">
           <button
             type="button"
             onClick={onCancel}
@@ -75,6 +76,7 @@ export function ConfirmDialog({
           >
             {loading ? loadingLabel : confirmLabel}
           </button>
+          {extraAction}
         </div>
       </div>
     </div>, document.body
@@ -94,6 +96,7 @@ ConfirmDialog.propTypes = {
   loadingLabel: PropTypes.string,
   allowWhenLocked: PropTypes.bool,
   ownerOverlay: PropTypes.string,
+  extraAction: PropTypes.node,
 };
 
 export default ConfirmDialog;

@@ -7,6 +7,7 @@ import MainArea from './MainArea';
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n: { language: 'en' } }) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock('./InspectorImage', () => ({ InspectorImage: () => null }));
+vi.mock('./SnapshotEditor', () => ({ default: () => null }));
 vi.mock('./AdvancedSearch', () => ({ AdvancedSearch: () => null }));
 vi.mock('./SmartClustersView', () => ({ default: () => null }));
 vi.mock('./PreviewActionBar', () => ({ default: () => null }));

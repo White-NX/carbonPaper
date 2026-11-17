@@ -103,6 +103,7 @@ export function useSearchBoxController({
   const [loading, setLoading] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [thumbCache, setThumbCache] = useState({});
+  const [editRevision, setEditRevision] = useState(0);
   const [deleteQueueStatus, setDeleteQueueStatus] = useState(EMPTY_DELETE_QUEUE_STATUS);
   const [deleteQueuePeak, setDeleteQueuePeak] = useState(0);
   const [smartClusterQueueStatus, setSmartClusterQueueStatus] = useState(EMPTY_CLUSTER_QUEUE_STATUS);
@@ -119,6 +120,21 @@ export function useSearchBoxController({
   const wasPausedRef = useRef(null);
   const handleResumeMonitorRef = useRef(handleResumeMonitor);
   const isMigrating = useHmacMigrationStatus();
+
+  useEffect(() => {
+    let disposed = false;
+    const changed = (event) => {
+      if (disposed || !event.payload?.screenshot_id) return;
+      searchQueue.cancel();
+      setResults((previous) => previous.filter((item) => item.screenshot_id !== event.payload.screenshot_id));
+      setEditRevision((previous) => previous + 1);
+    };
+    const subscriptions = Promise.all([
+      listen('screenshot-edited', changed),
+      listen('screenshot-ocr-updated', (event) => { if (event.payload?.status === 'completed') changed(event); }),
+    ]);
+    return () => { disposed = true; subscriptions.then((unlisten) => unlisten.forEach((dispose) => dispose())); };
+  }, [searchQueue]);
 
   useEffect(() => {
     if (query.trim() !== submittedQueryRef.current) submittedQueryRef.current = null;
@@ -174,7 +190,7 @@ export function useSearchBoxController({
       active = false;
       searchQueue.cancel();
     };
-  }, [debouncedQuery, query, disabled, searchQueue]);
+  }, [debouncedQuery, query, disabled, editRevision, searchQueue]);
 
   useEffect(() => {
     if (!results.length || disabled) {
@@ -216,6 +232,7 @@ export function useSearchBoxController({
 
   useEffect(() => {
     let cancelled = false;
+    let timer;
     const loadQueueStatus = async () => {
       try {
         const status = await getSoftDeleteQueueStatus();
@@ -226,19 +243,21 @@ export function useSearchBoxController({
         if (!cancelled) {
           setDeleteQueueStatus(EMPTY_DELETE_QUEUE_STATUS);
         }
+      } finally {
+        if (!cancelled) timer = setTimeout(loadQueueStatus, 4000);
       }
     };
 
     loadQueueStatus();
-    const timer = setInterval(loadQueueStatus, 4000);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
+    let timer;
     const loadClusterStatus = async () => {
       try {
         const config = await invoke('get_advanced_config');
@@ -255,14 +274,15 @@ export function useSearchBoxController({
         if (!cancelled) {
           setSmartClusterQueueStatus(EMPTY_CLUSTER_QUEUE_STATUS);
         }
+      } finally {
+        if (!cancelled) timer = setTimeout(loadClusterStatus, 4000);
       }
     };
 
     loadClusterStatus();
-    const timer = setInterval(loadClusterStatus, 4000);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
   }, []);
 

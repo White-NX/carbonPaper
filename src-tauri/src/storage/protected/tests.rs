@@ -38,6 +38,7 @@ impl crate::processing_stage::Broker for GatedPublicationBroker {
                     runtime_id: "test-runtime".into(),
                     supported_consumers: 0x1f,
                     supported_storage_keys: true,
+                    supported_task_revisions: false,
                 }))
             }
             Request::AttachDataset { .. } => Ok(Response::Ok),
