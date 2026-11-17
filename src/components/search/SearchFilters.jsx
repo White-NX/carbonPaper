@@ -116,7 +116,7 @@ export function TimeRangeChip({ preset, startDate, endDate, onChange }) {
       active={isActive}
       panelClassName="min-w-[310px]"
     >
-      {({ close }) => (
+      {({ close, panelRef }) => (
         <>
           {presetOptions.map((option) => (
             <button
@@ -143,6 +143,7 @@ export function TimeRangeChip({ preset, startDate, endDate, onChange }) {
             <div className="flex items-center gap-2 text-[11px] text-ide-muted">
               <span className="w-8 shrink-0">{t('advancedSearch.range.start')}</span>
               <DateTimePicker
+                anchorRef={panelRef}
                 label={t('advancedSearch.range.start')}
                 value={startDate}
                 max={endDate}
@@ -153,6 +154,7 @@ export function TimeRangeChip({ preset, startDate, endDate, onChange }) {
             <div className="flex items-center gap-2 text-[11px] text-ide-muted">
               <span className="w-8 shrink-0">{t('advancedSearch.range.end')}</span>
               <DateTimePicker
+                anchorRef={panelRef}
                 label={t('advancedSearch.range.end')}
                 value={endDate}
                 min={startDate}

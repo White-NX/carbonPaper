@@ -731,10 +731,11 @@ describe('AdvancedSearch', () => {
       fireEvent.click(screen.getByRole('button', { name: label }));
       const picker = within(screen.getByRole('dialog', { name: label }));
       fireEvent.change(picker.getByRole('spinbutton', { name: 'dateTimePicker.year' }), { target: { value: '2026' } });
-      fireEvent.change(picker.getByRole('combobox', { name: 'dateTimePicker.month' }), { target: { value: '0' } });
+      fireEvent.click(picker.getByRole('button', { name: 'dateTimePicker.month' }));
+      fireEvent.click(picker.getByRole('menuitemradio', { name: new Intl.DateTimeFormat(undefined, { month: 'long' }).format(new Date('2026-01-02T12:00')) }));
       fireEvent.click(picker.getByRole('gridcell', { name: new Intl.DateTimeFormat(undefined, { dateStyle: 'full' }).format(new Date('2026-01-02T12:00')) }));
-      fireEvent.change(picker.getByRole('spinbutton', { name: 'dateTimePicker.hour' }), { target: { value: hour } });
-      fireEvent.change(picker.getByRole('spinbutton', { name: 'dateTimePicker.minute' }), { target: { value: minute } });
+      fireEvent.click(within(picker.getByRole('listbox', { name: 'dateTimePicker.hour' })).getByRole('option', { name: hour }));
+      fireEvent.click(within(picker.getByRole('listbox', { name: 'dateTimePicker.minute' })).getByRole('option', { name: minute }));
       fireEvent.click(picker.getByRole('button', { name: 'dateTimePicker.confirm' }));
     };
     pickTime('advancedSearch.range.start', '03', '04');
