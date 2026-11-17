@@ -10,7 +10,7 @@ import { ChevronDown } from 'lucide-react';
  * @param {boolean} [props.active] 是否有生效的筛选条件
  * @param {boolean} [props.disabled] 禁用状态
  * @param {string} [props.panelClassName] 下拉面板的附加类名，用来控制宽度
- * @param {React.ReactNode | ((api: { close: () => void }) => React.ReactNode)} props.children
+ * @param {React.ReactNode | ((api: { close: () => void, panelRef: React.RefObject<HTMLDivElement> }) => React.ReactNode)} props.children
  *   下拉面板内容，传函数可以拿到关闭面板的方法
  */
 export function FilterChip({
@@ -24,6 +24,7 @@ export function FilterChip({
 }) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef(null);
+  const panelRef = useRef(null);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -71,10 +72,11 @@ export function FilterChip({
 
       {open && (
         <div
+          ref={panelRef}
           data-testid="filter-panel"
           className={`absolute left-0 top-full z-30 mt-1.5 rounded-lg border border-ide-border bg-ide-panel p-1.5 shadow-xl ${panelClassName}`}
         >
-          {typeof children === 'function' ? children({ close: () => setOpen(false) }) : children}
+          {typeof children === 'function' ? children({ close: () => setOpen(false), panelRef }) : children}
         </div>
       )}
     </div>

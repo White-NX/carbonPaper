@@ -36,7 +36,7 @@ use super::search_plan::QueryPlan;
 use super::search_rank;
 use super::{
     connection::IndependentReadConnection, wire_time, BackgroundReadError, SearchMatchEvidence,
-    SearchResult, StorageState,
+    SearchResult, SearchSortOrder, StorageState,
 };
 
 type SearchSqlParam = Box<dyn ToSql>;
@@ -438,6 +438,32 @@ struct Scored {
     score: f64,
 }
 
+fn sort_scored_newest(rows: &mut [Scored]) {
+    rows.sort_by(|a, b| {
+        b.screenshot_ts
+            .cmp(&a.screenshot_ts)
+            .then_with(|| a.screenshot_id.cmp(&b.screenshot_id))
+            .then_with(|| b.score.total_cmp(&a.score))
+            .then_with(|| a.ocr_id.cmp(&b.ocr_id))
+    });
+}
+
+fn finalize_scored_order(
+    rows: &mut Vec<Scored>,
+    distinct_keywords: bool,
+    sort_order: SearchSortOrder,
+) {
+    // Chronological result caps count captures rather than their OCR blocks.
+    // The incoming relevance order keeps the strongest representative first.
+    if distinct_keywords || sort_order == SearchSortOrder::Newest {
+        let mut seen = HashSet::new();
+        rows.retain(|row| seen.insert(row.screenshot_id));
+    }
+    if sort_order == SearchSortOrder::Newest {
+        sort_scored_newest(rows);
+    }
+}
+
 /// The ordered result of a text search, kept just long enough for the next
 /// page to arrive.
 ///
@@ -472,6 +498,7 @@ fn order_cache_key(
     categories: Option<&[String]>,
     start_time: Option<f64>,
     end_time: Option<f64>,
+    sort_order: SearchSortOrder,
 ) -> String {
     fn joined(values: Option<&[String]>) -> String {
         let mut values: Vec<&str> = values.unwrap_or(&[]).iter().map(String::as_str).collect();
@@ -482,7 +509,7 @@ fn order_cache_key(
     // Unit separators keep a process named like the query from colliding with
     // it once everything is one string.
     format!(
-        "{fuzzy}\u{1f}{query}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}",
+        "{sort_order:?}\u{1f}{fuzzy}\u{1f}{query}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}",
         joined(process_names),
         joined(categories),
         start_time,
@@ -886,6 +913,32 @@ impl StorageState {
         end_time: Option<f64>,
         categories: Option<Vec<String>>,
     ) -> Result<(Vec<SearchResult>, bool), String> {
+        self.search_text_ordered_with_coverage(
+            query,
+            limit,
+            offset,
+            fuzzy,
+            process_names,
+            start_time,
+            end_time,
+            categories,
+            SearchSortOrder::Relevance,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_text_ordered_with_coverage(
+        &self,
+        query: &str,
+        limit: i32,
+        offset: i32,
+        fuzzy: bool,
+        process_names: Option<Vec<String>>,
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        categories: Option<Vec<String>>,
+        sort_order: SearchSortOrder,
+    ) -> Result<(Vec<SearchResult>, bool), String> {
         let mut telemetry = SearchTelemetry::new();
         let mut watch = Stopwatch::start();
 
@@ -940,6 +993,7 @@ impl StorageState {
             categories.as_deref(),
             start_time,
             end_time,
+            sort_order,
         );
         let reset_generation = self
             .semantic_cache_reset_generation
@@ -1041,6 +1095,7 @@ impl StorageState {
             data_version,
             reset_generation,
             complete,
+            sort_order,
             &mut telemetry,
             &mut watch,
         )?;
@@ -1078,6 +1133,7 @@ impl StorageState {
         data_version: i64,
         reset_generation: u64,
         complete: bool,
+        sort_order: SearchSortOrder,
         telemetry: &mut SearchTelemetry,
         watch: &mut Stopwatch,
     ) -> Result<Vec<SearchResult>, String> {
@@ -1170,15 +1226,7 @@ impl StorageState {
         tolerated.sort_by(by_score);
         scored.append(&mut tolerated);
 
-        // A multi-word search reports captures, not text blocks — the words
-        // may well be spread across several. Keeping the first occurrence of
-        // each screenshot after sorting makes the representative the block
-        // that ranked best, where it used to be whichever block happened to
-        // have the largest row id.
-        if plan.has_distinct_keyword_pass() {
-            let mut seen: HashSet<i64> = HashSet::new();
-            scored.retain(|row| seen.insert(row.screenshot_id));
-        }
+        finalize_scored_order(&mut scored, plan.has_distinct_keyword_pass(), sort_order);
         telemetry.counts.kept = scored.len();
 
         let ordered: Vec<i64> = scored.iter().map(|row| row.ocr_id).collect();
@@ -2310,8 +2358,24 @@ mod tests {
 
     #[test]
     fn the_cache_key_separates_queries_from_their_filters() {
-        let query = order_cache_key("code.exe", true, None, None, None, None);
-        let filter = order_cache_key("", true, Some(&["code.exe".to_string()]), None, None, None);
+        let query = order_cache_key(
+            "code.exe",
+            true,
+            None,
+            None,
+            None,
+            None,
+            SearchSortOrder::Relevance,
+        );
+        let filter = order_cache_key(
+            "",
+            true,
+            Some(&["code.exe".to_string()]),
+            None,
+            None,
+            None,
+            SearchSortOrder::Relevance,
+        );
         assert_ne!(query, filter);
 
         // Filter order is not part of the query's identity.
@@ -2322,6 +2386,7 @@ mod tests {
             None,
             None,
             None,
+            SearchSortOrder::Relevance,
         );
         let other = order_cache_key(
             "x",
@@ -2330,12 +2395,110 @@ mod tests {
             None,
             None,
             None,
+            SearchSortOrder::Relevance,
         );
         assert_eq!(one, other);
 
         assert_ne!(
-            order_cache_key("x", true, None, None, None, None),
-            order_cache_key("x", false, None, None, None, None)
+            order_cache_key(
+                "x",
+                true,
+                None,
+                None,
+                None,
+                None,
+                SearchSortOrder::Relevance
+            ),
+            order_cache_key(
+                "x",
+                false,
+                None,
+                None,
+                None,
+                None,
+                SearchSortOrder::Relevance
+            )
+        );
+        assert_ne!(
+            order_cache_key(
+                "x",
+                true,
+                None,
+                None,
+                None,
+                None,
+                SearchSortOrder::Relevance
+            ),
+            order_cache_key("x", true, None, None, None, None, SearchSortOrder::Newest)
+        );
+    }
+
+    #[test]
+    fn newest_order_uses_capture_time_and_keeps_the_best_text_block_first() {
+        let mut rows = vec![
+            Scored {
+                ocr_id: 900,
+                screenshot_id: 1,
+                screenshot_ts: Some(100),
+                score: 2000.0,
+            },
+            Scored {
+                ocr_id: 4,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 500.0,
+            },
+            Scored {
+                ocr_id: 5,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 1000.0,
+            },
+            Scored {
+                ocr_id: 1000,
+                screenshot_id: 3,
+                screenshot_ts: None,
+                score: 3000.0,
+            },
+        ];
+        sort_scored_newest(&mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.ocr_id).collect::<Vec<_>>(),
+            vec![5, 4, 900, 1000]
+        );
+    }
+
+    #[test]
+    fn newest_single_keyword_results_count_captures_without_changing_relevance_pages() {
+        let mut rows = vec![
+            Scored {
+                ocr_id: 900,
+                screenshot_id: 1,
+                screenshot_ts: Some(100),
+                score: 2000.0,
+            },
+            Scored {
+                ocr_id: 5,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 1000.0,
+            },
+            Scored {
+                ocr_id: 4,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 500.0,
+            },
+        ];
+        finalize_scored_order(&mut rows, false, SearchSortOrder::Relevance);
+        assert_eq!(
+            rows.iter().map(|row| row.ocr_id).collect::<Vec<_>>(),
+            vec![900, 5, 4]
+        );
+        finalize_scored_order(&mut rows, false, SearchSortOrder::Newest);
+        assert_eq!(
+            rows.iter().map(|row| row.ocr_id).collect::<Vec<_>>(),
+            vec![5, 900]
         );
     }
 }

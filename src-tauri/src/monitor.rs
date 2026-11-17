@@ -310,6 +310,7 @@ pub async fn monitor_search_nl(
     end_time: Option<f64>,
     _fuzzy: Option<bool>,
     include_ocr: Option<bool>,
+    sort_order: Option<crate::storage::SearchSortOrder>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let process_names = process_names.unwrap_or_default();
@@ -328,6 +329,7 @@ pub async fn monitor_search_nl(
             end_time,
         )
         .with_ocr(include_ocr.unwrap_or(true))
+        .with_sort_order(sort_order.unwrap_or_default())
         .with_categories(&categories),
     )
     .await?;

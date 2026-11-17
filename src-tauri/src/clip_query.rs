@@ -7,7 +7,9 @@ use crate::clip_contract::{
 };
 use crate::ml_protocol::MlSemanticModel;
 use crate::semantic_runtime::SemanticRuntimeState;
-use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, ScoredSubject, StorageState};
+use crate::storage::{
+    BackgroundScreenshotSummary, DerivedIndexKind, ScoredSubject, SearchSortOrder, StorageState,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,6 +243,7 @@ pub struct ClipQueryRequest<'a> {
     start_time: Option<f64>,
     end_time: Option<f64>,
     include_ocr: bool,
+    sort_order: SearchSortOrder,
 }
 
 impl<'a> ClipQueryRequest<'a> {
@@ -261,6 +264,7 @@ impl<'a> ClipQueryRequest<'a> {
             start_time,
             end_time,
             include_ocr: true,
+            sort_order: SearchSortOrder::Relevance,
         }
     }
 
@@ -273,6 +277,11 @@ impl<'a> ClipQueryRequest<'a> {
 
     pub(crate) fn with_categories(mut self, categories: &'a [String]) -> Self {
         self.categories = categories;
+        self
+    }
+
+    pub(crate) fn with_sort_order(mut self, sort_order: SearchSortOrder) -> Self {
+        self.sort_order = sort_order;
         self
     }
 }
@@ -442,6 +451,7 @@ async fn run_rust_clip_query(
     let start_time = request.start_time;
     let end_time = request.end_time;
     let include_ocr = request.include_ocr;
+    let sort_order = request.sort_order;
 
     // Keep synchronous database/CNG work off the async runtime. Decrypt OCR after pagination.
     diagnostics.begin("queued");
@@ -471,59 +481,91 @@ async fn run_rust_clip_query(
                 None
             }
         };
-        let mut candidate_filter =
-            ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline)
-                .with_categories(&categories);
-        let filtered = search_candidates(
-            fetch,
-            target,
+        let mut candidate_filter = ClipCandidateFilter::new(
+            if sort_order == SearchSortOrder::Newest {
+                usize::MAX
+            } else {
+                target
+            },
+            &process_names,
+            start_time,
+            end_time,
             deadline,
-            |requested| {
-                app_ann_query(
-                    &ann_state,
+        )
+        .with_categories(&categories);
+        let filter_candidates = |scored| {
+            let filtered = candidate_filter.filter(scored, |hashes| {
+                query_stage(&scan_diagnostics, "candidate_metadata", || {
+                    if process_names.is_empty() && categories.is_empty() {
+                        scan_storage.clip_candidate_metadata(hashes, deadline)
+                    } else {
+                        load_candidate_summaries(&scan_storage, hashes, deadline)
+                    }
+                })
+            })?;
+            scan_diagnostics.filtered(filtered.len());
+            Ok(filtered)
+        };
+        // A similarity prefix cannot establish chronological pages: a newer
+        // qualifying image may rank below that prefix. Score the visible set
+        // for this explicit ordering and resolve only metadata before paging.
+        let filtered = if sort_order == SearchSortOrder::Newest {
+            let count = query_stage(&scan_diagnostics, "chronological_count", || {
+                scan_storage.count_query_visible_embeddings(DerivedIndexKind::ClipImage)
+            })?;
+            let count = usize::try_from(count).map_err(|_| "clip_index_too_large".to_string())?;
+            let scored = query_stage(&scan_diagnostics, "exact", || {
+                app_exact_query(
                     ann_snapshot.as_ref(),
                     &scan_storage,
                     &query_vec,
-                    requested,
+                    count,
                     deadline,
                     &scan_diagnostics,
                 )
-            },
-            |scored| {
-                let filtered = candidate_filter.filter(scored, |hashes| {
-                    query_stage(&scan_diagnostics, "candidate_metadata", || {
-                        if process_names.is_empty() && categories.is_empty() {
-                            scan_storage.clip_candidate_metadata(hashes, deadline)
-                        } else {
-                            load_candidate_summaries(&scan_storage, hashes, deadline)
-                        }
-                    })
-                })?;
-                scan_diagnostics.filtered(filtered.len());
-                Ok(filtered)
-            },
-            || {
-                scan_diagnostics.fallback_if_unset(
-                    if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
-                        "deep_pagination"
-                    } else {
-                        "filtered_candidates_insufficient"
-                    },
-                );
-                query_stage(&scan_diagnostics, "exact", || {
-                    app_exact_query(
+            })?;
+            let mut filter_candidates = filter_candidates;
+            filter_candidates(scored)?
+        } else {
+            search_candidates(
+                fetch,
+                target,
+                deadline,
+                |requested| {
+                    app_ann_query(
+                        &ann_state,
                         ann_snapshot.as_ref(),
                         &scan_storage,
                         &query_vec,
-                        fetch,
+                        requested,
                         deadline,
                         &scan_diagnostics,
                     )
-                })
-            },
-        )?;
+                },
+                filter_candidates,
+                || {
+                    scan_diagnostics.fallback_if_unset(
+                        if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
+                            "deep_pagination"
+                        } else {
+                            "filtered_candidates_insufficient"
+                        },
+                    );
+                    query_stage(&scan_diagnostics, "exact", || {
+                        app_exact_query(
+                            ann_snapshot.as_ref(),
+                            &scan_storage,
+                            &query_vec,
+                            fetch,
+                            deadline,
+                            &scan_diagnostics,
+                        )
+                    })
+                },
+            )?
+        };
         scan_diagnostics.filtered(filtered.len());
-        let page = paginate(filtered, offset, limit);
+        let page = paginate_clip_hits(filtered, offset, limit, sort_order);
         let page = resolve_page_metadata(page, |ids| {
             query_stage(&scan_diagnostics, "metadata", || {
                 scan_storage
@@ -1016,6 +1058,25 @@ fn paginate<T>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     rows.into_iter().skip(offset).take(limit).collect()
 }
 
+fn paginate_clip_hits(
+    mut rows: Vec<ClipHit>,
+    offset: usize,
+    limit: usize,
+    sort_order: SearchSortOrder,
+) -> Vec<ClipHit> {
+    if sort_order == SearchSortOrder::Newest {
+        rows.sort_by(|a, b| {
+            b.summary
+                .timestamp
+                .filter(|time| *time > 0)
+                .cmp(&a.summary.timestamp.filter(|time| *time > 0))
+                .then_with(|| a.summary.id.cmp(&b.summary.id))
+                .then_with(|| a.subject.subject_key.cmp(&b.subject.subject_key))
+        });
+    }
+    paginate(rows, offset, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,6 +1176,68 @@ mod tests {
             assert_eq!(rows[0]["ocr_text"], format!("ocr-{}", offset + 1));
             assert_eq!(rows[0]["metadata"]["screenshot_id"], (offset + 1) as i64);
         }
+    }
+
+    #[test]
+    fn newest_visual_pages_include_weaker_recent_matches_and_only_hydrate_page_text() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let page = |offset| {
+            let mut filter = ClipCandidateFilter::new(usize::MAX, &[], None, None, deadline);
+            let mut candidates = scored(400);
+            for (index, subject) in candidates.iter_mut().enumerate() {
+                subject.score = 1.0 - index as f32 / 1000.0;
+            }
+            candidates.push(ScoredSubject {
+                subject_key: "below-floor".into(),
+                score: 0.31,
+            });
+            let hits = filter
+                .filter(candidates, |keys| {
+                    assert!(!keys.iter().any(|key| key == "below-floor"));
+                    Ok(keys
+                        .iter()
+                        .map(|key| (key.clone(), summary_for_key(key)))
+                        .collect())
+                })
+                .unwrap();
+            let page = paginate_clip_hits(hits, offset, 10, SearchSortOrder::Newest);
+            hydrate_page(page, 0, 10, deadline, |ids| {
+                assert_eq!(ids.len(), 10);
+                Ok(HashMap::new())
+            })
+            .unwrap()
+        };
+        let ids = |rows: Vec<serde_json::Value>| {
+            rows.into_iter()
+                .map(|row| row["metadata"]["screenshot_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(page(0)), (391..=400).rev().collect::<Vec<_>>());
+        assert_eq!(ids(page(10)), (381..=390).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn newest_visual_ties_are_stable_and_unknown_times_stay_at_the_end() {
+        let mut rows: Vec<_> = [
+            (3, None),
+            (2, Some(100.0)),
+            (1, Some(100.0)),
+            (4, Some(0.0)),
+        ]
+        .into_iter()
+        .map(|(id, time)| {
+            let mut row = hit("code.exe", time);
+            row.summary.id = id;
+            row
+        })
+        .collect();
+        rows = paginate_clip_hits(rows, 0, 4, SearchSortOrder::Newest);
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| row.summary.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]

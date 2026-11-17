@@ -1,7 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { RequestQueue } from './monitor_api';
+import { invoke } from '@tauri-apps/api/core';
+import { RequestQueue, searchScreenshots } from './monitor_api';
+
+vi.mock('./auth_api', async (importOriginal) => ({
+  ...await importOriginal(),
+  withAuth: vi.fn((action) => action()),
+}));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe('visual search ordering', () => {
+  it('passes newest ordering through the authenticated Tauri command when loading another page', async () => {
+    invoke.mockResolvedValueOnce({ results: [] });
+    await searchScreenshots('notes', 'nl', { sortOrder: 'newest', offset: 50, limit: 50, includeOcr: false });
+    expect(invoke).toHaveBeenLastCalledWith('monitor_search_nl', expect.objectContaining({
+      query: 'notes', sortOrder: 'newest', offset: 50, limit: 50, includeOcr: false,
+    }));
+  });
+});
 
 describe('RequestQueue', () => {
   afterEach(() => {

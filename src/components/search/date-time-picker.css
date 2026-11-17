@@ -1,0 +1,52 @@
+.date-time-picker-year {
+  appearance: textfield;
+}
+
+.date-time-picker-year::-webkit-inner-spin-button,
+.date-time-picker-year::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+.date-time-month-options {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ide-border) transparent;
+}
+
+.date-time-month-options::-webkit-scrollbar {
+  width: 4px;
+}
+
+.date-time-month-options::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.date-time-month-options::-webkit-scrollbar-thumb {
+  border: 0;
+  border-radius: 999px;
+  background: var(--ide-border);
+}
+
+.date-time-wheel {
+  --wheel-height: 236px;
+  --wheel-row-height: 32px;
+  height: var(--wheel-height);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-block: calc((var(--wheel-height) - var(--wheel-row-height)) / 2);
+  scroll-snap-type: y mandatory;
+  scrollbar-width: none;
+  touch-action: pan-y;
+  mask-image: linear-gradient(transparent, black 20%, black 80%, transparent);
+}
+
+.date-time-wheel::-webkit-scrollbar {
+  display: none;
+}
+
+.date-time-wheel-option {
+  height: var(--wheel-row-height);
+  scroll-snap-align: center;
+  flex-shrink: 0;
+}
