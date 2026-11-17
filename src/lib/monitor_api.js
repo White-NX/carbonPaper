@@ -392,6 +392,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
         startTime = null,
         endTime = null,
         includeOcr = true,
+        sortOrder = 'relevance',
         fuzzy = true
     } = options || {};
     
@@ -409,6 +410,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
                 endTime,
                 fuzzy,
                 ...(includeOcr === false ? { includeOcr: false } : {}),
+                ...(sortOrder !== 'relevance' ? { sortOrder } : {}),
             });
             throwIfSearchAborted(options.signal);
             if (response.error) {

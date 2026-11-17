@@ -1317,6 +1317,21 @@
       }
     }
   },
+  "dateTimePicker": {
+    "select": "Choose date and time",
+    "calendar": "Calendar",
+    "previousMonth": "Previous month",
+    "nextMonth": "Next month",
+    "year": "Year",
+    "month": "Month",
+    "hour": "Hour",
+    "minute": "Minute",
+    "today": "Today",
+    "clear": "Clear",
+    "confirm": "OK",
+    "invalidTime": "Enter a valid hour and minute.",
+    "outOfRange": "Choose a time within the allowed range."
+  },
   "common": {
     "cancel": "Cancel",
     "confirm": "Confirm",
@@ -1665,7 +1680,13 @@
       "custom": "Custom",
       "custom_active": "Custom range",
       "start": "Start",
-      "end": "End"
+      "end": "End",
+      "invalid": "Start time must be before or equal to end time."
+    },
+    "sort": {
+      "label": "Sort results",
+      "relevance": "By relevance",
+      "newest": "Newest first"
     },
     "stats": {
       "loaded": "{{count}} results loaded",

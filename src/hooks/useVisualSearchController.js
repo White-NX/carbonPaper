@@ -25,14 +25,14 @@ function normalizeResult(item) {
 
 /** Visual retrieval updates independently from the text and recap channels. */
 export function useVisualSearchController({ active, query, debouncedQuery, processNames,
-  categories, startTime, endTime, refreshKey, sharedThumbnails = EMPTY_THUMBNAILS }) {
+  categories, startTime, endTime, refreshKey, sortOrder = 'relevance', sharedThumbnails = EMPTY_THUMBNAILS }) {
   const [retryRevision, setRetryRevision] = useState(0);
   const queue = useMemo(() => createLatestTaskQueue(), []);
   const generation = useRef(0);
   const pageRequest = useRef(null);
   const normalized = query.trim();
   const ready = active && Boolean(normalized) && normalized === debouncedQuery.trim();
-  const searchKey = JSON.stringify([normalized, processNames, categories, startTime, endTime, refreshKey]);
+  const searchKey = JSON.stringify([normalized, processNames, categories, startTime, endTime, refreshKey, sortOrder]);
   const key = JSON.stringify([searchKey, retryRevision]);
   const [state, setState] = useState(() => emptyState(key));
   const [indexReady, setIndexReady] = useState(null);
@@ -49,7 +49,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
     setState(emptyState(key, 'loading'));
     const limit = VISUAL_SEARCH_SUMMARY_SIZE;
     queue.run(`${key}:0:${limit}`, (signal) => searchScreenshots(normalized, 'nl', {
-      limit, offset: 0, processNames, categories, startTime, endTime, fuzzy: false, includeOcr: false, signal,
+      limit, offset: 0, processNames, categories, startTime, endTime, sortOrder, fuzzy: false, includeOcr: false, signal,
     })).then((items) => {
       if (generation.current !== version) return;
       setState({ ...emptyState(key, 'ready'), results: items.map(normalizeResult),
@@ -60,7 +60,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
       }
     });
     return () => { generation.current += 1; queue.cancel(); };
-  }, [active, ready, key, normalized, processNames, categories, startTime, endTime, queue]);
+  }, [active, ready, key, normalized, processNames, categories, startTime, endTime, sortOrder, queue]);
 
   usePolling(async () => {
     const version = generation.current;
@@ -78,7 +78,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
     setState((previous) => ({ ...previous, loadingMore: true, pageError: false, pageErrorMessage: null }));
     try {
       const items = await queue.run(pageKey, (signal) => searchScreenshots(normalized, 'nl', {
-        limit, offset, processNames, categories, startTime, endTime,
+        limit, offset, processNames, categories, startTime, endTime, sortOrder,
         fuzzy: false, includeOcr: false, signal,
       }));
       if (generation.current !== version) return;
@@ -100,7 +100,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
       if (pageRequest.current === pageKey) pageRequest.current = null;
     }
   }, [ready, current.phase, current.hasMore, current.loadingMore, current.offset, key, normalized,
-    processNames, categories, startTime, endTime, queue]);
+    processNames, categories, startTime, endTime, sortOrder, queue]);
 
   const loadMore = useCallback(() => loadPage(VISUAL_SEARCH_SUMMARY_SIZE), [loadPage]);
   // Establish a full first gallery page before continuing from its raw offset.

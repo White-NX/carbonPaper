@@ -1,8 +1,32 @@
 import React from 'react';
-import { CalendarRange, Filter, Tag, Layers, Sparkles } from 'lucide-react';
+import { CalendarRange, Filter, Tag, Layers, Sparkles, ArrowDownWideNarrow } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS } from '../../lib/categories';
 import { FilterChip, ChipPanelHeading } from './FilterChip';
+import { DateTimePicker } from './DateTimePicker';
+
+export function SearchSortChip({ value, onChange }) {
+  const { t } = useTranslation();
+  const options = [
+    { value: 'relevance', label: t('advancedSearch.sort.relevance') },
+    { value: 'newest', label: t('advancedSearch.sort.newest') },
+  ];
+  return <FilterChip icon={<ArrowDownWideNarrow className="h-3.5 w-3.5" />}
+    label={t(value === 'newest' ? 'advancedSearch.sort.newest' : 'advancedSearch.sort.relevance')}
+    title={t('advancedSearch.sort.label')} active={value !== 'relevance'} panelClassName="min-w-[180px]">
+    {({ close }) => <>
+      <ChipPanelHeading>{t('advancedSearch.sort.label')}</ChipPanelHeading>
+      <div role="radiogroup" aria-label={t('advancedSearch.sort.label')}>
+        {options.map((option) => <button key={option.value} type="button" role="radio"
+          aria-checked={value === option.value} onClick={() => { onChange(option.value); close(); }}
+          className={'flex w-full items-center justify-between gap-3 rounded px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-ide-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 '
+            + (value === option.value ? 'bg-ide-accent/10 text-ide-accent' : 'text-ide-text')}>
+          <span>{option.label}</span>{value === option.value && <span aria-hidden="true">✓</span>}
+        </button>)}
+      </div>
+    </>}
+  </FilterChip>;
+}
 
 export function SearchTargetChip({ value, onChange }) {
   const { t } = useTranslation();
@@ -90,7 +114,7 @@ export function TimeRangeChip({ preset, startDate, endDate, onChange }) {
       icon={<CalendarRange className="h-3.5 w-3.5" />}
       label={isActive ? activeLabel : t('advancedSearch.range.label')}
       active={isActive}
-      panelClassName="min-w-[260px]"
+      panelClassName="min-w-[310px]"
     >
       {({ close }) => (
         <>
@@ -116,24 +140,26 @@ export function TimeRangeChip({ preset, startDate, endDate, onChange }) {
 
           <ChipPanelHeading>{t('advancedSearch.range.custom')}</ChipPanelHeading>
           <div className="flex flex-col gap-1.5 px-1 pb-1">
-            <label className="flex items-center gap-2 text-[11px] text-ide-muted">
+            <div className="flex items-center gap-2 text-[11px] text-ide-muted">
               <span className="w-8 shrink-0">{t('advancedSearch.range.start')}</span>
-              <input
-                type="datetime-local"
+              <DateTimePicker
+                label={t('advancedSearch.range.start')}
                 value={startDate}
-                onChange={(event) => onChange('custom', event.target.value, endDate)}
-                className="flex-1 rounded border border-ide-border bg-ide-bg px-2 py-1 text-xs text-ide-text focus:border-ide-accent focus:outline-none"
+                max={endDate}
+                invalidMessage={t('advancedSearch.range.invalid')}
+                onChange={(value) => onChange('custom', value, endDate)}
               />
-            </label>
-            <label className="flex items-center gap-2 text-[11px] text-ide-muted">
+            </div>
+            <div className="flex items-center gap-2 text-[11px] text-ide-muted">
               <span className="w-8 shrink-0">{t('advancedSearch.range.end')}</span>
-              <input
-                type="datetime-local"
+              <DateTimePicker
+                label={t('advancedSearch.range.end')}
                 value={endDate}
-                onChange={(event) => onChange('custom', startDate, event.target.value)}
-                className="flex-1 rounded border border-ide-border bg-ide-bg px-2 py-1 text-xs text-ide-text focus:border-ide-accent focus:outline-none"
+                min={startDate}
+                invalidMessage={t('advancedSearch.range.invalid')}
+                onChange={(value) => onChange('custom', startDate, value)}
               />
-            </label>
+            </div>
           </div>
         </>
       )}

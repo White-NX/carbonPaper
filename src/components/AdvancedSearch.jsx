@@ -2,7 +2,7 @@ import React from 'react';
 import { Search, X, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SearchModeTabs } from './search/SearchModeTabs';
-import { TimeRangeChip, ProcessChip, CategoryChip, SearchTargetChip, RecapSemanticToggle } from './search/SearchFilters';
+import { TimeRangeChip, ProcessChip, CategoryChip, SearchTargetChip, RecapSemanticToggle, SearchSortChip } from './search/SearchFilters';
 import { SearchStatsBar } from './search/SearchStatsBar';
 import { SearchResultRow } from './search/SearchResultRow';
 import { SearchLanding, SearchNoResults } from './search/SearchLanding';
@@ -91,6 +91,8 @@ export function AdvancedSearch({
     semanticStatus,
     searchTarget,
     setSearchTarget,
+    sortOrder,
+    setSortOrder,
     recapSemantic,
     setRecapSemantic,
     useRecapSemantic,
@@ -110,7 +112,7 @@ export function AdvancedSearch({
   const visual = useVisualSearchController({
     active: active && isAuthenticated && !aiMode && showVisual,
     query, debouncedQuery, processNames: selectedProcesses, categories: selectedCategories,
-    startTime: visualStartTime, endTime: visualEndTime, refreshKey,
+    startTime: visualStartTime, endTime: visualEndTime, refreshKey, sortOrder,
     sharedThumbnails: thumbnailCache,
   });
   const [gallerySearchKey, setGallerySearchKey] = React.useState(null);
@@ -367,6 +369,7 @@ export function AdvancedSearch({
                   onChange={setSelectedCategories}
                 />
               )}
+              <SearchSortChip value={sortOrder} onChange={setSortOrder} />
               {hasFilters && (
                 <button
                   type="button"

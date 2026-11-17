@@ -175,6 +175,34 @@ describe('AdvancedSearch', () => {
     expect(screen.getAllByRole('button', { name: /Recall the design decision/ })).toHaveLength(2);
   });
 
+  it('discards a late page on sort changes and restarts both channels with the selected order', async () => {
+    let finishOldPage;
+    searchSnapshotsAndRecaps.mockImplementation((_query, options) => {
+      if (options.offset && options.sortOrder === 'relevance') return new Promise((resolve) => { finishOldPage = resolve; });
+      const start = options.sortOrder === 'newest' ? 101 : 1;
+      const snapshots = options.offset ? [makeOcrResult(141)] : Array.from({ length: 40 }, (_, index) => makeOcrResult(start + index));
+      return Promise.resolve({ ...response(snapshots, options.offset || 0), offset: options.offset || 0, ranking_revision: 'b'.repeat(64) });
+    });
+    render(<AdvancedSearch active searchParams={{ query: 'design' }} />);
+    await screen.findByText('text-1');
+    await act(async () => observerCallback?.([{ isIntersecting: true }]));
+    await waitFor(() => expect(finishOldPage).toEqual(expect.any(Function)));
+    fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.sort.relevance' }));
+    fireEvent.click(screen.getByRole('radio', { name: 'advancedSearch.sort.newest' }));
+    expect(screen.queryByText('text-1')).not.toBeInTheDocument();
+    await act(async () => finishOldPage(response([makeOcrResult(41)], 40)));
+    await screen.findByText('text-101');
+    expect(screen.queryByText('text-41')).not.toBeInTheDocument();
+    expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({ sortOrder: 'newest' }));
+    expect(searchSnapshotsAndRecaps.mock.calls.at(-1)[1].offset).toBeUndefined();
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalledWith('design', 'nl', expect.objectContaining({ sortOrder: 'newest', offset: 0 })));
+    await act(async () => observerCallback?.([{ isIntersecting: true }]));
+    await screen.findByText('text-141');
+    expect(searchSnapshotsAndRecaps).toHaveBeenLastCalledWith('design', expect.objectContaining({
+      sortOrder: 'newest', offset: 40, rankingRevision: 'b'.repeat(64),
+    }));
+  });
+
   it('loads filter options when active', async () => {
     render(
       <AdvancedSearch
@@ -699,12 +727,18 @@ describe('AdvancedSearch', () => {
     fireEvent.mouseDown(document.body);
 
     fireEvent.click(screen.getByText('advancedSearch.range.label'));
-    fireEvent.change(document.querySelectorAll('input[type="datetime-local"]')[0], {
-      target: { value: '2026-01-02T03:04' },
-    });
-    fireEvent.change(document.querySelectorAll('input[type="datetime-local"]')[1], {
-      target: { value: '2026-01-02T04:05' },
-    });
+    const pickTime = (label, hour, minute) => {
+      fireEvent.click(screen.getByRole('button', { name: label }));
+      const picker = within(screen.getByRole('dialog', { name: label }));
+      fireEvent.change(picker.getByRole('spinbutton', { name: 'dateTimePicker.year' }), { target: { value: '2026' } });
+      fireEvent.change(picker.getByRole('combobox', { name: 'dateTimePicker.month' }), { target: { value: '0' } });
+      fireEvent.click(picker.getByRole('gridcell', { name: new Intl.DateTimeFormat(undefined, { dateStyle: 'full' }).format(new Date('2026-01-02T12:00')) }));
+      fireEvent.change(picker.getByRole('spinbutton', { name: 'dateTimePicker.hour' }), { target: { value: hour } });
+      fireEvent.change(picker.getByRole('spinbutton', { name: 'dateTimePicker.minute' }), { target: { value: minute } });
+      fireEvent.click(picker.getByRole('button', { name: 'dateTimePicker.confirm' }));
+    };
+    pickTime('advancedSearch.range.start', '03', '04');
+    pickTime('advancedSearch.range.end', '04', '05');
 
     await waitFor(() => {
       expect(searchSnapshotsAndRecaps).toHaveBeenCalledWith('', expect.objectContaining({

@@ -9,6 +9,15 @@ use super::wire_time;
 use super::DerivedIndexBacklog;
 use super::StorageState;
 
+/// Ordering is independent of matching and uses capture/activity time.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSortOrder {
+    #[default]
+    Relevance,
+    Newest,
+}
+
 /// Screenshot record representing a row in the screenshots table, with decrypted fields.
 /// This is the main struct used for returning screenshot data to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]

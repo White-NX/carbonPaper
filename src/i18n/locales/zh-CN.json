@@ -1317,6 +1317,21 @@
       }
     }
   },
+  "dateTimePicker": {
+    "select": "选择日期和时间",
+    "calendar": "日历",
+    "previousMonth": "上个月",
+    "nextMonth": "下个月",
+    "year": "年",
+    "month": "月",
+    "hour": "时",
+    "minute": "分",
+    "today": "今天",
+    "clear": "清除",
+    "confirm": "确定",
+    "invalidTime": "请输入有效的小时和分钟。",
+    "outOfRange": "请选择范围内的时间。"
+  },
   "common": {
     "cancel": "取消",
     "confirm": "确认",
@@ -1665,7 +1680,13 @@
       "custom": "自定义",
       "custom_active": "自定义范围",
       "start": "开始",
-      "end": "结束"
+      "end": "结束",
+      "invalid": "开始时间不能晚于结束时间。"
+    },
+    "sort": {
+      "label": "排序方式",
+      "relevance": "按相关程度",
+      "newest": "最新优先"
     },
     "stats": {
       "loaded": "已加载 {{count}} 条结果",

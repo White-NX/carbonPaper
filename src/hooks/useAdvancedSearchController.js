@@ -45,6 +45,7 @@ export function useAdvancedSearchController({
     setQueryState({ query: value, sourceQuery: incomingQuery, refreshKey: reloadToken });
   }, [incomingQuery, reloadToken]);
   const [searchTarget, setSearchTarget] = useState('mixed');
+  const [sortOrder, setSortOrder] = useState('relevance');
   const [recapSemantic, setRecapSemantic] = useState(true);
   const [results, setResults] = useState([]);
   const [thumbnailCache, setThumbnailCache] = useState({});
@@ -96,7 +97,7 @@ export function useAdvancedSearchController({
     setThumbnailCache({});
     setHasMore(false);
     setTotals(null);
-  }, [query, active, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, keywordQueue, semanticQueue]);
+  }, [query, active, searchTarget, sortOrder, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, keywordQueue, semanticQueue]);
   useEffect(() => () => {
     searchIdRef.current += 1;
     keywordQueue.cancel();
@@ -186,7 +187,7 @@ export function useAdvancedSearchController({
     rankingRevisionRef.current = null;
     try {
       const options = { limit: PAGE_SIZE, processNames: selectedProcesses,
-        categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget,
+        categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget, sortOrder,
         includeSemantic: false, startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate) };
       const apply = (response, semantic) => {
         const items = response.items.map((item) => item.kind === 'snapshot'
@@ -234,7 +235,7 @@ export function useAdvancedSearchController({
         setLoading(false);
       }
     }
-  }, [active, query, debouncedQuery, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters, reloadToken, keywordQueue, semanticQueue]);
+  }, [active, query, debouncedQuery, searchTarget, sortOrder, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters, reloadToken, keywordQueue, semanticQueue]);
 
   useEffect(() => {
     // Query/filter changes and explicit refresh share one trigger. A separate
@@ -293,7 +294,7 @@ export function useAdvancedSearchController({
     try {
       const options = {
         limit: PAGE_SIZE, offset: offsetRef.current,
-        includeSemantic: stageRef.current, target: searchTarget, processNames: selectedProcesses,
+        includeSemantic: stageRef.current, target: searchTarget, sortOrder, processNames: selectedProcesses,
         rankingRevision: rankingRevisionRef.current,
         categories: searchTarget === 'recaps' ? [] : selectedCategories,
         startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate),
@@ -340,7 +341,7 @@ export function useAdvancedSearchController({
         setLoadingMore(false);
       }
     }
-  }, [debouncedQuery, searchTarget, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating, reloadToken, keywordQueue, semanticQueue]);
+  }, [debouncedQuery, searchTarget, sortOrder, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating, reloadToken, keywordQueue, semanticQueue]);
 
   useEffect(() => {
     if (!active) return;
@@ -427,6 +428,8 @@ export function useAdvancedSearchController({
     debouncedQuery,
     searchTarget,
     setSearchTarget,
+    sortOrder,
+    setSortOrder,
     recapSemantic,
     setRecapSemantic,
     useRecapSemantic,
