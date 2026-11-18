@@ -347,8 +347,18 @@ impl StorageState {
         self.startup_vacuum_in_progress.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn foreground_db_read(&self) -> connection::ActivityReadGuard {
-        self.foreground_db_activity.read("foreground_query")
+    pub(crate) fn foreground_db_read(&self) -> Result<connection::ActivityReadGuard, String> {
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        let activity = self
+            .foreground_db_activity
+            .try_read("foreground_query")
+            .ok_or(crate::maintenance::MAINTENANCE_IN_PROGRESS)?;
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        Ok(activity)
     }
 
     pub(crate) fn background_db_read(&self) -> connection::ActivityReadGuard {
@@ -509,8 +519,19 @@ impl StorageState {
         &self,
         caller: &'static str,
     ) -> Result<connection::IndependentReadConnection, String> {
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        let activity = self
+            .independent_db_activity
+            .try_read(caller)
+            .ok_or(crate::maintenance::MAINTENANCE_IN_PROGRESS)?;
+        // Maintenance can become pending between the first check and acquiring
+        // the permit. Release promptly; an admitted reader still fences swaps.
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
         let started = std::time::Instant::now();
-        let activity = self.independent_db_activity.read(caller);
         if !self.is_initialized() {
             return Err("Database not initialized".to_string());
         }
@@ -641,6 +662,40 @@ mod tests {
 
     const READ_TEST_TIMESTAMP: i64 = 1_700_000_040;
     const THREAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn independent_reads_reject_pending_and_active_maintenance_promptly() {
+        let (_temp, storage) = initialized_read_storage(mode::DatabaseModePolicy::Wal);
+        let reader = storage
+            .open_read_connection_named("test established reader")
+            .unwrap();
+        let pending = connection::MaintenanceRequestGuard::new(Arc::clone(
+            &storage.database_maintenance_pending,
+        ));
+        let started = Instant::now();
+        assert!(
+            matches!(storage.open_read_connection_named("test pending rejection"), Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Established readers remain usable and keep file swaps fenced.
+        assert!(
+            reader
+                .query_row("SELECT count(*) FROM screenshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        drop(pending);
+        drop(reader);
+        let maintenance = storage.database_maintenance("test active rejection");
+        assert!(
+            matches!(storage.open_read_connection_named("test active rejection"), Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS)
+        );
+        drop(maintenance);
+        assert!(storage
+            .open_read_connection_named("test resumed read")
+            .is_ok());
+    }
 
     fn test_storage() -> (tempfile::TempDir, StorageState) {
         let temp = tempfile::tempdir().expect("create temporary storage directory");

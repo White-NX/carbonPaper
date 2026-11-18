@@ -127,7 +127,7 @@ impl StorageState {
         bytes: &[u8],
         pixels: &RgbImage,
     ) -> Result<EditedScreenshotResponse, String> {
-        let _activity = self.foreground_db_read();
+        let _activity = self.foreground_db_read()?;
         let (old_path, wrapped_key) = {
             let guard = self.get_connection_named("replace_edited_screenshot.lookup")?;
             if self.db_generation() != generation {

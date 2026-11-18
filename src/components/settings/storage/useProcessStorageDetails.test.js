@@ -1,9 +1,14 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { getProcessMonthlyThumbnails, softDeleteProcessMonth, softDeleteScreenshots } from '../../../lib/monitor_api';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getSoftDeleteQueueStatus, getProcessMonthlyThumbnails, softDeleteProcessMonth, softDeleteScreenshots } from '../../../lib/monitor_api';
 import { useProcessStorageDetails } from './useProcessStorageDetails';
 
-vi.mock('../SettingsActivityContext', () => ({ useSettingsActive: () => false, useSettingsActivity: vi.fn() }));
+const activity = vi.hoisted(() => ({ active: false, busy: false }));
+vi.mock('../SettingsActivityContext', () => ({
+  useSettingsActive: () => activity.active,
+  useSettingsActivity: vi.fn(),
+  useSettingsWindowActivity: () => ({ busy: activity.busy }),
+}));
 vi.mock('../../../lib/settings_api', () => ({ notifySettingsChanged: vi.fn(async () => {}) }));
 vi.mock('../../../lib/monitor_api', () => ({
   fetchThumbnailBatch: vi.fn(async () => ({})),
@@ -21,7 +26,33 @@ const page = (time_zone, process_name = 'editor.exe') => ({
 const t = key => key;
 
 describe('process month calendar', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    activity.active = false;
+    activity.busy = false;
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('never overlaps a slow status poll and pauses during backup work', async () => {
+    vi.useFakeTimers();
+    activity.active = true;
+    let finish;
+    getSoftDeleteQueueStatus.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const hook = renderHook(() => useProcessStorageDetails({ t }));
+    await act(async () => vi.advanceTimersByTimeAsync(120_000));
+    expect(getSoftDeleteQueueStatus).toHaveBeenCalledTimes(1);
+    await act(async () => finish({ pending_screenshots: 12, pending_ocr: 34, running: false }));
+    activity.busy = true;
+    hook.rerender();
+    await act(async () => vi.advanceTimersByTimeAsync(120_000));
+    expect(getSoftDeleteQueueStatus).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.deleteQueueStatus.pending_screenshots).toBe(12);
+    activity.busy = false;
+    hook.rerender();
+    await act(async () => {});
+    expect(getSoftDeleteQueueStatus).toHaveBeenCalledTimes(2);
+    hook.unmount();
+  });
 
   it('pins pagination and a pending deletion to the calendar returned by the displayed page', async () => {
     getProcessMonthlyThumbnails.mockResolvedValue(page('Asia/Shanghai'));

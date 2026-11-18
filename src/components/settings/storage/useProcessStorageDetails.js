@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
+import { useSettingsActive, useSettingsActivity, useSettingsWindowActivity } from '../SettingsActivityContext';
+import { usePolling } from '../../../hooks/usePolling';
 import { notifySettingsChanged } from '../../../lib/settings_api';
 import {
   fetchThumbnailBatch,
@@ -12,6 +13,7 @@ import {
 
 export function useProcessStorageDetails({ onRefresh, t }) {
   const active = useSettingsActive();
+  const { busy } = useSettingsWindowActivity();
   const [panelView, setPanelView] = useState('overview');
   const [processStats, setProcessStats] = useState([]);
   const [processStatsLoading, setProcessStatsLoading] = useState(false);
@@ -175,12 +177,7 @@ export function useProcessStorageDetails({ onRefresh, t }) {
     setPendingDeleteIntent(null);
   }, [deletingTarget]);
 
-  useEffect(() => {
-    if (!active) return undefined;
-    loadDeleteQueueStatus();
-    const timer = setInterval(loadDeleteQueueStatus, 5000);
-    return () => clearInterval(timer);
-  }, [loadDeleteQueueStatus, active]);
+  usePolling(loadDeleteQueueStatus, { intervalMs: 5000, enabled: active && !busy });
 
   useEffect(() => {
     if (active && panelView === 'overview') {

@@ -188,7 +188,7 @@ impl StorageState {
         let started = Instant::now();
         // Keep the database and directory stable while using the fetched file location.
         // This shared maintenance permit does not serialize other image readers.
-        let _activity = self.foreground_db_read();
+        let _activity = self.foreground_db_read()?;
         let maintenance_wait = started.elapsed();
         let acquiring = Instant::now();
         let primary = self.try_get_connection_named("read_image")?;
@@ -373,7 +373,7 @@ impl StorageState {
         &self,
         lookup: ImageLookup<'_>,
     ) -> Result<(String, String), String> {
-        let _activity = self.foreground_db_read();
+        let _activity = self.foreground_db_read()?;
         // Phase 1: DB query for the encrypted row key
         let (location, abs_path) = {
             let conn = self.open_read_connection_named("read_thumbnail")?;
@@ -480,7 +480,15 @@ impl StorageState {
         let started = Instant::now();
         // Keep maintenance from replacing files or row keys during the batch;
         // this shared permit never holds the primary database mutex.
-        let _activity = self.foreground_db_read();
+        let _activity = match self.foreground_db_read() {
+            Ok(activity) => activity,
+            Err(error) => {
+                return ids
+                    .iter()
+                    .map(|id| (id.to_string(), Err(error.clone())))
+                    .collect()
+            }
+        };
         let lookup = (|| -> Result<_, String> {
             let conn = self.open_read_connection_named("batch_thumbnails_by_ids")?;
             let mut locations = image_locations_by_ids(&conn, ids)?;

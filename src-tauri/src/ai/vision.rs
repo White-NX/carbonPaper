@@ -348,7 +348,7 @@ fn prepare(
     filter: &SensitiveFilterState,
     input: ReadInput,
 ) -> Result<(ImagePayload, SnapshotRef, serde_json::Value), String> {
-    let _activity = storage.foreground_db_read();
+    let _activity = storage.foreground_db_read()?;
     let record = storage
         .screenshots()
         .by_id(input.screenshot_id)?

@@ -314,7 +314,7 @@ impl StorageState {
         id: i64,
         hash: &str,
     ) -> Result<EditOcrStatus, String> {
-        let _activity = self.foreground_db_read();
+        let _activity = self.foreground_db_read()?;
         let mut guard = self.get_connection_named("retry_edited_ocr_job")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
