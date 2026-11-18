@@ -12,6 +12,23 @@ use super::{BackgroundReadError, StorageState};
 
 type ThumbnailReadResult = (String, Result<(String, String), String>);
 
+/// Absence can be recovered from; permissions, I/O errors and non-file paths
+/// must remain explicit errors when publishing or backing up screenshots.
+pub(super) fn regular_image_file_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "Screenshot is not a regular file: {}",
+            path.display()
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect screenshot {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 const IMAGE_BY_ID_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
     WHERE id = ?1 AND is_deleted = 0";
 const IMAGE_BY_PATH_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
