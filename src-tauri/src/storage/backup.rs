@@ -2,10 +2,10 @@
 
 use super::{
     backup_format::{self, EncryptedReader, EncryptedWriter},
-    backup_keys, connection,
+    backup_images, backup_keys, connection,
     database_snapshot::{
-        self, BackupManifest, DatabaseSnapshot, ExtractedBackup, TemporaryDirectory,
-        BACKUP_MANIFEST_FILE_NAME, DATABASE_FILE_NAME,
+        self, BackupDatabaseFile, BackupManifest, ExtractedBackup, BACKUP_MANIFEST_FILE_NAME,
+        DATABASE_FILE_NAME,
     },
 };
 use crate::credential_manager::{CredentialManagerState, MASTER_KEY_FILE_NAME};
@@ -14,15 +14,17 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::Argon2;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::Instant,
 };
 use zeroize::Zeroizing;
 use zip::write::SimpleFileOptions;
@@ -126,26 +128,10 @@ impl Drop for PendingExport {
     }
 }
 
-fn snapshot_connection(
-    snapshot: &DatabaseSnapshot,
-) -> Result<(TemporaryDirectory, Connection), String> {
-    // Opening SQLite can change SHM read marks or checkpoint WALs. Enumerate
-    // keys on a disposable clone, keeping the archive's manifest exact.
-    let directory = TemporaryDirectory::create(
-        snapshot.path().parent().unwrap_or(snapshot.path()),
-        "carbonpaper-backup-keys",
-    )?;
-    database_snapshot::copy_database_group(
-        snapshot.path(),
-        directory.path(),
-        &snapshot.manifest.journal_mode,
-    )?;
-    let conn = Connection::open_with_flags(
-        directory.path().join(DATABASE_FILE_NAME),
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok((directory, conn))
+#[derive(Debug, Default, serde::Serialize)]
+pub struct BackupSummary {
+    pub(crate) missing_screenshots: u64,
+    pub(crate) repaired_paths: u64,
 }
 
 #[expect(
@@ -153,7 +139,7 @@ fn snapshot_connection(
     reason = "Keeps archive inputs, wrapping keys, cancellation and progress explicit."
 )]
 pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
-    snapshot: &DatabaseSnapshot,
+    snapshot_directory: &Path,
     data_directory: &Path,
     credentials: &CredentialManagerState,
     database_key: &[u8],
@@ -162,42 +148,8 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
     target: &Path,
     control: &Control,
     mut progress: F,
-) -> Result<(), String> {
+) -> Result<BackupSummary, String> {
     control.check()?;
-    let (_key_directory, conn) = snapshot_connection(snapshot)?;
-    connection::configure_sqlcipher_connection(&conn, database_key).map_err(|e| e.to_string())?;
-    backup_keys::validate_source_images(&conn, data_directory, credentials, &control.cancelled)?;
-    let mut files = snapshot
-        .manifest
-        .database_files
-        .iter()
-        .map(|file| (snapshot.path().join(&file.path), file.path.clone()))
-        .collect::<Vec<_>>();
-    let root = data_directory.join("screenshots");
-    if root.exists() {
-        for entry in walkdir::WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| entry.path() != root.join("thumbs"))
-        {
-            control.check()?;
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().is_symlink() {
-                return Err("Symbolic links are not valid backup payloads".into());
-            }
-            if entry.file_type().is_file() {
-                let relative = entry
-                    .path()
-                    .strip_prefix(data_directory)
-                    .map_err(|e| e.to_string())?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                database_snapshot::normalize_archive_name(&relative, false)?;
-                files.push((entry.into_path(), relative));
-            }
-        }
-    }
-    files.sort_by(|a, b| a.1.cmp(&b.1));
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -211,39 +163,166 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
     if parent_name.starts_with(&(source_name.clone() + "/")) || parent_name == source_name {
         return Err("BACKUP_EXPORT_TARGET_CONFLICT".into());
     }
-    let (pending, output) = PendingExport::create(target)?;
-    let encrypted =
-        EncryptedWriter::new(output, password, control.flag()).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipWriter::new_stream(encrypted);
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .large_file(true);
-    archive
-        .start_file(backup_keys::FILE_NAME, options)
-        .map_err(|e| e.to_string())?;
+
+    let started = Instant::now();
+    progress("images", 0, 0);
+    let conn =
+        Connection::open(snapshot_directory.join(DATABASE_FILE_NAME)).map_err(|e| e.to_string())?;
+    connection::configure_sqlcipher_connection(&conn, database_key).map_err(|e| e.to_string())?;
+    let mut images = backup_images::prepare_source_images(
+        &conn,
+        data_directory,
+        credentials,
+        &control.cancelled,
+        &mut progress,
+    )?;
+    let files = std::mem::take(&mut images.files);
+    tracing::info!(
+        phase = "images",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        repaired_paths = images.repaired_paths,
+        "Backup export phase completed"
+    );
+    let started = Instant::now();
+    progress("keys", 0, 0);
+    // Keep the bundle in zeroizing memory so the same unwrapped screenshot
+    // keys can authenticate archive bytes, avoiding a second CNG call per image.
+    let mut keys = Zeroizing::new(Vec::new());
     backup_keys::write_bundle(
         &conn,
         credentials,
         database_key,
         master_key,
-        &mut archive,
+        &mut *keys,
         &control.cancelled,
         |done, total| progress("keys", done, total),
     )?;
+    let bundle = backup_keys::Bundle::parse(&keys)?;
+    let screenshot_keys = bundle.screenshot_keys();
+    // No SQLite handle may change the database after its final archive read.
+    conn.close().map_err(|(_, error)| error.to_string())?;
+    tracing::info!(
+        phase = "keys",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        key_slots = bundle.count,
+        "Backup export phase completed"
+    );
+
+    let database_path = snapshot_directory.join(DATABASE_FILE_NAME);
+    let database_size = std::fs::metadata(&database_path)
+        .map_err(|e| e.to_string())?
+        .len();
+    let total_bytes = files.iter().map(|file| file.2).sum::<u64>() + database_size;
+    let (pending, output) = PendingExport::create(target)?;
+    let encrypted =
+        EncryptedWriter::new(output, password, control.flag()).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipWriter::new_stream(encrypted);
+    let stored = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
+    let compressed = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .large_file(true);
     archive
-        .start_file(BACKUP_MANIFEST_FILE_NAME, options)
+        .start_file(backup_keys::FILE_NAME, stored)
         .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut archive, &snapshot.manifest).map_err(|e| e.to_string())?;
-    progress("files", 0, files.len() as u64);
-    for (index, (path, name)) in files.iter().enumerate() {
+    archive.write_all(&keys).map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let mut done = 0;
+    progress("files", 0, total_bytes);
+    for (path, name, size) in &files {
         control.check()?;
+        let input = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                images.record_missing(name);
+                done += size;
+                progress("files", done, total_bytes);
+                continue;
+            }
+            Err(error) => return Err(format!("Failed to open screenshot {name}: {error}")),
+        };
+        let mut bytes = Zeroizing::new(Vec::new());
+        CancellableFile {
+            file: input,
+            cancelled: control.flag(),
+        }
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read screenshot {name}: {error}"))?;
+        images.validate(name, &bytes, &screenshot_keys)?;
         archive
-            .start_file(name, options)
+            .start_file(
+                name,
+                if name.contains(".enc") {
+                    stored
+                } else {
+                    compressed
+                },
+            )
             .map_err(|e| e.to_string())?;
-        let mut input = File::open(path).map_err(|e| e.to_string())?;
-        std::io::copy(&mut input, &mut archive).map_err(|e| e.to_string())?;
-        progress("files", (index + 1) as u64, files.len() as u64);
+        archive.write_all(&bytes).map_err(|e| e.to_string())?;
+        images.record_present(name);
+        done += size;
+        progress("files", done, total_bytes);
     }
+    // One SHA-256 pass, on the exact final database bytes being archived. The
+    // manifest is written last so both this hash and all omissions are exact.
+    archive
+        .start_file(DATABASE_FILE_NAME, stored)
+        .map_err(|e| e.to_string())?;
+    let mut input = CancellableFile {
+        file: File::open(&database_path).map_err(|e| e.to_string())?,
+        cancelled: control.flag(),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut size = 0;
+    loop {
+        let read = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        archive
+            .write_all(&buffer[..read])
+            .map_err(|e| e.to_string())?;
+        hasher.update(&buffer[..read]);
+        size += read as u64;
+        progress("files", done + size, total_bytes);
+    }
+    if size != database_size {
+        return Err("Export snapshot size changed while archiving".into());
+    }
+    images.finish_inventory(data_directory)?;
+    let summary = BackupSummary {
+        missing_screenshots: images.missing.len() as u64,
+        repaired_paths: images.repaired_paths,
+    };
+    let manifest = BackupManifest {
+        format_version: if images.missing.is_empty() {
+            database_snapshot::BACKUP_FORMAT_VERSION
+        } else {
+            database_snapshot::PORTABLE_BACKUP_FORMAT_VERSION
+        },
+        journal_mode: "delete".into(),
+        database_files: vec![BackupDatabaseFile {
+            path: DATABASE_FILE_NAME.into(),
+            size,
+            sha256: hex::encode(hasher.finalize()),
+        }],
+        missing_screenshots: images.missing,
+    };
+    archive
+        .start_file(BACKUP_MANIFEST_FILE_NAME, compressed)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut archive, &manifest).map_err(|e| e.to_string())?;
+    tracing::info!(
+        phase = "files",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        database_hash_passes = 1,
+        missing_screenshots = summary.missing_screenshots,
+        "Backup export phase completed"
+    );
+    progress("finalize", 0, 0);
     let output = archive
         .finish()
         .map_err(|e| e.to_string())?
@@ -253,7 +332,8 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
     output.sync_all().map_err(|e| e.to_string())?;
     drop(output);
     control.begin_commit()?;
-    pending.publish(target)
+    pending.publish(target)?;
+    Ok(summary)
 }
 
 struct CancellableFile {
@@ -415,6 +495,7 @@ pub(crate) fn prepare_import<F: FnMut(&str, u64, u64)>(
         credentials,
         extracted.path(),
         &control.cancelled,
+        &extracted.manifest.missing_screenshots,
         |done, total| progress("restore", done, total),
     )?;
     control.check()?;
@@ -440,11 +521,12 @@ pub(crate) fn prepare_import<F: FnMut(&str, u64, u64)>(
     .map_err(|e| e.to_string())?;
     drop(conn);
     extracted.manifest = BackupManifest {
-        format_version: database_snapshot::BACKUP_FORMAT_VERSION,
+        format_version: extracted.manifest.format_version,
         journal_mode: "delete".into(),
         database_files: vec![database_snapshot::fingerprint_file(
             &extracted.path().join(DATABASE_FILE_NAME),
         )?],
+        missing_screenshots: std::mem::take(&mut extracted.manifest.missing_screenshots),
     };
     database_snapshot::validate_database_snapshot(
         extracted.path(),

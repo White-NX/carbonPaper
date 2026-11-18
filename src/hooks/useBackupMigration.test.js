@@ -118,9 +118,20 @@ describe('backup cancellation', () => {
 it.each([
   ['BACKUP_LEGACY_DEVICE_REQUIRED', 'settings.backup.error_legacy_device'],
   ['BACKUP_INCORRECT_PASSWORD_OR_CORRUPT', 'settings.backup.error_password_or_corrupt'],
+  ['BACKUP_UNDECLARED_MISSING_SCREENSHOT: id=7', 'settings.backup.error_incomplete'],
 ])('translates %s into a recovery explanation', async (failure, translation) => {
   const { result, operation } = await startBackup('import');
   await act(async () => { backup.reject(failure); await operation; });
   expect(result.current.status).toBe('error');
   expect(result.current.error).toBe(translation);
+});
+
+it('retains the completed backup summary for the success view', async () => {
+  const { result, operation } = await startBackup();
+  await act(async () => {
+    backup.resolve({ missing_screenshots: 11, repaired_paths: 3 });
+    await operation;
+  });
+  expect(result.current.status).toBe('success');
+  expect(result.current.summary).toEqual({ missing_screenshots: 11, repaired_paths: 3 });
 });

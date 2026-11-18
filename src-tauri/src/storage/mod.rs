@@ -9,6 +9,7 @@ mod ann_build;
 mod background_scheduler;
 pub(crate) mod backup;
 mod backup_format;
+mod backup_images;
 mod backup_keys;
 mod blind_index;
 mod blind_search;
@@ -421,6 +422,24 @@ impl StorageState {
 
     pub(crate) fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
+    }
+
+    /// Producers and independent readers are fenced by the caller's maintenance
+    /// permit; retaining the primary handle also preserves caches and generation.
+    pub(crate) fn create_backup_snapshot_under_maintenance(
+        &self,
+        database_key: &[u8],
+        temporary_parent: &std::path::Path,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<database_snapshot::TemporaryDirectory, String> {
+        let guard = self.get_connection_named("backup_export.snapshot")?;
+        database_snapshot::create_export_snapshot(
+            guard.as_ref().ok_or("Database not initialized")?,
+            database_key,
+            temporary_parent,
+            || self.backup.check(),
+            progress,
+        )
     }
 
     /// Acquire DB connection with caller identification for diagnostic logging.

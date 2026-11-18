@@ -11,7 +11,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
   const { t } = useTranslation();
   const {
     password, setPassword, confirmPassword, setConfirmPassword,
-    status, error, progress, cancelState, handleAction, handleCancel, handleClose, handleRetry,
+    status, error, progress, summary, cancelState, handleAction, handleCancel, handleClose, handleRetry,
   } = useBackupMigration({ mode, t, onClose });
 
   const title = mode === 'export' 
@@ -84,14 +84,12 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
           <div className="py-8 flex flex-col items-center justify-center space-y-4">
             <RefreshCw className="w-10 h-10 text-ide-accent animate-spin" />
             <div className="text-center w-full max-w-sm">
-              <div className="text-sm font-medium">
-                {cancelState === 'pending' ? t('settings.backup.cancelling')
+              <ProgressBlock
+                label={cancelState === 'pending' ? t('settings.backup.cancelling')
                   : cancelState === 'finishing' ? t('settings.backup.phases.finalize')
                     : progress?.phase ? t(`settings.backup.phases.${progress.phase}`) : t('settings.backup.processing')}
-              </div>
-              <ProgressBlock
-                label={t('settings.backup.processing_hint')}
-                percent={progress?.total_files > 0 ? progress.copied_files / progress.total_files * 100 : undefined}
+                percent={progress?.total_files > 0 ? Math.round(progress.copied_files / progress.total_files * 100) : undefined}
+                detail={t('settings.backup.processing_hint')}
                 className="mt-4 text-left"
               />
             </div>
@@ -107,7 +105,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
 
         {status === 'success' && (
           <div className="py-6 flex flex-col items-center justify-center space-y-4">
-            <CheckCircle2 className="w-12 h-12 text-green-500" />
+            <CheckCircle2 className="w-12 h-12 text-ide-info-success" />
             <div className="text-center">
               <div className="text-sm font-medium">{t('settings.backup.success_title')}</div>
               <p className="text-xs text-ide-muted mt-2 max-w-[280px]">
@@ -116,6 +114,12 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
                   : t('settings.backup.import_success_hint')}
               </p>
             </div>
+            {summary?.missing_screenshots > 0 && (
+              <Banner tone="warning">
+                {t(mode === 'export' ? 'settings.backup.export_missing_hint' : 'settings.backup.import_missing_hint',
+                  { count: summary.missing_screenshots })}
+              </Banner>
+            )}
             <Button size="md"
               onClick={handleClose}
               className="mt-4 px-6"
@@ -127,11 +131,11 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
 
         {status === 'error' && (
           <div className="py-6 flex flex-col items-center justify-center space-y-4">
-            <div className="w-12 h-12 rounded-full bg-red-500/10 flex items-center justify-center">
-              <ShieldAlert className="w-7 h-7 text-red-500" />
+            <div className="w-12 h-12 rounded-full bg-ide-error/10 flex items-center justify-center">
+              <ShieldAlert className="w-7 h-7 text-ide-error" />
             </div>
             <div className="text-center">
-              <div className="text-sm font-medium text-red-500">{t('settings.backup.error_title')}</div>
+              <div className="text-sm font-medium text-ide-error">{t('settings.backup.error_title')}</div>
               <p className="text-xs text-ide-muted mt-2 break-all max-w-[300px]">
                 {error}
               </p>

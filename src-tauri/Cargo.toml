@@ -65,6 +65,7 @@ sysinfo = "0.30"
 walkdir = "2.5.0"
 rand = "0.8"
 rusqlite = { version = "=0.42.0", default-features = false, features = [
+    "backup",
     "cache",
     "hooks",
     "functions",
@@ -202,4 +203,8 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.base64]
+opt-level = 3
+
+# Backup fingerprints must not spend seconds per block in debug builds.
+[profile.dev.package.sha2]
 opt-level = 3

@@ -1,10 +1,13 @@
 //! Explicit inventory of portable key slots in a database snapshot.
 //!
-//! The bundle is streamed directly into the encrypted archive. On import it is
-//! held in zeroizing memory, never staged as a plaintext file. Slot digests bind
+//! The bundle is held in zeroizing memory and written into the encrypted archive,
+//! never staged as a plaintext file. Slot digests bind
 //! each recovered key to the exact original wrapping and snapshot row.
 
-use super::{backup_format::check_cancelled, connection, database_snapshot};
+use super::{
+    backup_format::check_cancelled, backup_images::relative_image_path, connection,
+    database_snapshot, image_io::regular_image_file_exists,
+};
 use crate::credential_manager::{
     decrypt_with_master_key, encrypt_with_master_key, load_public_key_from_file,
     unwrap_storage_domain_key, wrap_storage_domain_key, CredentialManagerState,
@@ -203,6 +206,18 @@ impl<'a> Bundle<'a> {
     pub(super) fn master_key(&self) -> &[u8] {
         &self.bytes[40..72]
     }
+    pub(super) fn screenshot_keys(&self) -> HashMap<i64, &'a [u8]> {
+        self.bytes[HEADER_BYTES..]
+            .chunks_exact(SLOT_BYTES)
+            .filter(|slot| slot[0] == 0)
+            .map(|slot| {
+                (
+                    i64::from_le_bytes(slot[1..9].try_into().unwrap()),
+                    &slot[41..73],
+                )
+            })
+            .collect()
+    }
     fn fingerprint(&self) -> String {
         hex::encode(&self.bytes[72..104])
     }
@@ -223,18 +238,39 @@ fn validate_row(
     if d.table == "ocr_keys" {
         return super::ocr_keys::backup::validate_key(conn, rowid, key);
     }
-    for column in d.payloads.iter().filter(|p| available.contains(**p)) {
-        let bytes: Option<Vec<u8>> = conn
-            .query_row(
-                &format!("SELECT {column} FROM {} WHERE rowid=?1", d.table),
-                [rowid],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+    let payloads = d
+        .payloads
+        .iter()
+        .copied()
+        .filter(|column| available.contains(*column))
+        .collect::<Vec<_>>();
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    // Fetch a row's envelopes together. Preparing and seeking the same row once
+    // per metadata field magnifies key preparation on a large screenshot history.
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT {} FROM {} WHERE rowid=?1",
+            payloads.join(","),
+            d.table
+        ))
+        .map_err(|error| error.to_string())?;
+    let envelopes = statement
+        .query_row([rowid], |row| {
+            (0..payloads.len())
+                .map(|index| row.get::<_, Option<Vec<u8>>>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| error.to_string())?;
+    for (column, bytes) in payloads.iter().zip(envelopes) {
         if let Some(bytes) = bytes.filter(|b| !b.is_empty()) {
             let _plaintext =
                 Zeroizing::new(decrypt_with_master_key(key, &bytes).map_err(|_| {
-                    format!("Content authentication failed for {}.{column}", d.table)
+                    format!(
+                        "Content authentication failed for {}.{column} (rowid={rowid})",
+                        d.table
+                    )
                 })?);
         }
     }
@@ -503,6 +539,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
     credentials: &CredentialManagerState,
     directory: &Path,
     cancelled: &AtomicBool,
+    missing_screenshots: &[database_snapshot::MissingScreenshot],
     mut progress: F,
 ) -> Result<(), String> {
     let present = inventory(conn)?;
@@ -568,7 +605,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
         }
         super::ocr_keys::backup::validate_members(&tx, &ocr_groups, cancelled)?;
         validate_protected(&tx, &protected)?;
-        normalize_images(&tx, directory, credentials, cancelled, true)?;
+        normalize_images(&tx, directory, credentials, cancelled, missing_screenshots)?;
         if !columns(&tx, "protected_storage_keys")?.is_empty() {
             tx.execute(
                 "UPDATE protected_storage_keys SET public_key_fingerprint=?1",
@@ -586,43 +623,30 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
     })
 }
 
-fn relative_image_path(path: &str) -> Result<String, String> {
-    let path = path.replace('\\', "/");
-    let relative = if path.starts_with("screenshots/") {
-        path.as_str()
-    } else {
-        let start = path
-            .to_ascii_lowercase()
-            .rfind("/screenshots/")
-            .ok_or("Unsupported screenshot path in backup")?;
-        &path[start + 1..]
-    };
-    let name = database_snapshot::normalize_archive_name(relative, false)?;
-    if !name.starts_with("screenshots/") || name.starts_with("screenshots/thumbs/") {
-        return Err("Unsupported screenshot path in backup".into());
-    }
-    Ok(name)
-}
-
 // Convert referenced legacy images in staging. Verified duplicate remnants are
 // removed; unrelated plaintext fails closed rather than being lost or exposed.
-pub(super) fn validate_source_images(
-    conn: &Connection,
-    directory: &Path,
-    credentials: &CredentialManagerState,
-    cancelled: &AtomicBool,
-) -> Result<(), String> {
-    normalize_images(conn, directory, credentials, cancelled, false)
-}
-
 fn normalize_images(
     conn: &Connection,
     directory: &Path,
     credentials: &CredentialManagerState,
     cancelled: &AtomicBool,
-    restore: bool,
+    missing_screenshots: &[database_snapshot::MissingScreenshot],
 ) -> Result<(), String> {
+    let mut declared_missing = HashMap::new();
+    for missing in missing_screenshots {
+        if relative_image_path(&missing.image_path)? != missing.image_path
+            || missing.screenshot_id <= 0
+            || declared_missing
+                .insert(missing.screenshot_id, missing.image_path.as_str())
+                .is_some()
+        {
+            return Err("Invalid missing screenshot inventory".into());
+        }
+    }
     if columns(conn, "screenshots")?.is_empty() {
+        if !declared_missing.is_empty() {
+            return Err("Missing screenshot inventory does not match the database".into());
+        }
         return Ok(());
     }
     let mut query = conn.prepare("SELECT rowid,image_path,content_key_encrypted,is_deleted,status FROM screenshots ORDER BY rowid").map_err(|e| e.to_string())?;
@@ -654,19 +678,22 @@ fn normalize_images(
         }
         let relative = relative_image_path(&path)?;
         let file = directory.join(&relative);
-        if !file.exists() {
+        if !regular_image_file_exists(&file)? {
             if deleted == 0 && status.as_deref() != Some("aborted") {
-                return Err("A screenshot file is missing from the backup".into());
+                if declared_missing.remove(&rowid) != Some(relative.as_str()) {
+                    return Err(format!(
+                        "BACKUP_UNDECLARED_MISSING_SCREENSHOT: id={rowid}, path={relative}"
+                    ));
+                }
+                tracing::warn!(phase = "restore", screenshot_id = rowid, image_path = %relative,
+                    outcome = "metadata_preserved", "Restored a record with a declared missing screenshot");
             }
-            if restore {
-                // Tombstones still feed deferred cleanup after import. Rebase
-                // their paths even when there is no file left to re-encrypt.
-                conn.execute(
-                    "UPDATE screenshots SET image_path=?1 WHERE rowid=?2",
-                    params![relative, rowid],
-                )
-                .map_err(|e| e.to_string())?;
-            }
+            // Preserve records and OCR, and rebase deferred cleanup paths.
+            conn.execute(
+                "UPDATE screenshots SET image_path=?1 WHERE rowid=?2",
+                params![relative, rowid],
+            )
+            .map_err(|e| e.to_string())?;
             continue;
         }
         let data = Zeroizing::new(std::fs::read(&file).map_err(|e| e.to_string())?);
@@ -692,38 +719,33 @@ fn normalize_images(
                     .map_err(|_| "Screenshot authentication failed")?,
             );
             relative.clone()
-        } else if restore {
+        } else {
             let encrypted = encrypt_with_master_key(&key, &data).map_err(|e| e.to_string())?;
             let destination = format!("{relative}.enc");
             let target = directory.join(&destination);
-            if target.exists() {
+            if regular_image_file_exists(&target)? {
                 return Err("Conflicting legacy screenshot files in backup".into());
             }
             database_snapshot::write_staged_file(&target, &encrypted)?;
             std::fs::remove_file(&file).map_err(|e| e.to_string())?;
             destination
-        } else {
-            relative.clone()
         };
-        let wrapping = if restore {
-            Some(wrap_storage_domain_key(credentials, &key).map_err(|e| e.to_string())?)
-        } else {
-            wrapping
-        };
+        let wrapping = Some(wrap_storage_domain_key(credentials, &key).map_err(|e| e.to_string())?);
         key.fill(0);
-        if restore {
-            conn.execute(
-                "UPDATE screenshots SET image_path=?1,content_key_encrypted=?2 WHERE rowid=?3",
-                params![destination, wrapping, rowid],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        conn.execute(
+            "UPDATE screenshots SET image_path=?1,content_key_encrypted=?2 WHERE rowid=?3",
+            params![destination, wrapping, rowid],
+        )
+        .map_err(|e| e.to_string())?;
         referenced.insert(destination.to_ascii_lowercase(), (rowid, wrapping));
     }
+    if !declared_missing.is_empty() {
+        return Err("Missing screenshot inventory does not match the database and files".into());
+    }
     let root = directory.join("screenshots");
-    // ZIP omits an empty payload directory; referenced missing files were
-    // rejected above, and the restore transaction recreates an empty root.
-    if !root.exists() {
+    // ZIP omits an empty payload directory; missing references were checked
+    // against the manifest above, and restore recreates an empty root.
+    if !root.try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
     for entry in walkdir::WalkDir::new(&root)
@@ -762,9 +784,7 @@ fn normalize_images(
         if *plaintext != *expected {
             return Err("BACKUP_UNREFERENCED_PLAINTEXT".into());
         }
-        if restore {
-            std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
-        }
+        std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

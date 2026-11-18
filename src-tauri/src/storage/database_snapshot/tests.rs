@@ -38,6 +38,102 @@ fn create_encrypted_database(directory: &Path, key: &[u8]) -> Connection {
     connection
 }
 
+#[test]
+fn export_snapshot_includes_wal_and_keeps_the_source_open() {
+    let source_directory = tempdir().unwrap();
+    let parent = tempdir().unwrap();
+    let key = [0x2b; 32];
+    let source = create_encrypted_database(source_directory.path(), &key);
+    source.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO records VALUES('wal');").unwrap();
+    assert!(
+        std::fs::metadata(source_directory.path().join(DATABASE_WAL_FILE_NAME))
+            .unwrap()
+            .len()
+            > 0
+    );
+    let mut events = Vec::new();
+    let snapshot = create_export_snapshot(
+        &source,
+        &key,
+        parent.path(),
+        || Ok(()),
+        |done, total| events.push((done, total)),
+    )
+    .unwrap();
+    assert!(events
+        .iter()
+        .any(|(done, total)| *total > 0 && done == total));
+    assert!(!snapshot.path().join(DATABASE_WAL_FILE_NAME).exists());
+    assert!(!snapshot.path().join(DATABASE_SHM_FILE_NAME).exists());
+    let bytes = std::fs::read(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+    assert_ne!(&bytes[..16], b"SQLite format 3\0");
+    let restored = Connection::open(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+    let status = connection::configure_sqlcipher_connection(&restored, &key).unwrap();
+    assert_eq!(status.journal_mode, "delete");
+    let values: Vec<String> = restored
+        .prepare("SELECT value FROM records ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(values, ["base", "wal"]);
+    source
+        .execute("INSERT INTO records VALUES('after')", [])
+        .unwrap();
+    assert_eq!(
+        source
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    assert_eq!(
+        restored
+            .query_row("SELECT count(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn cancelling_export_snapshot_cleans_only_its_temporary_copy() {
+    let source_directory = tempdir().unwrap();
+    let parent = tempdir().unwrap();
+    let key = [0x3b; 32];
+    let source = create_encrypted_database(source_directory.path(), &key);
+    source
+        .execute("INSERT INTO records VALUES(hex(randomblob(1048576)))", [])
+        .unwrap();
+    let cancelled = std::cell::Cell::new(false);
+    let result = create_export_snapshot(
+        &source,
+        &key,
+        parent.path(),
+        || {
+            if cancelled.get() {
+                Err("BACKUP_CANCELLED".into())
+            } else {
+                Ok(())
+            }
+        },
+        |done, _| {
+            if done > 0 {
+                cancelled.set(true);
+            }
+        },
+    );
+    assert!(result.unwrap_err().contains("BACKUP_CANCELLED"));
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    assert!(
+        source
+            .query_row("SELECT count(*) FROM records", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap()
+            > 0
+    );
+}
+
 fn write_backup(path: &Path, entries: &[(&str, &[u8])], manifest: Option<&BackupManifest>) {
     let output = File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(output);
@@ -396,6 +492,7 @@ fn manifest_hash_and_size_mismatches_are_rejected() {
                 size,
                 sha256: hash,
             }],
+            missing_screenshots: Vec::new(),
         };
         write_backup(
             &zip_path,
@@ -427,6 +524,7 @@ fn incomplete_wal_sidecars_are_rejected() {
                 sha256: wal_hash,
             },
         ],
+        missing_screenshots: Vec::new(),
     };
     write_backup(
         &zip_path,
@@ -553,6 +651,7 @@ fn corrupted_database_fails_validation() {
         format_version: BACKUP_FORMAT_VERSION,
         journal_mode: "delete".into(),
         database_files: vec![fingerprint_file(&database).unwrap()],
+        missing_screenshots: Vec::new(),
     };
 
     assert!(validate_database_snapshot(root.path(), &manifest, &key).is_err());
