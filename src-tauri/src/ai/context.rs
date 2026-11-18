@@ -146,16 +146,63 @@ impl SearchTimeRange {
 /// a fixed safety multiplier. Context allowance separately leaves 10% headroom.
 pub(super) fn estimated_input_tokens(kind: ProviderKind, request: &ChatRequest) -> u64 {
     let body = provider::request_body_for_estimate(kind, request).to_string();
-    super::tokenizer::estimate(&body)
+    let images: u64 = request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::SnapshotImage { image, .. } => Some(super::vision::estimated_image_tokens(
+                image.width,
+                image.height,
+            )),
+            _ => None,
+        })
+        .sum();
+    super::tokenizer::estimate(&body).saturating_add(images)
 }
 
 pub(super) fn input_allowance(request: &ChatRequest, context_tokens: u32) -> u64 {
     (u64::from(context_tokens) * 9 / 10).saturating_sub(u64::from(request.max_tokens.unwrap_or(0)))
 }
 
+/// The latest question and final answer resolve short follow-ups even when
+/// their complete search transcript no longer fits.
+fn prune_history(request: &mut ChatRequest, current_question: &mut usize) -> bool {
+    if *current_question <= 1 {
+        return false;
+    }
+    // Intermediate user messages can be prefetch results, images or a forced
+    // answer instruction. Only a final assistant answer ends a completed turn.
+    let end = request.messages[1..*current_question]
+        .iter()
+        .position(|message| {
+            matches!(message, Message::Assistant { tool_calls, .. } if tool_calls.is_empty())
+        })
+        .map(|index| index + 2)
+        .unwrap_or(*current_question);
+    if end < *current_question {
+        request.messages.drain(1..end);
+        *current_question -= end - 1;
+        return true;
+    }
+    if end <= 3
+        || !matches!(&request.messages[end - 1], Message::Assistant { tool_calls, .. } if tool_calls.is_empty())
+    {
+        return false;
+    }
+    // Keep the latest question, final answer, citations, time ranges and native
+    // reasoning. Discard its intervening tool exchanges as complete pairs.
+    request.messages.drain(2..end - 1);
+    *current_question -= end - 3;
+    if let Message::Assistant { text, .. } = &mut request.messages[2] {
+        text.push_str("\n\n<omitted_tool_context>Tool exchanges and images for this turn were omitted to fit the context. The question and answer remain as conversation context. Retrieve missing evidence again before making new claims.</omitted_tool_context>");
+    }
+    true
+}
+
 /// Keep system rules and the current question intact. Remove complete old turns
-/// (including their tool exchanges) first, then older current-turn exchanges. Never orphan a
-/// tool result or edit the retained provider-native reasoning blocks.
+/// first, retaining the latest question and answer when its tool exchanges must
+/// be omitted, then remove older current-turn exchanges. Never orphan a tool
+/// result or edit the retained provider-native reasoning blocks.
 pub(super) fn fit_request(
     request: &mut ChatRequest,
     current_question: &mut usize,
@@ -170,19 +217,7 @@ pub(super) fn fit_request(
     // Pruning only just enough would rewrite the distant prefix on every step.
     let target = allowance * 4 / 5;
     while estimated_input_tokens(kind, request) > target {
-        if *current_question > 1 {
-            // A completed turn ends with an assistant answer without tool calls.
-            // Intermediate user messages may contain prefetch results or the
-            // forced-answer instruction, so they are not turn boundaries.
-            let end = request.messages[1..*current_question]
-                .iter()
-                .position(|message| {
-                    matches!(message, Message::Assistant { tool_calls, .. } if tool_calls.is_empty())
-                })
-                .map(|index| index + 2)
-                .unwrap_or(*current_question);
-            request.messages.drain(1..end);
-            *current_question -= end - 1;
+        if prune_history(request, current_question) {
             continue;
         }
         let exchanges: Vec<_> = request
@@ -367,6 +402,28 @@ mod tests {
             assert!(!provider::request_body_for_estimate(kind, &req)
                 .to_string()
                 .contains("old"));
+        }
+    }
+
+    #[test]
+    fn oversized_latest_dialogue_returns_a_context_error_without_losing_the_followup_subject() {
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            let mut req = request();
+            req.messages.splice(
+                1..1,
+                [
+                    Message::User("Which game did I find?".into()),
+                    assistant(&"游戏名称和已经确认的信息。".repeat(3000)),
+                ],
+            );
+            let before = req.messages.clone();
+            let mut current = 3;
+            assert_eq!(
+                fit_request(&mut req, &mut current, kind, 8192),
+                Err(ProviderError::ContextLimit)
+            );
+            assert_eq!(req.messages, before);
+            assert_eq!(current, 3);
         }
     }
 

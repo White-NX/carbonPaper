@@ -26,6 +26,7 @@ function describeStep(step, t) {
     case 'get_snapshots_by_time_range':
       return t('aiSearch.steps.time_range', { start: formatTime(args.start_ms), end: formatTime(args.end_ms) });
     case 'get_snapshot_details': return t('aiSearch.steps.details', { id: args.screenshot_id ?? '' });
+    case 'view_snapshot': return t('aiSearch.steps.view_snapshot', { id: args.screenshot_id ?? '' });
     case 'get_smart_clusters': return t('aiSearch.steps.clusters');
     case 'get_smart_cluster_ocr_corpus':
     case 'get_smart_cluster_summary': return t('aiSearch.steps.cluster_content');
@@ -102,7 +103,7 @@ function Answer({ text, ...citationProps }) {
 
 function stepKind(step) {
   if (['search_ocr_text', 'search_nl'].includes(step.name)) return 'searches';
-  if (step.name === 'get_snapshot_details') return 'screenshots';
+  if (['get_snapshot_details', 'view_snapshot'].includes(step.name)) return 'screenshots';
   if (step.name === 'get_snapshots_by_time_range') return 'records';
   if (['get_recap_days', 'get_recap_day', 'search_recaps'].includes(step.name)) return 'recaps';
   return 'archives';

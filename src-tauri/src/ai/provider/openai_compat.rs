@@ -55,6 +55,25 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
             Message::ToolResult { call_id, content } => {
                 json!({ "role": "tool", "tool_call_id": call_id, "content": content })
             }
+            Message::SnapshotImage { call_id, screenshot_id, image, .. } => {
+                // The tool's original quality preserves local pixel dimensions.
+                // Servers with the common high/low schema still receive high.
+                let original_supported = model.rsplit('/').next().is_some_and(|id|
+                    id.starts_with("gpt-6-astra") || id.starts_with("gpt-5.6")
+                    || id.starts_with("gpt-5.5") || id.starts_with("gpt-5.4"));
+                let detail = if image.detail == super::ImageDetail::Original && original_supported {
+                    "original"
+                } else {
+                    "high"
+                };
+                json!({ "role": "user", "content": [
+                    { "type": "text", "text": format!("Visual evidence for tool call {call_id}: screenshot #{screenshot_id}, {} × {} pixels.", image.width, image.height) },
+                    { "type": "image_url", "image_url": {
+                        "url": format!("data:{};base64,{}", image.mime_type, image.data), "detail": detail
+                    }}
+                ]})
+            }
+            Message::SnapshotImageRef { .. } => json!({"role":"user","content":"Earlier image pixels are unavailable. Reread the screenshot for missing visual evidence."}),
         })
         .collect();
 

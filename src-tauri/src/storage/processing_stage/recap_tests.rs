@@ -24,6 +24,7 @@ fn config(storage: &StorageState) -> RecapConfig {
             api_key: Some("private-api-key".into()),
             tool_calling: ToolCalling::Unknown,
             context_tokens: 32768,
+            ..Default::default()
         },
         remote_consent: false,
         revision: storage.recap_config_revision().unwrap(),

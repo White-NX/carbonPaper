@@ -7,12 +7,14 @@
 //! future scheduled tasks.
 
 pub mod agent;
+pub mod catalog;
 pub mod config;
 mod context;
 pub mod provider;
 pub mod recap;
 mod tokenizer;
 pub mod tools;
+mod vision;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,6 +26,7 @@ use provider::Cancellation;
 #[derive(Default)]
 pub struct AiRuntimeState {
     running: Mutex<HashMap<String, Arc<Cancellation>>>,
+    image_cache: Mutex<vision::ImageCache>,
 }
 
 impl AiRuntimeState {

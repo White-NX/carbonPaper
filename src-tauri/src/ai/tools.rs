@@ -104,6 +104,7 @@ pub struct ToolOutcome {
     /// Number of top-level items when the result is a list.
     pub item_count: Option<usize>,
     pub error: Option<String>,
+    pub image: Option<super::vision::PreparedImage>,
 }
 
 /// Runs one tool call. Failures become results the model can read and react
@@ -133,12 +134,13 @@ pub async fn execute(
     }
 }
 
-fn failure(message: String) -> ToolOutcome {
+pub(crate) fn failure(message: String) -> ToolOutcome {
     ToolOutcome {
         content: mcp_contract::error_payload(&message).to_string(),
         snapshots: Vec::new(),
         item_count: None,
         error: Some(message),
+        image: None,
     }
 }
 
@@ -160,6 +162,7 @@ pub(crate) fn summarize(_tool_name: &str, mut result: Value) -> ToolOutcome {
         snapshots,
         item_count,
         error: None,
+        image: None,
     }
 }
 

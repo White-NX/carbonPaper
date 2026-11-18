@@ -95,11 +95,8 @@ export function useAiSearch({ active, isAuthenticated = true }) {
     setStatus('running');
     try {
       const completed = previous.filter((turn) => turn.status === 'done');
-      // Match the backend's four-turn eviction chunks, retaining the same
-      // oldest context over several follow-ups instead of shifting each time.
-      const historyStart = Math.ceil(Math.max(0, completed.length - 12) / 4) * 4;
       const result = await runAiSearch({ requestId, question: trimmed, providerId: provider?.id,
-        history: completed.slice(historyStart).map((turn) => ({
+        history: completed.map((turn) => ({
           question: turn.question, answer: turn.answer,
           ...(turn.outcome?.time_context ? { time_context: turn.outcome.time_context } : {}),
           ...(turn.outcome?.messages ? { messages: turn.outcome.messages } : {}),

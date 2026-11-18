@@ -1454,7 +1454,7 @@ async fn generate_inner(
     let provider = if let Some(run) = &protected {
         run.config.provider.clone()
     } else {
-        ai.resolve(&app.state::<Arc<CredentialManagerState>>(), id)?
+        ai.resolve(&storage, &app.state::<Arc<CredentialManagerState>>(), id)?
     };
     let remote_consent = protected
         .as_ref()
@@ -1862,6 +1862,7 @@ mod tests {
             api_key: None,
             tool_calling: ToolCalling::Unknown,
             context_tokens: 128_000,
+            ..Default::default()
         }
     }
 

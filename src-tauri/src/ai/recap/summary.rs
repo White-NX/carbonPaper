@@ -483,6 +483,7 @@ mod tests {
             api_key: None,
             tool_calling: crate::ai::config::ToolCalling::Unsupported,
             context_tokens: 8192,
+            ..Default::default()
         };
         let b = batch();
         let (req, included) = request(&b, &RecapSettings::default(), &provider).unwrap();

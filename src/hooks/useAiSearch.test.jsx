@@ -177,14 +177,13 @@ describe('AI conversation', () => {
     expect(runAiSearch.mock.lastCall[0].history).toEqual([]);
   });
 
-  it('keeps a stable bounded history prefix across several follow-ups', async () => {
+  it('sends every completed turn for the backend to fit to the model context', async () => {
     const { result } = await setup();
     for (let i = 0; i <= 17; i += 1) {
       act(() => { result.current.start(`question ${i}`); });
       const history = runAiSearch.mock.lastCall[0].history;
-      expect(history.length).toBeLessThanOrEqual(12);
-      if (i >= 13 && i <= 16) expect(history[0].question).toBe('question 4');
-      if (i === 17) expect(history[0].question).toBe('question 8');
+      expect(history).toHaveLength(i);
+      if (i > 0) expect(history[0].question).toBe('question 0');
       await act(async () => finish({ answer: `answer ${i}`, snapshots: [] }));
     }
     expect(result.current.turns).toHaveLength(17);

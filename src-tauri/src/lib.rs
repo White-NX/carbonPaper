@@ -1079,6 +1079,9 @@ pub fn run() {
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::ai::ai_get_settings,
+            commands::ai::ai_get_model_catalog,
+            commands::ai::ai_discover_models,
+            commands::ai::ai_test_image_input,
             commands::ai::ai_save_provider,
             commands::ai::ai_delete_provider,
             commands::ai::ai_set_default_provider,

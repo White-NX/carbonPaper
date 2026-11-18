@@ -496,7 +496,7 @@ pub(crate) fn sync_config(
         .or_else(|| ai.effective_default_id())
         .ok_or("AI_NO_PROVIDER")?;
     let config = RecapConfig {
-        provider: ai.resolve(credentials, id)?,
+        provider: ai.resolve(storage, credentials, id)?,
         settings,
         remote_consent: ai.remote_consent,
         ai_hash: ai_hash(&ai)?,
