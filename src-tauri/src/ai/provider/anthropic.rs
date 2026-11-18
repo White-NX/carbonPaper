@@ -78,6 +78,26 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                 "user",
                 vec![json!({ "type": "tool_result", "tool_use_id": call_id, "content": content })],
             ),
+            Message::SnapshotImage {
+                call_id,
+                screenshot_id,
+                image,
+                ..
+            } => push(
+                "user",
+                vec![
+                    json!({ "type": "text", "text": format!("Visual evidence for tool call {call_id}: screenshot #{screenshot_id}, {} × {} pixels.", image.width, image.height) }),
+                    json!({ "type": "image", "source": {
+                        "type": "base64", "media_type": image.mime_type, "data": image.data.as_ref()
+                    }}),
+                ],
+            ),
+            Message::SnapshotImageRef { .. } => push(
+                "user",
+                vec![
+                    json!({"type":"text","text":"Earlier image pixels are unavailable. Reread the screenshot for missing visual evidence."}),
+                ],
+            ),
         }
     }
 

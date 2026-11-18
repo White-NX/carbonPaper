@@ -1,11 +1,13 @@
 import React, { useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Bot, Check, Pencil, Plus, Trash2, PlugZap } from 'lucide-react';
-import { SettingsButton, SettingsSelect } from '../SettingsControls';
+import { Bot, Check, Pencil, Plus, Trash2, PlugZap, RefreshCw } from 'lucide-react';
+import { SettingsButton, SettingsSelect, SettingsSwitch } from '../SettingsControls';
 import { SettingsErrorBanner, SettingsGroup, SettingsSection, SettingsStatus } from '../SettingsPrimitives';
 import { useAiProviders } from './useAiProviders';
 import { PROVIDER_PRESETS } from '../../../lib/ai_provider_catalog';
 import { MIN_AI_CONTEXT_TOKENS, MAX_AI_CONTEXT_TOKENS } from '../../../lib/ai_api';
+import SearchableSelect from '../../ui/SearchableSelect';
+import ConfirmDialog from '../../ConfirmDialog';
 
 const inputClass = 'w-full min-w-0 rounded-lg border border-ide-border bg-ide-panel px-3 py-2 text-sm placeholder:text-ide-muted disabled:opacity-50';
 
@@ -24,28 +26,26 @@ function hostOf(url) {
   try { return new URL(url).host; } catch { return url; }
 }
 
-function ConnectionFields({ c, t, preset }) {
-  const { draft, busy } = c;
+function ModelFields({ c, t, preset }) {
+  const { draft, busy, models } = c;
   const disabled = Boolean(busy);
-  const models = preset?.models ?? [];
+  const hasKey = draft.keyTouched ? Boolean(draft.apiKey.trim()) : draft.hasApiKey;
   return (
     <>
-      <Field label={t('settings.ai.fields.name')}>
-        <input value={draft.name} disabled={disabled} placeholder={t('settings.ai.fields.name_placeholder')}
-          onChange={(e) => c.updateDraft({ name: e.target.value })} className={inputClass} />
-      </Field>
       {models.length > 0 && (
         <Field label={t('settings.ai.fields.model')}>
-          <select value={draft.customModel ? 'custom' : draft.model} disabled={disabled} className={inputClass}
-            onChange={(e) => c.updateDraft(e.target.value === 'custom' ? { customModel: true } : { model: e.target.value, customModel: false })}>
-            <optgroup label={t('settings.ai.models.recommended')}>
-              {models.filter((model) => model.recommended).map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
-            </optgroup>
-            <optgroup label={t('settings.ai.models.other')}>
-              {models.filter((model) => !model.recommended).map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
-            </optgroup>
-            <option value="custom">{t('settings.ai.models.custom')}</option>
-          </select>
+          <SearchableSelect value={draft.customModel ? 'custom' : draft.model} disabled={disabled} label={t('settings.ai.fields.model')}
+            placeholder={t('settings.ai.models.select')}
+            searchLabel={t('settings.ai.models.search')} emptyLabel={t('settings.ai.models.no_matches')} narrowLabel={t('settings.ai.models.narrow_search')}
+            onChange={(value) => c.updateDraft(value === 'custom' ? { customModel: true } : { model: value, customModel: false })}
+            options={[
+              ...models.map((model) => ({ value: model.id, label: model.name || model.id,
+                description: model.name !== model.id ? model.id : undefined,
+                group: t(model.recommended ? 'settings.ai.models.recommended' : 'settings.ai.models.other'),
+                badge: t(`settings.ai.images.${model.image_input || 'unknown'}`),
+              })),
+              { value: 'custom', label: t('settings.ai.models.custom') },
+            ]} />
         </Field>
       )}
       {(models.length === 0 || draft.customModel) && (
@@ -54,6 +54,28 @@ function ConnectionFields({ c, t, preset }) {
             onChange={(e) => c.updateDraft({ model: e.target.value })} className={inputClass} spellCheck={false} />
         </Field>
       )}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="rounded bg-ide-hover px-2 py-1 text-[10px] text-ide-muted">{t(`settings.ai.images.${c.imageInput || 'unknown'}`)}</span>
+        <SettingsButton size="xs" variant="ghost" icon={RefreshCw} loading={busy === 'discover'}
+          disabled={disabled || !draft.baseUrl.trim() || (preset && !preset.local && !hasKey)} onClick={c.discover}>
+          {t('settings.ai.models.discover')}
+        </SettingsButton>
+      </div>
+      {c.modelList?.stale && c.modelList.models?.length > 0 && <p className="text-xs text-ide-muted">{t('settings.ai.models.cached')}</p>}
+    </>
+  );
+}
+
+function ConnectionFields({ c, t, preset }) {
+  const { draft, busy } = c;
+  const disabled = Boolean(busy);
+  return (
+    <>
+      <Field label={t('settings.ai.fields.name')}>
+        <input value={draft.name} disabled={disabled} placeholder={t('settings.ai.fields.name_placeholder')}
+          onChange={(e) => c.updateDraft({ name: e.target.value })} className={inputClass} />
+      </Field>
+      <ModelFields c={c} t={t} preset={preset} />
       <Field label={t('settings.ai.fields.kind')}>
         <SettingsSelect value={draft.kind} disabled={disabled} label={t('settings.ai.fields.kind')} onChange={(kind) => c.updateDraft({ kind })}
           options={[
@@ -72,20 +94,25 @@ function ConnectionFields({ c, t, preset }) {
 function ProviderEditor({ c, t }) {
   const { draft, busy } = c;
   const disabled = Boolean(busy);
-  const preset = PROVIDER_PRESETS.find((item) => item.id === draft.presetId);
+  const preset = c.providers.find((item) => item.id === draft.presetId);
   const cloudPreset = Boolean(preset && !preset.local);
   const hasKey = draft.keyTouched ? Boolean(draft.apiKey.trim()) : draft.hasApiKey;
   const incomplete = !draft.presetId || !draft.baseUrl.trim() || !draft.model.trim() || (cloudPreset && !hasKey);
   const contextTokens = Number(draft.contextTokens);
-  const invalidBudget = !Number.isInteger(contextTokens) || contextTokens < MIN_AI_CONTEXT_TOKENS || contextTokens > MAX_AI_CONTEXT_TOKENS;
+  const invalidBudget = !draft.contextTokensAuto
+    && (!Number.isInteger(contextTokens) || contextTokens < MIN_AI_CONTEXT_TOKENS || contextTokens > MAX_AI_CONTEXT_TOKENS);
   return (
     <SettingsGroup className="space-y-3">
       {!draft.id && (
         <Field label={t('settings.ai.fields.preset')}>
-          <SettingsSelect value={draft.presetId} disabled={disabled} label={t('settings.ai.fields.preset')} onChange={c.applyPreset}
+          <SearchableSelect value={draft.presetId} disabled={disabled} label={t('settings.ai.fields.preset')} onChange={c.applyPreset}
+            placeholder={t('settings.ai.fields.preset_placeholder')} searchLabel={t('settings.ai.models.search_providers')}
+            emptyLabel={t('settings.ai.models.no_matches')} narrowLabel={t('settings.ai.models.narrow_search')}
             options={[
-              { value: '', label: t('settings.ai.fields.preset_placeholder'), disabled: true },
-              ...PROVIDER_PRESETS.map((p) => ({ value: p.id, label: p.name })),
+              ...c.providers.map((p) => ({ value: p.id, label: p.name, keywords: (p.aliases || []).join(' '),
+                group: t(p.local ? 'settings.ai.models.local_services' : PROVIDER_PRESETS.some((seed) => seed.id === p.id)
+                  ? 'settings.ai.models.common_services' : 'settings.ai.models.more_services'),
+              })),
               { value: 'custom', label: t('settings.ai.fields.custom_provider') },
             ]} />
         </Field>
@@ -101,12 +128,37 @@ function ProviderEditor({ c, t }) {
           <details key={draft.presetId} className="space-y-3">
             <summary className="cursor-pointer text-xs font-medium text-ide-muted">{t('settings.ai.advanced')}</summary>
             {cloudPreset && <ConnectionFields c={c} t={t} preset={preset} />}
-            <Field label={t('settings.ai.fields.context_tokens')} hint={t('settings.ai.fields.context_tokens_hint')}>
+            <Field label={t('settings.ai.fields.context_mode')} hint={t('settings.ai.fields.context_tokens_hint')}>
+              <SettingsSelect value={draft.contextTokensAuto ? 'auto' : 'manual'} disabled={disabled} label={t('settings.ai.fields.context_mode')}
+                onChange={(mode) => c.updateDraft({ contextTokensAuto: mode === 'auto', contextTokens: c.contextTokens })}
+                options={[
+                  { value: 'auto', label: t('settings.ai.fields.context_auto') },
+                  { value: 'manual', label: t('settings.ai.fields.context_manual') },
+                ]} />
+            </Field>
+            <Field label={t('settings.ai.fields.context_tokens')}>
               <input type="number" min={MIN_AI_CONTEXT_TOKENS} max={MAX_AI_CONTEXT_TOKENS} step="1"
-                value={draft.contextTokens} disabled={disabled} aria-invalid={invalidBudget}
+                value={c.contextTokens} disabled={disabled || draft.contextTokensAuto} aria-invalid={invalidBudget}
                 onChange={(e) => c.updateDraft({ contextTokens: e.target.value })} className={inputClass} />
             </Field>
             {invalidBudget && <p role="alert" className="text-xs text-ide-error">{t('ai.errors.AI_INVALID_CONTEXT_BUDGET')}</p>}
+            <Field label={t('settings.ai.images.capability')} hint={t('settings.ai.images.capability_hint')}>
+              <SettingsSelect value={draft.imageInputOverride} disabled={disabled} label={t('settings.ai.images.capability')}
+                onChange={(imageInputOverride) => c.updateDraft({ imageInputOverride })}
+                options={[
+                  { value: 'auto', label: t('settings.ai.images.auto') },
+                  { value: 'supported', label: t('settings.ai.images.supported') },
+                  { value: 'unsupported', label: t('settings.ai.images.unsupported') },
+                ]} />
+            </Field>
+            <Field label={t('settings.ai.images.allow')} hint={t('settings.ai.images.allow_hint')}>
+              <SettingsSwitch title={t('settings.ai.images.allow')} checked={draft.allowImages} disabled={disabled} onChange={c.setAllowImages} />
+            </Field>
+            {draft.allowImages && c.imageInput !== 'supported' && <p className="text-xs text-ide-muted">{t('settings.ai.images.needs_capability')}</p>}
+            <SettingsButton size="xs" icon={PlugZap} loading={busy === 'image-test'} disabled={disabled || incomplete || invalidBudget} onClick={c.testImages}>
+              {t('settings.ai.images.test')}
+            </SettingsButton>
+            <p className="text-xs text-ide-muted">{t('settings.ai.images.test_hint')}</p>
           </details>
         </>
       )}
@@ -115,6 +167,10 @@ function ProviderEditor({ c, t }) {
         <SettingsButton icon={PlugZap} loading={busy === 'test'} disabled={disabled || incomplete || invalidBudget} onClick={c.test}>{t('settings.ai.test.button')}</SettingsButton>
         <SettingsButton variant="primary" loading={busy === 'save'} disabled={disabled || incomplete || invalidBudget} onClick={c.save}>{t('common.save')}</SettingsButton>
       </div>
+      <ConfirmDialog isOpen={c.imageConsentOpen} title={t('settings.ai.images.consent_title')}
+        message={t('settings.ai.images.consent_message', { name: draft.name || hostOf(draft.baseUrl) })}
+        confirmLabel={t('settings.ai.images.consent_accept')} cancelLabel={t('common.cancel')}
+        onConfirm={c.acceptImageConsent} onCancel={() => c.setImageConsentOpen(false)} />
     </SettingsGroup>
   );
 }
@@ -126,7 +182,10 @@ export default function AiProvidersSection() {
 
   return (
     <SettingsSection id="ai-providers" icon={Bot} title={t('settings.ai.providers.title')} description={t('settings.ai.providers.description')}
-      actions={!c.draft && <SettingsButton icon={Plus} onClick={c.startAdd} disabled={!c.settings}>{t('settings.ai.providers.add')}</SettingsButton>}>
+      actions={<div className="flex flex-wrap gap-2">
+        <SettingsButton icon={RefreshCw} loading={c.busy === 'catalog'} disabled={Boolean(c.busy)} onClick={c.refreshCatalog}>{t('settings.ai.models.refresh_catalog')}</SettingsButton>
+        {!c.draft && <SettingsButton icon={Plus} onClick={c.startAdd} disabled={!c.settings}>{t('settings.ai.providers.add')}</SettingsButton>}
+      </div>}>
       {c.loadError && <SettingsErrorBanner>{c.loadError}</SettingsErrorBanner>}
       {c.settings && providers.length === 0 && !c.draft && (
         <SettingsGroup><p className="text-xs leading-relaxed text-ide-muted">{t('settings.ai.providers.empty')}</p></SettingsGroup>
@@ -144,6 +203,7 @@ export default function AiProvidersSection() {
                     {provider.is_local && <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-500">{t('settings.ai.providers.local_badge')}</span>}
                   </div>
                   <p className="mt-0.5 truncate text-xs text-ide-muted">{provider.model} · {hostOf(provider.base_url)}</p>
+                  {provider.allow_images && <p className="mt-0.5 text-xs text-ide-muted">{t('settings.ai.images.enabled')}</p>}
                   {provider.tool_calling === 'unsupported' && <p className="mt-0.5 text-xs text-ide-warning">{t('settings.ai.providers.limited')}</p>}
                 </div>
                 <div className="flex shrink-0 gap-1">

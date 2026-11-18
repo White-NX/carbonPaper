@@ -743,6 +743,7 @@ mod tests {
                 api_key: None,
                 tool_calling: ToolCalling::Supported,
                 context_tokens: 128_000,
+                ..Default::default()
             },
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(vec![]),

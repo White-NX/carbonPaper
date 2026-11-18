@@ -20,12 +20,17 @@ const KEY_PREFIX: &str = "v1:";
 const MAX_NAME_CHARS: usize = 64;
 const MAX_FIELD_CHARS: usize = 512;
 
-pub const DEFAULT_CONTEXT_TOKENS: u32 = 32_768;
+pub const DEFAULT_CONTEXT_TOKENS: u32 = 128_000;
+pub const LOCAL_CONTEXT_TOKENS: u32 = 32_768;
 pub const MIN_CONTEXT_TOKENS: u32 = 8_192;
 pub const MAX_CONTEXT_TOKENS: u32 = 2_000_000;
 
-pub fn default_context_tokens() -> u32 {
-    DEFAULT_CONTEXT_TOKENS
+pub fn fallback_context_tokens(base_url: &str) -> u32 {
+    if is_local_url(base_url) {
+        LOCAL_CONTEXT_TOKENS
+    } else {
+        DEFAULT_CONTEXT_TOKENS
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -48,6 +53,35 @@ pub enum ToolCalling {
     Unsupported,
 }
 
+/// Image input is independent of permission to send screenshot pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageInput {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageInputOverride {
+    #[default]
+    Auto,
+    Supported,
+    Unsupported,
+}
+
+impl ImageInputOverride {
+    pub fn resolve(self, discovered: ImageInput) -> ImageInput {
+        match self {
+            Self::Auto => discovered,
+            Self::Supported => ImageInput::Supported,
+            Self::Unsupported => ImageInput::Unsupported,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredProvider {
     pub id: String,
@@ -60,8 +94,33 @@ pub struct StoredProvider {
     pub api_key_encrypted: Option<String>,
     #[serde(default)]
     pub tool_calling: ToolCalling,
-    #[serde(default = "default_context_tokens")]
-    pub context_tokens: u32,
+    /// None uses model metadata; legacy numeric settings remain manual limits.
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
+    #[serde(default)]
+    pub allow_images: bool,
+    #[serde(default)]
+    pub image_input_override: ImageInputOverride,
+    #[serde(default)]
+    pub image_input: ImageInput,
+    #[serde(default)]
+    pub image_input_checked_at_ms: Option<i64>,
+}
+
+impl StoredProvider {
+    fn effective_image_input(&self) -> ImageInput {
+        let fresh = self.image_input_checked_at_ms.is_some_and(|checked| {
+            let age = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(checked);
+            (0..=30 * 24 * 60 * 60 * 1000).contains(&age)
+        });
+        self.image_input_override.resolve(if fresh {
+            self.image_input
+        } else {
+            ImageInput::Unknown
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,6 +146,10 @@ pub struct ProviderView {
     pub tool_calling: ToolCalling,
     pub is_local: bool,
     pub context_tokens: u32,
+    pub context_tokens_auto: bool,
+    pub allow_images: bool,
+    pub image_input_override: ImageInputOverride,
+    pub image_input: ImageInput,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,19 +172,57 @@ pub struct ProviderInput {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
-    #[serde(default = "default_context_tokens")]
-    pub context_tokens: u32,
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
+    #[serde(default)]
+    pub allow_images: bool,
+    #[serde(default)]
+    pub image_input_override: ImageInputOverride,
+}
+
+/// Model discovery works before a model has been selected.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectionInput {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub kind: ProviderKind,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// Everything needed to send a request, with the key already decrypted.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ResolvedProvider {
+    #[serde(default)]
+    pub id: Option<String>,
     pub kind: ProviderKind,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
     pub tool_calling: ToolCalling,
     pub context_tokens: u32,
+    #[serde(default)]
+    pub allow_images: bool,
+    #[serde(default)]
+    pub image_input: ImageInput,
+}
+
+impl Default for ResolvedProvider {
+    fn default() -> Self {
+        Self {
+            id: None,
+            kind: ProviderKind::default(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            tool_calling: ToolCalling::Unknown,
+            context_tokens: DEFAULT_CONTEXT_TOKENS,
+            allow_images: false,
+            image_input: ImageInput::Unknown,
+        }
+    }
 }
 
 impl std::fmt::Debug for ResolvedProvider {
@@ -173,7 +274,12 @@ impl AiSettings {
                     is_local: is_local_url(&p.base_url),
                     context_tokens: p
                         .context_tokens
+                        .unwrap_or_else(|| fallback_context_tokens(&p.base_url))
                         .clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS),
+                    context_tokens_auto: p.context_tokens.is_none(),
+                    allow_images: p.allow_images,
+                    image_input_override: p.image_input_override,
+                    image_input: p.effective_image_input(),
                 })
                 .collect(),
             default_provider_id: self.effective_default_id().map(str::to_string),
@@ -222,11 +328,15 @@ impl AiSettings {
             existing.base_url = input.base_url;
             existing.model = input.model;
             existing.context_tokens = input.context_tokens;
+            existing.allow_images = input.allow_images;
+            existing.image_input_override = input.image_input_override;
             if let Some(encrypted) = api_key_encrypted {
                 existing.api_key_encrypted = encrypted;
             }
-            if endpoint_changed {
+            if endpoint_changed || input.api_key.is_some() {
                 existing.tool_calling = ToolCalling::Unknown;
+                existing.image_input = ImageInput::Unknown;
+                existing.image_input_checked_at_ms = None;
             }
             return Ok(id.to_string());
         }
@@ -241,6 +351,10 @@ impl AiSettings {
             api_key_encrypted: api_key_encrypted.flatten(),
             tool_calling: ToolCalling::Unknown,
             context_tokens: input.context_tokens,
+            allow_images: input.allow_images,
+            image_input_override: input.image_input_override,
+            image_input: ImageInput::Unknown,
+            image_input_checked_at_ms: None,
         });
         if self.default_provider_id.is_none() {
             self.default_provider_id = Some(id.clone());
@@ -274,15 +388,24 @@ impl AiSettings {
         }
     }
 
+    pub fn set_image_input(&mut self, id: &str, value: ImageInput) {
+        if let Some(p) = self.find_mut(id) {
+            p.image_input = value;
+            p.image_input_checked_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        }
+    }
+
     pub fn resolve(
         &self,
+        storage: &StorageState,
         credential_state: &CredentialManagerState,
         id: &str,
     ) -> Result<ResolvedProvider, String> {
         let p = self
             .find(id)
             .ok_or_else(|| "AI_PROVIDER_NOT_FOUND".to_string())?;
-        Ok(ResolvedProvider {
+        let mut resolved = ResolvedProvider {
+            id: Some(p.id.clone()),
             kind: p.kind,
             base_url: p.base_url.clone(),
             model: p.model.clone(),
@@ -294,14 +417,22 @@ impl AiSettings {
             tool_calling: p.tool_calling,
             context_tokens: p
                 .context_tokens
+                .unwrap_or_else(|| fallback_context_tokens(&p.base_url))
                 .clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS),
-        })
+            allow_images: p.allow_images,
+            image_input: p.effective_image_input(),
+        };
+        if p.context_tokens.is_none() {
+            resolved.context_tokens = super::catalog::resolve_context_tokens(storage, &resolved);
+        }
+        Ok(resolved)
     }
 
     /// Resolves an unsaved input for a connection test. A missing key falls
     /// back to the stored key of the provider being edited.
     pub fn resolve_input(
         &self,
+        storage: &StorageState,
         credential_state: &CredentialManagerState,
         input: ProviderInput,
     ) -> Result<ResolvedProvider, String> {
@@ -309,7 +440,15 @@ impl AiSettings {
         let api_key = match input.api_key {
             Some(key) if key.is_empty() => None,
             Some(key) => Some(key),
-            None => match input.id.as_deref().and_then(|id| self.find(id)) {
+            None => match input
+                .id
+                .as_deref()
+                .and_then(|id| self.find(id))
+                .filter(|p| {
+                    p.kind == input.kind
+                        && models_endpoint(p.kind, &p.base_url).ok()
+                            == models_endpoint(input.kind, &input.base_url).ok()
+                }) {
                 Some(p) => p
                     .api_key_encrypted
                     .as_deref()
@@ -318,19 +457,83 @@ impl AiSettings {
                 None => None,
             },
         };
-        Ok(ResolvedProvider {
+        let context_tokens = input
+            .context_tokens
+            .unwrap_or_else(|| fallback_context_tokens(&input.base_url));
+        let automatic = input.context_tokens.is_none();
+        let mut resolved = ResolvedProvider {
+            id: input.id,
             kind: input.kind,
             base_url: input.base_url,
             model: input.model,
             api_key,
             tool_calling: ToolCalling::Unknown,
-            context_tokens: input.context_tokens,
-        })
+            context_tokens,
+            allow_images: input.allow_images,
+            image_input: input.image_input_override.resolve(ImageInput::Unknown),
+        };
+        if automatic {
+            resolved.context_tokens = super::catalog::resolve_context_tokens(storage, &resolved);
+        }
+        Ok(resolved)
+    }
+
+    pub fn resolve_connection(
+        &self,
+        storage: &StorageState,
+        credential_state: &CredentialManagerState,
+        input: ConnectionInput,
+    ) -> Result<ResolvedProvider, String> {
+        self.resolve_input(
+            storage,
+            credential_state,
+            ProviderInput {
+                id: input.id,
+                name: String::new(),
+                kind: input.kind,
+                base_url: input.base_url,
+                model: "model-discovery".into(),
+                api_key: input.api_key,
+                context_tokens: None,
+                allow_images: false,
+                image_input_override: ImageInputOverride::Auto,
+            },
+        )
     }
 }
 
+/// Canonical discovery URL also scopes saved-key reuse and metadata caches.
+pub fn models_endpoint(kind: ProviderKind, base_url: &str) -> Result<reqwest::Url, String> {
+    let mut url =
+        reqwest::Url::parse(base_url).map_err(|_| "AI_PROVIDER_INVALID_URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return Err("AI_PROVIDER_INVALID_URL".into());
+    }
+    let path = url.path().trim_end_matches('/');
+    let base = path
+        .strip_suffix("/chat/completions")
+        .or_else(|| path.strip_suffix("/messages"))
+        .or_else(|| path.strip_suffix("/models"))
+        .unwrap_or(path);
+    let base = if kind == ProviderKind::Anthropic && !base.ends_with("/v1") {
+        format!("{base}/v1")
+    } else {
+        base.to_string()
+    };
+    url.set_path(&format!("{base}/models"));
+    url.set_fragment(None);
+    Ok(url)
+}
+
 fn validate(mut input: ProviderInput) -> Result<ProviderInput, String> {
-    if !(MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&input.context_tokens) {
+    if input
+        .context_tokens
+        .is_some_and(|tokens| !(MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&tokens))
+    {
         return Err("AI_INVALID_CONTEXT_BUDGET".into());
     }
     input.name = input.name.trim().to_string();
@@ -345,6 +548,7 @@ fn validate(mut input: ProviderInput) -> Result<ProviderInput, String> {
     if !(input.base_url.starts_with("https://") || input.base_url.starts_with("http://")) {
         return Err("AI_PROVIDER_INVALID_URL".into());
     }
+    models_endpoint(input.kind, &input.base_url)?;
     if input.name.is_empty() {
         input.name = input.model.clone();
     }
@@ -429,7 +633,9 @@ mod tests {
             base_url: base_url.into(),
             model: " qwen3 ".into(),
             api_key: None,
-            context_tokens: DEFAULT_CONTEXT_TOKENS,
+            context_tokens: None,
+            allow_images: false,
+            image_input_override: ImageInputOverride::Auto,
         }
     }
 
@@ -456,33 +662,44 @@ mod tests {
             "id": "old", "name": "Old", "base_url": "http://localhost", "model": "m"
         });
         let stored: StoredProvider = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(stored.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(stored.context_tokens, None);
+        assert!(!stored.allow_images);
+        assert_eq!(stored.image_input_override, ImageInputOverride::Auto);
         let mut edited: ProviderInput = serde_json::from_value(raw).unwrap();
-        assert_eq!(edited.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(edited.context_tokens, None);
         for budget in [0, MIN_CONTEXT_TOKENS - 1, MAX_CONTEXT_TOKENS + 1] {
-            edited.context_tokens = budget;
+            edited.context_tokens = Some(budget);
             assert_eq!(
                 validate(edited.clone()).unwrap_err(),
                 "AI_INVALID_CONTEXT_BUDGET"
             );
         }
         for budget in [MIN_CONTEXT_TOKENS, 128_000, MAX_CONTEXT_TOKENS] {
-            edited.context_tokens = budget;
-            assert_eq!(validate(edited.clone()).unwrap().context_tokens, budget);
+            edited.context_tokens = Some(budget);
+            assert_eq!(
+                validate(edited.clone()).unwrap().context_tokens,
+                Some(budget)
+            );
         }
-        let credentials = CredentialManagerState::new(std::env::temp_dir());
+        let temp = tempfile::tempdir().unwrap();
+        let credentials =
+            std::sync::Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().join("data"), credentials.clone());
         let mut settings = AiSettings::default();
         edited.id = None;
-        edited.context_tokens = 64_000;
+        edited.context_tokens = Some(64_000);
         let id = settings.upsert(&credentials, edited.clone()).unwrap();
         edited.id = Some(id.clone());
-        edited.context_tokens = 128_000;
+        edited.context_tokens = Some(128_000);
         settings.upsert(&credentials, edited).unwrap();
         let reloaded: AiSettings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(reloaded.view().providers[0].context_tokens, 128_000);
         assert_eq!(
-            reloaded.resolve(&credentials, &id).unwrap().context_tokens,
+            reloaded
+                .resolve(&storage, &credentials, &id)
+                .unwrap()
+                .context_tokens,
             128_000
         );
     }
@@ -508,7 +725,11 @@ mod tests {
             model: "m".into(),
             api_key_encrypted: None,
             tool_calling: ToolCalling::Unknown,
-            context_tokens: DEFAULT_CONTEXT_TOKENS,
+            context_tokens: None,
+            allow_images: false,
+            image_input_override: ImageInputOverride::Auto,
+            image_input: ImageInput::Unknown,
+            image_input_checked_at_ms: None,
         };
         let mut settings = AiSettings {
             providers: vec![stored("a"), stored("b")],
@@ -531,7 +752,11 @@ mod tests {
                 model: "m".into(),
                 api_key_encrypted: Some("v1:secret".into()),
                 tool_calling: ToolCalling::Supported,
-                context_tokens: DEFAULT_CONTEXT_TOKENS,
+                context_tokens: None,
+                allow_images: false,
+                image_input_override: ImageInputOverride::Auto,
+                image_input: ImageInput::Unknown,
+                image_input_checked_at_ms: None,
             }],
             default_provider_id: None,
             remote_consent: false,

@@ -163,6 +163,7 @@ mod tests {
             api_key: None,
             tool_calling: ToolCalling::Unknown,
             context_tokens: 128000,
+            ..Default::default()
         };
         let mut progress = RecapProgress {
             attempts: vec![RecapAttempt::default()],
