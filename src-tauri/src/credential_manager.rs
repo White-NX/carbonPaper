@@ -1422,12 +1422,45 @@ impl CngKeyHandle {
     }
 
     fn unwrap_row_key(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-        use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
-        ncrypt_decrypt_with_key(
-            self.key,
-            ciphertext,
-            NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG,
-        )
+        use windows::Win32::Foundation::NTE_BUFFER_TOO_SMALL;
+        use windows::Win32::Security::Cryptography::{
+            NCryptDecrypt, NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG,
+        };
+
+        let flags = NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG;
+        let mut output = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+        let mut length = 0;
+        // SAFETY: the retained key and input are live. Content keys have a fixed
+        // 32-byte plaintext contract, so this zeroizing output needs no CNG size
+        // query (which performs another expensive private-key operation).
+        let result = unsafe {
+            NCryptDecrypt(
+                self.key,
+                Some(ciphertext),
+                None,
+                Some(output.as_mut_slice()),
+                &mut length,
+                flags,
+            )
+        };
+        match result {
+            Ok(()) if length as usize == MASTER_KEY_LEN => Ok(output.to_vec()),
+            Ok(()) => Err(CredentialError::CryptoError(
+                "Invalid content key length".into(),
+            )),
+            // Preserve compatibility with providers requiring a larger output
+            // allocation. The recovered plaintext must still be exactly 32 bytes.
+            Err(error) if error.code() == NTE_BUFFER_TOO_SMALL => {
+                let key = Zeroizing::new(ncrypt_decrypt_with_key(self.key, ciphertext, flags)?);
+                if key.len() != MASTER_KEY_LEN {
+                    return Err(CredentialError::CryptoError(
+                        "Invalid content key length".into(),
+                    ));
+                }
+                Ok(key.to_vec())
+            }
+            Err(error) => Err(map_cng_decrypt_error("NCryptDecrypt failed", error)),
+        }
     }
 }
 
@@ -1450,27 +1483,14 @@ fn ncrypt_decrypt_with_key(
     ciphertext: &[u8],
     flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
 ) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Foundation::{ERROR_CANCELLED, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED};
     use windows::Win32::Security::Cryptography::NCryptDecrypt;
-
-    let map_error = |stage: &str, e: windows::core::Error| {
-        if e.code() == NTE_SILENT_CONTEXT {
-            CredentialError::AuthRequired
-        } else if e.code() == NTE_USER_CANCELLED
-            || e.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0)
-        {
-            CredentialError::UserCancelled
-        } else {
-            CredentialError::SystemError(format!("{stage}: {e}"))
-        }
-    };
 
     // Query plaintext size before allocating the output buffer.
     let mut out_len: u32 = 0;
     // SAFETY: key and ciphertext are live; the null output buffer requests only the
     // plaintext length and `out_len` points to writable stack storage.
     unsafe { NCryptDecrypt(key, Some(ciphertext), None, None, &mut out_len, flags) }
-        .map_err(|e| map_error("NCryptDecrypt size failed", e))?;
+        .map_err(|e| map_cng_decrypt_error("NCryptDecrypt size failed", e))?;
 
     let mut output = vec![0u8; out_len as usize];
     // SAFETY: output is uniquely mutable and sized from CNG's query; all handles and
@@ -1485,10 +1505,24 @@ fn ncrypt_decrypt_with_key(
             flags,
         )
     }
-    .map_err(|e| map_error("NCryptDecrypt failed", e))?;
+    .map_err(|e| map_cng_decrypt_error("NCryptDecrypt failed", e))?;
 
     output.truncate(out_len as usize);
     Ok(output)
+}
+
+#[cfg(windows)]
+fn map_cng_decrypt_error(stage: &str, error: windows::core::Error) -> CredentialError {
+    use windows::Win32::Foundation::{ERROR_CANCELLED, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED};
+    if error.code() == NTE_SILENT_CONTEXT {
+        CredentialError::AuthRequired
+    } else if error.code() == NTE_USER_CANCELLED
+        || error.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0)
+    {
+        CredentialError::UserCancelled
+    } else {
+        CredentialError::SystemError(format!("{stage}: {error}"))
+    }
 }
 
 /// Unwrap a row key using the explicit unlock's retained context. Data reads

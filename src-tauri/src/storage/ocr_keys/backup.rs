@@ -46,7 +46,17 @@ pub(in crate::storage) fn validate_key(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    verify_scope(key, &dataset(conn)?, owner, id, &tag).map_err(|e| e.to_string())
+    validate_key_fields(&dataset(conn)?, owner, id, &tag, key)
+}
+
+pub(in crate::storage) fn validate_key_fields(
+    dataset: &str,
+    owner: i64,
+    id: i64,
+    tag: &[u8],
+    key: &[u8],
+) -> Result<(), String> {
+    verify_scope(key, dataset, owner, id, tag).map_err(|e| e.to_string())
 }
 
 pub(in crate::storage) fn validate_members(
@@ -58,6 +68,7 @@ pub(in crate::storage) fn validate_members(
         return Ok(());
     }
     let dataset = dataset(conn)?;
+    let mut scratch = carbonpaper_backup_core::ZeroizingBuffer::new();
     let mut counts = HashMap::<i64, i64>::new();
     let mut stmt = conn.prepare("SELECT id,screenshot_id,ocr_key_id,text_enc FROM ocr_results WHERE ocr_key_id IS NOT NULL ORDER BY id")
         .map_err(|e| e.to_string())?;
@@ -67,16 +78,18 @@ pub(in crate::storage) fn validate_members(
         let id: i64 = row.get(0).map_err(|e| e.to_string())?;
         let screenshot: i64 = row.get(1).map_err(|e| e.to_string())?;
         let group: i64 = row.get(2).map_err(|e| e.to_string())?;
-        let data: Vec<u8> = row.get(3).map_err(|e| e.to_string())?;
+        let data = row
+            .get_ref(3)
+            .map_err(|e| e.to_string())?
+            .as_blob()
+            .map_err(|e| e.to_string())?;
         let key = keys.get(&group).ok_or("Missing portable OCR group key")?;
-        let _plain = Zeroizing::new(
-            open(
-                key,
-                &aad(&dataset, screenshot, group, id).map_err(|e| e.to_string())?,
-                &data,
-            )
-            .map_err(|e| e.to_string())?,
-        );
+        carbonpaper_app_bound::crypto::authenticate_storage_bytes(
+            key,
+            data,
+            &aad(&dataset, screenshot, group, id).map_err(|e| e.to_string())?,
+            &mut scratch,
+        )?;
         *counts.entry(group).or_default() += 1;
     }
     let mut groups = conn

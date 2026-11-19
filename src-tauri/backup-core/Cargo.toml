@@ -1,0 +1,16 @@
+[package]
+name = "carbonpaper-backup-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+publish = false
+
+[dependencies]
+aead = { version = "0.5", features = ["stream"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+argon2 = "0.5"
+rand = "0.8"
+zeroize = "1"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

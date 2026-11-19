@@ -2,7 +2,9 @@
 
 use super::{
     backup_format::{self, EncryptedReader, EncryptedWriter},
-    backup_images, backup_keys, connection,
+    backup_images, backup_keys,
+    backup_prefetch::ImagePrefetcher,
+    connection,
     database_snapshot::{
         self, BackupDatabaseFile, BackupManifest, ExtractedBackup, BACKUP_MANIFEST_FILE_NAME,
         DATABASE_FILE_NAME,
@@ -14,6 +16,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::Argon2;
+use carbonpaper_backup_core::ZeroizingBuffer;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,7 +27,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 use zip::write::SimpleFileOptions;
@@ -187,13 +190,13 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
     progress("keys", 0, 0);
     // Keep the bundle in zeroizing memory so the same unwrapped screenshot
     // keys can authenticate archive bytes, avoiding a second CNG call per image.
-    let mut keys = Zeroizing::new(Vec::new());
+    let mut keys = ZeroizingBuffer::new();
     backup_keys::write_bundle(
         &conn,
         credentials,
         database_key,
         master_key,
-        &mut *keys,
+        &mut keys,
         &control.cancelled,
         |done, total| progress("keys", done, total),
     )?;
@@ -230,26 +233,29 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
     let started = Instant::now();
     let mut done = 0;
     progress("files", 0, total_bytes);
-    for (path, name, size) in &files {
+    let mut prefetch = ImagePrefetcher::new(files, control.flag())?;
+    let mut scratch = ZeroizingBuffer::new();
+    let mut authentication_time = Duration::ZERO;
+    let mut archive_time = Duration::ZERO;
+    let mut prefetch_wait = Duration::ZERO;
+    loop {
         control.check()?;
-        let input = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                images.record_missing(name);
-                done += size;
-                progress("files", done, total_bytes);
-                continue;
-            }
-            Err(error) => return Err(format!("Failed to open screenshot {name}: {error}")),
+        let waiting = Instant::now();
+        let next = prefetch.next()?;
+        prefetch_wait += waiting.elapsed();
+        let Some(mut input) = next else { break };
+        let name = &input.name;
+        let Some(payload) = input.payload.as_mut() else {
+            images.record_missing(name);
+            done += input.size;
+            progress("files", done, total_bytes);
+            continue;
         };
-        let mut bytes = Zeroizing::new(Vec::new());
-        CancellableFile {
-            file: input,
-            cancelled: control.flag(),
-        }
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("Failed to read screenshot {name}: {error}"))?;
-        images.validate(name, &bytes, &screenshot_keys)?;
+        let bytes = payload.bytes(name)?;
+        let authenticating = Instant::now();
+        images.validate(name, bytes, &screenshot_keys, &mut scratch)?;
+        authentication_time += authenticating.elapsed();
+        let writing = Instant::now();
         archive
             .start_file(
                 name,
@@ -260,9 +266,10 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
                 },
             )
             .map_err(|e| e.to_string())?;
-        archive.write_all(&bytes).map_err(|e| e.to_string())?;
+        archive.write_all(bytes).map_err(|e| e.to_string())?;
+        archive_time += writing.elapsed();
         images.record_present(name);
-        done += size;
+        done += input.size;
         progress("files", done, total_bytes);
     }
     // One SHA-256 pass, on the exact final database bytes being archived. The
@@ -319,6 +326,10 @@ pub(crate) fn write_portable<F: FnMut(&str, u64, u64)>(
         phase = "files",
         elapsed_ms = started.elapsed().as_millis() as u64,
         database_hash_passes = 1,
+        image_read_ms = prefetch.read_ms(),
+        image_authentication_ms = authentication_time.as_millis() as u64,
+        image_archive_ms = archive_time.as_millis() as u64,
+        prefetch_wait_ms = prefetch_wait.as_millis() as u64,
         missing_screenshots = summary.missing_screenshots,
         "Backup export phase completed"
     );
@@ -455,13 +466,13 @@ pub(crate) fn prepare_import<F: FnMut(&str, u64, u64)>(
             .map_err(|e| e.to_string())?;
         connection::configure_sqlcipher_connection(&conn, local_database_key)
             .map_err(|_| "BACKUP_LEGACY_DEVICE_REQUIRED")?;
-        let mut bundle = Zeroizing::new(Vec::new());
+        let mut bundle = ZeroizingBuffer::new();
         backup_keys::write_bundle(
             &conn,
             credentials,
             local_database_key,
             legacy_master.as_ref().unwrap(),
-            &mut *bundle,
+            &mut bundle,
             &control.cancelled,
             |done, total| progress("keys", done, total),
         )
@@ -474,7 +485,7 @@ pub(crate) fn prepare_import<F: FnMut(&str, u64, u64)>(
         })?;
         // Opening the extracted legacy DB may checkpoint it. The old manifest
         // was validated already; its new fingerprint is produced below.
-        bundle
+        bundle.into_zeroizing()
     };
     let bundle = backup_keys::Bundle::parse(&portable_keys)?;
     if portable {

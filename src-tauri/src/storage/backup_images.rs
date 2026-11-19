@@ -55,11 +55,12 @@ fn authenticate_published_image(
     let key = Zeroizing::new(unwrap_storage_domain_key(credentials, wrapping).map_err(|error| {
         format!("Failed to unwrap screenshot key during path recovery (id={rowid}, path={relative}): {error}")
     })?);
-    let _plaintext = Zeroizing::new(decrypt_with_master_key(&key, &bytes).map_err(|error| {
+    carbonpaper_app_bound::crypto::authenticate_storage_bytes(&key, &bytes, b"", &mut Vec::new())
+        .map_err(|error| {
         format!(
             "Screenshot path recovery authentication failed (id={rowid}, path={relative}): {error}"
         )
-    })?);
+    })?;
     Ok(true)
 }
 
@@ -87,6 +88,7 @@ impl SourceImages {
         name: &str,
         bytes: &[u8],
         keys: &HashMap<i64, &[u8]>,
+        scratch: &mut Vec<u8>,
     ) -> Result<(), String> {
         if !name.contains(".enc") {
             return Ok(());
@@ -99,13 +101,13 @@ impl SourceImages {
                         reference.rowid, reference.relative
                     )
                 })?;
-                let _plaintext =
-                    Zeroizing::new(decrypt_with_master_key(key, bytes).map_err(|error| {
+                carbonpaper_app_bound::crypto::authenticate_storage_bytes(key, bytes, b"", scratch)
+                    .map_err(|error| {
                         format!(
                             "Screenshot authentication failed (id={}, path={}): {error}",
                             reference.rowid, reference.relative
                         )
-                    })?);
+                    })?;
             }
         }
         Ok(())

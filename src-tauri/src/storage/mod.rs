@@ -11,6 +11,7 @@ pub(crate) mod backup;
 mod backup_format;
 mod backup_images;
 mod backup_keys;
+mod backup_prefetch;
 mod blind_index;
 mod blind_search;
 mod classification;

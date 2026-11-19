@@ -14,6 +14,7 @@ use crate::credential_manager::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use carbonpaper_app_bound::payload::{payload_key_id, CipherKey};
+use carbonpaper_backup_core::ZeroizingBuffer;
 use rand::RngCore;
 use rusqlite::{config::DbConfig, params, Connection};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,7 @@ use std::{
     io::Write,
     path::Path,
     sync::atomic::AtomicBool,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -285,6 +287,17 @@ fn protected_key(
 ) -> Result<CipherKey, String> {
     let (id, purpose, dataset, saved_fingerprint): (String, String, String, String) = conn.query_row(
         "SELECT key_id,purpose,dataset_id,public_key_fingerprint FROM protected_storage_keys WHERE rowid=?1", [rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
+    protected_key_fields(id, dataset, purpose, &saved_fingerprint, fingerprint, key)
+}
+
+fn protected_key_fields(
+    id: String,
+    dataset: String,
+    purpose: String,
+    saved_fingerprint: &str,
+    fingerprint: &str,
+    key: &[u8],
+) -> Result<CipherKey, String> {
     if saved_fingerprint != fingerprint
         || !matches!(purpose.as_str(), "metadata" | "vectors" | "ann")
         || !carbonpaper_app_bound::protocol::valid_id(&dataset)
@@ -417,28 +430,41 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
             let key = keys
                 .get(&id)
                 .ok_or("Missing protected backup content key")?;
-            let _plaintext = key.open(&identity, &data)?;
+            let _plaintext = ZeroizingBuffer::from(key.open(&identity, &data)?);
         }
     }
     Ok(())
 }
 
-pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
+pub(super) fn write_bundle<F: FnMut(u64, u64)>(
     conn: &Connection,
     credentials: &CredentialManagerState,
     database_key: &[u8],
     master_key: &[u8],
-    writer: &mut W,
+    writer: &mut ZeroizingBuffer,
     cancelled: &AtomicBool,
     mut progress: F,
 ) -> Result<(), String> {
     if database_key.len() != 32 || master_key.len() != 32 {
         return Err("Invalid backup root key length".into());
     }
+    let inventory_started = Instant::now();
     let present = inventory(conn)?;
     let count = slot_count(conn, &present)?;
     let public = load_public_key_from_file(credentials).map_err(|e| e.to_string())?;
     let fingerprint = Sha256::digest(public);
+    let fingerprint_hex = hex::encode(fingerprint);
+    let ocr_dataset = if present.iter().any(|(index, _)| *index == 8) {
+        Some(super::ocr_keys::dataset(conn)?)
+    } else {
+        None
+    };
+    let inventory_ms = inventory_started.elapsed().as_millis() as u64;
+    // The exact bundle size is known from the frozen inventory. Reserve once
+    // so growing the bundle never reallocates live plaintext content keys.
+    writer
+        .reserve_capacity(HEADER_BYTES + count as usize * SLOT_BYTES)
+        .map_err(|error| error.to_string())?;
     writer
         .write_all(MAGIC)
         .and_then(|_| writer.write_all(database_key))
@@ -449,41 +475,105 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
     let mut completed = 0u64;
     let mut protected = HashMap::new();
     let mut ocr_groups = HashMap::new();
+    let mut scratch = ZeroizingBuffer::new();
+    let mut unwrap_time = Duration::ZERO;
+    let mut row_authentication_time = Duration::ZERO;
     progress(0, count);
     for (index, available) in present {
         let d = &DOMAINS[index];
+        let payloads = d
+            .payloads
+            .iter()
+            .copied()
+            .filter(|column| available.contains(*column))
+            .collect::<Vec<_>>();
+        let mut selected = vec!["rowid", d.wrapping];
+        selected.extend(&payloads);
+        if index == 7 {
+            selected.extend(["key_id", "purpose", "dataset_id", "public_key_fingerprint"]);
+        } else if index == 8 {
+            selected.extend(["screenshot_id", "scope_tag"]);
+        }
         let mut query = conn
             .prepare(&format!(
-                "SELECT rowid,{} FROM {} WHERE {} IS NOT NULL AND length({})>0 ORDER BY rowid",
-                d.wrapping, d.table, d.wrapping, d.wrapping
+                "SELECT {} FROM {} WHERE {} IS NOT NULL AND length({})>0 ORDER BY rowid",
+                selected.join(","),
+                d.table,
+                d.wrapping,
+                d.wrapping
             ))
             .map_err(|e| e.to_string())?;
         let mut rows = query.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             check_cancelled(cancelled).map_err(|e| e.to_string())?;
             let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let wrapping: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            let wrapping = row
+                .get_ref(1)
+                .map_err(|e| e.to_string())?
+                .as_blob()
+                .map_err(|e| e.to_string())?;
             if wrapping.len() > 4096 {
                 return Err("Invalid backup key wrapping length".into());
             }
+            let unwrap_started = Instant::now();
             let key = Zeroizing::new(
-                unwrap_storage_domain_key(credentials, &wrapping).map_err(|e| e.to_string())?,
+                unwrap_storage_domain_key(credentials, wrapping).map_err(|e| e.to_string())?,
             );
+            unwrap_time += unwrap_started.elapsed();
             if key.len() != 32 {
                 return Err("Invalid backup content key length".into());
             }
-            validate_row(conn, index, rowid, &available, &key)?;
+            let authentication_started = Instant::now();
+            for (column_index, column) in payloads.iter().enumerate() {
+                let value = row.get_ref(2 + column_index).map_err(|e| e.to_string())?;
+                if value == rusqlite::types::ValueRef::Null {
+                    continue;
+                }
+                let bytes = value.as_blob().map_err(|e| e.to_string())?;
+                if !bytes.is_empty() {
+                    carbonpaper_app_bound::crypto::authenticate_storage_bytes(
+                        &key,
+                        bytes,
+                        b"",
+                        &mut scratch,
+                    )
+                    .map_err(|_| {
+                        format!(
+                            "Content authentication failed for {}.{column} (rowid={rowid})",
+                            d.table
+                        )
+                    })?;
+                }
+            }
             if index == 7 {
-                let cipher = protected_key(conn, rowid, &key, &hex::encode(fingerprint))?;
+                let cipher = protected_key_fields(
+                    row.get(2).map_err(|e| e.to_string())?,
+                    row.get(4).map_err(|e| e.to_string())?,
+                    row.get(3).map_err(|e| e.to_string())?,
+                    row.get::<_, String>(5).map_err(|e| e.to_string())?.as_str(),
+                    &fingerprint_hex,
+                    &key,
+                )?;
                 protected.insert(cipher.id.clone(), cipher);
             }
             if index == 8 {
+                super::ocr_keys::backup::validate_key_fields(
+                    ocr_dataset.as_deref().ok_or("Missing OCR backup dataset")?,
+                    row.get(2).map_err(|e| e.to_string())?,
+                    rowid,
+                    row.get_ref(3)
+                        .map_err(|e| e.to_string())?
+                        .as_blob()
+                        .map_err(|e| e.to_string())?,
+                    &key,
+                )?;
                 ocr_groups.insert(rowid, Zeroizing::new(key.to_vec()));
             }
+            row_authentication_time += authentication_started.elapsed();
             writer
                 .write_all(&[index as u8])
                 .and_then(|_| writer.write_all(&rowid.to_le_bytes()))
-                .and_then(|_| writer.write_all(&Sha256::digest(&wrapping)))
+                .and_then(|_| writer.write_all(&Sha256::digest(wrapping)))
                 .and_then(|_| writer.write_all(&key))
                 .map_err(|e| e.to_string())?;
             completed += 1;
@@ -492,8 +582,21 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
             }
         }
     }
+    let ocr_started = Instant::now();
     super::ocr_keys::backup::validate_members(conn, &ocr_groups, cancelled)?;
-    validate_protected(conn, &protected)
+    let ocr_authentication_ms = ocr_started.elapsed().as_millis() as u64;
+    let protected_started = Instant::now();
+    validate_protected(conn, &protected)?;
+    tracing::info!(
+        key_slots = count,
+        inventory_ms,
+        unwrap_ms = unwrap_time.as_millis() as u64,
+        row_authentication_ms = row_authentication_time.as_millis() as u64,
+        ocr_authentication_ms,
+        protected_authentication_ms = protected_started.elapsed().as_millis() as u64,
+        "Backup key preparation timings"
+    );
+    Ok(())
 }
 
 fn without_triggers<T>(

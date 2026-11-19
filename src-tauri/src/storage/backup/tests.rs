@@ -445,6 +445,61 @@ fn corrupt_image_aborts_export_with_context_and_preserves_the_previous_backup() 
 }
 
 #[test]
+fn streamed_key_validation_rejects_corrupt_metadata_ocr_scope_and_ocr_content() {
+    for (corrupt, expected) in [
+        (
+            "metadata",
+            "Content authentication failed for screenshots.window_title_enc",
+        ),
+        ("ocr_scope", "Invalid OCR key or payload binding"),
+        ("ocr_content", "Decryption failed"),
+    ] {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("source");
+        let archive = root.path().join("previous.cpbackup");
+        let source = storage(&directory);
+        populate(&source, false);
+        std::fs::write(&archive, b"previous valid backup").unwrap();
+        let _operation = source.backup.begin();
+        let snapshot = source
+            .create_backup_snapshot_under_maintenance(
+                &source.database_key().unwrap(),
+                root.path(),
+                |_, _| {},
+            )
+            .unwrap();
+        let conn = Connection::open(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+        connection::configure_sqlcipher_connection(&conn, &source.database_key().unwrap()).unwrap();
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+            false,
+        )
+        .unwrap();
+        let sql = match corrupt {
+            "metadata" => "UPDATE screenshots SET window_title_enc=zeroblob(28) WHERE id=7",
+            "ocr_scope" => "UPDATE ocr_keys SET scope_tag=zeroblob(32)",
+            _ => "UPDATE ocr_results SET text_enc=zeroblob(28) WHERE id=11",
+        };
+        assert_eq!(conn.execute(sql, []).unwrap(), 1);
+        conn.close().unwrap();
+        let error = write_portable(
+            snapshot.path(),
+            &directory,
+            &source.credential_state,
+            &source.database_key().unwrap(),
+            &[9; 32],
+            "backup-password",
+            &archive,
+            &source.backup,
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{corrupt}: {error}");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"previous valid backup");
+    }
+}
+
+#[test]
 fn undeclared_missing_image_rejects_import_before_installing() {
     let root = TempDir::new().unwrap();
     let original = root.path().join("original.cpbackup");
