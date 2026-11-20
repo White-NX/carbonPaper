@@ -300,6 +300,8 @@ fn dispatch_typed_monitor_command(
 #[tauri::command]
 pub async fn monitor_search_nl(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    requests: State<'_, crate::clip_query::ClipQueryRequests>,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     query: String,
     limit: Option<u32>,
@@ -311,10 +313,19 @@ pub async fn monitor_search_nl(
     _fuzzy: Option<bool>,
     include_ocr: Option<bool>,
     sort_order: Option<crate::storage::SearchSortOrder>,
+    request_id: Option<String>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let process_names = process_names.unwrap_or_default();
     let categories = categories.unwrap_or_default();
+    let ticket = request_id
+        .as_deref()
+        .map(|id| requests.begin(window.label(), id))
+        .transpose()?;
+    let cancelled = ticket
+        .as_ref()
+        .map(|ticket| ticket.cancelled.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     // `fuzzy` is retained in the command contract but does not apply to
     // text-to-image similarity.
@@ -330,10 +341,23 @@ pub async fn monitor_search_nl(
         )
         .with_ocr(include_ocr.unwrap_or(true))
         .with_sort_order(sort_order.unwrap_or_default())
+        .with_cancellation(cancelled)
         .with_categories(&categories),
     )
     .await?;
     Ok(serde_json::json!({ "status": "success", "results": results, "backend": "rust" }))
+}
+
+/// Cancel only a CLIP request owned by the calling window.
+#[tauri::command]
+pub fn monitor_cancel_search_nl(
+    window: tauri::WebviewWindow,
+    requests: State<'_, crate::clip_query::ClipQueryRequests>,
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    request_id: String,
+) -> Result<(), String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    requests.cancel(window.label(), &request_id)
 }
 
 #[tauri::command]

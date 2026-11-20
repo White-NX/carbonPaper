@@ -32,6 +32,30 @@ describe('visual search ordering', () => {
       query: 'notes', sortOrder: 'newest', offset: 50, limit: 50, includeOcr: false,
     }));
   });
+
+  it('cancels the native visual request when its signal is aborted', async () => {
+    let finish;
+    invoke.mockReset().mockImplementation((command) => command === 'monitor_search_nl'
+      ? new Promise(resolve => { finish = resolve; }) : Promise.resolve());
+    const controller = new AbortController();
+    const pending = searchScreenshots('notes', 'nl', { signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(finish).toEqual(expect.any(Function)));
+    const requestId = invoke.mock.calls.find(([command]) => command === 'monitor_search_nl')[1].requestId;
+    expect(requestId).toEqual(expect.any(String));
+    controller.abort();
+    expect(invoke).toHaveBeenCalledWith('monitor_cancel_search_nl', { requestId });
+    finish({ results: [] });
+    await rejected;
+  });
+
+  it('removes cancellation listeners after the native visual request finishes', async () => {
+    invoke.mockReset().mockResolvedValue({ results: [] });
+    const controller = new AbortController();
+    await searchScreenshots('notes', 'nl', { signal: controller.signal });
+    controller.abort();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('RequestQueue', () => {

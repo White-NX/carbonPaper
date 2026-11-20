@@ -49,6 +49,7 @@ const VISIBILITY_MARGIN: usize = 16;
 #[derive(Default)]
 pub(super) struct TopKOptions {
     pub(super) deadline: Option<Instant>,
+    pub(super) cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Override the resident-memory budget for focused scan regressions.
     pub(super) resident_budget: Option<usize>,
     pub(super) metrics: Option<std::sync::Arc<super::VectorQueryMetrics>>,
@@ -426,24 +427,53 @@ impl SemanticVectorCache {
     }
 
     /// Scores every resident row and returns the best `want`, highest first.
+    #[cfg(test)]
     fn top_candidates(&self, query: &[f32], want: usize) -> Vec<ScoredSubject> {
+        self.top_candidates_with_control(query, want, None, None)
+            .unwrap()
+    }
+
+    fn top_candidates_with_control(
+        &self,
+        query: &[f32],
+        want: usize,
+        deadline: Option<Instant>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<ScoredSubject>, String> {
         if want == 0 || self.subjects.is_empty() || query.len() != self.dimensions {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut top = TopK::new(want);
         for (index, row) in self.matrix.chunks_exact(self.dimensions).enumerate() {
+            if index % 256 == 0 {
+                check_vector_interruption(deadline, cancelled)?;
+            }
             top.push_with_key(dot_product_wide(query, row), &self.subjects[index], || {
                 index as u32
             });
         }
-        top.into_sorted()
+        Ok(top
+            .into_sorted()
             .into_iter()
             .map(|candidate| ScoredSubject {
                 subject_key: self.subjects[candidate.value as usize].clone(),
                 score: candidate.score,
             })
-            .collect()
+            .collect())
     }
+}
+
+fn check_vector_interruption(
+    deadline: Option<Instant>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("query_cancelled".into());
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("query_deadline_exceeded_during_vector_scan".into());
+    }
+    Ok(())
 }
 
 /// Rejects a query whose width does not match the stored vectors.
@@ -716,6 +746,8 @@ impl StorageState {
             .resident_budget
             .unwrap_or_else(|| cache_budget(index_kind));
         let deadline = options.deadline;
+        let cancelled = options.cancelled.as_deref();
+        check_vector_interruption(deadline, cancelled)?;
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -769,7 +801,12 @@ impl StorageState {
                         });
                     }
                     let scoring_started = Instant::now();
-                    let scored = cache.top_candidates(query, want.min(cache.rows()));
+                    let scored = cache.top_candidates_with_control(
+                        query,
+                        want.min(cache.rows()),
+                        deadline,
+                        cancelled,
+                    )?;
                     if let Some(metrics) = metrics {
                         metrics.update(|progress| {
                             progress.rows_scanned = cache.rows();
@@ -825,7 +862,12 @@ impl StorageState {
                             });
                         }
                         let scoring_started = Instant::now();
-                        let scored = cache.top_candidates(query, want.min(cache.rows()));
+                        let scored = cache.top_candidates_with_control(
+                            query,
+                            want.min(cache.rows()),
+                            deadline,
+                            cancelled,
+                        )?;
                         if let Some(metrics) = metrics {
                             metrics.update(|progress| {
                                 progress.rows_scanned = cache.rows();
@@ -862,6 +904,7 @@ impl StorageState {
                     resident_budget,
                     deadline,
                     metrics,
+                    cancelled,
                 )?;
                 check_authorization()?;
                 if self.semantic_cache_reset_generation.load(Ordering::Acquire) != reset_generation
@@ -976,6 +1019,7 @@ impl StorageState {
                 .map_err(|error| format!("Failed to prepare visibility re-check: {error}"))?;
             let mut visible = Vec::with_capacity(k.min(candidate_count));
             for candidate in candidates {
+                check_vector_interruption(deadline, cancelled)?;
                 if visible.len() == k {
                     break;
                 }
@@ -1052,6 +1096,7 @@ impl StorageState {
         resident_budget: usize,
         deadline: Option<Instant>,
         metrics: Option<&super::VectorQueryMetrics>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<CacheQueryMode, String> {
         let read_started = Instant::now();
         if let Some(metrics) = metrics {
@@ -1123,6 +1168,7 @@ impl StorageState {
                 metrics.update(|progress| progress.mode = if cache.is_some() { "resident_load" } else { "streaming" });
             }
             let (pages, rows) = scan_visible_embedding_pages(conn, index_kind, deadline, metrics, |subject, vector| {
+                check_vector_interruption(deadline, cancelled)?;
                 if vector.len() != query.len() {
                     skipped = skipped.saturating_add(1);
                     return Ok(());
@@ -1349,6 +1395,7 @@ impl StorageState {
         for index_kind in [DerivedIndexKind::SemanticText, DerivedIndexKind::ClipImage] {
             released |= self.evict_one_vector_cache_if_idle(index_kind, ttl);
         }
+        released |= self.evict_clip_chronological_cache_if_idle(ttl);
         released
     }
 

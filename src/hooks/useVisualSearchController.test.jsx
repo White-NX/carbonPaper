@@ -20,6 +20,26 @@ describe('visual search controller', () => {
     searchScreenshots.mockReset().mockResolvedValue([]);
     fetchThumbnailBatch.mockReset().mockImplementation(async (ids) => Object.fromEntries(ids.map((id) => [id, `thumbnail-${id}`])));
   });
+
+  it('preserves first-page timeout diagnostics and reports visual elapsed time', async () => {
+    const message = 'CLIP search unavailable: query_deadline_exceeded';
+    searchScreenshots.mockRejectedValueOnce(new Error(message));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { result } = renderHook(useVisualSearchController, { initialProps: props() });
+    await waitFor(() => expect(result.current.phase).toBe('error'));
+    expect(result.current.errorKind).toBe('timeout');
+    expect(result.current.errorMessage).toBe(message);
+    expect(result.current.elapsedMs).toEqual(expect.any(Number));
+    expect(log).toHaveBeenCalledWith('Visual search failed:', message);
+    log.mockRestore();
+  });
+
+  it('does not report ANN readiness for chronological searches', async () => {
+    const { result } = renderHook(useVisualSearchController, { initialProps: { ...props(), sortOrder: 'newest' } });
+    await waitFor(() => expect(result.current.phase).toBe('ready'));
+    expect(result.current.indexReady).toBeNull();
+    expect(getClipSearchStatus).not.toHaveBeenCalled();
+  });
   afterEach(() => vi.useRealTimers());
 
   it('reports pending readiness while retrieval runs and refreshes it without restarting the search', async () => {

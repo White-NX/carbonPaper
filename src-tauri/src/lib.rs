@@ -877,6 +877,7 @@ pub fn run() {
         .manage(Arc::new(blind_index_repair::BlindIndexRepairState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
         .manage(Arc::new(clip_ann::ClipAnnState::default()))
+        .manage(clip_query::ClipQueryRequests::default())
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -1002,6 +1003,7 @@ pub fn run() {
             monitor::resume_monitor,
             monitor::get_monitor_status,
             monitor::monitor_search_nl,
+            monitor::monitor_cancel_search_nl,
             monitor::monitor_update_filters,
             monitor::monitor_get_filters,
             monitor::monitor_update_advanced_config,

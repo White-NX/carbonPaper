@@ -1593,6 +1593,8 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to create soft-delete indexes: {}", e))?;
 
+        super::clip_chronological::init_index(conn)?;
+
         Ok(())
     }
 

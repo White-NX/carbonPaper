@@ -947,6 +947,21 @@ impl StorageState {
         index_kind: DerivedIndexKind,
         subject_keys: &[String],
     ) -> Result<std::collections::HashMap<String, Vec<f32>>, String> {
+        self.get_query_visible_embeddings_by_subjects_with_control(
+            index_kind,
+            subject_keys,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn get_query_visible_embeddings_by_subjects_with_control(
+        &self,
+        index_kind: DerivedIndexKind,
+        subject_keys: &[String],
+        deadline: Option<std::time::Instant>,
+        cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>, String> {
         let mut out = std::collections::HashMap::new();
         if subject_keys.is_empty() {
             return Ok(out);
@@ -954,11 +969,27 @@ impl StorageState {
         for subject_key in subject_keys {
             validate_required_text("subject_key", subject_key, MAX_SUBJECT_KEY_BYTES)?;
         }
-        let guard = self.get_connection_named("get_query_visible_embeddings_by_subjects")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut guard = self.get_connection_named("get_query_visible_embeddings_by_subjects")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let deadline_guard = super::connection::QueryDeadline::install_with_cancellation(
+            conn,
+            deadline,
+            cancelled.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let conn = &*deadline_guard;
         // Chunked to stay under SQLite's default 999-parameter ceiling, with
         // one slot reserved for `index_kind`.
         for chunk in subject_keys.chunks(500) {
+            if cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err("query_cancelled".into());
+            }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err("query_deadline_exceeded_during_vector_batch".into());
+            }
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1083,6 +1114,7 @@ impl StorageState {
         k: usize,
         deadline: std::time::Instant,
         metrics: Option<std::sync::Arc<super::VectorQueryMetrics>>,
+        cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<ScoredSubject>, String> {
         if query.is_empty() {
             return Err("CLIP query vector must not be empty".to_string());
@@ -1097,6 +1129,7 @@ impl StorageState {
             TopKOptions {
                 deadline: Some(deadline),
                 metrics,
+                cancelled,
                 ..TopKOptions::default()
             },
         )
@@ -1891,14 +1924,16 @@ fn embedding_source(table: &str, embedding_index: &str, job_index: &str) -> Stri
         FROM {table} e {embedding_index}
         INNER JOIN derived_index_jobs j {job_index}
           ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
-        WHERE e.index_kind = ?1 AND j.status = 'completed'
-          AND j.model_id = e.model_id
-          AND j.model_revision = e.model_revision
-          AND j.embedding_version = e.embedding_version
-          AND j.source_fingerprint = e.source_fingerprint
+        WHERE {QUERY_VISIBLE_EMBEDDING_PREDICATE}
 "#
     )
 }
+
+pub(super) const QUERY_VISIBLE_EMBEDDING_PREDICATE: &str =
+    "e.index_kind = ?1 AND j.status = 'completed'
+     AND j.model_id = e.model_id AND j.model_revision = e.model_revision
+     AND j.embedding_version = e.embedding_version
+     AND j.source_fingerprint = e.source_fingerprint";
 
 pub(super) fn visible_embedding_source() -> String {
     visible_embedding_payload_source("")

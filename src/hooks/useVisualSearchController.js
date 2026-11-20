@@ -10,7 +10,8 @@ const EMPTY_RESULTS = [];
 const EMPTY_THUMBNAILS = {};
 const emptyState = (key, phase = 'idle') => ({ key, phase, results: EMPTY_RESULTS,
   thumbnails: EMPTY_THUMBNAILS, offset: 0, summaryCount: VISUAL_SEARCH_SUMMARY_SIZE,
-  hasMore: false, loadingMore: false, pageError: false, pageErrorMessage: null });
+  hasMore: false, loadingMore: false, pageError: false, pageErrorMessage: null,
+  elapsedMs: null, errorMessage: null, errorKind: null });
 
 function normalizeResult(item) {
   const metadata = item.metadata || {};
@@ -47,16 +48,21 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
       return () => queue.cancel();
     }
     setState(emptyState(key, 'loading'));
+    const startedAt = performance.now();
     const limit = VISUAL_SEARCH_SUMMARY_SIZE;
     queue.run(`${key}:0:${limit}`, (signal) => searchScreenshots(normalized, 'nl', {
       limit, offset: 0, processNames, categories, startTime, endTime, sortOrder, fuzzy: false, includeOcr: false, signal,
     })).then((items) => {
       if (generation.current !== version) return;
       setState({ ...emptyState(key, 'ready'), results: items.map(normalizeResult),
-        offset: items.length, hasMore: items.length === limit });
+        offset: items.length, hasMore: items.length === limit, elapsedMs: performance.now() - startedAt });
     }).catch((error) => {
       if (generation.current === version && error?.name !== 'AbortError') {
-        setState(emptyState(key, 'error'));
+        const errorMessage = error?.message || String(error);
+        console.error('Visual search failed:', errorMessage);
+        setState({ ...emptyState(key, 'error'), errorMessage,
+          errorKind: errorMessage.includes('query_deadline_exceeded') ? 'timeout' : 'unavailable',
+          elapsedMs: performance.now() - startedAt });
       }
     });
     return () => { generation.current += 1; queue.cancel(); };
@@ -67,7 +73,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
     const status = await getClipSearchStatus();
     if (generation.current !== version) return;
     setIndexReady(typeof status?.ready === 'boolean' ? status.ready : null);
-  }, { intervalMs: 5000, enabled: ready });
+  }, { intervalMs: 5000, enabled: ready && sortOrder === 'relevance' });
 
   const loadPage = useCallback(async (limit, restart = false) => {
     if (!ready || current.phase !== 'ready' || !current.hasMore || current.loadingMore || pageRequest.current) return;
@@ -142,7 +148,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
 
   const thumbnails = useMemo(() => ready ? { ...sharedThumbnails, ...current.thumbnails } : EMPTY_THUMBNAILS,
     [ready, sharedThumbnails, current.thumbnails]);
-  return { ...current, indexReady: ready ? indexReady : null, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
+  return { ...current, indexReady: ready && sortOrder === 'relevance' ? indexReady : null, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
     summaryExpanded: current.summaryCount > VISUAL_SEARCH_SUMMARY_SIZE,
     summaryHasMore: current.results.length > current.summaryCount || current.hasMore,
     summaryPageError, showMore, loadMore, retry };

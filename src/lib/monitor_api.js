@@ -400,23 +400,37 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
         // Natural-language image search is served directly by Rust.
         throwIfSearchAborted(options.signal);
         if (mode === 'nl') {
-            const response = await invoke('monitor_search_nl', {
-                query,
-                limit,
-                offset,
-                processNames,
-                ...(categories.length ? { categories } : {}),
-                startTime,
-                endTime,
-                fuzzy,
-                ...(includeOcr === false ? { includeOcr: false } : {}),
-                ...(sortOrder !== 'relevance' ? { sortOrder } : {}),
-            });
-            throwIfSearchAborted(options.signal);
-            if (response.error) {
-                throw new Error(response.error);
+            const requestId = options.signal ? crypto.randomUUID() : null;
+            const cancel = () => {
+                void invoke('monitor_cancel_search_nl', { requestId }).catch(() => {});
+            };
+            options.signal?.addEventListener('abort', cancel, { once: true });
+            try {
+                throwIfSearchAborted(options.signal);
+                const response = await invoke('monitor_search_nl', {
+                    query,
+                    limit,
+                    offset,
+                    processNames,
+                    ...(categories.length ? { categories } : {}),
+                    startTime,
+                    endTime,
+                    fuzzy,
+                    ...(includeOcr === false ? { includeOcr: false } : {}),
+                    ...(sortOrder !== 'relevance' ? { sortOrder } : {}),
+                    ...(requestId ? { requestId } : {}),
+                });
+                throwIfSearchAborted(options.signal);
+                if (response.error) {
+                    throw new Error(response.error);
+                }
+                return response.results || [];
+            } catch (error) {
+                throwIfSearchAborted(options.signal);
+                throw error;
+            } finally {
+                options.signal?.removeEventListener('abort', cancel);
             }
-            return response.results || [];
         }
         
         // OCR/文本搜索使用 Rust 存储层

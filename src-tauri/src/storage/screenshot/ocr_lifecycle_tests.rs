@@ -723,6 +723,43 @@ fn clip_candidates_preserve_live_ids_and_optional_utc_timestamps_without_decrypt
 }
 
 #[test]
+fn clip_candidate_hash_batches_use_hash_seeks_with_and_without_statistics() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::storage::test_storage_with_schema(temp.path().into());
+    let guard = storage.db.lock().unwrap();
+    let conn = guard.as_ref().unwrap();
+    let hashes: Vec<String> = (0..200).map(|id| format!("candidate-{id}")).collect();
+    for analyzed in [false, true] {
+        if analyzed {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        for sql in [
+            image_hash_mapping_sql(hashes.len()),
+            clip_candidate_metadata_sql(hashes.len()),
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(hashes.iter()), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_image_hash (image_hash=?)")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("idx_screenshots_deleted_created_at")),
+                "{plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn silent_metadata_reads_fail_fast_while_session_is_locked() {
     let temp = tempfile::tempdir().expect("temp storage directory");
     let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));

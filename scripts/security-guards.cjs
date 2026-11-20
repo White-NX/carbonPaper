@@ -54,6 +54,7 @@ const COMMAND_TIERS = {
   'monitor::resume_monitor': 'runtime_public',
   'monitor::get_monitor_status': 'public',
   'monitor::monitor_search_nl': 'session_required',
+  'monitor::monitor_cancel_search_nl': 'session_required',
   'monitor::monitor_update_filters': 'session_required',
   'monitor::monitor_update_advanced_config': 'session_required',
   'monitor::monitor_nl_cluster_query': 'session_required',
