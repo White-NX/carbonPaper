@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
-import { RequestQueue, searchScreenshots } from './monitor_api';
+import { RequestQueue, searchScreenshots, getSoftDeleteQueueStatus } from './monitor_api';
 
 vi.mock('./auth_api', async (importOriginal) => ({
   ...await importOriginal(),
@@ -8,6 +8,21 @@ vi.mock('./auth_api', async (importOriginal) => ({
 }));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+it('shares concurrent delete status reads and preserves the last status during maintenance', async () => {
+  let finish;
+  invoke.mockReset().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const first = getSoftDeleteQueueStatus();
+  const second = getSoftDeleteQueueStatus();
+  expect(first).toBe(second);
+  await Promise.resolve();
+  expect(invoke).toHaveBeenCalledTimes(1);
+  const status = { pending_screenshots: 12, pending_ocr: 34, running: true };
+  finish(status);
+  await expect(first).resolves.toEqual(status);
+  invoke.mockRejectedValueOnce('MAINTENANCE_IN_PROGRESS');
+  await expect(getSoftDeleteQueueStatus()).resolves.toEqual(status);
+});
 
 describe('visual search ordering', () => {
   it('passes newest ordering through the authenticated Tauri command when loading another page', async () => {

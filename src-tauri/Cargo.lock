@@ -706,6 +706,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "carbonpaper-app-bound",
+ "carbonpaper-backup-core",
  "chrono",
  "chrono-tz",
  "dirs 5.0.1",
@@ -779,6 +780,17 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "windows 0.58.0",
+ "zeroize",
+]
+
+[[package]]
+name = "carbonpaper-backup-core"
+version = "0.1.0"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "argon2",
+ "rand 0.8.5",
  "zeroize",
 ]
 

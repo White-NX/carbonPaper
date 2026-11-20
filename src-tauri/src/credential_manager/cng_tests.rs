@@ -87,6 +87,24 @@ fn native_fixture() -> (CredentialManagerState, Vec<u8>) {
     (state, ciphertext)
 }
 
+#[test]
+fn native_row_key_unwrap_enforces_the_fixed_content_key_length() {
+    let key = ephemeral_key();
+    for length in [31, MASTER_KEY_LEN, 33] {
+        let plain = vec![7; length];
+        let encrypted = wrap_for_test(&key, &plain);
+        let result = key.unwrap_row_key(&encrypted);
+        if length == MASTER_KEY_LEN {
+            assert_eq!(result.unwrap(), plain);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    let mut corrupt = wrap_for_test(&key, &[7; MASTER_KEY_LEN]);
+    corrupt[0] ^= 1;
+    assert!(key.unwrap_row_key(&corrupt).is_err());
+}
+
 fn public_blob(key: &CngKeyHandle) -> Vec<u8> {
     let blob = HSTRING::from("RSAPUBLICBLOB");
     let mut length = 0;

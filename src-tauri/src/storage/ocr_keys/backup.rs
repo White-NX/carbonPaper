@@ -68,7 +68,17 @@ pub(in crate::storage) fn validate_key(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    verify_scope(key, &dataset(conn)?, owner, id, &tag).map_err(|e| e.to_string())
+    validate_key_fields(&dataset(conn)?, owner, id, &tag, key)
+}
+
+pub(in crate::storage) fn validate_key_fields(
+    dataset: &str,
+    owner: i64,
+    id: i64,
+    tag: &[u8],
+    key: &[u8],
+) -> Result<(), String> {
+    verify_scope(key, dataset, owner, id, tag).map_err(|e| e.to_string())
 }
 
 pub(in crate::storage) fn validate_members(
@@ -80,6 +90,7 @@ pub(in crate::storage) fn validate_members(
         return Ok(());
     }
     let dataset = dataset(conn)?;
+    let mut scratch = carbonpaper_backup_core::ZeroizingBuffer::new();
     let mut counts = HashMap::<i64, i64>::new();
     let has_blocks: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('ocr_results') WHERE name='ocr_block_slot')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
     let slot_column = if has_blocks { "ocr_block_slot" } else { "NULL" };
@@ -92,7 +103,6 @@ pub(in crate::storage) fn validate_members(
         let id: i64 = row.get(0).map_err(|e| e.to_string())?;
         let screenshot: i64 = row.get(1).map_err(|e| e.to_string())?;
         let group: i64 = row.get(2).map_err(|e| e.to_string())?;
-        let data: Option<Vec<u8>> = row.get(3).map_err(|e| e.to_string())?;
         let slot: Option<i64> = row.get(4).map_err(|e| e.to_string())?;
         let key = keys.get(&group).ok_or("Missing portable OCR group key")?;
         if let Some(slot) = slot {
@@ -138,15 +148,17 @@ pub(in crate::storage) fn validate_members(
                 .ok_or("Missing portable OCR block")?
                 .record(slot, id)?;
         } else {
-            let data = data.ok_or("Missing portable inline OCR payload")?;
-            let _plain = Zeroizing::new(
-                open(
-                    key,
-                    &aad(&dataset, screenshot, group, id).map_err(|e| e.to_string())?,
-                    &data,
-                )
-                .map_err(|e| e.to_string())?,
-            );
+            let data = row
+                .get_ref(3)
+                .map_err(|e| e.to_string())?
+                .as_blob()
+                .map_err(|e| e.to_string())?;
+            carbonpaper_app_bound::crypto::authenticate_storage_bytes(
+                key,
+                data,
+                &aad(&dataset, screenshot, group, id).map_err(|e| e.to_string())?,
+                &mut scratch,
+            )?;
         }
         *counts.entry(group).or_default() += 1;
     }

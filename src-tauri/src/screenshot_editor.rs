@@ -82,7 +82,7 @@ pub(crate) async fn save(
     let prepare_storage = storage.clone();
     let prepare_hash = expected_hash.clone();
     let (generation, bytes, pixels) = tokio::task::spawn_blocking(move || {
-        let _activity = prepare_storage.foreground_db_read();
+        let _activity = prepare_storage.foreground_db_read()?;
         prepare_storage.check_screenshot_edit(screenshot_id, &prepare_hash)?;
         let record = prepare_storage
             .screenshots()

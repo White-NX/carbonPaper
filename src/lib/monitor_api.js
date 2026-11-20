@@ -513,16 +513,25 @@ export const softDeleteScreenshots = async (screenshotIds = []) => {
     });
 };
 
-export const getSoftDeleteQueueStatus = async () => {
-    try {
-        return await withAuth(async () => {
-            const status = await invoke('storage_get_delete_queue_status');
-            return status || { pending_screenshots: 0, pending_ocr: 0, running: false };
-        });
-    } catch (e) {
-        console.warn('Failed to get soft delete queue status', e);
-        return { pending_screenshots: 0, pending_ocr: 0, running: false };
-    }
+let deleteQueueStatusRequest = null;
+let lastDeleteQueueStatus = { pending_screenshots: 0, pending_ocr: 0, running: false };
+
+export const getSoftDeleteQueueStatus = () => {
+    if (deleteQueueStatusRequest) return deleteQueueStatusRequest;
+    deleteQueueStatusRequest = Promise.resolve()
+        .then(() => withAuth(() => invoke('storage_get_delete_queue_status')))
+        .then(status => {
+            if (status) lastDeleteQueueStatus = status;
+            return lastDeleteQueueStatus;
+        })
+        .catch(error => {
+            if (!String(error).includes('MAINTENANCE_IN_PROGRESS')) {
+                console.warn('Failed to get soft delete queue status', error);
+            }
+            return lastDeleteQueueStatus;
+        })
+        .finally(() => { deleteQueueStatusRequest = null; });
+    return deleteQueueStatusRequest;
 };
 
 export const getScreenshotDetails = async (id, path = null, { fresh = false } = {}) => {

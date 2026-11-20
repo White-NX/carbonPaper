@@ -3,6 +3,125 @@ use crate::credential_manager::CredentialManagerState;
 use std::sync::Arc;
 
 #[test]
+fn commit_retry_uses_a_final_image_after_a_database_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::storage::test_storage_with_schema(temp.path().into());
+    std::fs::create_dir_all(temp.path().join("screenshots")).unwrap();
+    std::fs::write(
+        temp.path().join("screenshots/retry.enc.pending"),
+        b"encrypted fixture",
+    )
+    .unwrap();
+    storage.db.lock().unwrap().as_ref().unwrap().execute_batch(
+        "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(1,'screenshots/retry.enc.pending','retry','pending');
+         CREATE TRIGGER reject_commit BEFORE UPDATE OF status ON screenshots BEGIN SELECT RAISE(ABORT,'forced failure'); END;",
+    ).unwrap();
+    assert!(storage
+        .commit_screenshot(1, None, None, None)
+        .unwrap_err()
+        .contains("forced failure"));
+    assert!(!temp.path().join("screenshots/retry.enc.pending").exists());
+    assert!(temp.path().join("screenshots/retry.enc").is_file());
+    storage
+        .db
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_commit")
+        .unwrap();
+    let committed = storage.commit_screenshot(1, None, None, None).unwrap();
+    assert_eq!(
+        committed.image_path.as_deref(),
+        Some("screenshots/retry.enc")
+    );
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT image_path FROM screenshots WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "screenshots/retry.enc"
+    );
+}
+
+#[test]
+fn failed_image_publication_does_not_mark_a_pending_record_committed() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::storage::test_storage_with_schema(temp.path().into());
+    storage.db.lock().unwrap().as_ref().unwrap().execute(
+        "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(1,'screenshots/missing.enc.pending','missing','pending')", [],
+    ).unwrap();
+    assert!(storage
+        .commit_screenshot(1, None, None, None)
+        .unwrap_err()
+        .contains("Failed to publish screenshot 1"));
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT status FROM screenshots WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "pending"
+    );
+}
+
+#[test]
+fn concurrent_commit_retries_never_write_back_a_pending_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Arc::new(crate::storage::test_storage_with_schema(temp.path().into()));
+    std::fs::create_dir_all(temp.path().join("screenshots")).unwrap();
+    std::fs::write(
+        temp.path().join("screenshots/concurrent.enc.pending"),
+        b"encrypted fixture",
+    )
+    .unwrap();
+    storage.db.lock().unwrap().as_ref().unwrap().execute(
+        "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(1,'screenshots/concurrent.enc.pending','concurrent','pending')", [],
+    ).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            storage.commit_screenshot(1, None, None, None).unwrap()
+        });
+        barrier.wait();
+        let second = storage.commit_screenshot(1, None, None, None).unwrap();
+        assert_eq!(
+            first.join().unwrap().image_path.as_deref(),
+            Some("screenshots/concurrent.enc")
+        );
+        assert_eq!(
+            second.image_path.as_deref(),
+            Some("screenshots/concurrent.enc")
+        );
+    });
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT image_path FROM screenshots WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "screenshots/concurrent.enc"
+    );
+}
+
+#[test]
 fn postprocess_retry_uses_bounded_exponential_backoff() {
     assert_eq!(ocr_postprocess_retry_decision(0), ("pending", Some(30), 1));
     assert_eq!(ocr_postprocess_retry_decision(1), ("pending", Some(60), 2));

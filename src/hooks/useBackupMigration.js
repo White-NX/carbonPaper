@@ -14,6 +14,7 @@ const backupErrors = {
   BACKUP_UNSUPPORTED_FORMAT: 'settings.backup.error_unsupported_format',
   BACKUP_EXPORT_TARGET_CONFLICT: 'settings.backup.error_export_target',
   BACKUP_UNREFERENCED_PLAINTEXT: 'settings.backup.error_legacy_images',
+  BACKUP_UNDECLARED_MISSING_SCREENSHOT: 'settings.backup.error_incomplete',
 };
 
 export function useBackupMigration({ mode, t, onClose }) {
@@ -22,6 +23,7 @@ export function useBackupMigration({ mode, t, onClose }) {
   const [status, setStatus] = useState('idle');
   const [error, setError] = useState('');
   const [progress, setProgress] = useState(null);
+  const [summary, setSummary] = useState(null);
   const [cancelState, setCancelState] = useState('idle');
   const runRef = useRef(null);
   const mountedRef = useRef(true);
@@ -34,11 +36,12 @@ export function useBackupMigration({ mode, t, onClose }) {
 
   useTauriEventListener('backup-migration-progress', (event) => {
     if (runRef.current && !runRef.current.finished) setProgress(event.payload);
-  }, [], status === 'processing');
+  });
 
   const showIdle = () => {
     setStatus('idle');
     setProgress(null);
+    setSummary(null);
     setCancelState('idle');
   };
 
@@ -57,6 +60,7 @@ export function useBackupMigration({ mode, t, onClose }) {
     runRef.current = run;
     setError('');
     setProgress(null);
+    setSummary(null);
     setCancelState('idle');
     setStatus('processing');
     try {
@@ -66,7 +70,7 @@ export function useBackupMigration({ mode, t, onClose }) {
         return;
       }
 
-      await withAuth(async () => {
+      const result = await withAuth(async () => {
         // A cancelled picker or authentication retry must never admit new work.
         if (run.cancelRequested) throw new Error(CANCELLED);
         run.started = true;
@@ -80,7 +84,10 @@ export function useBackupMigration({ mode, t, onClose }) {
       }, { autoPrompt: true });
 
       run.finished = true;
-      if (mountedRef.current) setStatus('success');
+      if (mountedRef.current) {
+        setSummary(result ?? null);
+        setStatus('success');
+      }
       if (mode === 'import') {
         try { await notifySettingsChanged(['storage', 'records']); }
         catch (failure) { console.warn('Failed to notify settings after backup import:', failure); }
@@ -145,6 +152,6 @@ export function useBackupMigration({ mode, t, onClose }) {
 
   return {
     password, setPassword, confirmPassword, setConfirmPassword,
-    status, error, progress, cancelState, handleAction, handleCancel, handleClose, handleRetry,
+    status, error, progress, summary, cancelState, handleAction, handleCancel, handleClose, handleRetry,
   };
 }

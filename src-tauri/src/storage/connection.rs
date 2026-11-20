@@ -154,6 +154,30 @@ pub(crate) struct ActivityGate {
 }
 
 impl ActivityGate {
+    /// Reject new independent queries at the same admission lock used by
+    /// maintenance. Existing readers retain their permits and drain normally.
+    pub(crate) fn try_read(&self, caller: &'static str) -> Option<ActivityReadGuard> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.active_writer || state.waiting_writers > 0 {
+            return None;
+        }
+        state.active_readers += 1;
+        state.foreground_readers += 1;
+        state.last_foreground_read_at = Some(Instant::now());
+        drop(state);
+        Some(ActivityReadGuard {
+            inner: Arc::clone(&self.inner),
+            caller,
+            foreground: true,
+            acquired_at: Instant::now(),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn read(&self, caller: &'static str) -> ActivityReadGuard {
         self.acquire_read(caller, true)
     }
