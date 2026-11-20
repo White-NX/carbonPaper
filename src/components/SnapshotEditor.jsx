@@ -8,6 +8,7 @@ import {
   resizeObject, TEXT_FONT, TEXT_LEADING, TEXT_PADDING, textErasureMask,
 } from '../lib/snapshot_editor';
 import { InspectorOverlay } from './InspectorImage';
+import OcrTextSelection from './OcrTextSelection';
 import PreviewActionBar from './PreviewActionBar';
 import PreviewZoomControls from './PreviewZoomControls';
 import ConfirmDialog from './ConfirmDialog';
@@ -31,6 +32,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   const renderScaleRef = useRef(1);
   const textRef = useRef(null);
   const gestureRef = useRef(null);
+  const textSelectingRef = useRef(false);
   const spacePressedRef = useRef(false);
   const loadedImageIdRef = useRef(null);
   const [image, setImage] = useState(null);
@@ -51,6 +53,8 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     onSaved, onNavigationGuardChange, placeholder: t('snapshotEditor.placeholder') });
   const width = image?.naturalWidth || 1;
   const height = image?.naturalHeight || 1;
+  const selectionResults = useMemo(() => selectedDetails?.ocr_results
+    || overlayBoxes?.filter((box) => box.type === 'text') || [], [selectedDetails?.ocr_results, overlayBoxes]);
   const fitScale = Math.min(viewport.width / width, viewport.height / height, 1) || 1;
   const actualScale = fitScale * view.scale;
   renderScaleRef.current = actualScale;
@@ -143,7 +147,8 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   useEffect(() => {
     const element = viewportRef.current;
     const wheel = (event) => {
-      if (editor.stateRef.current.busy || gestureRef.current) return;
+      if (editor.stateRef.current.busy || gestureRef.current || textSelectingRef.current
+        || event.target.closest('[data-ocr-selection-controls]')) return;
       event.preventDefault();
       const rect = element.getBoundingClientRect();
       const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? element.clientHeight : 1);
@@ -212,6 +217,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
     if (!image || editor.busy || gestureRef.current || ![0, 1].includes(event.button)) return;
     if (event.target.closest(EDITABLE_TARGETS)) return;
     const forcePan = event.button === 1 || event.altKey || spacePressedRef.current;
+    if (!editor.stateRef.current.editing && event.target.closest('[data-ocr-selection]') && !forcePan) return;
     if (event.target.closest('[data-editor-control]')
       && !(forcePan && event.target.closest('.snapshot-editor-object'))) return;
     if (event.target.closest('.cursor-pointer') && !forcePan) return;
@@ -350,7 +356,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
   }, []);
 
   useEffect(() => {
-    if (!editor.editing || !isAuthenticated) return undefined;
+    if (!isAuthenticated) return undefined;
     const keyDown = (event) => {
       if (event.code !== 'Space' && event.key !== ' ') return;
       if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing || editor.stateRef.current.busy
@@ -433,8 +439,16 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
                   stroke="#458ee8" strokeWidth={1.5 * inverseScale} strokeDasharray={`${4 * inverseScale} ${3 * inverseScale}`} />
               </svg>
             )}
-            {!editor.editing && <InspectorOverlay boxes={overlayBoxes} metrics={{ renderWidth: width, renderHeight: height, offsetX: 0, offsetY: 0 }}
-              naturalSize={{ width, height }} onBoxClick={onBoxClick} />}
+            {!editor.editing && <>
+              <InspectorOverlay boxes={overlayBoxes?.filter((box) => box.type !== 'text')}
+                metrics={{ renderWidth: width, renderHeight: height, offsetX: 0, offsetY: 0 }}
+                naturalSize={{ width, height }} onBoxClick={onBoxClick} />
+              {isAuthenticated && <OcrTextSelection key={imageSrc} results={selectionResults}
+                naturalSize={{ width, height }} controlsRef={viewportRef} panReady={spacePressed}
+                onGestureStart={freezeView} onSelectingChange={(selecting) => {
+                  textSelectingRef.current = selecting; setAnimateView(false); setInteracting(selecting);
+                }} />}
+            </>}
             {editor.editing && selected && !editor.busy && (
               <div className="snapshot-editor-object" data-editor-control style={{ left: selected.cx - selected.w / 2,
                 top: selected.cy - selected.h / 2, width: selected.w, height: selected.h,

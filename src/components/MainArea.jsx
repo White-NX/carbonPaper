@@ -360,6 +360,7 @@ export default function MainArea({
               /> : <InspectorImage
                 item={{ imageUrl: selectedImageSrc }}
                 overlayBoxes={ocrBoxes}
+                ocrResults={selectedDetails?.ocr_results}
                 onBoxClick={onInspectorBoxClick}
                 className="w-full h-full rounded-none border-none bg-transparent"
               />}

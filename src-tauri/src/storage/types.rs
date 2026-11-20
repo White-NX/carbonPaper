@@ -72,6 +72,8 @@ pub struct OcrResult {
     pub confidence: f64,
     pub box_coords: Vec<Vec<f64>>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_layout: Option<crate::ml_protocol::MlOcrTextLayout>,
 }
 
 /// A visible link collected from the browser extension, containing the link text and URL.
@@ -233,6 +235,8 @@ pub struct OcrResultInput {
     pub confidence: f64,
     #[serde(rename = "box")]
     pub box_coords: Vec<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_layout: Option<crate::ml_protocol::MlOcrTextLayout>,
 }
 
 /// Response after saving a screenshot, contains the assigned ID and dedup counts.

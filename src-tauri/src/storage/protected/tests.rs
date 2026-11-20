@@ -328,6 +328,7 @@ fn screenshot(storage: &StorageState, hash: &str, process: &str) -> i64 {
             process_name: Some(process.into()),
             metadata: None,
             ocr_results: Some(vec![OcrResultInput {
+                text_layout: None,
                 text: format!("Synthetic captured text for {hash}"),
                 confidence: 1.0,
                 box_coords: vec![

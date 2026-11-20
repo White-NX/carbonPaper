@@ -1,0 +1,45 @@
+.ocr-text-selection {
+  pointer-events: none;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+
+.ocr-text-selection svg {
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.ocr-text-selection:focus-visible {
+  outline: 1px solid var(--ide-accent);
+  outline-offset: -1px;
+}
+
+.ocr-text-hit {
+  fill: transparent;
+  pointer-events: all;
+  cursor: text;
+}
+
+.ocr-text-highlight {
+  fill: var(--ide-accent);
+  fill-opacity: 0.3;
+  pointer-events: none;
+}
+
+.ocr-text-caret {
+  stroke: var(--ide-accent);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+.ocr-text-toolbar {
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ocr-text-estimate {
+  padding: 0 0.25rem;
+  color: var(--ide-muted);
+  font-size: 0.8rem;
+}

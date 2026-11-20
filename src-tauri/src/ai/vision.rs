@@ -614,6 +614,7 @@ mod tests {
     fn privacy_masks_contextual_pii_and_rejects_missing_coordinates() {
         let filter = SensitiveFilterState::default();
         let block = |text: &str, coords: Vec<Vec<f64>>| OcrResult {
+            text_layout: None,
             id: 1,
             screenshot_id: 1,
             text: text.into(),

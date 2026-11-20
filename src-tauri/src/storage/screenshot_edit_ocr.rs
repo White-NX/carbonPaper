@@ -37,49 +37,26 @@ fn current(conn: &Connection, job: &EditOcrJob) -> Result<bool, String> {
 }
 
 fn insert_results(
+    storage: &StorageState,
     conn: &Connection,
     id: i64,
     results: &[OcrResultInput],
     key: Option<&WriteKey>,
 ) -> Result<(), String> {
-    let dataset = ocr_keys::dataset(conn)?;
     let mut row_id = ocr_keys::next_row_id(conn)?;
-    if let Some(key) = key {
-        key.insert(conn, &dataset, id)?;
-    }
+    let mut records = Vec::with_capacity(results.len());
     for result in results {
-        super::screenshot::validate_ocr_result(result)?;
-        let key = key.ok_or("Missing fresh OCR encryption key")?;
-        let text = key.encrypt(&dataset, id, row_id, result.text.as_bytes())?;
-        conn.execute(
-            "INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,ocr_key_id,confidence,
-             box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
-             VALUES(?1,?2,'',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                row_id,
-                id,
-                text,
-                key.id,
-                result.confidence,
-                result.box_coords[0][0],
-                result.box_coords[0][1],
-                result.box_coords[1][0],
-                result.box_coords[1][1],
-                result.box_coords[2][0],
-                result.box_coords[2][1],
-                result.box_coords[3][0],
-                result.box_coords[3][1]
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        records.push(super::ocr_blocks::input_record(row_id, result)?);
         row_id = row_id
             .checked_add(1)
             .ok_or("OCR row ID capacity exhausted")?;
     }
+    super::ocr_blocks::insert_records(conn, id, &records, key, || storage.new_ocr_write_key())?;
     Ok(())
 }
 
 fn publish_results(
+    storage: &StorageState,
     conn: &mut Connection,
     job: &EditOcrJob,
     results: &[OcrResultInput],
@@ -91,7 +68,7 @@ fn publish_results(
     if !current(&tx, job)? {
         return Ok(false);
     }
-    insert_results(&tx, job.screenshot_id, results, key)?;
+    insert_results(storage, &tx, job.screenshot_id, results, key)?;
     tx.execute(
         "UPDATE screenshot_edit_ocr_jobs SET status='completed',lease=NULL,error=NULL,
         updated_at=CURRENT_TIMESTAMP WHERE screenshot_id=?1",
@@ -238,7 +215,8 @@ impl StorageState {
             return Err("AUTH_REQUIRED".into());
         }
         let conn = guard.as_mut().ok_or("Database not initialized")?;
-        let published = publish_results(conn, job, results, key.as_ref(), elapsed_ms, provider)?;
+        let published =
+            publish_results(self, conn, job, results, key.as_ref(), elapsed_ms, provider)?;
         if published {
             self.ocr_row_count
                 .fetch_add(results.len() as u64, Ordering::Relaxed);

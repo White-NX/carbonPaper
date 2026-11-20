@@ -73,12 +73,24 @@ impl EncryptedOcrResultRow {
             screenshot_id: row.get(1)?,
             text_enc: row.get(2)?,
             text_key_encrypted: row.get(3)?,
-            confidence: row.get(4)?,
+            confidence: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
             box_coords: vec![
-                vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
-                vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
-                vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
-                vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
+                vec![
+                    row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
+                ],
+                vec![
+                    row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(8)?.unwrap_or_default(),
+                ],
+                vec![
+                    row.get::<_, Option<f64>>(9)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(10)?.unwrap_or_default(),
+                ],
+                vec![
+                    row.get::<_, Option<f64>>(11)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
+                ],
             ],
             created_at: row.get(13)?,
         })
@@ -310,6 +322,9 @@ pub(super) fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String>
     }
     if result.text.chars().count() > 16_384 {
         return Err("OCR result text exceeds the storage limit".to_string());
+    }
+    if let Some(layout) = &result.text_layout {
+        crate::ocr_layout::validate(&result.text, layout)?;
     }
     Ok(())
 }
@@ -719,9 +734,8 @@ impl StorageState {
         let mut skipped = 0;
 
         if let Some(ocr_results) = &request.ocr_results {
-            let dataset = super::ocr_keys::dataset(conn)?;
             let mut next_id = super::ocr_keys::next_row_id(conn)?;
-            let mut inserted_key = false;
+            let mut records: Vec<super::ocr_blocks::Record> = Vec::new();
             for result in ocr_results {
                 if let Err(error) = validate_ocr_result(result) {
                     tracing::warn!("Skipping invalid OCR result during save: {}", error);
@@ -742,40 +756,16 @@ impl StorageState {
                         )
                         .unwrap_or(0);
 
-                    if existing > 0 {
+                    if existing > 0
+                        || records.iter().any(|r| {
+                            (r.box_coords[0][0] - box_coords[0][0]).abs() < 10.0
+                                && (r.box_coords[0][1] - box_coords[0][1]).abs() < 10.0
+                        })
+                    {
                         skipped += 1;
                         continue;
                     }
-                    let key = ocr_key.as_ref().ok_or("Missing fresh OCR write key")?;
-                    if !inserted_key {
-                        key.insert(conn, &dataset, screenshot_id)?;
-                        inserted_key = true;
-                    }
-                    let text_enc =
-                        key.encrypt(&dataset, screenshot_id, next_id, result.text.as_bytes())?;
-
-                    // Insert new OCR result with encrypted text (lazy indexing will process this later)
-                    conn.execute(
-                        "INSERT INTO ocr_results (
-                            screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
-                            box_x1, box_y1, box_x2, box_y2,
-                            box_x3, box_y3, box_x4, box_y4, id, ocr_key_id
-                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        params![
-                            screenshot_id,
-                            Option::<String>::None,
-                            "", // empty text_hash signifies unindexed/backlogged
-                            text_enc,
-                            Option::<Vec<u8>>::None,
-                            result.confidence,
-                            box_coords[0][0], box_coords[0][1],
-                            box_coords[1][0], box_coords[1][1],
-                            box_coords[2][0], box_coords[2][1],
-                            box_coords[3][0], box_coords[3][1],
-                            next_id,key.id,
-                        ],
-                    )
-                    .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
+                    records.push(super::ocr_blocks::input_record(next_id, result)?);
 
                     added += 1;
                     next_id = next_id
@@ -783,6 +773,13 @@ impl StorageState {
                         .ok_or("OCR row ID capacity exhausted")?;
                 }
             }
+            super::ocr_blocks::insert_records(
+                conn,
+                screenshot_id,
+                &records,
+                ocr_key.as_ref(),
+                || self.new_ocr_write_key(),
+            )?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         self.ocr_row_count
@@ -1060,49 +1057,23 @@ impl StorageState {
                 .transaction()
                 .map_err(|e| format!("Failed to start commit transaction: {}", e))?;
 
-            let dataset = super::ocr_keys::dataset(&tx)?;
             let mut next_id = super::ocr_keys::next_row_id(&tx)?;
-            if let Some(key) = &ocr_key {
-                key.insert(&tx, &dataset, screenshot_id)?;
-            }
+            let mut records = Vec::with_capacity(valid_results.len());
             for result in valid_results {
-                let te0 = std::time::Instant::now();
-                let key = ocr_key.as_ref().ok_or("Missing fresh OCR write key")?;
-                let text_enc =
-                    key.encrypt(&dataset, screenshot_id, next_id, result.text.as_bytes())?;
-                total_encrypt_dur += te0.elapsed();
-                tx.execute(
-                    "INSERT INTO ocr_results (
-                        screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
-                        box_x1, box_y1, box_x2, box_y2,
-                        box_x3, box_y3, box_x4, box_y4, id, ocr_key_id
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        screenshot_id,
-                        Option::<String>::None,
-                        "", // empty text_hash signifies unindexed/backlogged
-                        text_enc,
-                        Option::<Vec<u8>>::None,
-                        result.confidence,
-                        result.box_coords[0][0],
-                        result.box_coords[0][1],
-                        result.box_coords[1][0],
-                        result.box_coords[1][1],
-                        result.box_coords[2][0],
-                        result.box_coords[2][1],
-                        result.box_coords[3][0],
-                        result.box_coords[3][1],
-                        next_id,
-                        key.id,
-                    ],
-                )
-                .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
-
-                added += 1;
+                records.push(super::ocr_blocks::input_record(next_id, result)?);
                 next_id = next_id
                     .checked_add(1)
                     .ok_or("OCR row ID capacity exhausted")?;
             }
+            let te0 = std::time::Instant::now();
+            added += super::ocr_blocks::insert_records(
+                &tx,
+                screenshot_id,
+                &records,
+                ocr_key.as_ref(),
+                || self.new_ocr_write_key(),
+            )? as i32;
+            total_encrypt_dur += te0.elapsed();
 
             // Mark committed and set committed_at. If classification has already
             // arrived asynchronously, do not overwrite it with NULL.
@@ -1767,8 +1738,10 @@ impl StorageState {
         &self,
         screenshot_id: i64,
     ) -> Result<Vec<super::OcrResult>, String> {
+        let decoder = self.ocr_decoder();
         let encrypted_rows = {
             let conn = self.open_read_connection_named("get_screenshot_ocr_results")?;
+            let _snapshot = super::ocr_keys::read_snapshot(&conn)?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, screenshot_id, text_enc, text_key_ref, confidence,
@@ -1783,11 +1756,14 @@ impl StorageState {
                 .map_err(|e| format!("Failed to execute query: {}", e))?
                 .filter_map(|row| row.ok())
                 .collect::<Vec<_>>();
+            decoder.load_blocks(
+                &conn,
+                rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+            )?;
             rows
         };
 
         // Close the SQLite read before using the retained, silent CNG context.
-        let decoder = self.ocr_decoder();
         Ok(encrypted_rows
             .into_iter()
             .map(|row| Self::decrypt_ocr_row(row, &decoder))
@@ -1795,21 +1771,23 @@ impl StorageState {
     }
 
     fn decrypt_ocr_row(
-        row: EncryptedOcrResultRow,
+        mut row: EncryptedOcrResultRow,
         decoder: &super::ocr_keys::Decoder<'_>,
     ) -> super::OcrResult {
-        let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
-            (Some(data), Some(key)) => decoder
-                .decrypt(data, key)
-                .ok()
-                .and_then(|v| String::from_utf8(v).ok()),
-            _ => None,
+        let decoded = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
+            (Some(data), Some(key)) => decoder.decrypt_record(data, key).unwrap_or_default(),
+            _ => super::ocr_keys::DecodedRecord::default(),
         };
+        if let Some(metadata) = decoded.metadata {
+            row.confidence = metadata.confidence;
+            row.box_coords = metadata.box_coords.map(Vec::from).to_vec();
+        }
 
         super::OcrResult {
             id: row.id,
             screenshot_id: row.screenshot_id,
-            text: text.unwrap_or_default(),
+            text: decoded.text,
+            text_layout: decoded.text_layout,
             confidence: row.confidence,
             box_coords: row.box_coords,
             created_at: wire_time::from_sqlite_utc(&row.created_at),
@@ -1828,8 +1806,10 @@ impl StorageState {
         if screenshot_ids.is_empty() {
             return Ok(blocks);
         }
+        let decoder = self.ocr_decoder();
         let encrypted_rows = {
             let conn = self.open_read_connection_named("get_ocr_blocks_by_screenshot_ids")?;
+            let _snapshot = super::ocr_keys::read_snapshot(&conn)?;
             let mut rows = Vec::new();
             // Chunked to stay under SQLite's bound-parameter limit.
             for chunk in screenshot_ids.chunks(500) {
@@ -1852,11 +1832,14 @@ impl StorageState {
                     .map_err(|e| format!("Failed to execute batch OCR block query: {}", e))?;
                 rows.extend(mapped.filter_map(|row| row.ok()));
             }
+            decoder.load_blocks(
+                &conn,
+                rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+            )?;
             rows
         };
 
         // As above, decrypt only after the read connection is closed.
-        let decoder = self.ocr_decoder();
         for row in encrypted_rows {
             let block = Self::decrypt_ocr_row(row, &decoder);
             blocks.entry(block.screenshot_id).or_default().push(block);
@@ -1874,11 +1857,14 @@ impl StorageState {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
+        let decoder = self.ocr_decoder();
         let encrypted_rows = {
             let guard = self
                 .get_connection_named("get_screenshot_ocr_results_silent")
                 .map_err(BackgroundReadError::Other)?;
             let conn = guard.as_ref().unwrap();
+            let _snapshot =
+                super::ocr_keys::read_snapshot(conn).map_err(BackgroundReadError::Other)?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, screenshot_id, text_enc, text_key_ref, confidence,
@@ -1898,27 +1884,34 @@ impl StorageState {
                 .map_err(|e| {
                     BackgroundReadError::Other(format!("Failed to read OCR row: {}", e))
                 })?;
+            decoder
+                .load_blocks(
+                    conn,
+                    rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+                )
+                .map_err(BackgroundReadError::Other)?;
             rows
         };
 
-        let decoder = self.ocr_decoder();
         encrypted_rows
             .into_iter()
-            .map(|row| {
+            .map(|mut row| {
                 if !self.is_silent_read_authorized() {
                     return Err(BackgroundReadError::AuthRequired);
                 }
-                let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
-                    (Some(data), Some(key)) => String::from_utf8(decoder.decrypt(data, key)?)
-                        .map_err(|e| {
-                            BackgroundReadError::Other(format!("Invalid OCR text encoding: {}", e))
-                        })?,
-                    _ => String::new(),
+                let decoded = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
+                    (Some(data), Some(key)) => decoder.decrypt_record(data, key)?,
+                    _ => super::ocr_keys::DecodedRecord::default(),
                 };
+                if let Some(metadata) = decoded.metadata {
+                    row.confidence = metadata.confidence;
+                    row.box_coords = metadata.box_coords.map(Vec::from).to_vec();
+                }
                 Ok(super::OcrResult {
                     id: row.id,
                     screenshot_id: row.screenshot_id,
-                    text,
+                    text: decoded.text,
+                    text_layout: decoded.text_layout,
                     confidence: row.confidence,
                     box_coords: row.box_coords,
                     created_at: wire_time::from_sqlite_utc(&row.created_at),
@@ -1977,11 +1970,14 @@ impl StorageState {
         check_read_deadline(deadline)?;
 
         // Phase 1: fetch the raw encrypted rows with a read-only connection.
+        let decoder = self.ocr_decoder();
         let raw_rows = {
             let conn = self
                 .open_read_connection_named("get_ocr_text_prefixes_by_screenshot_ids_silent")
                 .map_err(BackgroundReadError::Other)?;
 
+            let _snapshot =
+                super::ocr_keys::read_snapshot(&conn).map_err(BackgroundReadError::Other)?;
             let mut raw_rows: Vec<EncryptedMetadataRow> = Vec::new();
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
@@ -2014,6 +2010,9 @@ impl StorageState {
                     raw_rows.push(row);
                 }
             }
+            decoder
+                .load_blocks(&conn, raw_rows.iter().filter_map(|r| r.2.as_deref()))
+                .map_err(BackgroundReadError::Other)?;
             raw_rows
         };
 
@@ -2036,7 +2035,6 @@ impl StorageState {
         }
 
         // Phase 3: decrypt each screenshot's prefix in parallel.
-        let decoder = self.ocr_decoder();
         let maps = unwrap_batch_parallel(&self.credential_state, groups, |session, group| {
             assemble_ocr_text_prefixes(group, min_chars, deadline, |data, key| {
                 if !self.is_silent_read_authorized() {
@@ -2074,6 +2072,7 @@ impl StorageState {
         }
 
         // Phase 1: Use an independent read-only connection to retrieve the raw encrypted rows.
+        let decoder = self.ocr_decoder();
         let raw_rows = {
             let conn = self
                 .open_read_connection_named(if silent {
@@ -2083,6 +2082,8 @@ impl StorageState {
                 })
                 .map_err(BackgroundReadError::Other)?;
 
+            let _snapshot =
+                super::ocr_keys::read_snapshot(&conn).map_err(BackgroundReadError::Other)?;
             let mut raw_rows = Vec::new();
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
@@ -2120,6 +2121,9 @@ impl StorageState {
                     raw_rows.push(row);
                 }
             }
+            decoder
+                .load_blocks(&conn, raw_rows.iter().filter_map(|r| r.2.as_deref()))
+                .map_err(BackgroundReadError::Other)?;
             raw_rows
         };
 
@@ -2131,7 +2135,6 @@ impl StorageState {
             result_map.insert(id, Vec::new());
         }
 
-        let decoder = self.ocr_decoder();
         for (screenshot_id, text_enc, text_key_enc) in raw_rows {
             if silent && !self.is_silent_read_authorized() {
                 return Err(BackgroundReadError::AuthRequired);
@@ -2663,9 +2666,11 @@ impl StorageState {
             });
         }
 
+        let decoder = self.ocr_decoder();
         let rows: Vec<OcrDeleteQueueRow> = {
             let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
             let conn = guard.as_ref().unwrap();
+            let _snapshot = super::ocr_keys::read_snapshot(conn)?;
             // A LEFT JOIN directly to ocr_results_read can materialize its
             // nested key join for the entire corpus before applying LIMIT.
             // Bound both queue membership and view reads before joining them,
@@ -2691,9 +2696,14 @@ impl StorageState {
                 .query_map([safe_batch_size], OcrDeleteQueueRow::from_row)
                 .map_err(|e| format!("Failed to read OCR queue rows: {}", e))?;
 
-            mapped_rows
+            let rows = mapped_rows
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to decode OCR queue row: {}", e))?
+                .map_err(|e| format!("Failed to decode OCR queue row: {}", e))?;
+            decoder.load_blocks(
+                conn,
+                rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+            )?;
+            rows
         };
 
         if rows.is_empty() {
@@ -2711,7 +2721,6 @@ impl StorageState {
         let mut stale_queue_rows = 0usize;
         let mut hmac_key: Option<Vec<u8>> = None;
 
-        let decoder = self.ocr_decoder();
         for row in &rows {
             // Authorization can expire after the batch-level check. Abort
             // before touching even legacy plaintext so the batch remains

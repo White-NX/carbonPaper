@@ -139,6 +139,51 @@ describe('snapshot editor zoom and pointer handoff', () => {
   });
 });
 
+describe('screenshot text selection and canvas gesture handoff', () => {
+  async function selectableEditor() {
+    const view = await renderEditor({ selectedDetails: { record: { id: 42, status: 'committed', image_hash: 'original' },
+      ocr_results: [{ id: 1, text: 'abcd', text_layout: { matrix: [[80, 0, 100], [0, 20, 100], [0, 0, 1]],
+        source_size: [800, 600], input_width: 16, valid_width: 16, time_steps: 4,
+        centers: [1, 3, 5, 7], text_lengths: [1, 1, 1, 1] } }] } });
+    const overlay = screen.getByRole('group', { name: 'snapshotPreview.selectText' });
+    vi.spyOn(overlay, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 800, height: 600 });
+    overlay.setPointerCapture = vi.fn();
+    overlay.hasPointerCapture = () => true;
+    overlay.releasePointerCapture = vi.fn();
+    const polygon = overlay.querySelector('[data-ocr-line]');
+    fireEvent.pointerDown(polygon, { button: 0, pointerId: 3, clientX: 120, clientY: 110 });
+    fireEvent.pointerMove(overlay, { pointerId: 3, clientX: 160, clientY: 110 });
+    fireEvent.pointerUp(overlay, { pointerId: 3, clientX: 160, clientY: 110 });
+    return { ...view, overlay, polygon };
+  }
+
+  it('selects text without panning or changing the editable screenshot draft', async () => {
+    const { image, viewport, overlay } = await selectableEditor();
+    expect(overlay.querySelector('[data-ocr-highlight]')).not.toBeNull();
+    expect(image.style.transform).toBe('translate(400px,300px) scale(1) translate(-50%,-50%)');
+    expect(viewport.setPointerCapture).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'snapshotPreview.copySelectedText' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'snapshotEditor.undo' })).not.toBeInTheDocument();
+    expect(lastScene()).toEqual([]);
+  });
+
+  it.each(['middle', 'space'])('pans over selected text with %s and retains Ctrl+C', async (method) => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+    const { image, viewport, overlay, polygon } = await selectableEditor();
+    if (method === 'space') fireEvent.keyDown(overlay, { key: ' ', code: 'Space' });
+    fireEvent.pointerDown(polygon, { button: method === 'middle' ? 1 : 0, pointerId: 7, clientX: 120, clientY: 110 });
+    fireEvent.pointerMove(viewport, { pointerId: 7, clientX: 160, clientY: 110 });
+    fireEvent.pointerUp(viewport, { pointerId: 7, clientX: 160, clientY: 110 });
+    if (method === 'space') fireEvent.keyUp(viewport, { key: ' ', code: 'Space' });
+    expect(viewport.setPointerCapture).toHaveBeenLastCalledWith(7);
+    expect(image.style.transform).toBe('translate(440px,300px) scale(1) translate(-50%,-50%)');
+    expect(overlay.querySelector('[data-ocr-highlight]')).not.toBeNull();
+    await user.keyboard('{Control>}c{/Control}');
+    expect(writeText).toHaveBeenCalledWith('bc');
+  });
+});
+
 describe('snapshot editor background recognition', () => {
   it('dismisses a successful save notice after a short delay', async () => {
     vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,cG5n');

@@ -22,8 +22,6 @@ const DATASET: &str = "protected_content_dataset_id";
 const MAX_CACHED_KEYS: usize = 64;
 
 pub(super) mod backup;
-mod migration;
-pub(super) use migration::CURSOR as COMPACTION_CURSOR;
 
 fn invalid() -> CredentialError {
     CredentialError::CryptoError("Invalid OCR key or payload binding".into())
@@ -73,6 +71,16 @@ fn aad(dataset: &str, screenshot: i64, group: i64, row: i64) -> Result<Vec<u8>, 
     let mut data = scope(dataset, screenshot, group)?;
     data.extend_from_slice(b"/text/");
     data.extend_from_slice(&row.to_le_bytes());
+    Ok(data)
+}
+
+pub(super) fn block_aad(
+    dataset: &str,
+    screenshot: i64,
+    group: i64,
+) -> Result<Vec<u8>, CredentialError> {
+    let mut data = scope(dataset, screenshot, group)?;
+    data.extend_from_slice(b"/block/v2");
     Ok(data)
 }
 
@@ -137,6 +145,7 @@ impl WriteKey {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn encrypt(
         &self,
         dataset: &str,
@@ -151,6 +160,20 @@ impl WriteKey {
         )
         .map_err(|e| e.to_string())
     }
+
+    pub(super) fn encrypt_block(
+        &self,
+        dataset: &str,
+        screenshot: i64,
+        plain: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        seal(
+            &self.key,
+            &block_aad(dataset, screenshot, self.id).map_err(|e| e.to_string())?,
+            plain,
+        )
+        .map_err(|e| e.to_string())
+    }
 }
 
 pub(super) fn dataset(conn: &Connection) -> Result<String, String> {
@@ -160,6 +183,20 @@ pub(super) fn dataset(conn: &Connection) -> Result<String, String> {
         |r| r.get(0),
     )
     .map_err(|e| e.to_string())
+}
+
+/// Keep locators, key descriptors and separately fetched block ciphertext in
+/// one SQLite snapshot. Callers finish this read before entering CNG.
+pub(super) fn read_snapshot(
+    conn: &Connection,
+) -> Result<Option<rusqlite::Transaction<'_>>, String> {
+    if conn.is_autocommit() {
+        conn.unchecked_transaction()
+            .map(Some)
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(None)
+    }
 }
 
 impl StorageState {
@@ -189,14 +226,18 @@ pub(super) fn next_row_id(conn: &Connection) -> Result<i64, String> {
 pub(super) fn register(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
         "cp_ocr_key_ref",
-        8,
+        9,
         FunctionFlags::SQLITE_UTF8
             | FunctionFlags::SQLITE_DETERMINISTIC
             | FunctionFlags::SQLITE_INNOCUOUS,
         |ctx| {
             let group: Option<i64> = ctx.get(2)?;
+            let slot: Option<i64> = ctx.get(8)?;
             let mut result = MAGIC.to_vec();
             let Some(group) = group else {
+                if slot.is_some() {
+                    return Err(rusqlite::Error::UserFunctionError(Box::new(invalid())));
+                }
                 let Some(wrapped) = ctx.get::<Option<Vec<u8>>>(3)? else {
                     return Ok(None);
                 };
@@ -214,9 +255,17 @@ pub(super) fn register(conn: &Connection) -> rusqlite::Result<()> {
             if tag.len() != 32 || dataset.len() > 128 || wrapped.len() > 1024 {
                 return Err(failed());
             }
-            result.push(1);
+            if slot
+                .is_some_and(|slot| !(0..super::ocr_blocks::codec::MAX_ROWS as i64).contains(&slot))
+            {
+                return Err(failed());
+            }
+            result.push(if slot.is_some() { 2 } else { 1 });
             for id in [row, screenshot, group, owner] {
                 result.extend_from_slice(&id.to_le_bytes());
+            }
+            if let Some(slot) = slot {
+                result.extend_from_slice(&slot.to_le_bytes());
             }
             result.push(dataset.len() as u8);
             result.extend_from_slice(dataset.as_bytes());
@@ -236,6 +285,7 @@ enum Reference<'a> {
         dataset: &'a str,
         tag: &'a [u8],
         wrapped: &'a [u8],
+        slot: Option<usize>,
     },
 }
 
@@ -248,25 +298,37 @@ fn parse(bytes: &[u8]) -> Result<Reference<'_>, CredentialError> {
     }
     match bytes.get(8) {
         Some(0) => Ok(Reference::Legacy(&bytes[9..])),
-        Some(1) if bytes.len() >= 74 => {
+        Some(kind @ (1 | 2)) if bytes.len() >= if *kind == 1 { 74 } else { 82 } => {
             let read = |start| i64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
             let row = read(9);
             let screenshot = read(17);
             let group = read(25);
             let owner = read(33);
-            let length = bytes[41] as usize;
-            if owner != screenshot || bytes.len() < 42 + length + 32 || length > 128 {
+            let start = if *kind == 1 { 42 } else { 50 };
+            let slot = if *kind == 2 {
+                let slot = usize::try_from(read(41)).map_err(|_| invalid())?;
+                if slot >= super::ocr_blocks::codec::MAX_ROWS {
+                    return Err(invalid());
+                }
+                Some(slot)
+            } else {
+                None
+            };
+            let length = bytes[start - 1] as usize;
+            if owner != screenshot || bytes.len() < start + length + 32 || length > 128 {
                 return Err(invalid());
             }
-            let dataset = std::str::from_utf8(&bytes[42..42 + length]).map_err(|_| invalid())?;
+            let dataset =
+                std::str::from_utf8(&bytes[start..start + length]).map_err(|_| invalid())?;
             scope(dataset, screenshot, group)?;
             Ok(Reference::Group {
                 row,
                 screenshot,
                 group,
                 dataset,
-                tag: &bytes[42 + length..74 + length],
-                wrapped: &bytes[74 + length..],
+                tag: &bytes[start + length..start + length + 32],
+                wrapped: &bytes[start + length + 32..],
+                slot,
             })
         }
         _ => Err(invalid()),
@@ -290,7 +352,11 @@ fn decode(
             dataset,
             tag,
             wrapped,
+            slot,
         } => {
+            if slot.is_some() {
+                return Err(invalid());
+            }
             let key = Zeroizing::new(unwrap(wrapped)?);
             verify_scope(&key, dataset, screenshot, group, tag)?;
             open(&key, &aad(dataset, screenshot, group, row)?, data)
@@ -304,6 +370,15 @@ pub(super) struct Decoder<'a> {
     credential: &'a CredentialManagerState,
     admitted: Option<Instant>,
     keys: Mutex<HashMap<Vec<u8>, Zeroizing<Vec<u8>>>>,
+    encrypted_blocks: Mutex<HashMap<i64, Vec<u8>>>,
+    blocks: Mutex<HashMap<i64, super::ocr_blocks::Decoded>>,
+}
+
+#[derive(Default)]
+pub(super) struct DecodedRecord {
+    pub text: String,
+    pub text_layout: Option<crate::ml_protocol::MlOcrTextLayout>,
+    pub metadata: Option<super::ocr_blocks::Metadata>,
 }
 
 impl<'a> Decoder<'a> {
@@ -312,6 +387,8 @@ impl<'a> Decoder<'a> {
             credential,
             admitted: credential.session_marker(),
             keys: Mutex::new(HashMap::new()),
+            encrypted_blocks: Mutex::new(HashMap::new()),
+            blocks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -320,13 +397,143 @@ impl<'a> Decoder<'a> {
             || self.credential.session_marker() != self.admitted
         {
             self.keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.blocks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             Err(CredentialError::AuthRequired)
         } else {
             Ok(())
         }
     }
 
-    pub(super) fn decrypt_with_unwrap(
+    /// Fetch each ciphertext block once while the caller's read snapshot is
+    /// open. SQL rows carry only empty payload placeholders and bound references.
+    pub(super) fn load_blocks<'b>(
+        &self,
+        conn: &Connection,
+        references: impl IntoIterator<Item = &'b [u8]>,
+    ) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for reference in references {
+            if let Reference::Group {
+                group,
+                slot: Some(_),
+                ..
+            } = parse(reference).map_err(|e| e.to_string())?
+            {
+                ids.insert(group);
+            }
+        }
+        let mut encrypted = self
+            .encrypted_blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<_> = ids
+            .into_iter()
+            .filter(|id| !encrypted.contains_key(id))
+            .collect();
+        for chunk in ids.chunks(500) {
+            let sql = format!(
+                "SELECT id,content_enc FROM ocr_blocks WHERE id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk), |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, data) = row.map_err(|e| e.to_string())?;
+                if data.len() > super::ocr_blocks::codec::MAX_BYTES + 33 {
+                    return Err("Oversized OCR block ciphertext".into());
+                }
+                encrypted.insert(id, data);
+            }
+        }
+        Ok(())
+    }
+
+    fn cached_key(
+        &self,
+        wrapped: &[u8],
+        unwrap: &impl Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+    ) -> Result<Vec<u8>, CredentialError> {
+        self.check()?;
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = keys.get(wrapped) {
+            return Ok(key.to_vec());
+        }
+        let key = Zeroizing::new(unwrap(wrapped)?);
+        if self.credential.session_marker() != self.admitted
+            || !self.credential.protected_read_authorized()
+        {
+            keys.clear();
+            return Err(CredentialError::AuthRequired);
+        }
+        if keys.len() >= MAX_CACHED_KEYS {
+            keys.clear();
+        }
+        let output = key.to_vec();
+        keys.insert(wrapped.to_vec(), key);
+        Ok(output)
+    }
+
+    fn read_block<T>(
+        &self,
+        reference: &[u8],
+        unwrap: &impl Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+        read: impl FnOnce(&super::ocr_blocks::Decoded, usize, i64) -> Result<T, String>,
+    ) -> Result<T, BackgroundReadError> {
+        let operation = || {
+            self.check()?;
+            let Reference::Group {
+                row,
+                screenshot,
+                group,
+                dataset,
+                tag,
+                wrapped,
+                slot: Some(slot),
+            } = parse(reference)?
+            else {
+                return Err(invalid());
+            };
+            let key = Zeroizing::new(self.cached_key(wrapped, unwrap)?);
+            verify_scope(&key, dataset, screenshot, group, tag)?;
+            let result = {
+                let mut blocks = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+                if !blocks.contains_key(&group) {
+                    let encrypted = self
+                        .encrypted_blocks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let data = encrypted.get(&group).ok_or_else(invalid)?;
+                    let plain =
+                        Zeroizing::new(open(&key, &block_aad(dataset, screenshot, group)?, data)?);
+                    let decoded =
+                        super::ocr_blocks::Decoded::open(&plain).map_err(|_| invalid())?;
+                    if blocks.len() >= MAX_CACHED_KEYS
+                        || blocks.values().map(|b| b.size()).sum::<usize>() + decoded.size()
+                            > 4 * 1024 * 1024
+                    {
+                        blocks.clear();
+                    }
+                    blocks.insert(group, decoded);
+                }
+                read(blocks.get(&group).ok_or_else(invalid)?, slot, row).map_err(|_| invalid())?
+            };
+            self.check()?;
+            Ok(result)
+        };
+        operation().map_err(|e| match e {
+            CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+            other => BackgroundReadError::Other(other.to_string()),
+        })
+    }
+
+    fn decrypt_payload_with_unwrap(
         &self,
         data: &[u8],
         reference: &[u8],
@@ -340,23 +547,7 @@ impl<'a> Decoder<'a> {
                 if !grouped {
                     return unwrap(wrapped);
                 }
-                let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(key) = keys.get(wrapped) {
-                    return Ok(key.to_vec());
-                }
-                let key = Zeroizing::new(unwrap(wrapped)?);
-                if self.credential.session_marker() != self.admitted
-                    || !self.credential.protected_read_authorized()
-                {
-                    keys.clear();
-                    return Err(CredentialError::AuthRequired);
-                }
-                if keys.len() >= MAX_CACHED_KEYS {
-                    keys.clear();
-                }
-                let output = key.to_vec();
-                keys.insert(wrapped.to_vec(), key);
-                Ok(output)
+                self.cached_key(wrapped, unwrap)
             })?;
             let plain = Zeroizing::new(plain);
             self.check()?;
@@ -377,6 +568,78 @@ impl<'a> Decoder<'a> {
             decrypt_row_key_with_cng_silent(self.credential, key)
         })
     }
+
+    pub(super) fn decrypt_with_unwrap(
+        &self,
+        data: &[u8],
+        reference: &[u8],
+        unwrap: &impl Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+    ) -> Result<Vec<u8>, BackgroundReadError> {
+        if matches!(
+            parse(reference).map_err(|e| BackgroundReadError::Other(e.to_string()))?,
+            Reference::Group { slot: Some(_), .. }
+        ) {
+            return self.read_block(reference, unwrap, |block, slot, row| {
+                Ok(block.text(slot, row)?.as_bytes().to_vec())
+            });
+        }
+        let plain = Zeroizing::new(self.decrypt_payload_with_unwrap(data, reference, unwrap)?);
+        crate::ocr_layout::decode_text(&plain)
+            .map(|text| text.as_bytes().to_vec())
+            .map_err(BackgroundReadError::Other)
+    }
+
+    pub(super) fn decrypt_record(
+        &self,
+        data: &[u8],
+        reference: &[u8],
+    ) -> Result<DecodedRecord, BackgroundReadError> {
+        let unwrap = |key: &[u8]| decrypt_row_key_with_cng_silent(self.credential, key);
+        if matches!(
+            parse(reference).map_err(|e| BackgroundReadError::Other(e.to_string()))?,
+            Reference::Group { slot: Some(_), .. }
+        ) {
+            return self.read_block(reference, &unwrap, |block, slot, row| {
+                let record = block.record(slot, row)?;
+                Ok(DecodedRecord {
+                    text: record.text,
+                    text_layout: record.text_layout,
+                    metadata: Some(super::ocr_blocks::Metadata {
+                        confidence: record.confidence,
+                        box_coords: record.box_coords,
+                    }),
+                })
+            });
+        }
+        let plain = Zeroizing::new(self.decrypt_payload_with_unwrap(data, reference, &|key| {
+            decrypt_row_key_with_cng_silent(self.credential, key)
+        })?);
+        let (text, text_layout) =
+            crate::ocr_layout::decode(&plain).map_err(BackgroundReadError::Other)?;
+        Ok(DecodedRecord {
+            text,
+            text_layout,
+            metadata: None,
+        })
+    }
+
+    pub(super) fn metadata_with_unwrap(
+        &self,
+        reference: &[u8],
+        unwrap: &impl Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+    ) -> Result<Option<super::ocr_blocks::Metadata>, BackgroundReadError> {
+        if matches!(
+            parse(reference).map_err(|e| BackgroundReadError::Other(e.to_string()))?,
+            Reference::Group { slot: Some(_), .. }
+        ) {
+            self.read_block(reference, unwrap, |block, slot, row| {
+                block.metadata_for(slot, row)
+            })
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
@@ -389,24 +652,41 @@ pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     StorageState::add_column_if_missing(&tx, "ocr_results", "ocr_key_id", "INTEGER")?;
+    super::ocr_blocks::initialize(&tx)?;
     // Counts and ownership checks maintain the sparse group relation without
     // building another multi-million-row index during startup. Backups verify
     // all members in one sequential pass rather than querying each group.
-    tx.execute_batch("CREATE VIEW IF NOT EXISTS ocr_results_read AS SELECT r.*,
+    tx.execute_batch("DROP VIEW IF EXISTS ocr_results_read;
+        CREATE VIEW ocr_results_read AS SELECT r.id,r.screenshot_id,r.text,r.text_hash,
+        CASE WHEN r.ocr_block_slot IS NULL THEN r.text_enc ELSE X'' END AS text_enc,
+        r.text_key_encrypted,r.confidence,r.box_x1,r.box_y1,r.box_x2,r.box_y2,r.box_x3,r.box_y3,r.box_x4,r.box_y4,
+        r.text_enc AS row_text_enc,r.created_at AS row_created_at,
+        COALESCE(r.created_at,b.created_at) AS created_at,r.is_deleted,r.ocr_key_id,r.ocr_block_slot,
         cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
             k.screenshot_id,k.scope_tag,k.wrapped_key,
-            (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id')) AS text_key_ref
-        FROM ocr_results r LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id;
-        CREATE TRIGGER IF NOT EXISTS ocr_key_insert AFTER INSERT ON ocr_results
+            (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id'),r.ocr_block_slot) AS text_key_ref
+        FROM ocr_results r LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id
+        LEFT JOIN ocr_blocks b ON b.id=r.ocr_key_id AND r.ocr_block_slot IS NOT NULL;
+        DROP TRIGGER IF EXISTS ocr_key_insert;
+        DROP TRIGGER IF EXISTS ocr_key_update;
+        CREATE TRIGGER ocr_key_insert AFTER INSERT ON ocr_results
         WHEN NEW.ocr_key_id IS NOT NULL BEGIN
             SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM ocr_keys WHERE id=NEW.ocr_key_id AND screenshot_id=NEW.screenshot_id)
                 THEN RAISE(ABORT,'Missing or mismatched OCR key') END;
+            SELECT CASE WHEN NEW.ocr_block_slot IS NOT NULL AND
+                (NEW.ocr_block_slot<0 OR NEW.ocr_block_slot>=512 OR NEW.text_enc IS NOT NULL OR NEW.text_key_encrypted IS NOT NULL OR
+                 NOT EXISTS(SELECT 1 FROM ocr_blocks WHERE id=NEW.ocr_key_id AND screenshot_id=NEW.screenshot_id))
+                THEN RAISE(ABORT,'Invalid OCR block member') END;
             UPDATE ocr_keys SET live_rows=live_rows+1 WHERE id=NEW.ocr_key_id;
         END;
-        CREATE TRIGGER IF NOT EXISTS ocr_key_update AFTER UPDATE OF ocr_key_id,screenshot_id ON ocr_results
-        WHEN OLD.ocr_key_id IS NOT NEW.ocr_key_id OR OLD.screenshot_id!=NEW.screenshot_id BEGIN
+        CREATE TRIGGER ocr_key_update AFTER UPDATE OF ocr_key_id,screenshot_id,ocr_block_slot ON ocr_results
+        WHEN OLD.ocr_key_id IS NOT NEW.ocr_key_id OR OLD.screenshot_id!=NEW.screenshot_id OR OLD.ocr_block_slot IS NOT NEW.ocr_block_slot BEGIN
             SELECT CASE WHEN NEW.ocr_key_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM ocr_keys WHERE id=NEW.ocr_key_id AND screenshot_id=NEW.screenshot_id)
                 THEN RAISE(ABORT,'Missing or mismatched OCR key') END;
+            SELECT CASE WHEN NEW.ocr_block_slot IS NOT NULL AND
+                (NEW.ocr_block_slot<0 OR NEW.ocr_block_slot>=512 OR NEW.text_enc IS NOT NULL OR NEW.text_key_encrypted IS NOT NULL OR
+                 NOT EXISTS(SELECT 1 FROM ocr_blocks WHERE id=NEW.ocr_key_id AND screenshot_id=NEW.screenshot_id))
+                THEN RAISE(ABORT,'Invalid OCR block member') END;
             UPDATE ocr_keys SET live_rows=live_rows+1 WHERE id=NEW.ocr_key_id;
             UPDATE ocr_keys SET live_rows=live_rows-1 WHERE id=OLD.ocr_key_id;
             DELETE FROM ocr_keys WHERE id=OLD.ocr_key_id AND live_rows=0;

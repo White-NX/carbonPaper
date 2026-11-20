@@ -435,6 +435,11 @@ impl StorageState {
         let mut row_hashes: Vec<(i64, String)> = Vec::new();
 
         let decoder = self.ocr_decoder();
+        {
+            let guard = self.get_connection_named("index_batch_blocks")?;
+            let conn = guard.as_ref().ok_or("Database not initialized")?;
+            decoder.load_blocks(conn, rows.iter().map(|r| r.2.as_slice()))?;
+        }
         for (ocr_id, text_enc, text_key_enc) in &rows {
             let plaintext = match decoder.decrypt(text_enc, text_key_enc) {
                 Ok(bytes) => match String::from_utf8(bytes) {
@@ -576,6 +581,7 @@ impl StorageState {
         let mut row_hashes: Vec<(i64, String)> = Vec::new();
 
         let decoder = self.ocr_decoder();
+        decoder.load_blocks(conn, rows.iter().map(|r| r.2.as_slice()))?;
         for (ocr_id, text_enc, text_key_enc) in &rows {
             let plaintext = match decoder.decrypt(text_enc, text_key_enc) {
                 Ok(bytes) => match String::from_utf8(bytes) {

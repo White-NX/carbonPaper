@@ -258,6 +258,7 @@ fn filter_capture(
     let capture = input.recap.clone().unwrap_or_default();
     let blocks = if capture.blocks.is_empty() {
         vec![OcrResult {
+            text_layout: None,
             id: 0,
             screenshot_id: id,
             text: input.ocr_text.clone(),
@@ -271,6 +272,7 @@ fn filter_capture(
             .iter()
             .enumerate()
             .map(|(i, b)| OcrResult {
+                text_layout: None,
                 id: i as i64,
                 screenshot_id: id,
                 text: b.text.clone(),

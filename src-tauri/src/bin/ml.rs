@@ -15,12 +15,15 @@ mod ann_worker;
 #[allow(dead_code)]
 #[path = "../ml_protocol.rs"]
 mod ml_protocol;
+#[allow(dead_code)]
+#[path = "../ocr_layout.rs"]
+mod ocr_layout;
 #[path = "../semantic_metrics.rs"]
 mod semantic_metrics;
 
 use ml_protocol::{
-    read_request, write_response, MlOcrBlock, MlOcrTimings, MlProvider, MlRequest, MlResponse,
-    ML_PROTOCOL_VERSION,
+    read_request, write_response, MlOcrBlock, MlOcrTextLayout, MlOcrTimings, MlProvider, MlRequest,
+    MlResponse, ML_PROTOCOL_VERSION,
 };
 use rapidocr_core::{
     config::{ExecutionProvider, InferenceOptions, PipelineConfig},
@@ -33,6 +36,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MODEL_ID: &str = "ppocrv5-ch-mobile";
+
+fn selection_layout(
+    text: &str,
+    alignment: &rapidocr_core::types::OcrTextAlignment,
+) -> Option<MlOcrTextLayout> {
+    let mapping = alignment.mapping.as_ref()?;
+    let layout = MlOcrTextLayout {
+        matrix: mapping.matrix,
+        source_size: mapping.source_size,
+        input_width: alignment.input_width.try_into().ok()?,
+        valid_width: alignment.valid_width.try_into().ok()?,
+        time_steps: alignment.time_steps.try_into().ok()?,
+        centers: alignment
+            .tokens
+            .iter()
+            .map(|token| {
+                token
+                    .timestep_range
+                    .start
+                    .checked_add(token.timestep_range.end)?
+                    .try_into()
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()?,
+        text_lengths: alignment
+            .tokens
+            .iter()
+            .map(|token| token.text_range.len().try_into().ok())
+            .collect::<Option<Vec<_>>>()?,
+    };
+    ocr_layout::validate(text, &layout).ok()?;
+    Some(layout)
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -62,7 +98,7 @@ fn run() -> Result<(), String> {
     cache
         .ensure_model_set_for_pipeline(model_set, pipeline, ModelDownloadMode::Never)
         .map_err(|error| format!("OCR model verification failed: {error:#}"))?;
-    let config = cache
+    let mut config = cache
         .config_for(model_set)
         .with_pipeline(pipeline)
         .with_inference_options(
@@ -77,6 +113,7 @@ fn run() -> Result<(), String> {
                     ExecutionProvider::Cpu
                 }),
         );
+    config.rec = config.rec.map(|rec| rec.with_return_tokens(true));
 
     eprintln!(
         "[ML] loading model={} provider={:?} intra_threads={} arena=false",
@@ -109,7 +146,7 @@ fn run() -> Result<(), String> {
         &MlResponse::Ready {
             protocol_version: ML_PROTOCOL_VERSION,
             worker_version: env!("CARGO_PKG_VERSION").to_string(),
-            rapidocr_core_version: "0.3.0".to_string(),
+            rapidocr_core_version: "0.3.1".to_string(),
             provider,
             model_id: MODEL_ID.to_string(),
         },
@@ -165,10 +202,17 @@ fn run() -> Result<(), String> {
                             .output
                             .lines
                             .into_iter()
-                            .map(|line| MlOcrBlock {
-                                text: line.text,
-                                confidence: line.score,
-                                points: line.bbox.points,
+                            .map(|line| {
+                                let text_layout = line
+                                    .text_alignment
+                                    .as_ref()
+                                    .and_then(|alignment| selection_layout(&line.text, alignment));
+                                MlOcrBlock {
+                                    text: line.text,
+                                    confidence: line.score,
+                                    points: line.bbox.points,
+                                    text_layout,
+                                }
                             })
                             .collect::<Vec<_>>();
                         eprintln!(

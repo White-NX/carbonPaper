@@ -334,7 +334,7 @@ fn ocr_delete_queue_reads_only_the_bounded_batch_and_preserves_stale_entries() {
     connection
         .create_scalar_function(
             "cp_ocr_key_ref",
-            8,
+            9,
             FunctionFlags::SQLITE_UTF8
                 | FunctionFlags::SQLITE_DETERMINISTIC
                 | FunctionFlags::SQLITE_INNOCUOUS,
@@ -679,9 +679,16 @@ fn ocr_text_prefix_query_replays_insertion_order() {
             "CREATE TABLE ocr_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     screenshot_id INTEGER NOT NULL,
+                    text TEXT,
+                    text_hash TEXT NOT NULL DEFAULT '',
                     text_enc BLOB,
                     text_key_encrypted BLOB,
+                    confidence REAL,
                     box_x1 REAL, box_y1 REAL,
+                    box_x2 REAL, box_y2 REAL,
+                    box_x3 REAL, box_y3 REAL,
+                    box_x4 REAL, box_y4 REAL,
+                    created_at TEXT,
                     is_deleted INTEGER NOT NULL DEFAULT 0
                  );
                  -- Rows are listed in OCR engine order, which is the order the

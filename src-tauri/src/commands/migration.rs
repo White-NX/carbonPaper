@@ -267,6 +267,7 @@ pub async fn storage_export_backup(
         let _database_maintenance = worker_state.database_maintenance("backup_export");
         let result = (|| {
             worker_state.backup.check()?;
+            worker_state.prepare_ocr_blocks_for_backup()?;
             let journal_mode = worker_state.prepare_database_snapshot_under_maintenance()?;
             let master_key =
                 zeroize::Zeroizing::new(get_cached_master_key(&credentials).ok_or_else(|| {
