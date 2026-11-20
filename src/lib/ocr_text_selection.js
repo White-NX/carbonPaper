@@ -126,6 +126,98 @@ export function textRangeQuad(line, from, to) {
   return points.map(([x, y]) => [clamp(x, 0, line.sourceSize[0] - 1), clamp(y, 0, line.sourceSize[1] - 1)]);
 }
 
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
+const unit = ([x, y]) => {
+  const length = Math.hypot(x, y);
+  return length > 1e-8 ? [x / length, y / length] : null;
+};
+
+function textGeometry(points, direction) {
+  const normal = [-direction[1], direction[0]];
+  const along = points.map((point) => dot(point, direction));
+  const across = points.map((point) => dot(point, normal));
+  const left = Math.min(...along);
+  const right = Math.max(...along);
+  const top = Math.min(...across);
+  const bottom = Math.max(...across);
+  return { direction, normal, width: right - left, height: bottom - top,
+    center: [direction[0] * (left + right) / 2 + normal[0] * (top + bottom) / 2,
+      direction[1] * (left + right) / 2 + normal[1] * (top + bottom) / 2], top, bottom };
+}
+
+function textNeighbors(a, b) {
+  // Use line-relative distances so source resolution and preview zoom cannot
+  // change the grouping. Short, centered wraps may overlap a much wider line.
+  if (dot(a.direction, b.direction) < 0.978 || Math.max(a.height, b.height) > Math.min(a.height, b.height) * 2) return null;
+  const direction = unit([a.direction[0] + b.direction[0], a.direction[1] + b.direction[1]]);
+  const delta = [b.center[0] - a.center[0], b.center[1] - a.center[1]];
+  const along = Math.abs(dot(delta, direction));
+  const across = dot(delta, [-direction[1], direction[0]]);
+  const height = Math.min(a.height, b.height);
+  const overlap = Math.min(a.width, b.width, (a.width + b.width) / 2 - along);
+  if (Math.abs(across) <= height * 0.35 && along - (a.width + b.width) / 2 <= height * 0.5) return { inline: true };
+  const gap = Math.abs(across) - (a.height + b.height) / 2;
+  if (gap < -height * 0.35 || gap > Math.max(a.height, b.height) * 1.5
+    || overlap < Math.min(a.width, b.width) * 0.35) return null;
+  return { forward: across > 0,
+    score: Math.abs(across) / ((a.height + b.height) / 2)
+      + 0.25 * (1 - overlap / Math.min(a.width, b.width)) + 0.1 * along / Math.max(a.width, b.width) };
+}
+
+function groupTextLines(lines) {
+  const parents = lines.map((_, index) => index);
+  const root = (index) => {
+    while (parents[index] !== index) { parents[index] = parents[parents[index]]; index = parents[index]; }
+    return index;
+  };
+  const join = (a, b) => { parents[root(b)] = root(a); };
+  for (let a = 0; a < lines.length; a += 1) {
+    for (let b = a + 1; b < lines.length; b += 1) {
+      if (textNeighbors(lines[a], lines[b])?.inline) join(a, b);
+    }
+  }
+  const inlineRows = new Map();
+  lines.forEach((_, index) => {
+    const id = root(index);
+    if (!inlineRows.has(id)) inlineRows.set(id, []);
+    inlineRows.get(id).push(index);
+  });
+  const rows = Array.from(inlineRows.values(), (indices) => ({ indices,
+    ...textGeometry(indices.flatMap((index) => lines[index].quad), lines[indices[0]].direction),
+    previous: null, next: null }));
+  const choose = (row, side, index, score) => {
+    if (!row[side] || score < row[side].score) row[side] = { index, score };
+  };
+  for (let a = 0; a < rows.length; a += 1) {
+    for (let b = a + 1; b < rows.length; b += 1) {
+      const neighbor = textNeighbors(rows[a], rows[b]);
+      if (!neighbor || neighbor.inline) continue;
+      choose(rows[a], neighbor.forward ? 'next' : 'previous', b, neighbor.score);
+      choose(rows[b], neighbor.forward ? 'previous' : 'next', a, neighbor.score);
+    }
+  }
+  // Only mutual continuations join. A wide heading above parallel columns
+  // must not connect every column through a shared overlapping rectangle.
+  rows.forEach((row, index) => {
+    if (row.next && rows[row.next.index].previous?.index === index) join(row.indices[0], rows[row.next.index].indices[0]);
+  });
+  const regions = new Map();
+  rows.forEach((row) => {
+    const id = root(row.indices[0]);
+    if (!regions.has(id)) regions.set(id, []);
+    regions.get(id).push(row);
+  });
+  regions.forEach((members) => {
+    const direction = unit(members.reduce((sum, row) => [sum[0] + row.direction[0], sum[1] + row.direction[1]], [0, 0]));
+    const normal = [-direction[1], direction[0]];
+    members.sort((a, b) => dot(a.center, normal) - dot(b.center, normal));
+    const indices = members.flatMap((row) => row.indices.sort((a, b) => dot(lines[a].center, direction) - dot(lines[b].center, direction)));
+    const region = { indices, ...textGeometry(indices.flatMap((index) => lines[index].quad), direction) };
+    indices.forEach((index, order) => { lines[index].region = region; lines[index].regionOrder = order; });
+  });
+  return lines;
+}
+
 export function buildTextSelectionLines(results = [], naturalSize) {
   if (!naturalSize?.width || !naturalSize?.height) return [];
   const lines = [];
@@ -168,11 +260,16 @@ export function buildTextSelectionLines(results = [], naturalSize) {
       positions: [0, ...cells.map((cell) => cell.to)] };
     line.quad = textRangeQuad(line, 0, 1);
     if (!line.quad) return;
+    const direction = unit([line.quad[1][0] - line.quad[0][0] + line.quad[2][0] - line.quad[3][0],
+      line.quad[1][1] - line.quad[0][1] + line.quad[2][1] - line.quad[3][1]]);
+    if (!direction) return;
+    Object.assign(line, textGeometry(line.quad, direction));
+    if (line.height < 1e-8) return;
     line.top = Math.min(...line.quad.map((point) => point[1]));
     line.left = Math.min(...line.quad.map((point) => point[0]));
     lines.push(line);
   });
-  return lines.sort((a, b) => a.top - b.top || a.left - b.left);
+  return groupTextLines(lines.sort((a, b) => a.top - b.top || a.left - b.left));
 }
 
 function polygonDistance(point, polygon) {
@@ -206,14 +303,33 @@ function endpointOnLine(lines, lineIndex, point, character) {
   return { line: lineIndex, offset: line.offsets[low] };
 }
 
-export function textEndpointAt(lines, point, { lineIndex, preferredLine, character = false } = {}) {
-  if (Number.isInteger(lineIndex) && lines[lineIndex]) return endpointOnLine(lines, lineIndex, point, character);
+export function textEndpointAt(lines, point, { lineIndex, preferredLine, region, character = false } = {}) {
+  if (Number.isInteger(lineIndex) && lines[lineIndex] && (!region || lines[lineIndex].region === region)) {
+    return endpointOnLine(lines, lineIndex, point, character);
+  }
+  if (region) {
+    const position = dot(point, region.normal);
+    const first = region.indices[0];
+    const last = region.indices.at(-1);
+    if (position < region.top) return { line: first, offset: 0 };
+    if (position > region.bottom) return { line: last, offset: lines[last].text.length };
+  }
   let best = -1;
   let distance = Infinity;
-  lines.forEach((line, index) => {
-    const candidate = polygonDistance(point, line.quad);
-    if (candidate < distance || (candidate === distance && index === preferredLine)) {
+  let horizontalDistance = Infinity;
+  const indices = region?.indices || lines.map((_, index) => index);
+  indices.forEach((index) => {
+    const line = lines[index];
+    const horizontal = polygonDistance(point, line.quad);
+    const normalized = region && projectTextPoint(line.inverse, point);
+    // Follow the row band through ragged margins and centered short wraps,
+    // then resolve fragments on that row by their horizontal distance.
+    const candidate = region ? normalized && Math.max(0, -normalized[1], normalized[1] - 1) * line.height : horizontal;
+    if (candidate === null) return;
+    if (candidate < distance || (candidate === distance && (horizontal < horizontalDistance
+      || (horizontal === horizontalDistance && index === preferredLine)))) {
       distance = candidate;
+      horizontalDistance = horizontal;
       best = index;
     }
   });
@@ -223,11 +339,18 @@ export function textEndpointAt(lines, point, { lineIndex, preferredLine, charact
 export function textSelectionContent(lines, selection) {
   if (!selection?.anchor || !selection.focus) return { text: '', ranges: [] };
   let { anchor: start, focus: end } = selection;
-  if (start.line > end.line || (start.line === end.line && start.offset > end.offset)) [start, end] = [end, start];
   if (!lines[start.line] || !lines[end.line]) return { text: '', ranges: [] };
+  const region = lines[start.line].region;
+  const indices = selection.all || !region ? lines.map((_, index) => index) : region.indices;
+  let first = indices.indexOf(start.line);
+  let last = indices.indexOf(end.line);
+  if (first < 0 || last < 0) return { text: '', ranges: [] };
+  if (first > last || (first === last && start.offset > end.offset)) {
+    [start, end] = [end, start]; [first, last] = [last, first];
+  }
   const texts = [];
   const ranges = [];
-  for (let index = start.line; index <= end.line; index += 1) {
+  for (const index of indices.slice(first, last + 1)) {
     const line = lines[index];
     const from = index === start.line ? start.offset : 0;
     const to = index === end.line ? end.offset : line.text.length;
@@ -252,12 +375,14 @@ export function textWordSelection(lines, endpoint) {
     focus: { line: endpoint.line, offset: word.index + word.segment.length } } : null;
 }
 
-export function moveTextEndpoint(lines, endpoint, direction) {
+export function moveTextEndpoint(lines, endpoint, direction, { all = false } = {}) {
   const line = lines[endpoint.line];
+  if (!line) return endpoint;
   const current = line.offsets.indexOf(endpoint.offset);
+  if (current < 0) return endpoint;
   const next = current + direction;
   if (next >= 0 && next < line.offsets.length) return { line: endpoint.line, offset: line.offsets[next] };
-  const lineIndex = endpoint.line + direction;
+  const lineIndex = all || !line.region ? endpoint.line + direction : line.region.indices[line.regionOrder + direction];
   if (!lines[lineIndex]) return endpoint;
   return { line: lineIndex, offset: direction > 0 ? 0 : lines[lineIndex].text.length };
 }

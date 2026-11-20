@@ -33,13 +33,10 @@
   pointer-events: none;
 }
 
-.ocr-text-toolbar {
-  white-space: nowrap;
+.ocr-text-menu {
   user-select: none;
 }
 
 .ocr-text-estimate {
-  padding: 0 0.25rem;
   color: var(--ide-muted);
-  font-size: 0.8rem;
 }

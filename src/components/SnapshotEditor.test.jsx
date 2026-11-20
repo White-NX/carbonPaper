@@ -162,7 +162,8 @@ describe('screenshot text selection and canvas gesture handoff', () => {
     expect(overlay.querySelector('[data-ocr-highlight]')).not.toBeNull();
     expect(image.style.transform).toBe('translate(400px,300px) scale(1) translate(-50%,-50%)');
     expect(viewport.setPointerCapture).not.toHaveBeenCalled();
-    expect(screen.getByRole('button', { name: 'snapshotPreview.copySelectedText' })).toBeInTheDocument();
+    fireEvent.contextMenu(overlay, { clientX: 160, clientY: 110 });
+    expect(screen.getByRole('menuitem', { name: 'snapshotPreview.copy' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'snapshotEditor.undo' })).not.toBeInTheDocument();
     expect(lastScene()).toEqual([]);
   });
@@ -181,6 +182,32 @@ describe('screenshot text selection and canvas gesture handoff', () => {
     expect(overlay.querySelector('[data-ocr-highlight]')).not.toBeNull();
     await user.keyboard('{Control>}c{/Control}');
     expect(writeText).toHaveBeenCalledWith('bc');
+  });
+
+  it('copies from the context menu with Space without starting canvas panning', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+    const { container, image, viewport, overlay } = await selectableEditor();
+    fireEvent.contextMenu(overlay, { clientX: 160, clientY: 110 });
+    expect(screen.getByRole('menuitem', { name: 'snapshotPreview.copy' })).toHaveFocus();
+    await user.keyboard(' ');
+    expect(writeText).toHaveBeenCalledWith('bc');
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(container.querySelector('.snapshot-editor')).toHaveAttribute('data-pan-ready', 'false');
+    expect(viewport.setPointerCapture).not.toHaveBeenCalled();
+    expect(image.style.transform).toBe('translate(400px,300px) scale(1) translate(-50%,-50%)');
+    expect(overlay.querySelector('[data-ocr-highlight]')).not.toBeNull();
+    expect(lastScene()).toEqual([]);
+  });
+
+  it('retains selected text shortcuts after using the zoom controls', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+    const { overlay } = await selectableEditor();
+    await user.click(screen.getByRole('button', { name: 'snapshotPreview.zoomIn' }));
+    await user.keyboard('{Control>}c{/Control}');
+    expect(writeText).toHaveBeenCalledWith('bc');
+    expect(overlay.querySelector('[data-ocr-highlight]')).not.toBeNull();
   });
 });
 

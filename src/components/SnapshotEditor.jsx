@@ -444,7 +444,7 @@ export default function SnapshotEditor({ imageSrc, selectedEvent, selectedDetail
                 metrics={{ renderWidth: width, renderHeight: height, offsetX: 0, offsetY: 0 }}
                 naturalSize={{ width, height }} onBoxClick={onBoxClick} />
               {isAuthenticated && <OcrTextSelection key={imageSrc} results={selectionResults}
-                naturalSize={{ width, height }} controlsRef={viewportRef} panReady={spacePressed}
+                naturalSize={{ width, height }} controlsRef={viewportRef} keyboardRef={rootRef} panReady={spacePressed}
                 onGestureStart={freezeView} onSelectingChange={(selecting) => {
                   textSelectingRef.current = selecting; setAnimateView(false); setInteracting(selecting);
                 }} />}
