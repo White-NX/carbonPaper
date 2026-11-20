@@ -1,11 +1,11 @@
 use crate::protocol::{BrokerError, Result, TaskBinding, TaskKey, MAX_INPUT_BYTES};
 use aes_gcm::{
-    aead::{Aead, Payload},
-    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, AeadInPlace, Payload},
+    Aes256Gcm, KeyInit, Nonce, Tag,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub fn new_key() -> TaskKey {
     let mut key = vec![0; 32];
@@ -39,6 +39,40 @@ pub fn decrypt_storage_bytes(key: &[u8], encrypted: &[u8]) -> std::result::Resul
     cipher
         .decrypt(Nonce::from_slice(&encrypted[..12]), &encrypted[12..])
         .map_err(|error| format!("Decryption failed: {error}"))
+}
+
+/// Authenticates the existing nonce/ciphertext/tag envelope using reusable
+/// scratch space. No plaintext is returned, and scratch is erased on every
+/// success or error path. AAD also supports OCR's bound row envelopes.
+#[inline(never)]
+pub fn authenticate_storage_bytes(
+    key: &[u8],
+    encrypted: &[u8],
+    aad: &[u8],
+    scratch: &mut Vec<u8>,
+) -> std::result::Result<(), String> {
+    scratch.as_mut_slice().zeroize();
+    scratch.clear();
+    let result = (|| {
+        if encrypted.len() < 28 {
+            return Err("Invalid encrypted data".into());
+        }
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|error| format!("Failed to create cipher: {error}"))?;
+        let tag_start = encrypted.len() - 16;
+        scratch.extend_from_slice(&encrypted[12..tag_start]);
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&encrypted[..12]),
+                aad,
+                scratch,
+                Tag::from_slice(&encrypted[tag_start..]),
+            )
+            .map_err(|error| format!("Decryption failed: {error}"))
+    })();
+    scratch.as_mut_slice().zeroize();
+    scratch.clear();
+    result
 }
 
 pub fn encrypt_input(key: &TaskKey, binding: &TaskBinding, input: &[u8]) -> Result<Vec<u8>> {
@@ -195,6 +229,44 @@ mod tests {
             assert_eq!(decrypt_storage_bytes(&key, &first).unwrap(), plaintext);
         }
         assert!(encrypt_storage_bytes(&[0; 31], b"bytes").is_err());
+    }
+
+    #[test]
+    fn storage_authentication_binds_aad_and_clears_reusable_scratch_on_all_paths() {
+        let key = [7; 32];
+        let nonce = [1; 12];
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let plaintext = b"authenticated OCR row";
+        let mut encrypted = nonce.to_vec();
+        encrypted.extend(
+            cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad: b"row scope",
+                    },
+                )
+                .unwrap(),
+        );
+        let mut scratch = vec![99; 64];
+        authenticate_storage_bytes(&key, &encrypted, b"row scope", &mut scratch).unwrap();
+        assert!(scratch.is_empty());
+        let capacity = scratch.capacity();
+        assert!(authenticate_storage_bytes(&key, &encrypted, b"other row", &mut scratch).is_err());
+        assert!(scratch.is_empty());
+        assert_eq!(scratch.capacity(), capacity);
+        encrypted[12] ^= 1;
+        assert!(authenticate_storage_bytes(&key, &encrypted, b"row scope", &mut scratch).is_err());
+        assert!(scratch.is_empty());
+        assert!(
+            authenticate_storage_bytes(&key[..31], &encrypted, b"row scope", &mut scratch).is_err()
+        );
+        assert!(scratch.is_empty());
+        assert!(
+            authenticate_storage_bytes(&key, &encrypted[..27], b"row scope", &mut scratch).is_err()
+        );
+        assert!(scratch.is_empty());
     }
 
     #[test]

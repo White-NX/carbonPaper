@@ -216,21 +216,17 @@ fn image_bytes() -> Vec<u8> {
     STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4bAAAAAASUVORK5CYII=").unwrap()
 }
 
-fn export(storage: &StorageState, path: &Path) {
+fn export(storage: &StorageState, path: &Path) -> BackupSummary {
     let _maintenance = storage.database_maintenance("test backup export");
     let _operation = storage.backup.begin();
-    let mode = storage
-        .prepare_database_snapshot_under_maintenance()
-        .unwrap();
     let directory = storage.data_dir.lock().unwrap().clone();
     let key = storage.database_key().unwrap();
     let master = Zeroizing::new(get_cached_master_key(&storage.credential_state).unwrap());
-    storage.shutdown_under_maintenance().unwrap();
-    let snapshot =
-        database_snapshot::create_database_snapshot(&directory, &mode, directory.parent().unwrap())
-            .unwrap();
+    let snapshot = storage
+        .create_backup_snapshot_under_maintenance(&key, directory.parent().unwrap(), |_, _| {})
+        .unwrap();
     write_portable(
-        &snapshot,
+        snapshot.path(),
         &directory,
         &storage.credential_state,
         &key,
@@ -240,7 +236,321 @@ fn export(storage: &StorageState, path: &Path) {
         &storage.backup,
         |_, _, _| {},
     )
+    .unwrap()
+}
+
+#[test]
+fn missing_committed_image_preserves_ocr_and_metadata_across_credentials() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("missing.cpbackup");
+    let source_directory = root.path().join("source");
+    let source = storage(&source_directory);
+    populate(&source, false);
+    std::fs::remove_file(source_directory.join("screenshots/私密截图.png.enc")).unwrap();
+    let generation = source.db_generation();
+    let dataset = source.processing_dataset_id().unwrap();
+    let summary = export(&source, &archive);
+    assert_eq!(summary.missing_screenshots, 1);
+    assert!(source.is_initialized());
+    assert_eq!(source.db_generation(), generation);
+    assert_eq!(source.processing_dataset_id().unwrap(), dataset);
+    drop(source);
+
+    let destination_directory = root.path().join("destination");
+    let destination = storage(&destination_directory);
+    let _operation = destination.backup.begin();
+    let prepared = prepare(&destination, &archive, root.path());
+    assert_eq!(
+        prepared.extracted.manifest.format_version,
+        database_snapshot::PORTABLE_BACKUP_FORMAT_VERSION
+    );
+    assert_eq!(
+        prepared.extracted.manifest.missing_screenshots[0].screenshot_id,
+        7
+    );
+    {
+        let _maintenance = destination.database_maintenance("test missing screenshot import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    let credentials = destination.credential_state.clone();
+    destination.shutdown().unwrap();
+    drop(_operation);
+    drop(destination);
+    drop(prepared);
+    let credentials = crate::credential_manager::cng_tests::reopen_storage_credentials(
+        &credentials,
+        &destination_directory,
+    );
+    let reopened = open_storage(&destination_directory, credentials);
+    assert_eq!(
+        reopened.get_screenshot_ocr_results(7).unwrap()[0].text,
+        "私密备份搜索内容"
+    );
+    let screenshot = reopened.screenshots().by_id(7).unwrap().unwrap();
+    assert_eq!(
+        screenshot.window_title.as_deref(),
+        Some("Private window title")
+    );
+    let conn = reopened.db.lock().unwrap();
+    let record: (i64, String) = conn
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT is_deleted,image_path FROM screenshots WHERE id=7",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(record, (0, "screenshots/私密截图.png.enc".into()));
+    assert!(!destination_directory.join(record.1).exists());
+}
+
+#[test]
+fn export_recovers_a_stale_pending_path_only_in_its_snapshot() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("recovered.cpbackup");
+    let source_directory = root.path().join("source");
+    let source = storage(&source_directory);
+    populate(&source, false);
+    let pending = "screenshots/私密截图.png.enc.pending";
+    source
+        .db
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .execute("UPDATE screenshots SET image_path=?1 WHERE id=7", [pending])
+        .unwrap();
+    let summary = export(&source, &archive);
+    assert_eq!(summary.repaired_paths, 1);
+    assert_eq!(summary.missing_screenshots, 0);
+    assert_eq!(
+        source
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT image_path FROM screenshots WHERE id=7", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        pending
+    );
+    drop(source);
+    let destination = storage(&root.path().join("destination"));
+    let _operation = destination.backup.begin();
+    let prepared = prepare(&destination, &archive, root.path());
+    {
+        let _maintenance = destination.database_maintenance("test pending image import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    destination.credential_state.update_auth_time();
+    assert_eq!(
+        STANDARD
+            .decode(destination.read_image_by_id(7).unwrap().0)
+            .unwrap(),
+        image_bytes()
+    );
+}
+
+#[test]
+fn images_removed_after_inventory_are_declared_in_the_completed_archive() {
+    for removal_phase in ["scan", "files"] {
+        let root = TempDir::new().unwrap();
+        let source_directory = root.path().join("source");
+        let archive = root.path().join("late-missing.cpbackup");
+        let source = storage(&source_directory);
+        populate(&source, false);
+        let _operation = source.backup.begin();
+        let snapshot = source
+            .create_backup_snapshot_under_maintenance(
+                &source.database_key().unwrap(),
+                root.path(),
+                |_, _| {},
+            )
+            .unwrap();
+        let mut removed = false;
+        let summary = write_portable(
+            snapshot.path(),
+            &source_directory,
+            &source.credential_state,
+            &source.database_key().unwrap(),
+            &[9; 32],
+            "backup-password",
+            &archive,
+            &source.backup,
+            |phase, _, _| {
+                if phase == removal_phase && !removed {
+                    std::fs::remove_file(source_directory.join("screenshots/私密截图.png.enc"))
+                        .unwrap();
+                    removed = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(removed);
+        assert_eq!(summary.missing_screenshots, 1);
+        let destination = storage(&root.path().join("destination"));
+        let _operation = destination.backup.begin();
+        let prepared = prepare(&destination, &archive, root.path());
+        assert_eq!(prepared.extracted.manifest.missing_screenshots.len(), 1);
+        assert_eq!(
+            prepared.extracted.manifest.missing_screenshots[0].screenshot_id,
+            7
+        );
+    }
+}
+
+#[test]
+fn corrupt_image_aborts_export_with_context_and_preserves_the_previous_backup() {
+    let root = TempDir::new().unwrap();
+    let source_directory = root.path().join("source");
+    let archive = root.path().join("existing.cpbackup");
+    std::fs::write(&archive, b"previous valid backup").unwrap();
+    let source = storage(&source_directory);
+    populate(&source, false);
+    let image = source_directory.join("screenshots/私密截图.png.enc");
+    let mut bytes = std::fs::read(&image).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&image, bytes).unwrap();
+    let _operation = source.backup.begin();
+    let snapshot = source
+        .create_backup_snapshot_under_maintenance(
+            &source.database_key().unwrap(),
+            root.path(),
+            |_, _| {},
+        )
+        .unwrap();
+    let error = write_portable(
+        snapshot.path(),
+        &source_directory,
+        &source.credential_state,
+        &source.database_key().unwrap(),
+        &[9; 32],
+        "backup-password",
+        &archive,
+        &source.backup,
+        |_, _, _| {},
+    )
+    .unwrap_err();
+    assert!(error
+        .contains("Screenshot authentication failed (id=7, path=screenshots/私密截图.png.enc)"));
+    assert_eq!(std::fs::read(&archive).unwrap(), b"previous valid backup");
+    assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".partial")));
+}
+
+#[test]
+fn streamed_key_validation_rejects_corrupt_metadata_ocr_scope_and_ocr_content() {
+    for (corrupt, expected) in [
+        (
+            "metadata",
+            "Content authentication failed for screenshots.window_title_enc",
+        ),
+        ("ocr_scope", "Invalid OCR key or payload binding"),
+        ("ocr_content", "Decryption failed"),
+    ] {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("source");
+        let archive = root.path().join("previous.cpbackup");
+        let source = storage(&directory);
+        populate(&source, false);
+        std::fs::write(&archive, b"previous valid backup").unwrap();
+        let _operation = source.backup.begin();
+        let snapshot = source
+            .create_backup_snapshot_under_maintenance(
+                &source.database_key().unwrap(),
+                root.path(),
+                |_, _| {},
+            )
+            .unwrap();
+        let conn = Connection::open(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+        connection::configure_sqlcipher_connection(&conn, &source.database_key().unwrap()).unwrap();
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+            false,
+        )
+        .unwrap();
+        let sql = match corrupt {
+            "metadata" => "UPDATE screenshots SET window_title_enc=zeroblob(28) WHERE id=7",
+            "ocr_scope" => "UPDATE ocr_keys SET scope_tag=zeroblob(32)",
+            _ => "UPDATE ocr_results SET text_enc=zeroblob(28) WHERE id=11",
+        };
+        assert_eq!(conn.execute(sql, []).unwrap(), 1);
+        conn.close().unwrap();
+        let error = write_portable(
+            snapshot.path(),
+            &directory,
+            &source.credential_state,
+            &source.database_key().unwrap(),
+            &[9; 32],
+            "backup-password",
+            &archive,
+            &source.backup,
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{corrupt}: {error}");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"previous valid backup");
+    }
+}
+
+#[test]
+fn undeclared_missing_image_rejects_import_before_installing() {
+    let root = TempDir::new().unwrap();
+    let original = root.path().join("original.cpbackup");
+    let incomplete = root.path().join("incomplete.cpbackup");
+    let source = storage(&root.path().join("source"));
+    populate(&source, false);
+    export(&source, &original);
+    drop(source);
+    // Build an authenticated archive with a missing payload but no declaration:
+    // encryption/ZIP integrity cannot substitute for the completeness contract.
+    let flag = Arc::new(AtomicBool::new(false));
+    let reader = EncryptedReader::open(
+        File::open(&original).unwrap(),
+        "backup-password",
+        flag.clone(),
+    )
     .unwrap();
+    let mut input = zip::ZipArchive::new(reader).unwrap();
+    let encrypted =
+        EncryptedWriter::new(File::create(&incomplete).unwrap(), "backup-password", flag).unwrap();
+    let mut output = zip::ZipWriter::new_stream(encrypted);
+    for index in 0..input.len() {
+        let mut entry = input.by_index(index).unwrap();
+        let name = entry.name().unwrap().into_owned();
+        if name == "screenshots/私密截图.png.enc" {
+            continue;
+        }
+        output
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+    }
+    output.finish().unwrap().into_inner().finish().unwrap();
+    let destination = storage(&root.path().join("destination"));
+    let generation = destination.db_generation();
+    let _operation = destination.backup.begin();
+    let result = prepare_import(
+        &incomplete,
+        root.path(),
+        &destination.credential_state,
+        &destination.database_key().unwrap(),
+        "backup-password",
+        &destination.backup,
+        |_, _, _| {},
+    );
+    assert!(result
+        .err()
+        .unwrap()
+        .contains("BACKUP_UNDECLARED_MISSING_SCREENSHOT"));
+    assert_eq!(destination.db_generation(), generation);
+    assert_eq!(destination.count_active_screenshots().unwrap(), 0);
 }
 
 fn prepare(storage: &StorageState, archive: &Path, parent: &Path) -> PreparedBackup {
@@ -782,15 +1092,16 @@ fn cancelled_export_and_unknown_key_slots_never_replace_an_existing_backup() {
     populate(&source, false);
     let directory = source.data_dir.lock().unwrap().clone();
     let _maintenance = source.database_maintenance("test cancellation");
-    let mode = source
-        .prepare_database_snapshot_under_maintenance()
+    let snapshot = source
+        .create_backup_snapshot_under_maintenance(
+            &source.database_key().unwrap(),
+            root.path(),
+            |_, _| {},
+        )
         .unwrap();
-    source.shutdown_under_maintenance().unwrap();
-    let snapshot =
-        database_snapshot::create_database_snapshot(&directory, &mode, root.path()).unwrap();
     let _operation = source.backup.begin();
     let result = write_portable(
-        &snapshot,
+        snapshot.path(),
         &directory,
         &source.credential_state,
         &source.database_key().unwrap(),
@@ -814,7 +1125,7 @@ fn cancelled_export_and_unknown_key_slots_never_replace_an_existing_backup() {
         .unwrap();
     drop(conn);
     assert!(write_portable(
-        &snapshot,
+        snapshot.path(),
         &directory,
         &source.credential_state,
         &source.database_key().unwrap(),

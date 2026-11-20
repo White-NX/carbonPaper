@@ -463,7 +463,7 @@ async fn run_rust_clip_query(
             return Err("query_deadline_exceeded_before_scan".to_string());
         }
         let _foreground_db = query_stage(&scan_diagnostics, "database_wait", || {
-            Ok(scan_storage.foreground_db_read())
+            scan_storage.foreground_db_read()
         })?;
         let ann_snapshot = match query_stage(&scan_diagnostics, "ann_snapshot", || {
             ann_state.prepare_query_with_reason(&scan_storage, &query_vec, Some(deadline))

@@ -1001,18 +1001,32 @@ impl StorageState {
 
         let image_path = self.resolve_image_path(&image_path_str);
 
-        // If filename ends with .pending, rename to final name before taking the DB lock again.
+        // Publishing the file can precede a failed database transaction. A
+        // retry must adopt the final file rather than write a stale pending path.
         let mut final_image_path_str = image_path_str.clone();
         if let Some(fname) = image_path.file_name().and_then(|s| s.to_str()) {
-            if fname.ends_with(".pending") {
-                let new_name = fname.trim_end_matches(".pending");
+            if let Some(new_name) = fname.strip_suffix(".pending") {
                 let new_path = image_path.with_file_name(new_name);
-                if let Err(e) = std::fs::rename(&image_path, &new_path) {
-                    // Log but continue trying to insert OCR results
-                    tracing::error!("Failed to rename pending image file: {}", e);
-                } else {
-                    final_image_path_str = self.to_relative_image_path(&new_path);
+                match std::fs::rename(&image_path, &new_path) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && super::image_io::regular_image_file_exists(&new_path)? =>
+                    {
+                        tracing::debug!(
+                            screenshot_id,
+                            "Screenshot commit reused an already published image"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(screenshot_id, image_path = %image_path_str, error = %error,
+                            "Failed to publish pending screenshot");
+                        return Err(format!(
+                            "Failed to publish screenshot {screenshot_id}: {error}"
+                        ));
+                    }
                 }
+                final_image_path_str = self.to_relative_image_path(&new_path);
             }
         }
 
@@ -1059,6 +1073,24 @@ impl StorageState {
             let tx = conn
                 .transaction()
                 .map_err(|e| format!("Failed to start commit transaction: {}", e))?;
+
+            // A concurrent edit or abort must not be overwritten by work which
+            // prepared OCR against an earlier screenshot path.
+            let current: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT image_path,status FROM screenshots WHERE id=?1 AND is_deleted=0",
+                    [screenshot_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let (current_path, status) = current.ok_or("Screenshot not found")?;
+            if current_path != image_path_str && current_path != final_image_path_str {
+                return Err("Screenshot changed while preparing OCR results".into());
+            }
+            if status.as_deref() == Some("aborted") {
+                return Err("Screenshot was aborted while preparing OCR results".into());
+            }
 
             let dataset = super::ocr_keys::dataset(&tx)?;
             let mut next_id = super::ocr_keys::next_row_id(&tx)?;
