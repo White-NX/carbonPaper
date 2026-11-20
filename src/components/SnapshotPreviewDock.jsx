@@ -670,6 +670,7 @@ export default function SnapshotPreviewDock({
               <InspectorImage
                 item={{ imageUrl: activeImage, prompt: tabTitle }}
                 overlayBoxes={ocrBoxes}
+                ocrResults={ocrResults}
                 className="h-full w-full rounded-none border-0 bg-transparent"
               />
             </div>

@@ -91,10 +91,11 @@ roaring = "0.11.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
+zstd = "0.13"
 window-vibrancy = "0.5"
 raw-window-handle = "0.6"
 open = "5"
-rapidocr-core = { version = "=0.3.0", default-features = false, features = ["download-binaries", "tokio", "directml"] }
+rapidocr-core = { version = "=0.3.1", default-features = false, features = ["download-binaries", "tokio", "directml"] }
 memmap2 = "0.9"
 usearch = { version = "=2.26.0", default-features = false }
 

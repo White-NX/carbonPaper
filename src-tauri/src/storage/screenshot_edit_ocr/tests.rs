@@ -68,6 +68,7 @@ fn later_edits_and_deletion_reject_old_results_and_error_updates() {
     let latest = storage.claim_edited_ocr_job().unwrap().unwrap();
     let key = WriteKey::new(|bytes| Ok(bytes.to_vec())).unwrap();
     let results = vec![OcrResultInput {
+        text_layout: None,
         text: "current edited text".into(),
         confidence: 0.9,
         box_coords: vec![vec![0.0, 0.0]; 4],
@@ -75,6 +76,7 @@ fn later_edits_and_deletion_reject_old_results_and_error_updates() {
     {
         let mut guard = storage.db.lock().unwrap();
         assert!(publish_results(
+            &storage,
             guard.as_mut().unwrap(),
             &latest,
             &results,
@@ -86,7 +88,7 @@ fn later_edits_and_deletion_reject_old_results_and_error_updates() {
         let conn = guard.as_ref().unwrap();
         let (plain, encrypted): (Option<String>, Vec<u8>) = conn
             .query_row(
-                "SELECT text,text_enc FROM ocr_results WHERE screenshot_id=1 AND is_deleted=0",
+                "SELECT r.text,b.content_enc FROM ocr_results r JOIN ocr_blocks b ON b.id=r.ocr_key_id WHERE r.screenshot_id=1 AND r.is_deleted=0",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

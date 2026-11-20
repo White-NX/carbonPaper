@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
 import { EyeOff } from 'lucide-react';
 import { cn } from '../lib/utils';
 import PreviewZoomControls from './PreviewZoomControls';
+import OcrTextSelection from './OcrTextSelection';
 
 export const DetectionLabels = ({ detections }) => {
   if (!detections?.length) return null;
@@ -135,15 +136,25 @@ InspectorOverlay.propTypes = {
   onBoxClick: PropTypes.func,
 };
 
-export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHeight, className }) => {
+export const InspectorImage = ({ item, overlayBoxes, ocrResults, blurred, onBoxClick, maxHeight, className }) => {
   const containerRef = useRef(null);
+  const viewRef = useRef(null);
   const imageRef = useRef(null);
   const [metrics, setMetrics] = useState(null);
   const [naturalSize, setNaturalSize] = useState(null);
 
   const [transform, setTransform] = useState({ scale: 1, x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
+  const [isSelectingText, setIsSelectingText] = useState(false);
+  const selectingTextRef = useRef(false);
+  const panPointerRef = useRef(null);
+  const [spacePressed, setSpacePressed] = useState(false);
+  const spacePressedRef = useRef(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
+  const selectionResults = useMemo(() => ocrResults || overlayBoxes?.filter((box) => box.type === 'text') || [],
+    [ocrResults, overlayBoxes]);
+  const otherBoxes = useMemo(() => selectionResults.length && !blurred
+    ? overlayBoxes?.filter((box) => box.type !== 'text') : overlayBoxes, [selectionResults, overlayBoxes, blurred]);
 
   const updateMetrics = useCallback(() => {
     const containerEl = containerRef.current;
@@ -194,7 +205,7 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
   }, []);
 
   const handleWheel = useCallback((e) => {
-    if (e.target.closest('[data-preview-zoom-controls]')) return;
+    if (selectingTextRef.current || e.target.closest('[data-preview-zoom-controls],[data-ocr-selection-controls]')) return;
     e.preventDefault();
     setTransform(prev => {
       const scaleAdjust = e.deltaY * -0.0015;
@@ -212,15 +223,22 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
   }, [constrainPan]);
 
   const handlePointerDown = useCallback((e) => {
-    if (e.button !== 0) return;
+    if (![0, 1].includes(e.button) || selectingTextRef.current) return;
+    if (e.target.closest('[data-preview-zoom-controls],[data-ocr-selection-controls]')) return;
+    const forcePan = e.button === 1 || e.altKey || spacePressedRef.current;
+    if (e.target.closest('[data-ocr-selection]') && !forcePan) return;
     if (e.target.closest('.cursor-pointer')) return;
     e.preventDefault();
+    e.stopPropagation();
+    containerRef.current.focus({ preventScroll: true });
+    panPointerRef.current = e.pointerId;
+    containerRef.current.setPointerCapture?.(e.pointerId);
     setIsDragging(true);
     dragStartRef.current = { x: e.clientX - transform.x, y: e.clientY - transform.y };
   }, [transform.x, transform.y]);
 
   const handlePointerMove = useCallback((e) => {
-    if (!isDragging) return;
+    if (!isDragging || panPointerRef.current !== e.pointerId) return;
     setTransform(prev => {
       const newX = e.clientX - dragStartRef.current.x;
       const newY = e.clientY - dragStartRef.current.y;
@@ -229,8 +247,43 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
   }, [isDragging, constrainPan]);
 
   const handlePointerUp = useCallback(() => {
+    const pointerId = panPointerRef.current;
+    panPointerRef.current = null;
     setIsDragging(false);
+    if (containerRef.current?.hasPointerCapture?.(pointerId)) containerRef.current.releasePointerCapture(pointerId);
   }, []);
+
+  useEffect(() => {
+    const down = (event) => {
+      if (event.code !== 'Space' && event.key !== ' ') return;
+      if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing
+        || !containerRef.current?.contains(event.target)
+        || event.target.closest('input,textarea,select,[contenteditable="true"]')
+        || document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      spacePressedRef.current = true;
+      setSpacePressed(true);
+      if (!event.target.closest('button,a[href]')) event.preventDefault();
+    };
+    const clear = () => { spacePressedRef.current = false; setSpacePressed(false); };
+    const up = (event) => { if (event.code === 'Space' || event.key === ' ') clear(); };
+    const blur = () => { clear(); handlePointerUp(); };
+    document.addEventListener('keydown', down);
+    document.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    return () => {
+      document.removeEventListener('keydown', down);
+      document.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+    };
+  }, [handlePointerUp]);
+
+  const freezeTextView = () => {
+    const value = getComputedStyle(viewRef.current).transform;
+    if (typeof DOMMatrixReadOnly === 'function' && value && value !== 'none') {
+      const matrix = new DOMMatrixReadOnly(value);
+      setTransform({ scale: matrix.a, x: matrix.e, y: matrix.f });
+    }
+  };
 
   const resetZoom = useCallback(() => {
     setTransform({ scale: 1, x: 0, y: 0 });
@@ -273,19 +326,22 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
   return (
     <div
       ref={containerRef}
+      tabIndex={0}
       className={cn(containerClass, className, isDragging ? 'cursor-grabbing' : 'cursor-grab')}
       style={maxHeight ? { maxHeight } : undefined}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
-      onPointerLeave={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      onLostPointerCapture={handlePointerUp}
       onDoubleClick={resetZoom}
     >
       <div
+        ref={viewRef}
         style={{
           transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
           transformOrigin: '0 0',
-          transition: isDragging ? 'none' : 'transform 0.1s ease-out'
+          transition: isDragging || isSelectingText ? 'none' : 'transform 0.1s ease-out'
         }}
         className="w-full h-full flex items-center justify-center relative"
       >
@@ -299,11 +355,15 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHei
           loading="lazy"
         />
         <InspectorOverlay
-          boxes={overlayBoxes}
+          boxes={otherBoxes}
           metrics={metrics}
           naturalSize={naturalSize}
           onBoxClick={onBoxClick}
         />
+        {!blurred && naturalSize && metrics && <OcrTextSelection key={item.imageUrl}
+          results={selectionResults} naturalSize={naturalSize} metrics={metrics}
+          controlsRef={containerRef} panReady={spacePressed} onGestureStart={freezeTextView}
+          onSelectingChange={(selecting) => { selectingTextRef.current = selecting; setIsSelectingText(selecting); }} />}
       </div>
 
       <PreviewZoomControls
@@ -324,6 +384,7 @@ InspectorImage.propTypes = {
     prompt: PropTypes.string,
   }),
   overlayBoxes: PropTypes.array,
+  ocrResults: PropTypes.array,
   blurred: PropTypes.bool,
   onBoxClick: PropTypes.func,
   maxHeight: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),

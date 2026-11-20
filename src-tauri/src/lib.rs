@@ -55,6 +55,7 @@ mod monitor;
 mod native_messaging;
 mod nmh_pipe;
 mod nmh_protocol;
+mod ocr_layout;
 mod office_protocol;
 mod office_runtime;
 mod office_window;

@@ -185,11 +185,11 @@ struct BatchWork {
     marker_rows_scanned: u64,
     vector_work_units: u64,
     icon_rows_scanned: u64,
-    ocr_key_rows_scanned: u64,
+    ocr_block_members_repacked: u64,
     marker_time: Duration,
     vector_time: Duration,
     icon_time: Duration,
-    ocr_key_time: Duration,
+    ocr_block_time: Duration,
 }
 
 impl BatchWork {
@@ -197,18 +197,18 @@ impl BatchWork {
         self.marker_rows_scanned
             + self.vector_work_units
             + self.icon_rows_scanned
-            + self.ocr_key_rows_scanned
+            + self.ocr_block_members_repacked
     }
 
     fn add(&mut self, batch: Self) {
         self.marker_rows_scanned += batch.marker_rows_scanned;
         self.vector_work_units += batch.vector_work_units;
         self.icon_rows_scanned += batch.icon_rows_scanned;
-        self.ocr_key_rows_scanned += batch.ocr_key_rows_scanned;
+        self.ocr_block_members_repacked += batch.ocr_block_members_repacked;
         self.marker_time += batch.marker_time;
         self.vector_time += batch.vector_time;
         self.icon_time += batch.icon_time;
-        self.ocr_key_time += batch.ocr_key_time;
+        self.ocr_block_time += batch.ocr_block_time;
     }
 }
 
@@ -503,9 +503,10 @@ impl StorageState {
         work.icon_time = started.elapsed();
         work.icon_rows_scanned = result.map_err(|error| format!("process icons: {error}"))? as u64;
         let started = Instant::now();
-        let result = self.compact_ocr_keys_batch();
-        work.ocr_key_time = started.elapsed();
-        work.ocr_key_rows_scanned = result.map_err(|error| format!("OCR keys: {error}"))? as u64;
+        let result = self.compact_ocr_blocks_batch();
+        work.ocr_block_time = started.elapsed();
+        work.ocr_block_members_repacked =
+            result.map_err(|error| format!("OCR blocks: {error}"))? as u64;
         Ok(())
     }
 }

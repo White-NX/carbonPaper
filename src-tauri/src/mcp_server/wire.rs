@@ -152,6 +152,7 @@ mod tests {
         let f = fixture();
         let record = record(&f);
         let ocr = OcrResult {
+            text_layout: None,
             id: f["ocr_id"].as_i64().unwrap(),
             screenshot_id: record.id,
             text: "Save location".into(),

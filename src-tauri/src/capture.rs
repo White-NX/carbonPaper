@@ -2409,6 +2409,9 @@ pub(crate) fn convert_ml_ocr_blocks(
             continue;
         }
         results.push(OcrResultInput {
+            text_layout: block
+                .text_layout
+                .filter(|layout| crate::ocr_layout::validate(&block.text, layout).is_ok()),
             text: block.text,
             confidence: block.confidence.clamp(0.0, 1.0) as f64,
             box_coords: block
@@ -2774,6 +2777,7 @@ mod tests {
     #[test]
     fn rust_ocr_conversion_clamps_confidence_and_preserves_four_points() {
         let converted = convert_ml_ocr_blocks(vec![crate::ml_protocol::MlOcrBlock {
+            text_layout: None,
             text: "hello".to_string(),
             confidence: 1.5,
             points: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
@@ -2789,11 +2793,13 @@ mod tests {
         let converted = convert_ml_ocr_blocks(vec![
             crate::ml_protocol::MlOcrBlock {
                 text: "bad".to_string(),
+                text_layout: None,
                 confidence: f32::NAN,
                 points: [[0.0; 2]; 4],
             },
             crate::ml_protocol::MlOcrBlock {
                 text: "x".repeat(16_385),
+                text_layout: None,
                 confidence: 0.5,
                 points: [[0.0; 2]; 4],
             },

@@ -271,6 +271,7 @@ pub async fn storage_export_backup(
         let _database_maintenance = worker_state.database_maintenance("backup_export");
         let result = (|| {
             worker_state.backup.check()?;
+            worker_state.prepare_ocr_blocks_for_backup()?;
             let master_key =
                 zeroize::Zeroizing::new(get_cached_master_key(&credentials).ok_or_else(|| {
                     "AUTH_REQUIRED: Please verify Windows Hello before backing up".to_string()

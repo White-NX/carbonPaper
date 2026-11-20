@@ -1,7 +1,7 @@
 //! Cached UI progress and inexpensive estimates from durable scan cursors.
 //! MAX(rowid) seeks the end of each table; no content or row-count scan is needed.
 use super::{OCR_CURSOR, OCR_DONE};
-use crate::storage::{ocr_keys, process_icons, vector_blocks, StorageState};
+use crate::storage::{process_icons, vector_blocks, StorageState};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
@@ -68,7 +68,6 @@ pub(super) struct Checkpoints {
     markers_done: bool,
     vectors: i64,
     icons: i64,
-    ocr_keys: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +82,7 @@ pub(super) struct Snapshot {
     pub checkpoints: Checkpoints,
     pub max_ids: MaxIds,
     pub free_pages: u64,
+    pub ocr_blocks_dirty: bool,
 }
 
 impl Snapshot {
@@ -93,14 +93,12 @@ impl Snapshot {
                 COALESCE((SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key=?1),0),
                 EXISTS(SELECT 1 FROM app_metadata WHERE key=?2 AND value='1'),
                 COALESCE((SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key=?3),0),
-                COALESCE((SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key=?4),0),
-                COALESCE((SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key=?5),0)",
+                COALESCE((SELECT CAST(value AS INTEGER) FROM app_metadata WHERE key=?4),0)",
                 params![
                     OCR_CURSOR,
                     OCR_DONE,
                     vector_blocks::CURSOR,
-                    process_icons::CURSOR,
-                    ocr_keys::COMPACTION_CURSOR
+                    process_icons::CURSOR
                 ],
                 |row| {
                     Ok(Checkpoints {
@@ -108,7 +106,6 @@ impl Snapshot {
                         markers_done: row.get(1)?,
                         vectors: row.get(2)?,
                         icons: row.get(3)?,
-                        ocr_keys: row.get(4)?,
                     })
                 },
             )
@@ -133,10 +130,18 @@ impl Snapshot {
             .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
             .map_err(|error| error.to_string())?
             .max(0) as u64;
+        let has_gc: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ocr_block_gc')", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let ocr_blocks_dirty = has_gc
+            && conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM ocr_block_gc)", [], |r| {
+                    r.get::<_, bool>(0)
+                })
+                .map_err(|e| e.to_string())?;
         Ok(Self {
             checkpoints,
             max_ids,
             free_pages,
+            ocr_blocks_dirty,
         })
     }
 
@@ -146,9 +151,9 @@ impl Snapshot {
     }
 
     pub(super) fn pending(&self) -> bool {
-        self.unprotected_pending()
+        self.ocr_blocks_dirty
+            || self.unprotected_pending()
             || (self.max_ids.screenshots > 0 && self.checkpoints.icons != i64::MAX)
-            || (self.max_ids.ocr > 0 && self.checkpoints.ocr_keys != i64::MAX)
     }
 
     pub(super) fn phase(&self, read_wait_reason: Option<&'static str>) -> &'static str {
@@ -164,9 +169,8 @@ impl Snapshot {
     /// IDs can have gaps and new captures can extend the ranges, so this is an
     /// estimate of scan traversal, not a row count or remaining-time estimate.
     pub(super) fn estimated_percent(&self) -> Option<f64> {
-        let total = self.max_ids.ocr as f64 * 2.0
-            + self.max_ids.screenshots as f64
-            + self.max_ids.vectors as f64;
+        let total =
+            self.max_ids.ocr as f64 + self.max_ids.screenshots as f64 + self.max_ids.vectors as f64;
         if total <= 0.0 {
             return None;
         }
@@ -182,8 +186,7 @@ impl Snapshot {
             self.max_ids.vectors as f64
         } else {
             traversed(self.checkpoints.vectors, self.max_ids.vectors)
-        } + traversed(self.checkpoints.icons, self.max_ids.screenshots)
-            + traversed(self.checkpoints.ocr_keys, self.max_ids.ocr);
+        } + traversed(self.checkpoints.icons, self.max_ids.screenshots);
         // Reaching the last ID is not completion: the next committed page must
         // publish the terminal marker, including after authentication waits.
         Some((visited / total * 100.0).clamp(0.0, 99.0))
