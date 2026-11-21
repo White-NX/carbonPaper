@@ -21,6 +21,7 @@ struct RequestShape {
     has_start_time: bool,
     has_end_time: bool,
     include_ocr: bool,
+    sort_order: crate::storage::SearchSortOrder,
 }
 
 #[derive(Clone)]
@@ -44,6 +45,7 @@ pub(super) struct QueryDiagnostics {
     request: RequestShape,
     progress: Mutex<Progress>,
     pub(super) vectors: Arc<VectorQueryMetrics>,
+    pub(super) cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl QueryDiagnostics {
@@ -59,6 +61,7 @@ impl QueryDiagnostics {
                 has_start_time: request.start_time.is_some(),
                 has_end_time: request.end_time.is_some(),
                 include_ocr: request.include_ocr,
+                sort_order: request.sort_order,
             },
             progress: Mutex::new(Progress {
                 stage: "admission",
@@ -74,6 +77,7 @@ impl QueryDiagnostics {
                 embedding: None,
             }),
             vectors: Arc::new(VectorQueryMetrics::default()),
+            cancelled: request.cancelled.clone(),
         }
     }
 
@@ -81,6 +85,14 @@ impl QueryDiagnostics {
         let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         progress.stage = stage;
         progress.stage_started = Instant::now();
+    }
+
+    pub(super) fn check_cancellation(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err("query_cancelled".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn finish(&self, stage: &'static str, elapsed: Duration, error: Option<&str>) {
@@ -197,6 +209,7 @@ impl QueryDiagnostics {
                     has_start_time = self.request.has_start_time,
                     has_end_time = self.request.has_end_time,
                     include_ocr = self.request.include_ocr,
+                    sort_order = ?self.request.sort_order,
                     embedding = ?progress.embedding,
                     timings_ms = ?progress.timings_ms,
                     vector_scan = ?vector_scan,
@@ -216,14 +229,17 @@ pub(super) fn query_stage<T>(
     stage: &'static str,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    diagnostics.check_cancellation()?;
     diagnostics.begin(stage);
     let started = Instant::now();
     let result = operation();
+    diagnostics.check_cancellation()?;
     diagnostics.finish(
         stage,
         started.elapsed(),
         result.as_ref().err().map(String::as_str),
     );
+    diagnostics.check_cancellation()?;
     result
 }
 
@@ -232,14 +248,17 @@ pub(super) async fn query_stage_async<T>(
     stage: &'static str,
     operation: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
+    diagnostics.check_cancellation()?;
     diagnostics.begin(stage);
     let started = Instant::now();
     let result = operation.await;
+    diagnostics.check_cancellation()?;
     diagnostics.finish(
         stage,
         started.elapsed(),
         result.as_ref().err().map(String::as_str),
     );
+    diagnostics.check_cancellation()?;
     result
 }
 
@@ -254,10 +273,18 @@ pub(super) async fn observe_query(
     let slow = tokio::time::sleep_until(diagnostics.started + slow_after);
     let deadline = tokio::time::sleep_until(diagnostics.started + budget);
     tokio::pin!(slow, deadline);
+    let mut cancellation = tokio::time::interval(Duration::from_millis(50));
+    cancellation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut warned = false;
     loop {
         tokio::select! {
             biased;
+            _ = cancellation.tick() => {
+                if diagnostics.cancelled.load(Ordering::Acquire) {
+                    diagnostics.log(tracing::Level::DEBUG, "query cancelled", Some("query_cancelled"), None);
+                    return Err("query_cancelled".into());
+                }
+            }
             _ = &mut deadline => {
                 diagnostics.log(tracing::Level::ERROR, "query timed out", Some("query_deadline_exceeded"), None);
                 return Err("query_deadline_exceeded".into());
@@ -267,6 +294,7 @@ pub(super) async fn observe_query(
                     Err(error) if error.starts_with("query_deadline_exceeded") => {
                         diagnostics.log(tracing::Level::ERROR, "query timed out", Some(error), None);
                     }
+                    Err(error) if error == "query_cancelled" => diagnostics.log(tracing::Level::DEBUG, "query cancelled", Some(error), None),
                     Err(error) => diagnostics.log(tracing::Level::WARN, "query failed", Some(error), None),
                     Ok(results) => diagnostics.log(
                         if warned || diagnostics.started.elapsed() > slow_after {
@@ -285,7 +313,9 @@ pub(super) async fn observe_query(
 }
 
 fn error_kind(error: &str) -> &'static str {
-    if error.starts_with("query_deadline_exceeded") {
+    if error == "query_cancelled" {
+        "cancelled"
+    } else if error.starts_with("query_deadline_exceeded") {
         "deadline"
     } else if error.contains("AUTH_REQUIRED") {
         "authorization"
@@ -427,5 +457,31 @@ mod tests {
         assert!(!output.contains("ERROR"));
         assert!(!output.contains("private search text"));
         assert!(!output.contains("private window content"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_queries_stop_before_the_deadline_without_failure_warnings() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let diagnostics = diagnostics();
+        let cancelled = diagnostics.cancelled.clone();
+        let task = tokio::spawn(
+            async move {
+                observe_query(
+                    std::future::pending(),
+                    &diagnostics,
+                    QUERY_SLOW_WARN_AFTER,
+                    QUERY_TOTAL_TIMEOUT,
+                )
+                .await
+            }
+            .with_subscriber(subscriber(buffer.clone())),
+        );
+        tokio::task::yield_now().await;
+        cancelled.store(true, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(task.await.unwrap().unwrap_err(), "query_cancelled");
+        let output = logs(&buffer);
+        assert!(output.contains("query cancelled"));
+        assert!(!output.contains("WARN") && !output.contains("ERROR"));
     }
 }

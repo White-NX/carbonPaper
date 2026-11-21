@@ -14,15 +14,35 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection after returning to its owner.
 pub(super) struct QueryDeadline<'a> {
     conn: &'a mut Connection,
-    deadline: Option<Instant>,
+    interruptible: bool,
 }
 
 impl<'a> QueryDeadline<'a> {
     pub(super) fn install(conn: &'a mut Connection, deadline: Option<Instant>) -> Result<Self> {
-        if let Some(deadline) = deadline {
-            conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+        Self::install_with_cancellation(conn, deadline, None)
+    }
+
+    pub(super) fn install_with_cancellation(
+        conn: &'a mut Connection,
+        deadline: Option<Instant>,
+        cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Self> {
+        let interruptible = deadline.is_some() || cancelled.is_some();
+        if interruptible {
+            conn.progress_handler(
+                1000,
+                Some(move || {
+                    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                        || cancelled
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                }),
+            )?;
         }
-        Ok(Self { conn, deadline })
+        Ok(Self {
+            conn,
+            interruptible,
+        })
     }
 }
 
@@ -36,7 +56,7 @@ impl Deref for QueryDeadline<'_> {
 
 impl Drop for QueryDeadline<'_> {
     fn drop(&mut self) {
-        if self.deadline.is_some() {
+        if self.interruptible {
             let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
         }
     }
@@ -1164,6 +1184,37 @@ mod tests {
                 || error.to_ascii_lowercase().contains("read-only")
                 || error.contains("effective mode is"),
             "diagnostic should preserve SQLite failure context: {error}"
+        );
+    }
+
+    #[test]
+    fn cancelled_sql_queries_remove_their_progress_handler_after_interrupting() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            worker_cancelled.store(true, Ordering::Release);
+        });
+        {
+            let guard =
+                QueryDeadline::install_with_cancellation(&mut conn, None, Some(cancelled)).unwrap();
+            let error = guard.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT SUM(x) FROM n",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::OperationInterrupted)
+            );
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT SUM(x) FROM n",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(),
+            50_005_000
         );
     }
 }

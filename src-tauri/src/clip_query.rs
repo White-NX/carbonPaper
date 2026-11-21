@@ -17,13 +17,15 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
+mod cancellation;
 mod diagnostics;
+pub(crate) use cancellation::ClipQueryRequests;
 use diagnostics::{observe_query, query_stage, query_stage_async, QueryDiagnostics};
 
 /// Minimum cosine similarity for a hit, frozen by the M2.1 oracle
 /// (`clip_vector_search.min_similarity`). Cross-modal scores are low in
 /// absolute terms; this is the floor below which a match is noise.
-pub const CLIP_MIN_SIMILARITY: f32 = 0.32;
+pub const CLIP_MIN_SIMILARITY: f32 = 0.35;
 
 /// Timeout budget for text encoding, covering model load and worker wait.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(15);
@@ -244,6 +246,7 @@ pub struct ClipQueryRequest<'a> {
     end_time: Option<f64>,
     include_ocr: bool,
     sort_order: SearchSortOrder,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<'a> ClipQueryRequest<'a> {
@@ -265,6 +268,7 @@ impl<'a> ClipQueryRequest<'a> {
             end_time,
             include_ocr: true,
             sort_order: SearchSortOrder::Relevance,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -284,6 +288,19 @@ impl<'a> ClipQueryRequest<'a> {
         self.sort_order = sort_order;
         self
     }
+
+    pub(crate) fn with_cancellation(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = cancelled;
+        self
+    }
+}
+
+struct QueryCancellationGuard(Arc<AtomicBool>);
+
+impl Drop for QueryCancellationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// Shared search behavior; adapters own transport formats and privacy filtering.
@@ -291,6 +308,7 @@ pub async fn search(
     app: &AppHandle,
     request: ClipQueryRequest<'_>,
 ) -> Result<Vec<serde_json::Value>, String> {
+    let _cancellation = QueryCancellationGuard(request.cancelled.clone());
     match try_rust_clip_query(app, request).await {
         ClipQueryOutcome::Served(results) => Ok(results),
         ClipQueryOutcome::Unavailable(reason) => Err(format!("CLIP search unavailable: {reason}")),
@@ -340,8 +358,8 @@ async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> 
                 let empty = query_stage_async(&diagnostics, "empty_index_check", async {
                     Ok(tokio::task::spawn_blocking(move || {
                         storage
-                            .count_query_visible_embeddings(DerivedIndexKind::ClipImage)
-                            .map(|count| count == 0)
+                            .has_query_visible_embeddings(DerivedIndexKind::ClipImage)
+                            .map(|exists| !exists)
                             .unwrap_or(true)
                     })
                     .await
@@ -364,6 +382,7 @@ async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> 
             observe_served();
             ClipQueryOutcome::Served(results)
         }
+        Err(error) if error == "query_cancelled" => ClipQueryOutcome::Unavailable(error),
         Err(error) => unavailable(&error),
     }
 }
@@ -388,7 +407,9 @@ async fn run_rust_clip_query(
         .clone();
     // Verify/decrypt an evicted persistent reader while the query text model
     // loads. Missing or damaged generations remain owned by the builder.
-    crate::clip_ann::ensure_reader_loaded(app);
+    if request.sort_order == SearchSortOrder::Relevance {
+        crate::clip_ann::ensure_reader_loaded(app);
+    }
 
     let embedding = query_stage_async(&diagnostics, "embedding", async {
         semantic
@@ -417,17 +438,19 @@ async fn run_rust_clip_query(
         ));
     }
 
-    query_stage_async(&diagnostics, "ann_arm", async {
-        crate::clip_ann::ensure_reader_loaded(app);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if !remaining.is_zero() {
-            let _ = ann_state
-                .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
-                .await;
-        }
-        Ok(())
-    })
-    .await?;
+    if request.sort_order == SearchSortOrder::Relevance {
+        query_stage_async(&diagnostics, "ann_arm", async {
+            crate::clip_ann::ensure_reader_loaded(app);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = ann_state
+                    .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
+                    .await;
+            }
+            Ok(())
+        })
+        .await?;
+    }
     diagnostics.ann_status(ann_state.search_status());
 
     // Preserve over-fetch and pagination so process/time filters still have a full page.
@@ -465,69 +488,67 @@ async fn run_rust_clip_query(
         let _foreground_db = query_stage(&scan_diagnostics, "database_wait", || {
             scan_storage.foreground_db_read()
         })?;
-        let ann_snapshot = match query_stage(&scan_diagnostics, "ann_snapshot", || {
-            ann_state.prepare_query_with_reason(&scan_storage, &query_vec, Some(deadline))
-        }) {
-            Ok((snapshot, reason)) => {
-                if snapshot.is_none() {
-                    scan_diagnostics.fallback(reason);
-                }
-                snapshot
-            }
-            Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
-            Err(_) => {
-                scan_diagnostics.fallback("ann_snapshot_failed");
-                ann_state.disarm();
-                None
-            }
-        };
-        let mut candidate_filter = ClipCandidateFilter::new(
-            if sort_order == SearchSortOrder::Newest {
-                usize::MAX
-            } else {
-                target
-            },
-            &process_names,
-            start_time,
-            end_time,
-            deadline,
-        )
-        .with_categories(&categories);
-        let filter_candidates = |scored| {
-            let filtered = candidate_filter.filter(scored, |hashes| {
-                query_stage(&scan_diagnostics, "candidate_metadata", || {
-                    if process_names.is_empty() && categories.is_empty() {
-                        scan_storage.clip_candidate_metadata(hashes, deadline)
-                    } else {
-                        load_candidate_summaries(&scan_storage, hashes, deadline)
-                    }
+        let (filtered, page_offset) = if sort_order == SearchSortOrder::Newest {
+            scan_diagnostics.retrieval("chronological");
+            let page = query_stage(&scan_diagnostics, "chronological", || {
+                scan_storage.clip_image_chronological(crate::storage::ClipChronologicalRequest {
+                    query: &query_vec,
+                    limit,
+                    offset,
+                    process_names: &process_names,
+                    categories: &categories,
+                    start_time,
+                    end_time,
+                    min_similarity: CLIP_MIN_SIMILARITY,
+                    deadline,
+                    cancelled: scan_diagnostics.cancelled.clone(),
+                    metrics: &scan_diagnostics.vectors,
                 })
             })?;
-            scan_diagnostics.filtered(filtered.len());
-            Ok(filtered)
-        };
-        // A similarity prefix cannot establish chronological pages: a newer
-        // qualifying image may rank below that prefix. Score the visible set
-        // for this explicit ordering and resolve only metadata before paging.
-        let filtered = if sort_order == SearchSortOrder::Newest {
-            let count = query_stage(&scan_diagnostics, "chronological_count", || {
-                scan_storage.count_query_visible_embeddings(DerivedIndexKind::ClipImage)
-            })?;
-            let count = usize::try_from(count).map_err(|_| "clip_index_too_large".to_string())?;
-            let scored = query_stage(&scan_diagnostics, "exact", || {
-                app_exact_query(
-                    ann_snapshot.as_ref(),
-                    &scan_storage,
-                    &query_vec,
-                    count,
-                    deadline,
-                    &scan_diagnostics,
-                )
-            })?;
-            let mut filter_candidates = filter_candidates;
-            filter_candidates(scored)?
+            (
+                page.into_iter()
+                    .map(|hit: crate::storage::ClipChronologicalHit| ClipHit {
+                        subject: hit.subject,
+                        summary: hit.summary,
+                        summary_complete: false,
+                    })
+                    .collect(),
+                0,
+            )
         } else {
-            search_candidates(
+            let ann_snapshot = match query_stage(&scan_diagnostics, "ann_snapshot", || {
+                ann_state.prepare_query_with_reason(&scan_storage, &query_vec, Some(deadline))
+            }) {
+                Ok((snapshot, reason)) => {
+                    if snapshot.is_none() {
+                        scan_diagnostics.fallback(reason);
+                    }
+                    snapshot
+                }
+                Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
+                Err(_) => {
+                    scan_diagnostics.fallback("ann_snapshot_failed");
+                    ann_state.disarm();
+                    None
+                }
+            };
+            let mut candidate_filter =
+                ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline)
+                    .with_categories(&categories);
+            let filter_candidates = |scored| {
+                let filtered = candidate_filter.filter(scored, |hashes| {
+                    query_stage(&scan_diagnostics, "candidate_metadata", || {
+                        if process_names.is_empty() && categories.is_empty() {
+                            scan_storage.clip_candidate_metadata(hashes, deadline)
+                        } else {
+                            load_candidate_summaries(&scan_storage, hashes, deadline)
+                        }
+                    })
+                })?;
+                scan_diagnostics.filtered(filtered.len());
+                Ok(filtered)
+            };
+            let filtered = search_candidates(
                 fetch,
                 target,
                 deadline,
@@ -562,10 +583,11 @@ async fn run_rust_clip_query(
                         )
                     })
                 },
-            )?
+            )?;
+            (filtered, offset)
         };
         scan_diagnostics.filtered(filtered.len());
-        let page = paginate_clip_hits(filtered, offset, limit, sort_order);
+        let page = paginate_clip_hits(filtered, page_offset, limit, sort_order);
         let page = resolve_page_metadata(page, |ids| {
             query_stage(&scan_diagnostics, "metadata", || {
                 scan_storage
@@ -635,7 +657,12 @@ fn app_exact_query(
     });
     match snapshot
         .map(|snapshot| {
-            snapshot.exact_with_metrics(fetch, Some(deadline), Some(&diagnostics.vectors))
+            snapshot.exact_with_metrics(
+                fetch,
+                Some(deadline),
+                Some(&diagnostics.vectors),
+                Some(&diagnostics.cancelled),
+            )
         })
         .transpose()?
     {
@@ -648,6 +675,7 @@ fn app_exact_query(
             fetch,
             deadline,
             Some(diagnostics.vectors.clone()),
+            Some(diagnostics.cancelled.clone()),
         ),
     }
 }
@@ -892,7 +920,11 @@ fn resolve_page_metadata(
         .into_iter()
         .filter_map(|mut hit| {
             if !hit.summary_complete {
+                let timestamp = hit.summary.timestamp;
                 hit.summary = summaries.get(&hit.summary.id)?.clone();
+                // Keep the time that established this page's filtering/order
+                // while filling in the private metadata.
+                hit.summary.timestamp = timestamp;
                 hit.summary_complete = true;
             }
             Some(hit)
@@ -1130,7 +1162,11 @@ mod tests {
             temp.path().to_path_buf(),
         ));
         let storage = StorageState::new(temp.path().to_path_buf(), credentials);
-        for (score, requires_read) in [(0.31, false), (0.32, true), (0.33, true)] {
+        for (score, requires_read) in [
+            (CLIP_MIN_SIMILARITY.next_down(), false),
+            (CLIP_MIN_SIMILARITY, true),
+            (CLIP_MIN_SIMILARITY.next_up(), true),
+        ] {
             let rows = vec![crate::storage::ScoredSubject {
                 subject_key: "unreadable".into(),
                 score,

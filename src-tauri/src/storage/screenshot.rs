@@ -26,6 +26,25 @@ const MAX_OCR_DELETE_CLEANUP_FAILURES: i64 = 3;
 const STARTUP_PENDING_SCREENSHOTS_SQL: &str =
     "SELECT id FROM screenshots WHERE status = 'pending' AND is_deleted = 0 ORDER BY id ASC";
 
+fn image_hash_mapping_sql(count: usize) -> String {
+    let placeholders = vec!["?"; count].join(",");
+    // The live/time index otherwise attracts repeated archive scans before
+    // ANALYZE, even though this is a bounded set of exact hash lookups.
+    format!(
+        "SELECT image_hash, id FROM screenshots INDEXED BY idx_image_hash
+             WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+             ORDER BY created_at DESC, id DESC"
+    )
+}
+
+fn clip_candidate_metadata_sql(count: usize) -> String {
+    let placeholders = vec!["?"; count].join(",");
+    format!("SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), cp_process(process_name), category
+             FROM screenshots INDEXED BY idx_image_hash
+             WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+             ORDER BY created_at DESC, id DESC")
+}
+
 struct OcrDeleteQueueRow {
     id: i64,
     existing_id: Option<i64>,
@@ -1447,13 +1466,8 @@ impl StorageState {
         self.with_vector_scan_connection("map_image_hashes_to_screenshot_ids", |conn| {
             let mut mapped: HashMap<String, Vec<i64>> = HashMap::new();
             for chunk in image_hashes.chunks(500) {
-                let placeholders = vec!["?"; chunk.len()].join(",");
                 let mut statement = conn
-                    .prepare(&format!(
-                        "SELECT image_hash, id FROM screenshots
-                         WHERE is_deleted = 0 AND image_hash IN ({placeholders})
-                         ORDER BY created_at DESC, id DESC"
-                    ))
+                    .prepare(&image_hash_mapping_sql(chunk.len()))
                     .map_err(|e| format!("Failed to prepare the image hash mapping: {}", e))?;
                 let rows = statement
                     .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
@@ -1489,19 +1503,22 @@ impl StorageState {
             let mut result = std::collections::HashMap::new();
             for chunk in hashes.chunks(500) {
                 check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
-                let placeholders = vec!["?"; chunk.len()].join(",");
-                let sql = format!(
-                    "SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), cp_process(process_name), category
-                     FROM screenshots WHERE is_deleted = 0 AND image_hash IN ({placeholders})
-                     ORDER BY created_at DESC, id DESC"
-                );
+                let sql = clip_candidate_metadata_sql(chunk.len());
                 let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-                let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                    Ok((row.get::<_, String>(0)?, BackgroundScreenshotSummary {
-                        id: row.get(1)?, timestamp: row.get(2)?, process_name: row.get(3)?,
-                        category: row.get(4)?, window_title: None,
-                    }))
-                }).map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            BackgroundScreenshotSummary {
+                                id: row.get(1)?,
+                                timestamp: row.get(2)?,
+                                process_name: row.get(3)?,
+                                category: row.get(4)?,
+                                window_title: None,
+                            },
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?;
                 for row in rows {
                     let (hash, metadata) = row.map_err(|error| error.to_string())?;
                     result.entry(hash).or_insert(metadata);

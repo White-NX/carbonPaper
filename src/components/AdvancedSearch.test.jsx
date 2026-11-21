@@ -880,9 +880,10 @@ describe('AdvancedSearch', () => {
     const visualRegion = screen.getByRole('region', { name: 'advancedSearch.visual.results' });
     expect(visualRegion).toHaveAttribute('aria-busy', 'true');
     expect(visualRegion.querySelectorAll('.animate-pulse')).toHaveLength(10);
-    expect(screen.queryByText('advancedSearch.visual.loading')).not.toBeInTheDocument();
+    expect(screen.getByText('advancedSearch.visual.loading')).toBeVisible();
     await act(async () => finishVisual([{ ...makeOcrResult(26), similarity: 0.8 }]));
     expect(await screen.findByRole('button', { name: '26' })).toHaveAttribute('data-image-kind', 'original');
+    expect(screen.queryByText('advancedSearch.visual.loading')).not.toBeInTheDocument();
     expect(screen.getByText('text-1')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.open' }));
     expect(screen.getByText('text-1')).not.toBeVisible();

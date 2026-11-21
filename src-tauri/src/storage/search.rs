@@ -903,6 +903,7 @@ impl StorageState {
             .search_order_cache
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
+        self.clear_clip_chronological_cache();
     }
 
     /// Search text using the blind bigram bitmap index.

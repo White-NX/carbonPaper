@@ -15,6 +15,7 @@ mod backup_prefetch;
 mod blind_index;
 mod blind_search;
 mod classification;
+mod clip_chronological;
 mod compaction;
 mod connection;
 pub(crate) mod database_snapshot;
@@ -59,6 +60,7 @@ pub(crate) mod wire_time;
 pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
 pub use background_scheduler::BackgroundTaskState;
 pub(crate) use classification::{ClassificationFeedback, ClassificationLease};
+pub(crate) use clip_chronological::{ClipChronologicalHit, ClipChronologicalRequest};
 pub use compaction::StorageCompactionProgress;
 #[allow(unused_imports)]
 pub use derived_index::*;
@@ -186,6 +188,9 @@ pub struct StorageState {
     /// order itself holds no plaintext and expires on its own; see
     /// `search.rs::CachedSearchOrder`.
     search_order_cache: Mutex<Option<search::CachedSearchOrder>>,
+    /// A bounded chronological CLIP prefix and cursor, without plaintext query
+    /// or screenshot content. Its watcher invalidates it on database writes.
+    clip_chronological_cache: Mutex<Option<clip_chronological::CachedClipOrder>>,
     /// Incremented on every close and every open of the backing database file,
     /// always while the `db` mutex is held. A background writer that captured
     /// this value before being scheduled can tell whether it is still facing
@@ -290,6 +295,7 @@ impl StorageState {
             clip_cache_load_lock: Mutex::new(()),
             semantic_cache_reset_generation: AtomicU64::new(0),
             search_order_cache: Mutex::new(None),
+            clip_chronological_cache: Mutex::new(None),
             db_generation: AtomicU64::new(0),
         }
     }
@@ -760,7 +766,7 @@ mod tests {
         assert_eq!(error, "Database not initialized");
     }
 
-    fn initialized_read_storage(
+    pub(super) fn initialized_read_storage(
         policy: mode::DatabaseModePolicy,
     ) -> (tempfile::TempDir, Arc<StorageState>) {
         let temp = tempfile::tempdir().expect("temporary encrypted storage");

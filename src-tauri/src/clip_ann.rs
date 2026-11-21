@@ -31,6 +31,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -949,9 +950,14 @@ fn exact_candidates(
                 .map(|v| (row.subject_key.as_str(), dot_product(query, v)))
         }),
         None,
+        None,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exact scans keep generation, tail visibility, and interruption controls explicit"
+)]
 fn exact_candidates_with_tail<'a>(
     generation: &GenerationReader,
     query: &[f32],
@@ -960,6 +966,7 @@ fn exact_candidates_with_tail<'a>(
     changed: impl Fn(&str) -> bool,
     tail_scores: impl Iterator<Item = (&'a str, f32)>,
     metrics: Option<&crate::storage::VectorQueryMetrics>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<ScoredSubject>, String> {
     let started = Instant::now();
     if let Some(metrics) = metrics {
@@ -971,6 +978,9 @@ fn exact_candidates_with_tail<'a>(
     }
     let mut top = BoundedTopK::new(k);
     for ordinal in 0..generation.flat.rows() {
+        if ordinal % 64 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("query_cancelled".into());
+        }
         if ordinal % 256 == 0 {
             if let Some(metrics) = metrics {
                 metrics.update(|progress| {
@@ -997,6 +1007,9 @@ fn exact_candidates_with_tail<'a>(
         });
     }
     for (index, (key, score)) in tail_scores.enumerate() {
+        if index % 64 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("query_cancelled".into());
+        }
         if index % 1024 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
