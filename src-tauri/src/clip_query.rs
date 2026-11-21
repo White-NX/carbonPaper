@@ -25,7 +25,7 @@ use diagnostics::{observe_query, query_stage, query_stage_async, QueryDiagnostic
 /// Minimum cosine similarity for a hit, frozen by the M2.1 oracle
 /// (`clip_vector_search.min_similarity`). Cross-modal scores are low in
 /// absolute terms; this is the floor below which a match is noise.
-pub const CLIP_MIN_SIMILARITY: f32 = 0.32;
+pub const CLIP_MIN_SIMILARITY: f32 = 0.35;
 
 /// Timeout budget for text encoding, covering model load and worker wait.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(15);
