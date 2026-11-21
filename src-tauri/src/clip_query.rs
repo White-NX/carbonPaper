@@ -1162,7 +1162,11 @@ mod tests {
             temp.path().to_path_buf(),
         ));
         let storage = StorageState::new(temp.path().to_path_buf(), credentials);
-        for (score, requires_read) in [(0.31, false), (0.32, true), (0.33, true)] {
+        for (score, requires_read) in [
+            (CLIP_MIN_SIMILARITY.next_down(), false),
+            (CLIP_MIN_SIMILARITY, true),
+            (CLIP_MIN_SIMILARITY.next_up(), true),
+        ] {
             let rows = vec![crate::storage::ScoredSubject {
                 subject_key: "unreadable".into(),
                 score,
