@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::{
-    evidence_agent::MAX_REQUESTS,
+    budget::{self, Allowance},
     runner::{complete_with_limit, RunContext},
     types::RecapWarning,
 };
@@ -267,13 +267,6 @@ fn apply_repairs(draft: &mut Value, response: &Value, issues: &[Issue]) -> Resul
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct Allowance {
-    input: u64,
-    output: u64,
-    requests: u64,
-}
-
 trait RepairHost: Sync {
     fn provider(&self) -> &ResolvedProvider;
     fn check(&self) -> Result<(), String>;
@@ -300,21 +293,13 @@ impl RepairHost for Host<'_> {
         self.ctx.check()
     }
     fn allowance(&self) -> Result<Allowance, String> {
-        let used = self.ctx.storage.recap_run_usage(self.run)?;
-        Ok(Allowance {
-            input: self
-                .ctx
-                .settings
-                .batch_input_tokens
-                .saturating_sub(used.input_tokens),
-            output: self
-                .ctx
-                .settings
-                .batch_output_tokens
-                .saturating_sub(used.output_tokens)
-                .min(u64::from(self.ctx.settings.request_output_tokens)),
-            requests: MAX_REQUESTS.saturating_sub(used.requests),
-        })
+        let mut allowance = self.ctx.allowance(self.run, self.stage)?;
+        allowance.output = allowance.output.tighter(budget::Limit {
+            code: "RECAP_RUN_OUTPUT_EXHAUSTED",
+            limit: u64::from(self.ctx.settings.request_output_tokens),
+            used: 0,
+        });
+        Ok(allowance)
     }
     fn validation(&self, error: Option<&str>, partial: bool) {
         self.ctx.progress(true, |progress| {
@@ -332,7 +317,7 @@ impl RepairHost for Host<'_> {
             request,
             self.run,
             self.stage,
-            MAX_REQUESTS,
+            self.ctx.settings.request_limit(),
         )
         .await
     }
@@ -403,14 +388,18 @@ async fn drive<T: Send>(
         }
         host.validation(report.first_error(), false);
         let allowance = host.allowance()?;
-        if allowance.requests == 0 || allowance.output == 0 {
-            report.repair_error = Some("RECAP_BUDGET_EXHAUSTED".into());
+        if let Err(error) = allowance
+            .requests
+            .check(1)
+            .and_then(|_| allowance.output.check(1))
+        {
+            report.repair_error = Some(error);
             break;
         }
-        let output = (allowance.output / (MAX_REPAIRS - repair_index) as u64)
+        let output = (allowance.output.available() / (MAX_REPAIRS - repair_index) as u64)
             .min(u64::from(host.provider().context_tokens / 2)) as u32;
         if output == 0 {
-            report.repair_error = Some("RECAP_BUDGET_EXHAUSTED".into());
+            report.repair_error = Some(allowance.output.error((MAX_REPAIRS - repair_index) as u64));
             break;
         }
         let feedback = feedback(&draft, &report.issues);
@@ -423,7 +412,7 @@ async fn drive<T: Send>(
         request.max_tokens = Some(output);
         request.disable_tools = !request.tools.is_empty();
         if context::estimated_input_tokens(host.provider().kind, &request)
-            > allowance.input.min(context::input_allowance(
+            > allowance.input.available().min(context::input_allowance(
                 &request,
                 host.provider().context_tokens,
             ))
@@ -436,12 +425,28 @@ async fn drive<T: Send>(
             ];
         }
         if context::estimated_input_tokens(host.provider().kind, &request)
-            > allowance.input.min(context::input_allowance(
+            > allowance.input.available().min(context::input_allowance(
                 &request,
                 host.provider().context_tokens,
             ))
         {
-            report.repair_error = Some("RECAP_BUDGET_EXHAUSTED".into());
+            let context = context::input_allowance(&request, host.provider().context_tokens);
+            report.repair_error = Some(if context < allowance.input.available() {
+                budget::Limit {
+                    code: "AI_CONTEXT_LIMIT",
+                    limit: context,
+                    used: 0,
+                }
+                .error(context::estimated_input_tokens(
+                    host.provider().kind,
+                    &request,
+                ))
+            } else {
+                allowance.input.error(context::estimated_input_tokens(
+                    host.provider().kind,
+                    &request,
+                ))
+            });
             break;
         }
         let result = host.complete(&request).await;
@@ -522,9 +527,21 @@ mod tests {
         fn allowance(&self) -> Result<Allowance, String> {
             let requests = self.requests.lock().unwrap().len() as u64;
             Ok(Allowance {
-                input: 128_000 - requests * 100,
-                output: 32_000 - requests * 100,
-                requests: 15 - requests,
+                input: budget::Limit {
+                    code: "RECAP_RUN_INPUT_EXHAUSTED",
+                    limit: 128_000,
+                    used: requests * 100,
+                },
+                output: budget::Limit {
+                    code: "RECAP_RUN_OUTPUT_EXHAUSTED",
+                    limit: 32_000,
+                    used: requests * 100,
+                },
+                requests: budget::Limit {
+                    code: "RECAP_REQUEST_LIMIT",
+                    limit: 15,
+                    used: requests,
+                },
             })
         }
         fn validation(&self, error: Option<&str>, partial: bool) {

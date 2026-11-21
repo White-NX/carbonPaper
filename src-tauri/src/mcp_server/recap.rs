@@ -381,6 +381,7 @@ mod tests {
                     warnings: vec![],
                 }],
                 validation_version: 0,
+                budget_hash: String::new(),
             }],
         }
     }

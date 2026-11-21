@@ -9,6 +9,7 @@ use serde_json::json;
 use tauri::{Emitter, Manager};
 
 use super::{
+    budget,
     evidence_agent::{self, activity_value, EvidenceContext},
     runner::{day_evidence, RunContext},
     types::*,
@@ -47,6 +48,8 @@ pub(super) struct CachedMainlines {
     pub attempts: Vec<RecapAttempt>,
     #[serde(default)]
     pub validation_version: u32,
+    #[serde(default)]
+    pub budget_hash: String,
 }
 
 pub(super) fn fingerprint(day: &RecapDay, language: &str) -> String {
@@ -101,13 +104,13 @@ fn should_generate(
     }
     // Like period summaries, failures are durable until explicit retry, changed
     // input, or a renewed daily budget. An empty result is a successful judgment.
-    cached.error.as_deref() == Some("RECAP_BUDGET_EXHAUSTED")
-        && chrono::DateTime::from_timestamp_millis(cached.updated_at_ms)
-            .zip(chrono::DateTime::from_timestamp_millis(now))
-            .is_some_and(|(a, b)| {
-                a.with_timezone(&chrono::Local).date_naive()
-                    != b.with_timezone(&chrono::Local).date_naive()
-            })
+    budget::retry_due(
+        cached.error.as_deref(),
+        &cached.budget_hash,
+        &cached.budget_hash,
+        cached.updated_at_ms,
+        now,
+    )
 }
 
 #[cfg(test)]
@@ -340,7 +343,6 @@ fn request(
     {
         tasks.entry(&activity.task_id).or_default().push(activity);
     }
-    let directory = tasks.iter().map(|(id,activities)| json!({"id":id,"title":activities[0].task_title,"occurrences":activities.len()})).collect::<Vec<_>>();
     // Interleave tasks so long histories cannot crowd out unrelated brief work.
     let mut selected = Vec::new();
     for index in 0..480 {
@@ -353,22 +355,54 @@ fn request(
     let output = u64::from(settings.request_output_tokens)
         .min(settings.batch_output_tokens / 2)
         .min(u64::from(provider.context_tokens / 2)) as u32;
+    if output == 0 {
+        return Err(budget::Limit {
+            code: "RECAP_RUN_OUTPUT_EXHAUSTED",
+            limit: settings.batch_output_tokens,
+            used: 0,
+        }
+        .error(2));
+    }
     loop {
         if selected.is_empty() {
             return Err("AI_CONTEXT_LIMIT".into());
         }
+        let selected_tasks = selected
+            .iter()
+            .map(|a| a.task_id.as_str())
+            .collect::<HashSet<_>>();
+        let directory = tasks.iter().filter(|(id,_)| selected_tasks.contains(*id))
+            .map(|(id,activities)| json!({"id":id,"title":activities[0].task_title,"occurrences":activities.len()})).collect::<Vec<_>>();
         let mut request = ChatRequest {
             messages:vec![Message::System(PROMPT.into()),Message::User(json!({"language":settings.language,"calendar":day.calendar,"tasks":directory,
                 "activities":selected.iter().map(|a| activity_value(a,1600)).collect::<Vec<_>>(),
+                "omitted_tasks":tasks.len().saturating_sub(directory.len()),
                 "omitted_activities":tasks.values().map(Vec::len).sum::<usize>().saturating_sub(selected.len())}).to_string())],
             max_tokens:Some(output),temperature:Some(0.2),..Default::default()
         };
         validation::configure(&mut request);
-        evidence_agent::configure(&mut request, provider, true);
+        evidence_agent::configure(&mut request, provider, true, settings);
         if context::estimated_input_tokens(provider.kind, &request)
-            <= (settings.batch_input_tokens.min(36_000) * 2 / 5)
+            <= (settings.batch_input_tokens * 2 / 5)
                 .min(context::input_allowance(&request, provider.context_tokens))
         {
+            return Ok((request, selected));
+        }
+        if selected.len() == 1 {
+            // A minimal final answer may use the remaining run allowance when
+            // the preferred initial allocation is too small for one activity.
+            let full = budget::Limit {
+                code: "RECAP_RUN_INPUT_EXHAUSTED",
+                limit: settings.batch_input_tokens,
+                used: 0,
+            }
+            .tighter(budget::Limit {
+                code: "AI_CONTEXT_LIMIT",
+                limit: context::input_allowance(&request, provider.context_tokens),
+                used: 0,
+            });
+            let estimate = context::estimated_input_tokens(provider.kind, &request);
+            full.check(estimate)?;
             return Ok((request, selected));
         }
         selected.pop();
@@ -385,18 +419,33 @@ pub(super) async fn generate(
         return Ok(());
     }
     let hash = fingerprint(&day, &ctx.settings.language);
+    let budget_hash = budget::fingerprint(&ctx.settings, provider);
     let cached: Option<CachedMainlines> = match ctx.read("mainlines", &ctx.day, Some(ctx.revision))
     {
         Err(error) if error == "RECAP_INVALID_CACHE" => None,
         result => result?,
     };
-    if !should_generate(
-        cached.as_ref(),
-        &hash,
-        force,
-        ctx.automatic,
-        chrono::Utc::now().timestamp_millis(),
-    ) {
+    let renewed_budget = cached
+        .as_ref()
+        .filter(|cache| cache.input_hash == hash)
+        .is_some_and(|cache| {
+            budget::retry_due(
+                cache.error.as_deref(),
+                &cache.budget_hash,
+                &budget_hash,
+                cache.updated_at_ms,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        });
+    if !renewed_budget
+        && !should_generate(
+            cached.as_ref(),
+            &hash,
+            force,
+            ctx.automatic,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    {
         return Ok(());
     }
     ctx.progress(true, |p| p.batch_start_ms = Some(day.calendar.start_ms));
@@ -408,7 +457,9 @@ pub(super) async fn generate(
     }
     let run = format!("mainlines-{}", hex::encode(rand::random::<[u8; 16]>()));
     let result = async {
-        let (request, included) = request(&input, &ctx.settings, provider)?;
+        let available = ctx.available_settings(&run, "mainlines")?;
+        let (request, included) = request(&input, &available, provider)
+            .map_err(|error| ctx.refine_request_error(&run,"mainlines",error))?;
         let records = day_evidence(ctx).await?;
         let activities = input
             .batches
@@ -478,6 +529,7 @@ pub(super) async fn generate(
             .filter(|a| a.id.starts_with(&run))
             .collect(),
         validation_version: validation::VERSION,
+        budget_hash,
     };
     ctx.write("mainlines", &ctx.day, &value)?;
     let _ = ctx.app.emit("recap-changed", &ctx.day);
@@ -487,6 +539,48 @@ pub(super) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mainline_input_uses_configured_allowance_and_shrinks_its_directory_with_activities() {
+        let mut day = day();
+        let template = day.batches[0].activities[0].clone();
+        day.batches[0].activities = (0..100)
+            .map(|index| {
+                let mut activity = template.clone();
+                activity.id = format!("activity-{index}");
+                activity.task_id = format!("task-{index}");
+                activity.task_title = format!("Task {index}");
+                activity.text = "step ".repeat(320);
+                activity
+            })
+            .collect();
+        let provider = ResolvedProvider {
+            context_tokens: 128_000,
+            ..Default::default()
+        };
+        let settings = RecapSettings::default();
+        let (large, large_included) = request(&day, &settings, &provider).unwrap();
+        assert!(context::estimated_input_tokens(provider.kind, &large) > 14_400);
+        assert!(
+            context::estimated_input_tokens(provider.kind, &large)
+                <= settings.batch_input_tokens * 2 / 5
+        );
+        let smaller = RecapSettings {
+            batch_input_tokens: 24_000,
+            ..settings
+        };
+        let (small, included) = request(&day, &smaller, &provider).unwrap();
+        assert!(included.len() < large_included.len());
+        let Message::User(payload) = &small.messages[1] else {
+            panic!()
+        };
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["tasks"].as_array().unwrap().len(), included.len());
+        assert!(payload["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| included.iter().any(|a| task["id"] == a.task_id)));
+    }
     #[test]
     fn mainlines_are_validated_independently_and_unknown_sources_are_not_fabricated() {
         let day = day();
@@ -552,6 +646,7 @@ mod tests {
             summary: None,
             summary_error: None,
             validation_version: 0,
+            budget_hash: String::new(),
         };
         RecapDay {
             date: calendar.date.clone(),
@@ -675,6 +770,7 @@ mod tests {
             error: None,
             attempts: vec![],
             validation_version: 0,
+            budget_hash: String::new(),
         };
         let mut runtime_only = original.clone();
         runtime_only.running = true;
@@ -716,6 +812,7 @@ mod tests {
             error: None,
             attempts: vec![],
             validation_version: 0,
+            budget_hash: String::new(),
         };
         assert!(!should_generate(Some(&cache), "hash", false, true, 10));
         assert!(should_generate(Some(&cache), "changed", false, true, 10));

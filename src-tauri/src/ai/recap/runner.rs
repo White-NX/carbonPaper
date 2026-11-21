@@ -288,6 +288,57 @@ impl RunContext {
             &self.app.state::<Arc<crate::idle::IdleState>>(),
         )
     }
+
+    pub(super) fn allowance(
+        &self,
+        run: &str,
+        stage: &str,
+    ) -> Result<super::budget::Allowance, String> {
+        let daily = self
+            .storage
+            .recap_usage(&Local::now().date_naive().to_string())?;
+        let used = self.storage.recap_run_usage(run)?;
+        Ok(super::budget::allowance(
+            &self.settings,
+            &daily,
+            &used,
+            self.settings.request_limit(),
+            super::budget::is_mainline(stage),
+        ))
+    }
+
+    pub(super) fn available_settings(
+        &self,
+        run: &str,
+        stage: &str,
+    ) -> Result<RecapSettings, String> {
+        let allowance = self.allowance(run, stage)?;
+        allowance.requests.check(1)?;
+        allowance.input.check(1)?;
+        allowance.output.check(1)?;
+        let mut settings = self.settings.clone();
+        settings.batch_input_tokens = allowance.input.available();
+        settings.batch_output_tokens = allowance.output.available();
+        Ok(settings)
+    }
+
+    /// Builders receive reduced limits; preserve the original limit's cause.
+    pub(super) fn refine_request_error(&self, run: &str, stage: &str, error: String) -> String {
+        let Some(detail) = super::budget::numeric_detail(&error) else {
+            return error;
+        };
+        let requested = detail
+            .split(", ")
+            .find_map(|field| field.strip_prefix("requested=")?.parse::<u64>().ok());
+        let (Some(requested), Ok(allowance)) = (requested, self.allowance(run, stage)) else {
+            return error;
+        };
+        match super::budget::code(&error) {
+            "RECAP_RUN_INPUT_EXHAUSTED" => allowance.input.error(requested),
+            "RECAP_RUN_OUTPUT_EXHAUSTED" => allowance.output.error(requested),
+            _ => error,
+        }
+    }
 }
 
 fn check_background_gate(automatic: bool, state: &crate::idle::IdleState) -> Result<(), String> {
@@ -423,6 +474,7 @@ fn read_day_impl(
                 summary: None,
                 summary_error: None,
                 validation_version: 0,
+                budget_hash: String::new(),
             }),
         );
     }
@@ -674,12 +726,13 @@ pub(crate) fn initial_request(
     // follow-up to rebuild a smaller prompt even when the model context fit.
     let make_request = |payload: &Value| {
         let mut req = request(payload, output);
-        evidence_agent::configure(&mut req, provider, !prior.threads.is_empty());
+        evidence_agent::configure(&mut req, provider, !prior.threads.is_empty(), settings);
         req
     };
-    let allowance = (settings.batch_input_tokens.min(36_000) * 2 / 5).min(
-        context::input_allowance(&make_request(&Value::Null), provider.context_tokens),
-    );
+    let allowance = (settings.batch_input_tokens * 2 / 5).min(context::input_allowance(
+        &make_request(&Value::Null),
+        provider.context_tokens,
+    ));
     let order = selection::selection_order(records, start as u64);
     let mut tasks = prior
         .threads
@@ -764,7 +817,7 @@ pub(super) async fn complete(
     run: &str,
     stage: &str,
 ) -> Result<ChatResponse, String> {
-    complete_with_limit(ctx, provider, req, run, stage, 2).await
+    complete_with_limit(ctx, provider, req, run, stage, ctx.settings.request_limit()).await
 }
 
 pub(super) async fn complete_with_limit(
@@ -779,8 +832,15 @@ pub(super) async fn complete_with_limit(
     if context::estimated_input_tokens(provider.kind, req)
         > context::input_allowance(req, provider.context_tokens)
     {
-        return Err("AI_CONTEXT_LIMIT".into());
+        return Err(super::budget::Limit {
+            code: "AI_CONTEXT_LIMIT",
+            limit: context::input_allowance(req, provider.context_tokens),
+            used: 0,
+        }
+        .error(context::estimated_input_tokens(provider.kind, req)));
     }
+    // Client construction is local preflight and must not consume allowance.
+    let client = provider::http_client()?;
     let usage_day = Local::now().date_naive().to_string();
     let reservation = ctx.storage.recap_reserve_with_limit(
         &usage_day,
@@ -791,8 +851,8 @@ pub(super) async fn complete_with_limit(
         &ctx.settings,
         ctx.generation,
         request_limit,
-    )?;
-    let client = provider::http_client()?;
+        super::budget::is_mainline(stage),
+    );
     let started = std::time::Instant::now();
     let request_id = format!("{run}:{stage}:{}", hex::encode(rand::random::<[u8; 4]>()));
     ctx.progress(true, |p| {
@@ -803,16 +863,31 @@ pub(super) async fn complete_with_limit(
             kind: stage.into(),
             model: provider.model.clone(),
             started_at_ms: chrono::Utc::now().timestamp_millis(),
-            status: "running".into(),
+            status: if reservation.is_ok() {
+                "running"
+            } else {
+                "failed"
+            }
+            .into(),
+            finished_at_ms: reservation
+                .as_ref()
+                .err()
+                .map(|_| chrono::Utc::now().timestamp_millis()),
+            error: reservation.as_ref().err().cloned(),
+            submitted: Some(false),
             max_output_tokens: req.max_tokens.unwrap_or(0),
             input_estimate: context::estimated_input_tokens(provider.kind, req),
             ..Default::default()
         });
     });
+    let reservation = reservation?;
     tracing::info!(target: "recap", day = %ctx.day, run, stage, request_id = %request_id,
         model = %provider.model, input_estimate = context::estimated_input_tokens(provider.kind, req),
         max_output = req.max_tokens, "[RECAP] Request started");
+    let submitted = std::sync::atomic::AtomicBool::new(false);
     let response = guarded(ctx, async {
+        ctx.check_before_request()?;
+        submitted.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut sink = |event| {
             ctx.progress(false, |p| p.stream(event));
         };
@@ -825,7 +900,21 @@ pub(super) async fn complete_with_limit(
         .map_err(|e| e.code().to_string())
     })
     .await;
-    ctx.progress(true, |p| p.finish_attempt(&response));
+    let submitted = submitted.load(std::sync::atomic::Ordering::SeqCst);
+    if !submitted {
+        if let Err(error) = ctx
+            .storage
+            .recap_release_unsubmitted(reservation, ctx.generation)
+        {
+            log_failure(&ctx.day, run, "reservation_release", &error);
+        }
+    }
+    ctx.progress(true, |p| {
+        if let Some(attempt) = p.attempts.last_mut() {
+            attempt.submitted = Some(submitted);
+        }
+        p.finish_attempt(&response);
+    });
     let response = match response {
         Ok(response) => response,
         Err(error) => {
@@ -861,14 +950,16 @@ fn error_code(error: &str) -> &str {
 }
 
 pub(super) fn log_failure(day: &str, run: &str, stage: &str, error: &str) {
-    // Provider/storage messages can contain private content. Only our codes
-    // and structural parse positions are safe for the ordinary app log.
+    // Provider/storage messages can contain private content. Only our codes,
+    // structural parse positions and checked numeric limits enter ordinary logs.
     let code = error_code(error);
     let detail = if matches!(code, "RECAP_INVALID_JSON" | "RECAP_INVALID_STRUCTURE") {
         error
             .split_once(':')
             .map(|(_, detail)| detail)
             .unwrap_or_default()
+    } else if super::budget::is_limit(error) {
+        super::budget::numeric_detail(error).unwrap_or_default()
     } else {
         ""
     };
@@ -1050,6 +1141,7 @@ async fn generate_batch(
         summary: None,
         summary_error: None,
         validation_version: 0,
+        budget_hash: String::new(),
     };
     ctx.write("index", &format!("{}:{start}", ctx.day), &batch.records)?;
     if records.is_empty() {
@@ -1215,7 +1307,7 @@ async fn generate_batch(
                     &second,
                     &run,
                     "supplement",
-                    evidence_agent::MAX_REQUESTS,
+                    ctx.settings.request_limit(),
                 )
                 .await?;
                 let report = validation::repair(
@@ -1620,10 +1712,13 @@ async fn generate_inner(
         }
         if !force
             && cached.as_ref().is_some_and(|c| {
-                let renewed_budget = c.error.as_deref() == Some("RECAP_BUDGET_EXHAUSTED")
-                    && chrono::DateTime::from_timestamp_millis(c.updated_at_ms).is_some_and(|t| {
-                        t.with_timezone(&Local).date_naive() != Local::now().date_naive()
-                    });
+                let renewed_budget = super::budget::retry_due(
+                    c.error.as_deref(),
+                    &c.budget_hash,
+                    &super::budget::fingerprint(&ctx.settings, &provider),
+                    c.updated_at_ms,
+                    chrono::Utc::now().timestamp_millis(),
+                );
                 let legacy_validation = c.validation_version < validation::VERSION
                     && c.error
                         .as_deref()
@@ -1677,6 +1772,7 @@ async fn generate_inner(
                         summary: None,
                         summary_error: None,
                         validation_version: 0,
+                        budget_hash: String::new(),
                     }
                 }
             }
@@ -1687,6 +1783,7 @@ async fn generate_inner(
         batch.summary = None;
         batch.summary_error = None;
         batch.validation_version = validation::VERSION;
+        batch.budget_hash = super::budget::fingerprint(&ctx.settings, &provider);
         ctx.write("batch", &key, &batch)?;
         ctx.progress(true, |p| p.completed_batches += 1);
         tracing::info!(target: "recap", day = %date, start_ms = a, status = %batch.status,
@@ -1709,14 +1806,19 @@ fn batch_incomplete(batch: &RecapBatch) -> bool {
 }
 
 fn summary_update_finished(day: &RecapDay) -> bool {
-    day.mainlines_error.as_deref() != Some("RECAP_BUDGET_EXHAUSTED")
+    !day.mainlines_error
+        .as_deref()
+        .is_some_and(super::budget::is_limit)
         && (day.batches.iter().all(|b| b.activities.is_empty())
             || day.mainlines.is_some()
             || day.mainlines_error.is_some())
         && day.batches.iter().all(|b| {
             b.status != "pending"
-                && b.error.as_deref() != Some("RECAP_BUDGET_EXHAUSTED")
-                && b.summary_error.as_deref() != Some("RECAP_BUDGET_EXHAUSTED")
+                && !b.error.as_deref().is_some_and(super::budget::is_limit)
+                && !b
+                    .summary_error
+                    .as_deref()
+                    .is_some_and(super::budget::is_limit)
                 && (b.activities.is_empty() || b.summary.is_some() || b.summary_error.is_some())
         })
 }

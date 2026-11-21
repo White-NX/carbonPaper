@@ -20,6 +20,8 @@ pub struct RecapSettings {
     pub batch_output_tokens: u64,
     pub request_output_tokens: u32,
     pub answer_tokens: u32,
+    pub evidence_rounds: u32,
+    pub mainline_reserve_percent: u32,
     #[serde(default)]
     pub budget_version: u32,
     pub daily_input_tokens: u64,
@@ -41,6 +43,8 @@ impl Default for RecapSettings {
             batch_output_tokens: 64_000,
             request_output_tokens: 32_000,
             answer_tokens: 4_000,
+            evidence_rounds: 12,
+            mainline_reserve_percent: 10,
             budget_version: 2,
             daily_input_tokens: 432_000,
             daily_output_tokens: 384_000,
@@ -90,6 +94,19 @@ impl Default for ScreeningSettings {
 }
 
 impl RecapSettings {
+    pub(crate) fn request_limit(&self) -> u64 {
+        u64::from(
+            self.evidence_rounds
+                .clamp(1, super::budget::MAX_EVIDENCE_ROUNDS),
+        ) + 4
+    }
+
+    pub(crate) fn tool_call_limit(&self) -> usize {
+        self.evidence_rounds
+            .clamp(1, super::budget::MAX_EVIDENCE_ROUNDS) as usize
+            * 4
+    }
+
     /// The stored recap language is legacy data; the application preference is authoritative.
     pub(crate) fn with_app_language(mut self) -> Self {
         let language = crate::registry_config::get_string("language").unwrap_or_default();
@@ -140,6 +157,8 @@ impl RecapSettings {
             || !(1_000..=64_000).contains(&self.batch_output_tokens)
             || !(1_000..=64_000).contains(&self.request_output_tokens)
             || !(512..=16_000).contains(&self.answer_tokens)
+            || !(1..=super::budget::MAX_EVIDENCE_ROUNDS).contains(&self.evidence_rounds)
+            || self.mainline_reserve_percent > 50
             || self.daily_input_tokens < self.batch_input_tokens
             || self.daily_output_tokens < self.batch_output_tokens
             || self.daily_input_tokens > 10_000_000
@@ -259,6 +278,8 @@ pub struct RecapBatch {
     pub summary_error: Option<String>,
     #[serde(default)]
     pub validation_version: u32,
+    #[serde(default)]
+    pub budget_hash: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -329,6 +350,8 @@ pub struct RecapAttempt {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_calls: Vec<RecapEvidenceCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -402,6 +425,14 @@ pub struct RecapUsage {
     pub output_tokens: u64,
     pub screening_input_tokens: u64,
     pub requests: u64,
+    #[serde(default)]
+    pub unconfirmed_input_tokens: u64,
+    #[serde(default)]
+    pub unconfirmed_output_tokens: u64,
+    #[serde(default)]
+    pub unconfirmed_requests: u64,
+    #[serde(default)]
+    pub unconfirmed_screening_input_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -610,6 +641,7 @@ mod tests {
                 warnings: vec![],
             }],
             validation_version: 0,
+            budget_hash: String::new(),
         }
     }
     #[test]

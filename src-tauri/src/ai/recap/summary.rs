@@ -8,6 +8,7 @@ use serde_json::json;
 use tauri::{Emitter, Manager};
 
 use super::{
+    budget,
     runner::{complete, RunContext},
     types::*,
     validation::{self, Report},
@@ -45,6 +46,8 @@ pub(super) struct CachedSummary {
     pub attempts: Vec<RecapAttempt>,
     #[serde(default)]
     pub validation_version: u32,
+    #[serde(default)]
+    pub budget_hash: String,
 }
 
 pub(super) fn fingerprint(batch: &RecapBatch, language: &str) -> String {
@@ -98,13 +101,13 @@ pub(super) fn should_generate(
     }
     // Durable failures avoid retrying every scheduler tick. A new daily budget
     // may retry budget exhaustion, but never treats an old success as expired.
-    cached.error.as_deref() == Some("RECAP_BUDGET_EXHAUSTED")
-        && chrono::DateTime::from_timestamp_millis(cached.updated_at_ms)
-            .zip(chrono::DateTime::from_timestamp_millis(now))
-            .is_some_and(|(a, b)| {
-                a.with_timezone(&chrono::Local).date_naive()
-                    != b.with_timezone(&chrono::Local).date_naive()
-            })
+    budget::retry_due(
+        cached.error.as_deref(),
+        &cached.budget_hash,
+        &cached.budget_hash,
+        cached.updated_at_ms,
+        now,
+    )
 }
 
 pub(super) fn attach(batch: &mut RecapBatch, cached: Option<CachedSummary>, language: &str) {
@@ -288,6 +291,14 @@ fn request(
         .min(16_000)
         .min((settings.batch_output_tokens / (validation::MAX_REPAIRS as u64 + 1)) as u32)
         .min(provider.context_tokens / 2);
+    if output == 0 {
+        return Err(budget::Limit {
+            code: "RECAP_RUN_OUTPUT_EXHAUSTED",
+            limit: settings.batch_output_tokens,
+            used: 0,
+        }
+        .error(3));
+    }
     loop {
         if selected.is_empty() {
             return Err("AI_CONTEXT_LIMIT".into());
@@ -322,6 +333,19 @@ fn request(
                 .min(context::input_allowance(&req, provider.context_tokens))
         {
             return Ok((req, selected));
+        }
+        if selected.len() == 1 {
+            return Err(budget::Limit {
+                code: "RECAP_RUN_INPUT_EXHAUSTED",
+                limit: settings.batch_input_tokens,
+                used: 0,
+            }
+            .tighter(budget::Limit {
+                code: "AI_CONTEXT_LIMIT",
+                limit: context::input_allowance(&req, provider.context_tokens),
+                used: 0,
+            })
+            .error(context::estimated_input_tokens(provider.kind, &req)));
         }
         selected.pop();
     }
@@ -361,21 +385,36 @@ pub(super) async fn generate(
     force: bool,
 ) -> Result<(), String> {
     let day = ctx.read_day()?;
+    let budget_hash = budget::fingerprint(&ctx.settings, provider);
     for batch in day.batches.iter().filter(|b| !b.activities.is_empty()) {
         ctx.check()?;
         let key = format!("{}:{}", ctx.day, batch.start_ms);
         let hash = fingerprint(batch, &ctx.settings.language);
-        let cached = match ctx.read("summary", &key, Some(ctx.revision)) {
+        let cached: Option<CachedSummary> = match ctx.read("summary", &key, Some(ctx.revision)) {
             Err(error) if error == "RECAP_INVALID_CACHE" => None,
             result => result?,
         };
-        if !should_generate(
-            cached.as_ref(),
-            &hash,
-            force,
-            ctx.automatic,
-            chrono::Utc::now().timestamp_millis(),
-        ) {
+        let renewed_budget = cached
+            .as_ref()
+            .filter(|cache| cache.input_hash == hash)
+            .is_some_and(|cache| {
+                budget::retry_due(
+                    cache.error.as_deref(),
+                    &cache.budget_hash,
+                    &budget_hash,
+                    cache.updated_at_ms,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            });
+        if !renewed_budget
+            && !should_generate(
+                cached.as_ref(),
+                &hash,
+                force,
+                ctx.automatic,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        {
             continue;
         }
         ctx.progress(true, |p| p.batch_start_ms = Some(batch.start_ms));
@@ -392,7 +431,9 @@ pub(super) async fn generate(
             if let Some(summary) = single_activity_summary(&input) {
                 return Ok(validate_value(&json!(summary), &input.activities));
             }
-            let (req, included) = request(&input, &ctx.settings, provider)?;
+            let available = ctx.available_settings(&run, "summary")?;
+            let (req, included) = request(&input, &available, provider)
+                .map_err(|error| ctx.refine_request_error(&run,"summary",error))?;
             let response = complete(ctx, provider, &req, &run, "summary").await?;
             let report = validation::repair(
                 ctx, provider, req, response, &run, "summary_repair",
@@ -454,6 +495,7 @@ pub(super) async fn generate(
                 .filter(|a| a.id.starts_with(&run))
                 .collect(),
             validation_version: validation::VERSION,
+            budget_hash: budget_hash.clone(),
         };
         ctx.write("summary", &key, &value)?;
         let _ = ctx.app.emit("recap-changed", &ctx.day);
@@ -535,6 +577,7 @@ mod tests {
             summary: None,
             summary_error: None,
             validation_version: 0,
+            budget_hash: String::new(),
         }
     }
     fn draft() -> RecapSummary {
@@ -597,6 +640,7 @@ mod tests {
             error: None,
             attempts: vec![],
             validation_version: 0,
+            budget_hash: String::new(),
         };
         assert!(!should_generate(
             Some(&cache),
@@ -620,6 +664,7 @@ mod tests {
             error: Some("AI_NETWORK_ERROR".into()),
             attempts: vec![],
             validation_version: 0,
+            budget_hash: String::new(),
         };
         assert!(!should_generate(Some(&cache), "h", false, true, 1));
         assert!(should_generate(Some(&cache), "h", false, false, 1));

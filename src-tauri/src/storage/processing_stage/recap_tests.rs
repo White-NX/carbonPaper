@@ -451,6 +451,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
             warnings: vec![],
         }],
         validation_version: 0,
+        budget_hash: String::new(),
     };
     let first_key = format!("{date}:{}", calendar.start_ms);
     mirror(

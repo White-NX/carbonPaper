@@ -14,6 +14,7 @@ let settings;
 beforeEach(() => {
   settings = { enabled: false, language: 'zh-CN', provider_id: null, request_output_tokens: 32000, answer_tokens: 4000, batch_input_tokens: 36000, batch_output_tokens: 64000,
     daily_input_tokens: 432000, daily_output_tokens: 384000, screening_input_tokens: 2000000,
+    evidence_rounds: 12, mainline_reserve_percent: 10,
     screening: { enabled: false, base_url: 'https://example.com/v1', model: 'screen', has_api_key: true } };
   getRecapSettings.mockResolvedValue(settings);
   getRecapUsage.mockResolvedValue({ input_tokens: 1, output_tokens: 2, screening_input_tokens: 3 });
@@ -27,6 +28,28 @@ function Activity() { const { dirty, busy } = useSettingsWindowActivity(); retur
 function Host({ enabled = true }) { return <SettingsActivityProvider enabled={enabled}><Activity /><RecapSection /></SettingsActivityProvider>; }
 
 describe('daily recap in the settings window', () => {
+  it('saves evidence depth and mainline allocation with their supported bounds', async () => {
+    render(<Host />);
+    const depth = await screen.findByLabelText('recap.settings.evidence_rounds');
+    fireEvent.change(depth, { target: { value: '25' } });
+    fireEvent.blur(depth);
+    expect(saveRecapSettings).not.toHaveBeenCalled();
+    fireEvent.change(depth, { target: { value: '24' } });
+    fireEvent.blur(depth);
+    await waitFor(() => expect(saveRecapSettings).toHaveBeenCalledWith(expect.objectContaining({ evidence_rounds: 24 })));
+    const reserve = screen.getByLabelText('recap.settings.mainline_reserve_percent');
+    fireEvent.change(reserve, { target: { value: '0' } });
+    fireEvent.blur(reserve);
+    await waitFor(() => expect(saveRecapSettings).toHaveBeenLastCalledWith(expect.objectContaining({ evidence_rounds: 24, mainline_reserve_percent: 0 })));
+  });
+  it('shows remaining allowance and includes unconfirmed reservations in usage', async () => {
+    getRecapUsage.mockResolvedValueOnce({ input_tokens: 100, output_tokens: 200, screening_input_tokens: 300,
+      unconfirmed_input_tokens: 50, unconfirmed_output_tokens: 60, unconfirmed_screening_input_tokens: 70, unconfirmed_requests: 2 });
+    render(<Host />);
+    expect(await screen.findByText('recap.settings.remainingUsage')).toBeInTheDocument();
+    expect(screen.getByText('recap.settings.unconfirmedUsage')).toBeInTheDocument();
+    expect(getRecapDay).not.toHaveBeenCalled();
+  });
   it('defaults semantic search on and saves disabling it without a key detail switch', async () => {
     render(<Host />);
     const control = await screen.findByRole('switch', { name: 'recap.settings.semanticSearch' });

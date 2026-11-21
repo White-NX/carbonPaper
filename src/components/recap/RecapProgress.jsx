@@ -77,6 +77,7 @@ function AttemptDetails({ attempt, progress, now }) {
         <dt>{t('recap.progress.reasoningUsage')}</dt><dd>{value(attempt.reasoning_tokens)}</dd>
         <dt>{t('recap.progress.received')}</dt><dd>{t('recap.progress.receivedCounts', { reasoning: attempt.reasoning_chars ?? 0, text: attempt.text_chars ?? 0 })}</dd>
         <dt>{t('recap.progress.requestId')}</dt><dd className="[overflow-wrap:anywhere] font-mono">{attempt.id}</dd>
+        {attempt.submitted != null && <><dt>{t('recap.diagnostics.submission')}</dt><dd>{t(attempt.submitted ? 'recap.diagnostics.submitted' : 'recap.diagnostics.notSubmitted')}</dd></>}
         {attempt.error && <><dt>{t('recap.diagnostics.rawError')}</dt><dd className="whitespace-pre-wrap [overflow-wrap:anywhere] font-mono">{attempt.error}</dd></>}
       </dl>
         {attempt.evidence_calls?.length > 0 && <div className="mt-4 border-t border-ide-border pt-3">
