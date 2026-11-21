@@ -12,6 +12,7 @@ use super::{
     evidence_agent::{self, activity_value, EvidenceContext},
     runner::{day_evidence, RunContext},
     types::*,
+    validation::{self, Report},
 };
 use crate::ai::{
     config::ResolvedProvider,
@@ -44,6 +45,8 @@ pub(super) struct CachedMainlines {
     pub error: Option<String>,
     #[serde(default)]
     pub attempts: Vec<RecapAttempt>,
+    #[serde(default)]
+    pub validation_version: u32,
 }
 
 pub(super) fn fingerprint(day: &RecapDay, language: &str) -> String {
@@ -82,10 +85,18 @@ fn should_generate(
     if force {
         return true;
     }
-    if cached.mainlines.is_some() && cached.error.is_none() {
-        return false;
+    if let Some(mainlines) = cached.mainlines.as_ref().filter(|_| cached.error.is_none()) {
+        return !automatic && mainlines.items.iter().any(|item| !item.warnings.is_empty());
     }
     if !automatic {
+        return true;
+    }
+    if cached.validation_version < validation::VERSION
+        && cached
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("RECAP_INVALID_"))
+    {
         return true;
     }
     // Like period summaries, failures are durable until explicit retry, changed
@@ -99,19 +110,54 @@ fn should_generate(
             })
 }
 
+#[cfg(test)]
 fn validate(
-    mut mainlines: RecapMainlines,
+    mainlines: RecapMainlines,
     activities: &[RecapActivity],
     extra: &[Evidence],
     date: &str,
 ) -> Result<RecapMainlines, String> {
-    if mainlines.items.len() > 8 {
-        return Err("RECAP_INVALID_MAINLINES".into());
+    validate_value(&json!(mainlines), activities, activities, extra, date).strict()
+}
+
+fn validate_value(
+    value: &serde_json::Value,
+    activities: &[RecapActivity],
+    task_catalog: &[RecapActivity],
+    extra: &[Evidence],
+    date: &str,
+) -> Report<RecapMainlines> {
+    let mut report = Report::new(RecapMainlines::default());
+    if !value.is_object() {
+        report.issues.push(validation::issue(
+            "",
+            "mainlines",
+            "RECAP_INVALID_MAINLINES",
+            "invalid_field",
+        ));
+        return report;
     }
+    let Some(items) = value.get("items").and_then(serde_json::Value::as_array) else {
+        report.issues.push(validation::issue(
+            "/items",
+            "items",
+            "RECAP_INVALID_MAINLINES",
+            "invalid_field",
+        ));
+        return report;
+    };
     let known = activities
         .iter()
         .map(|a| (a.id.as_str(), a))
         .collect::<HashMap<_, _>>();
+    let received_activities = activities
+        .iter()
+        .map(|activity| activity.id.clone())
+        .collect::<HashSet<_>>();
+    let catalog_tasks = task_catalog
+        .iter()
+        .map(|activity| activity.task_id.clone())
+        .collect::<HashSet<_>>();
     let sources = activities
         .iter()
         .flat_map(|a| a.sources.iter().cloned())
@@ -123,42 +169,107 @@ fn validate(
         )
         .map(|s| (s.id, s))
         .collect::<HashMap<_, _>>();
+    let received_sources = sources.keys().copied().collect::<HashSet<_>>();
     let mut assigned = HashSet::new();
-    for item in &mut mainlines.items {
+    for (index, value) in items.iter().enumerate() {
+        if value.is_null() {
+            continue;
+        }
+        let target = format!("/items/{index}");
+        if report.value.items.len() >= 8 {
+            report.issues.push(validation::issue(
+                &target,
+                "mainline",
+                "RECAP_INVALID_MAINLINES",
+                "too_many_items",
+            ));
+            continue;
+        }
+        let Ok(mut item) = serde_json::from_value::<RecapMainline>(value.clone()) else {
+            report.issues.push(validation::issue(
+                &target,
+                "mainline",
+                "RECAP_INVALID_MAINLINES",
+                "invalid_field",
+            ));
+            continue;
+        };
+        item.sources.clear();
+        item.warnings.clear();
         if item.title.trim().is_empty()
             || item.title.chars().count() > 120
             || item.text.trim().is_empty()
             || item.text.chars().count() > 600
             || item.task_ids.is_empty()
             || item.task_ids.len() > 128
-            || item.activity_ids.is_empty()
-            || item.activity_ids.len() > 480
-            || item.evidence_ids.is_empty()
-            || item.evidence_ids.len() > 24
         {
-            return Err("RECAP_INVALID_MAINLINES".into());
+            report.issues.push(validation::issue(
+                &target,
+                "title_text_or_tasks",
+                "RECAP_INVALID_MAINLINES",
+                "invalid_field",
+            ));
+            continue;
         }
-        if item.activity_ids.iter().collect::<HashSet<_>>().len() != item.activity_ids.len()
-            || item.evidence_ids.iter().collect::<HashSet<_>>().len() != item.evidence_ids.len()
+        let mut unique_tasks = HashSet::new();
+        item.task_ids.retain(|id| unique_tasks.insert(id.clone()));
+        if item
+            .task_ids
+            .iter()
+            .any(|id| !catalog_tasks.contains(id) || assigned.contains(id))
         {
-            return Err("RECAP_INVALID_CITATION".into());
+            let mut error = validation::issue(
+                &target,
+                "task_ids",
+                "RECAP_INVALID_MAINLINES",
+                "unknown_or_assigned_task",
+            );
+            error.available_references = catalog_tasks
+                .iter()
+                .filter(|id| !assigned.contains(*id))
+                .map(|id| json!(id))
+                .collect();
+            error
+                .available_references
+                .sort_by_key(serde_json::Value::to_string);
+            report.issues.push(error);
+            continue;
         }
+        let allowed_activities = activities
+            .iter()
+            .filter(|activity| item.task_ids.contains(&activity.task_id))
+            .map(|activity| activity.id.clone())
+            .collect();
+        let mut issues = validation::check_ids(
+            &mut item.activity_ids,
+            &received_activities,
+            &allowed_activities,
+            &target,
+            "activity_ids",
+            480,
+        );
         let cited = item
             .activity_ids
             .iter()
-            .map(|id| {
-                known
-                    .get(id.as_str())
-                    .copied()
-                    .filter(|a| !a.sources.is_empty())
-                    .ok_or("RECAP_INVALID_CITATION")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|id| known.get(id.as_str()).copied())
+            .collect::<Vec<_>>();
         let cited_tasks = cited.iter().map(|a| &a.task_id).collect::<HashSet<_>>();
-        if item.task_ids.iter().collect::<HashSet<_>>() != cited_tasks
-            || item.task_ids.iter().any(|id| !assigned.insert(id.clone()))
-        {
-            return Err("RECAP_INVALID_MAINLINES".into());
+        let missing_tasks = item
+            .task_ids
+            .iter()
+            .filter(|id| !cited_tasks.contains(id))
+            .collect::<Vec<_>>();
+        if !missing_tasks.is_empty() {
+            let mut error = validation::issue(
+                &target,
+                "activity_ids",
+                "RECAP_INVALID_MAINLINES",
+                "uncited_task",
+            );
+            error.reference_ids = missing_tasks.into_iter().map(|id| json!(id)).collect();
+            error.available_references = allowed_activities.iter().map(|id| json!(id)).collect();
+            error.retainable = issues.iter().any(|issue| issue.retainable);
+            issues.push(error);
         }
         let allowed = cited
             .iter()
@@ -170,20 +281,30 @@ fn validate(
                     .map(|e| e.id),
             )
             .collect::<HashSet<_>>();
+        issues.extend(validation::check_ids(
+            &mut item.evidence_ids,
+            &received_sources,
+            &allowed,
+            &target,
+            "evidence_ids",
+            24,
+        ));
+        if issues.iter().any(|issue| !issue.retainable) {
+            report.issues.extend(issues);
+            continue;
+        }
         item.sources = item
             .evidence_ids
             .iter()
-            .map(|id| {
-                sources
-                    .get(id)
-                    .filter(|_| allowed.contains(id))
-                    .cloned()
-                    .ok_or("RECAP_INVALID_CITATION")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|id| sources.get(id).filter(|_| allowed.contains(id)).cloned())
+            .collect();
+        item.warnings = issues.iter().map(|issue| issue.warning()).collect();
+        for activity in &cited {
+            item.warnings.extend(activity.warnings.clone());
+        }
         item.sources.sort_by_key(|s| (s.timestamp_ms, s.id));
         item.task_ids.sort_by_key(|id| {
-            activities
+            task_catalog
                 .iter()
                 .filter(|a| &a.task_id == id)
                 .map(|a| a.start_ms)
@@ -198,8 +319,11 @@ fn validate(
         );
         item.title = item.title.trim().into();
         item.text = item.text.trim().into();
+        assigned.extend(item.task_ids.iter().cloned());
+        report.value.items.push(item);
+        report.issues.extend(issues);
     }
-    Ok(mainlines)
+    report
 }
 
 fn request(
@@ -212,7 +336,7 @@ fn request(
         .batches
         .iter()
         .flat_map(|b| &b.activities)
-        .filter(|a| !a.sources.is_empty())
+        .filter(|a| !a.sources.is_empty() || !a.warnings.is_empty())
     {
         tasks.entry(&activity.task_id).or_default().push(activity);
     }
@@ -239,6 +363,7 @@ fn request(
                 "omitted_activities":tasks.values().map(Vec::len).sum::<usize>().saturating_sub(selected.len())}).to_string())],
             max_tokens:Some(output),temperature:Some(0.2),..Default::default()
         };
+        validation::configure(&mut request);
         evidence_agent::configure(&mut request, provider, true);
         if context::estimated_input_tokens(provider.kind, &request)
             <= (settings.batch_input_tokens.min(36_000) * 2 / 5)
@@ -299,23 +424,18 @@ pub(super) async fn generate(
             &included,
         );
         let outcome = evidence_agent::run(ctx, provider, request, &run, "mainlines", tools).await?;
-        if outcome.response.truncated {
-            return Err("RECAP_OUTPUT_TRUNCATED".into());
+        let catalog = input.batches.iter().flat_map(|batch| batch.activities.iter().cloned()).collect::<Vec<_>>();
+        let report = validation::repair(
+            ctx, provider, outcome.request, outcome.response, &run, "mainline_repair",
+            json!({"language":ctx.settings.language,
+                "activities":outcome.activities.iter().map(|activity| activity_value(activity,1600)).collect::<Vec<_>>(),
+                "evidence":outcome.evidence.iter().map(|source| super::runner::evidence_value(source,1800)).collect::<Vec<_>>() }),
+            |value| validate_value(value, &outcome.activities, &catalog, &outcome.evidence, &ctx.day),
+        ).await?;
+        if report.value.items.is_empty() && !report.issues.is_empty() {
+            return Err(report.repair_error.clone().unwrap_or_else(|| report.first_error().unwrap_or("RECAP_INVALID_MAINLINES").into()));
         }
-        let text = outcome.response.text.trim();
-        if text.is_empty() {
-            return Err("RECAP_EMPTY_RESPONSE".into());
-        }
-        let text = if text.starts_with("```") {
-            text.split_once('\n')
-                .map(|(_, body)| body.trim_end().trim_end_matches("```").trim())
-                .unwrap_or(text)
-        } else {
-            text
-        };
-        let draft: RecapMainlines =
-            serde_json::from_str(text).map_err(|_| "RECAP_INVALID_MAINLINES")?;
-        validate(draft, &outcome.activities, &outcome.evidence, &ctx.day)
+        Ok(report)
     }
     .await;
     ctx.check()?;
@@ -324,14 +444,19 @@ pub(super) async fn generate(
     }
     ctx.progress(true, |p| {
         if p.attempts.last().is_some_and(|a| a.id.starts_with(&run)) {
-            p.validation(result.as_ref().err().map(String::as_str));
+            if let Err(error) = &result {
+                p.validation(Some(error));
+            }
         }
     });
     if fingerprint(&ctx.read_day()?, &ctx.settings.language) != hash {
         return Ok(());
     }
     let (mainlines, error) = match result {
-        Ok(mainlines) => (Some(mainlines), None),
+        Ok(report) => {
+            let error = report.error();
+            (Some(report.value), error)
+        }
         Err(error) => {
             super::runner::log_failure(&ctx.day, &run, "mainlines", &error);
             (
@@ -352,6 +477,7 @@ pub(super) async fn generate(
             .into_iter()
             .filter(|a| a.id.starts_with(&run))
             .collect(),
+        validation_version: validation::VERSION,
     };
     ctx.write("mainlines", &ctx.day, &value)?;
     let _ = ctx.app.emit("recap-changed", &ctx.day);
@@ -361,6 +487,30 @@ pub(super) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mainlines_are_validated_independently_and_unknown_sources_are_not_fabricated() {
+        let day = day();
+        let activities = &day.batches[0].activities;
+        let mut value = json!(draft());
+        value["items"].as_array_mut().unwrap().push(json!({
+            "title":"Music","text":"Listened to music.","task_ids":["music"],
+            "activity_ids":["activity-3"],"evidence_ids":[99,99],
+            "sources":[{"id":99,"timestamp_ms":0,"process_name":"fake","window_title":"fake"}]
+        }));
+        let result = validate_value(&value, activities, activities, &[], &day.date);
+        assert_eq!(result.value.items.len(), 2);
+        assert_eq!(result.value.items[0].sources.len(), 2);
+        assert_eq!(result.value.items[1].evidence_ids, vec![99]);
+        assert!(result.value.items[1].sources.is_empty());
+        assert_eq!(
+            result.value.items[1].warnings[0].reference_ids,
+            vec![json!(99)]
+        );
+        value["items"][1]["evidence_ids"] = json!([1]);
+        let result = validate_value(&value, activities, activities, &[], &day.date);
+        assert_eq!(result.value.items.len(), 1);
+        assert_eq!(result.issues[0].target, "/items/1");
+    }
     fn day() -> RecapDay {
         let calendar = CalendarDay::in_zone("2026-01-01", chrono_tz::UTC).unwrap();
         let activity = |id: i64, task: &str, text: &str| RecapActivity {
@@ -379,6 +529,7 @@ mod tests {
                 process_name: "app".into(),
                 window_title: "project".into(),
             }],
+            warnings: vec![],
         };
         let batch = RecapBatch {
             start_ms: calendar.start_ms,
@@ -400,6 +551,7 @@ mod tests {
             attempts: vec![],
             summary: None,
             summary_error: None,
+            validation_version: 0,
         };
         RecapDay {
             date: calendar.date.clone(),
@@ -426,6 +578,7 @@ mod tests {
                 activity_ids: vec!["activity-1".into(), "activity-2".into()],
                 evidence_ids: vec![1, 2],
                 sources: vec![],
+                warnings: vec![],
             }],
         }
     }
@@ -521,6 +674,7 @@ mod tests {
             mainlines: Some(draft()),
             error: None,
             attempts: vec![],
+            validation_version: 0,
         };
         let mut runtime_only = original.clone();
         runtime_only.running = true;
@@ -561,6 +715,7 @@ mod tests {
             mainlines: Some(RecapMainlines::default()),
             error: None,
             attempts: vec![],
+            validation_version: 0,
         };
         assert!(!should_generate(Some(&cache), "hash", false, true, 10));
         assert!(should_generate(Some(&cache), "changed", false, true, 10));

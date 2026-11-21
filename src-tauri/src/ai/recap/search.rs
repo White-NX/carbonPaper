@@ -157,6 +157,8 @@ pub struct RecapSearchHit {
     pub start_ms: i64,
     pub end_ms: i64,
     pub sources: Vec<SourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RecapWarning>,
     #[serde(flatten)]
     pub evidence: ActivityEvidence,
     pub keyword_rank: Option<usize>,
@@ -648,6 +650,16 @@ impl Drop for Corpus {
             for detail in &mut activity.details {
                 detail.text.zeroize();
             }
+            for warning in &mut activity.warnings {
+                warning.field.zeroize();
+                warning.reason.zeroize();
+                for reference in &mut warning.reference_ids {
+                    if let serde_json::Value::String(text) = reference {
+                        text.zeroize();
+                    }
+                    *reference = serde_json::Value::Null;
+                }
+            }
             for source in &mut activity.sources {
                 source.process_name.zeroize();
                 source.window_title.zeroize();
@@ -913,13 +925,14 @@ fn filtered_activity(
     activity.task_title =
         crate::mcp_server::filter_identity(filter, mode, &activity.task_title).ok()?;
     activity.text = crate::mcp_server::filter_joined_text(filter, mode, &activity.text).ok()?;
+    activity.warnings = super::privacy::filtered_warnings(filter, &activity.warnings);
     for source in &mut activity.sources {
         source.process_name =
             crate::mcp_server::filter_identity(filter, mode, &source.process_name).ok()?;
         source.window_title =
             crate::mcp_server::filter_identity(filter, mode, &source.window_title).ok()?;
     }
-    if activity.sources.is_empty() {
+    if activity.sources.is_empty() && activity.warnings.is_empty() {
         return None;
     }
     activity.details = activity
@@ -927,10 +940,13 @@ fn filtered_activity(
         .into_iter()
         .filter_map(|mut detail| {
             if detail.evidence_ids.is_empty()
-                || !detail
-                    .evidence_ids
-                    .iter()
-                    .all(|id| activity.sources.iter().any(|s| s.id == *id))
+                || !detail.evidence_ids.iter().all(|id| {
+                    activity.sources.iter().any(|s| s.id == *id)
+                        || activity
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.reference_ids.contains(&serde_json::json!(id)))
+                })
             {
                 return None;
             }
@@ -1390,6 +1406,7 @@ fn activity_hit(
         start_ms: activity.start_ms,
         end_ms: activity.end_ms,
         sources: activity.sources,
+        warnings: activity.warnings,
         evidence,
         keyword_rank: None,
         semantic_rank: None,
@@ -1409,6 +1426,7 @@ fn hit_activity(hit: &RecapSearchHit) -> RecapActivity {
         start_ms: hit.start_ms,
         end_ms: hit.end_ms,
         sources: hit.sources.clone(),
+        warnings: hit.warnings.clone(),
         member_ids: hit.evidence.member_screenshot_ids.clone(),
         segments: vec![],
     }
@@ -1721,6 +1739,7 @@ fn rank_with_report(
                 start_ms: a.start_ms,
                 end_ms: a.end_ms,
                 sources: a.sources.clone(),
+                warnings: a.warnings.clone(),
                 evidence: d.evidence.clone(),
                 keyword_rank,
                 semantic_rank,
@@ -2308,6 +2327,7 @@ mod tests {
                 text: "采用内存缓存降低查询延迟".into(),
                 evidence_ids: vec![1],
             }],
+            warnings: vec![],
         }
     }
 

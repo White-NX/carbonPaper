@@ -1,5 +1,6 @@
 const FINISHED = new Set(['ready', 'failed', 'partial', 'cancelled', 'paused', 'empty']);
-const isMainline = attempt => ['mainlines', 'mainline_evidence'].includes(attempt?.kind);
+const isMainline = attempt => ['mainlines', 'mainline_evidence', 'mainline_repair'].includes(attempt?.kind);
+const isSummary = attempt => ['summary', 'summary_repair'].includes(attempt?.kind);
 
 export function recapAttemptStatus(attempt, progress) {
   if (!progress && !FINISHED.has(attempt.status)) return 'interrupted';
@@ -41,8 +42,8 @@ export function recapDiagnosticPeriods(batches, progress) {
   if (Number.isFinite(current) && !groups.has(current)) groups.set(current, { start_ms: current, live: [] });
   return [...groups.values()].sort((a, b) => a.start_ms - b.start_ms).map(group => {
     const saved = group.saved?.attempts || [];
-    const regenerating = group.live.some(attempt => attempt.kind !== 'summary');
-    const retained = group.live.length ? (regenerating ? [] : saved.filter(attempt => attempt.kind !== 'summary')) : saved;
+    const regenerating = group.live.some(attempt => !isSummary(attempt));
+    const retained = group.live.length ? (regenerating ? [] : saved.filter(attempt => !isSummary(attempt))) : saved;
     const attempts = [...new Map([...retained, ...group.live].map(attempt => [attempt.id, attempt])).values()]
       .sort((a, b) => a.started_at_ms - b.started_at_ms);
     const active = progress?.finished_at_ms == null && progress != null && current === group.start_ms;
@@ -69,6 +70,7 @@ export function recapDiagnosticMainlines(day, progress) {
     .sort((a, b) => a.started_at_ms - b.started_at_ms);
   const unsaved = live.some(attempt => !saved.some(old => old.id === attempt.id && old.status === attempt.status));
   let status = day?.mainlines_error ? 'summaryFailed' : day?.mainlines ? 'ready' : 'summaryPending';
+  if (!day?.mainlines_error && day?.mainlines?.items?.some(item => item.warnings?.length)) status = 'partial';
   if (active) status = progress.stage;
   else if (unsaved && ['cancelled', 'paused', 'failed'].includes(progress.stage)) status = progress.stage;
   return { daily: true, start_ms: day?.calendar?.start_ms ?? 0, live, attempts, active, status, error: day?.mainlines_error };

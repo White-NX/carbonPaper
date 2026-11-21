@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { ChevronRight, GitBranch, Images } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Banner } from '../ui/Banner';
+import RecapWarnings from './RecapWarnings';
 
 function Mainline({ item, threads, batches, time, onTask, onSources }) {
   const { t } = useTranslation();
@@ -13,6 +14,7 @@ function Mainline({ item, threads, batches, time, onTask, onSources }) {
     <div className="min-w-0">
       <h3 id={`${id}-title`} className="w-full min-w-0 break-words px-2.5 py-2 text-[15px] font-semibold leading-relaxed">{item.title}</h3>
       <p className="mx-2.5 mt-2 whitespace-pre-wrap break-words text-sm leading-7 text-ide-muted">{item.text}</p>
+      <RecapWarnings warnings={item.warnings} className="mx-2.5 mt-3" />
     </div>
     <div className="recap-mainline-branches min-w-0">
       <p className="mb-2 pl-8 text-xs text-ide-muted">{t('recap.mainlines.taskCount', { count: tasks.length })}</p>

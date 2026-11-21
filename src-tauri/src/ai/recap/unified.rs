@@ -524,6 +524,7 @@ mod tests {
             keyword_score: keyword.map(|_| 1000.0),
             semantic_score: semantic.map(|_| 0.8),
             match_evidence: None,
+            warnings: vec![],
         }
     }
 

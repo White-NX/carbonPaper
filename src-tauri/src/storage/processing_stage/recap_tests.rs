@@ -448,7 +448,9 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
             segments: vec![],
             sources: vec![recap::SourceRef::from(&evidence(1, first))],
             member_ids: vec![1],
+            warnings: vec![],
         }],
+        validation_version: 0,
     };
     let first_key = format!("{date}:{}", calendar.start_ms);
     mirror(

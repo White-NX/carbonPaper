@@ -27,6 +27,7 @@ fn fixture(activities: usize) -> Corpus {
             segments: vec![],
             sources: vec![],
             member_ids: vec![],
+            warnings: vec![],
         };
         let document = Document::new(date.to_string(), 0, 0, activity);
         for chunk in &document.chunks {
@@ -279,6 +280,7 @@ fn rank_reference(
                 keyword_score: None,
                 semantic_score: None,
                 match_evidence: None,
+                warnings: vec![],
             }
         })
         .collect();

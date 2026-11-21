@@ -6,6 +6,15 @@ import RecapMainlines from './RecapMainlines';
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
 
 describe('daily mainline branches', () => {
+  it('keeps an unverified mainline visible with a warning and no unknown source links', () => {
+    const item = { id: 'music', title: 'Music', text: 'Unconfirmed music activity.', task_ids: ['music'], sources: [],
+      warnings: [{ field: 'evidence_ids', reason: 'unknown_reference', reference_ids: [99] }] };
+    render(<RecapMainlines mainlines={{ items: [item] }} threads={[{ id: 'music', title: 'Music task' }]}
+      batches={[{ start_ms: 0, end_ms: 1, activities: [{ task_id: 'music' }] }]} time={String} onTask={vi.fn()} />);
+    expect(screen.getByText(item.text)).toBeVisible();
+    expect(screen.getByText('recap.unverifiedContent')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'recap.mainlines.sources' })).not.toBeInTheDocument();
+  });
   it('shows selectable summaries with task branches and source navigation', () => {
     const sources = [{ id: 42 }];
     const item = { id: 'project', title: 'Improve the project flow', text: 'Reviewed login handling and notification settings.', task_ids: ['login'], sources };

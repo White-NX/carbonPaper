@@ -212,7 +212,16 @@ pub struct RecapDetail {
     pub evidence_ids: Vec<i64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Unresolved model references are retained as warnings, never as source grants.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecapWarning {
+    pub field: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_ids: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecapActivity {
     pub id: String,
     pub task_id: String,
@@ -226,9 +235,11 @@ pub struct RecapActivity {
     pub sources: Vec<SourceRef>,
     #[serde(default)]
     pub member_ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RecapWarning>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecapBatch {
     pub start_ms: i64,
     pub end_ms: i64,
@@ -246,16 +257,20 @@ pub struct RecapBatch {
     pub summary: Option<RecapSummary>,
     #[serde(default)]
     pub summary_error: Option<String>,
+    #[serde(default)]
+    pub validation_version: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecapSummary {
     pub overview: String,
     pub overview_activity_ids: Vec<String>,
     pub topics: Vec<RecapTopic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RecapWarning>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecapTopic {
     pub task_id: String,
     /// Resolved locally from the corrected task, never invented by the model.
@@ -263,6 +278,8 @@ pub struct RecapTopic {
     pub title: String,
     pub text: String,
     pub activity_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RecapWarning>,
 }
 
 /// A derived relationship between concrete tasks, without changing their IDs,
@@ -272,7 +289,7 @@ pub struct RecapMainlines {
     pub items: Vec<RecapMainline>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RecapMainline {
     #[serde(default)]
     pub id: String,
@@ -284,6 +301,8 @@ pub struct RecapMainline {
     /// Resolved locally; models cannot supply source metadata.
     #[serde(default)]
     pub sources: Vec<SourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RecapWarning>,
 }
 
 /// Bounded previews are private recap data and are persisted only inside the
@@ -452,6 +471,11 @@ pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) 
         let original = std::mem::take(&mut batch.activities);
         for activity in original {
             let mut groups = BTreeMap::<String, Vec<SourceRef>>::new();
+            // Unverified activities have no source identities to assign. Keep
+            // their text and warning without manufacturing screenshot membership.
+            if activity.sources.is_empty() && !activity.warnings.is_empty() {
+                groups.entry(resolve(&activity.task_id)).or_default();
+            }
             for source in &activity.sources {
                 let task = resolve(
                     corrections
@@ -487,10 +511,13 @@ pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) 
                 // be attributed to either task on its own.
                 a.details.retain(|detail| {
                     !detail.evidence_ids.is_empty()
-                        && detail
-                            .evidence_ids
-                            .iter()
-                            .all(|id| a.sources.iter().any(|s| s.id == *id))
+                        && detail.evidence_ids.iter().all(|id| {
+                            a.sources.iter().any(|s| s.id == *id)
+                                || (!split
+                                    && a.warnings.iter().any(|warning| {
+                                        warning.reference_ids.contains(&serde_json::json!(id))
+                                    }))
+                        })
                 });
                 if split {
                     a.member_ids.retain(|id| {
@@ -522,6 +549,28 @@ pub fn apply_corrections(batches: &mut [RecapBatch], corrections: &Corrections) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn corrections_keep_source_less_warning_entries_without_assigning_screenshots() {
+        let mut batch = batch();
+        batch.activities[0].sources.clear();
+        batch.activities[0].member_ids.clear();
+        batch.activities[0].warnings.push(RecapWarning {
+            field: "evidence_ids".into(),
+            reason: "unknown_reference".into(),
+            reference_ids: vec![serde_json::json!(99)],
+        });
+        let mut corrections = Corrections::default();
+        corrections
+            .names
+            .insert("new-model-id".into(), "Corrected name".into());
+        let mut batches = vec![batch];
+        let threads = apply_corrections(&mut batches, &corrections);
+        assert_eq!(batches[0].activities.len(), 1);
+        assert_eq!(threads[0].title, "Corrected name");
+        assert!(batches[0].activities[0].sources.is_empty());
+        assert!(batches[0].activities[0].member_ids.is_empty());
+        assert_eq!(batches[0].activities[0].warnings.len(), 1);
+    }
     fn batch() -> RecapBatch {
         RecapBatch {
             start_ms: 0,
@@ -558,7 +607,9 @@ mod tests {
                         window_title: String::new(),
                     },
                 ],
+                warnings: vec![],
             }],
+            validation_version: 0,
         }
     }
     #[test]

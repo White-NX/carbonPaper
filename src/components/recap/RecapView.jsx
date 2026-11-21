@@ -18,6 +18,7 @@ import RecapRunStatus from './RecapRunStatus';
 import RecapApps from './RecapApps';
 import RecapMainlines from './RecapMainlines';
 import RecapKeyDetails from './RecapKeyDetails';
+import RecapWarnings from './RecapWarnings';
 
 function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
   const [open, setOpen] = useState(false);
@@ -55,19 +56,21 @@ function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false })
 
 function Period({ batch, time, onTask, onDetails }) {
   const { t } = useTranslation();
-  const topics = batch.summary?.topics?.length ? batch.summary.topics : [...new Map(batch.activities.map((activity) => [activity.task_id, activity])).values()].map((activity) => ({ task_id: activity.task_id, title: activity.task_title, text: activity.text }));
+  const topics = batch.summary?.topics?.length ? batch.summary.topics : [...new Map(batch.activities.map((activity) => [activity.task_id, activity])).values()].map((activity) => ({ task_id: activity.task_id, title: activity.task_title, text: activity.text,
+    warnings: batch.activities.filter((entry) => entry.task_id === activity.task_id).flatMap((entry) => entry.warnings || []) }));
   const problem = batch.error || batch.summary_error;
   return <article className="recap-period">
     <div className="recap-period-time"><span className="recap-time-dot" /><h3 className="text-xs font-medium tabular-nums text-ide-muted">{time(batch.start_ms)}–{time(batch.end_ms)}</h3></div>
     <div className="min-w-0 pb-9">
       {batch.summary?.overview && <p className={`${batch.apps?.length ? 'mb-2' : 'mb-5'} whitespace-pre-wrap text-sm leading-7`}>{batch.summary.overview}</p>}
+      <RecapWarnings warnings={batch.summary?.warnings} className="mb-3" />
       <RecapApps apps={batch.apps} />
       {problem ? <div className="mb-3 flex flex-wrap items-center gap-3"><RecapError error={problem} /><button className="recap-focus rounded text-xs text-ide-muted hover:text-ide-text" onClick={onDetails}>{t('recap.generationDetails')}</button></div>
         : !batch.summary && topics.length > 0 && <p className="mb-3 text-xs text-ide-muted">{t('recap.overviewPending')}</p>}
       {topics.length > 0 ? <div className="divide-y divide-ide-border/60 border-y border-ide-border/60">
         {topics.map((topic) => <button key={topic.task_id} data-recap-task={topic.task_id} data-recap-entry={`${batch.start_ms}:${topic.task_id}`} onClick={() => onTask(topic.task_id, batch.start_ms)}
           className="recap-focus group flex w-full items-center gap-5 px-3 py-4 text-left transition-colors hover:bg-ide-hover">
-          <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{topic.title}</span><span className="mt-1.5 line-clamp-2 text-[13px] leading-relaxed text-ide-muted">{topic.text}</span></span>
+          <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{topic.title}</span><span className="mt-1.5 line-clamp-2 text-[13px] leading-relaxed text-ide-muted">{topic.text}</span><RecapWarnings warnings={topic.warnings} compact /></span>
           <ChevronRight className="h-4 w-4 shrink-0 text-ide-muted transition-transform group-hover:translate-x-0.5" aria-hidden="true" />
         </button>)}
       </div> : !problem && <p className="text-sm text-ide-muted">{t(batch.status === 'pending' ? 'recap.waitingPeriod' : 'recap.noActivities')}</p>}
@@ -292,10 +295,11 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
           {activities.map((activity) => <article key={activity.id} data-recap-activity={activity.id}
             className={`border-t border-ide-border/70 py-6 ${activity.id === highlightedActivity ? 'border-l-2 pl-4' : ''}`}>
             {activity.id === highlightedActivity && <p className="mb-3 text-xs font-medium text-ide-muted">{t('recap.snapshotActivity')}</p>}
-            <div className="mb-3 flex items-center justify-between gap-3"><time className="text-xs font-medium tabular-nums text-ide-muted">{time(activity.start_ms)}{activity.start_ms !== activity.end_ms && `–${time(activity.end_ms)}`}</time>
+            <div className="mb-3 flex items-center justify-between gap-3"><time className="text-xs font-medium tabular-nums text-ide-muted">{activity.sources.length ? <>{time(activity.start_ms)}{activity.start_ms !== activity.end_ms && `–${time(activity.end_ms)}`}</> : t('recap.unverifiedTime')}</time>
               <Button variant="ghost" icon={Pencil} onClick={() => setEditing({ ...activity, kind: 'move', epoch: epoch.current })}>{t('recap.adjust')}</Button></div>
             <p className="whitespace-pre-wrap break-words text-sm leading-7">{activity.text}</p>
-            <RecapKeyDetails details={activity.details} sources={activity.sources} onSources={setSources} />
+            <RecapWarnings warnings={activity.warnings} className="mt-3" />
+            <RecapKeyDetails details={activity.details} sources={activity.sources} warnings={activity.warnings} onSources={setSources} />
             {activity.sources.length > 0 && <div className="mt-4"><div className="grid max-w-lg grid-cols-3 gap-3">{activity.sources.slice(0, 3).map((source) => <SourceThumbnail key={source.id} source={source} action={action} time={time} />)}</div>
               <button className="recap-focus mt-3 rounded text-xs text-ide-muted hover:text-ide-accent" onClick={() => setSources(activity.sources)}>{t('recap.viewSources', { count: activity.sources.length })}</button>
             </div>}

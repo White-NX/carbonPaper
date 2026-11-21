@@ -10,6 +10,7 @@ use super::{
     runner::{complete_with_limit, RunContext},
     selection,
     types::*,
+    validation,
 };
 use crate::ai::{
     config::{ResolvedProvider, ToolCalling},
@@ -36,6 +37,7 @@ pub(super) fn activity_value(activity: &RecapActivity, cap: usize) -> Value {
         "last_observed_ms": activity.end_ms,
         "key_details": activity.details.iter().map(|d| json!({"text": d.text, "evidence_ids": d.evidence_ids})).collect::<Vec<_>>(),
         "source_ids": activity.sources.iter().map(|s| s.id).collect::<Vec<_>>(),
+        "citation_warnings": activity.warnings,
     })
 }
 
@@ -519,17 +521,18 @@ async fn drive(
     let mut requests = 0;
     loop {
         host.check()?;
-        if requests >= MAX_REQUESTS - 1 || output == 0 {
+        if requests >= MAX_REQUESTS - validation::MAX_REPAIRS as u64 || output == 0 {
             return Err("RECAP_BUDGET_EXHAUSTED".into());
         }
         let estimate = context::estimated_input_tokens(provider.kind, &request);
         let mut final_turn = !supported
             || rounds >= MAX_TOOL_ROUNDS
             || tools.calls >= MAX_TOOL_CALLS
+            || requests >= MAX_REQUESTS - validation::MAX_REPAIRS as u64 - 1
             || input < estimate.saturating_mul(2).saturating_add(1000);
         request.max_tokens = Some(
             u64::from(settings.request_output_tokens)
-                .min(output / if final_turn { 1 } else { 2 })
+                .min(output / 2)
                 .min(u64::from(provider.context_tokens / 2)) as u32,
         );
         request.disable_tools = final_turn && supported;

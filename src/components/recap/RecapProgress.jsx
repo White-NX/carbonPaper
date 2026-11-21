@@ -111,7 +111,7 @@ function Attempt({ attempt, progress, now, onInspect }) {
       <ChevronRight aria-hidden="true" className={`h-3.5 w-3.5 shrink-0 text-ide-muted ${open ? 'rotate-90' : ''}`} />
     </Button>
     {open && <div id={id}>
-      {attempt.error && <div className="mt-2"><Banner tone="error">{t(recapErrorKey(attempt.error), { defaultValue: t('recap.errors.unknown') })}</Banner></div>}
+      {attempt.error && <div className="mt-2"><Banner tone={attempt.status === 'partial' ? 'warning' : 'error'}>{t(recapErrorKey(attempt.error), { defaultValue: t('recap.errors.unknown') })}</Banner></div>}
       <AttemptDetails attempt={attempt} progress={progress} now={now} />
     </div>}
   </li>;

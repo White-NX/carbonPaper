@@ -103,6 +103,9 @@
         "initial": "整理活动",
         "repair": "补全与修复",
         "summary": "归纳概述",
+        "summary_repair": "修复概述来源",
+        "supplement": "补充活动细节",
+        "mainline_repair": "修复主线来源",
         "evidence": "补充活动依据",
         "mainlines": "整合全天主线",
         "mainline_evidence": "查证任务关联"
@@ -239,6 +242,8 @@
       "RECAP_WORKER_FAILED": "回顾处理意外中断，请重试。",
       "RECAP_INTERNAL_ERROR": "回顾处理发生内部错误，请查看应用日志。",
       "RECAP_INVALID_CITATION": "部分内容缺少有效来源，可以重试。",
+      "RECAP_UNVERIFIED_CITATION": "内容已保留，部分来源尚未确认，请核对原始记录。",
+      "RECAP_PARTIAL_VALIDATION": "已保留可用内容，部分条目仍需补全。",
       "RECAP_SCREENING_UNAVAILABLE": "语义筛查暂不可用。",
       "RECAP_SCREENING_INVALID_RESPONSE": "语义筛查服务返回的内容无法读取，本次回顾已使用本地筛选结果。",
       "RECAP_WAITING_FOR_IDLE": "将在阻挡后台任务的全屏应用退出后继续整理。",
@@ -276,6 +281,8 @@
       "openDay": "查看当天回顾"
     },
     "periodRecaps": "分时段回顾",
+    "unverifiedContent": "这部分内容的来源尚未确认，请核对原始记录。",
+    "unverifiedTime": "记录时间尚未确认",
     "mainlines": {
       "title": "全天主线",
       "count": "{{count}} 条主线",

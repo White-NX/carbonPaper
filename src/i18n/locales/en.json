@@ -103,6 +103,9 @@
         "initial": "Organize activities",
         "repair": "Complete and repair",
         "summary": "Summarize period",
+        "summary_repair": "Repair overview sources",
+        "supplement": "Add activity details",
+        "mainline_repair": "Repair mainline sources",
         "evidence": "Verify activity evidence",
         "mainlines": "Connect daily tasks",
         "mainline_evidence": "Verify task connections"
@@ -239,6 +242,8 @@
       "RECAP_WORKER_FAILED": "Recap processing stopped unexpectedly. Please retry.",
       "RECAP_INTERNAL_ERROR": "An internal error interrupted the recap. Check the app logs.",
       "RECAP_INVALID_CITATION": "Some content lacked valid sources. You can retry.",
+      "RECAP_UNVERIFIED_CITATION": "Content was retained with unresolved sources. Check the original records.",
+      "RECAP_PARTIAL_VALIDATION": "Available content was retained. Some entries still need completion.",
       "RECAP_SCREENING_UNAVAILABLE": "Semantic screening is temporarily unavailable.",
       "RECAP_SCREENING_INVALID_RESPONSE": "The screening service returned unreadable content. This recap used local record selection.",
       "RECAP_WAITING_FOR_IDLE": "Processing will continue after the fullscreen app blocking background tasks closes.",
@@ -276,6 +281,8 @@
       "openDay": "Open daily recap"
     },
     "periodRecaps": "Period recaps",
+    "unverifiedContent": "Sources for this content are still unconfirmed. Check the original records.",
+    "unverifiedTime": "Record time is unconfirmed",
     "mainlines": {
       "title": "Main tasks of the day",
       "count": "Main tasks · {{count}}",

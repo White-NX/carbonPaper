@@ -837,6 +837,25 @@ impl StorageState {
             |r| Ok(RecapUsage {input_tokens:r.get::<_,i64>(0)?.max(0) as u64,output_tokens:r.get::<_,i64>(1)?.max(0) as u64,screening_input_tokens:r.get::<_,i64>(2)?.max(0) as u64,requests:r.get::<_,i64>(3)?.max(0) as u64})
         ).map_err(|e| e.to_string()))
     }
+
+    pub(crate) fn recap_run_usage(&self, run: &str) -> Result<RecapUsage, String> {
+        self.with_read_connection_named("recap_run_usage", |conn| {
+            conn.query_row(
+                "SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*)
+                 FROM recap_usage WHERE run_id=?1 AND role='generation'",
+                [run],
+                |row| {
+                    Ok(RecapUsage {
+                        input_tokens: row.get::<_, i64>(0)?.max(0) as u64,
+                        output_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                        requests: row.get::<_, i64>(2)?.max(0) as u64,
+                        ..Default::default()
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
+    }
 }
 
 fn ensure_day_calendar(

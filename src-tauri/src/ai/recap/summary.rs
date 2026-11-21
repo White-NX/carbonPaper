@@ -10,6 +10,7 @@ use tauri::{Emitter, Manager};
 use super::{
     runner::{complete, RunContext},
     types::*,
+    validation::{self, Report},
 };
 use crate::ai::{
     config::ResolvedProvider,
@@ -42,6 +43,8 @@ pub(super) struct CachedSummary {
     pub error: Option<String>,
     #[serde(default)]
     pub attempts: Vec<RecapAttempt>,
+    #[serde(default)]
+    pub validation_version: u32,
 }
 
 pub(super) fn fingerprint(batch: &RecapBatch, language: &str) -> String {
@@ -74,10 +77,23 @@ pub(super) fn should_generate(
     if force {
         return true;
     }
-    if cached.summary.is_some() && cached.error.is_none() {
-        return false;
+    if let Some(summary) = cached.summary.as_ref().filter(|_| cached.error.is_none()) {
+        return !automatic
+            && (!summary.warnings.is_empty()
+                || summary
+                    .topics
+                    .iter()
+                    .any(|topic| !topic.warnings.is_empty()));
     }
     if !automatic {
+        return true;
+    }
+    if cached.validation_version < validation::VERSION
+        && cached
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("RECAP_INVALID_"))
+    {
         return true;
     }
     // Durable failures avoid retrying every scheduler tick. A new daily budget
@@ -101,41 +117,148 @@ pub(super) fn attach(batch: &mut RecapBatch, cached: Option<CachedSummary>, lang
     }
 }
 
-fn validate(
-    mut summary: RecapSummary,
-    activities: &[RecapActivity],
-) -> Result<RecapSummary, String> {
+#[cfg(test)]
+fn validate(summary: RecapSummary, activities: &[RecapActivity]) -> Result<RecapSummary, String> {
+    validate_value(&json!(summary), activities).strict()
+}
+
+fn validate_value(value: &serde_json::Value, activities: &[RecapActivity]) -> Report<RecapSummary> {
+    let mut report = Report::new(RecapSummary::default());
+    if !value.is_object() {
+        report.issues.push(validation::issue(
+            "",
+            "summary",
+            "RECAP_INVALID_SUMMARY",
+            "invalid_field",
+        ));
+        return report;
+    }
     let known: HashMap<_, _> = activities.iter().map(|a| (a.id.as_str(), a)).collect();
+    let received = activities
+        .iter()
+        .map(|activity| activity.id.clone())
+        .collect::<HashSet<_>>();
     let valid_text = |s: &str| !s.trim().is_empty() && s.chars().count() <= 600;
-    let valid_ids = |ids: &[String], task: Option<&str>| {
-        !ids.is_empty()
-            && ids.len() <= 80
-            && ids.iter().collect::<HashSet<_>>().len() == ids.len()
-            && ids.iter().all(|id| {
-                known
-                    .get(id.as_str())
-                    .is_some_and(|a| !a.sources.is_empty() && task.is_none_or(|t| a.task_id == t))
-            })
+    let overview = value
+        .get("overview")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if valid_text(overview) {
+        let mut ids = serde_json::from_value::<Vec<String>>(value["overview_activity_ids"].clone())
+            .unwrap_or_default();
+        let issues = validation::check_ids(
+            &mut ids,
+            &received,
+            &received,
+            "/overview",
+            "overview_activity_ids",
+            80,
+        );
+        if issues.iter().all(|issue| issue.retainable) {
+            report.value.overview = overview.trim().into();
+            report.value.overview_activity_ids = ids;
+            report.value.warnings = issues.iter().map(|issue| issue.warning()).collect();
+            for id in &report.value.overview_activity_ids {
+                if let Some(activity) = known.get(id.as_str()) {
+                    report.value.warnings.extend(activity.warnings.clone());
+                }
+            }
+        }
+        report.issues.extend(issues);
+    } else {
+        report.issues.push(validation::issue(
+            "/overview",
+            "overview",
+            "RECAP_INVALID_SUMMARY",
+            "invalid_text",
+        ));
+    }
+    let Some(topics) = value.get("topics").and_then(serde_json::Value::as_array) else {
+        report.issues.push(validation::issue(
+            "/topics",
+            "topics",
+            "RECAP_INVALID_SUMMARY",
+            "invalid_field",
+        ));
+        return report;
     };
-    if !valid_text(&summary.overview) || summary.topics.is_empty() || summary.topics.len() > 8 {
-        return Err("RECAP_INVALID_SUMMARY".into());
-    }
-    if !valid_ids(&summary.overview_activity_ids, None) {
-        return Err("RECAP_INVALID_CITATION".into());
-    }
     let mut tasks = HashSet::new();
-    for topic in &mut summary.topics {
-        if !valid_text(&topic.text) || !tasks.insert(topic.task_id.clone()) {
-            return Err("RECAP_INVALID_SUMMARY".into());
+    for (index, value) in topics.iter().enumerate() {
+        if value.is_null() {
+            continue;
         }
-        if !valid_ids(&topic.activity_ids, Some(&topic.task_id)) {
-            return Err("RECAP_INVALID_CITATION".into());
+        let target = format!("/topics/{index}");
+        if report.value.topics.len() >= 8 {
+            report.issues.push(validation::issue(
+                &target,
+                "topic",
+                "RECAP_INVALID_SUMMARY",
+                "too_many_items",
+            ));
+            continue;
         }
-        topic.title = known[topic.activity_ids[0].as_str()].task_title.clone();
+        let Ok(mut topic) = serde_json::from_value::<RecapTopic>(value.clone()) else {
+            report.issues.push(validation::issue(
+                &target,
+                "topic",
+                "RECAP_INVALID_SUMMARY",
+                "invalid_field",
+            ));
+            continue;
+        };
+        topic.warnings.clear();
+        if !valid_text(&topic.text) || tasks.contains(&topic.task_id) {
+            report.issues.push(validation::issue(
+                &target,
+                "text_or_task_id",
+                "RECAP_INVALID_SUMMARY",
+                "invalid_or_duplicate_topic",
+            ));
+            continue;
+        }
+        let task = activities
+            .iter()
+            .find(|activity| activity.task_id == topic.task_id);
+        let Some(task) = task else {
+            let mut error =
+                validation::issue(&target, "task_id", "RECAP_INVALID_TASK", "unknown_task");
+            error.available_references = activities
+                .iter()
+                .map(|activity| json!(activity.task_id))
+                .collect();
+            report.issues.push(error);
+            continue;
+        };
+        let allowed = activities
+            .iter()
+            .filter(|activity| activity.task_id == topic.task_id)
+            .map(|activity| activity.id.clone())
+            .collect();
+        let issues = validation::check_ids(
+            &mut topic.activity_ids,
+            &received,
+            &allowed,
+            &target,
+            "activity_ids",
+            80,
+        );
+        if issues.iter().any(|issue| !issue.retainable) {
+            report.issues.extend(issues);
+            continue;
+        }
+        topic.title = task.task_title.clone();
         topic.text = topic.text.trim().into();
+        topic.warnings = issues.iter().map(|issue| issue.warning()).collect();
+        for id in &topic.activity_ids {
+            if let Some(activity) = known.get(id.as_str()) {
+                topic.warnings.extend(activity.warnings.clone());
+            }
+        }
+        tasks.insert(topic.task_id.clone());
+        report.value.topics.push(topic);
+        report.issues.extend(issues);
     }
-    summary.overview = summary.overview.trim().into();
-    Ok(summary)
+    report
 }
 
 fn request(
@@ -146,7 +269,7 @@ fn request(
     // Round-robin across tasks so a long task cannot crowd out every short one.
     let mut tasks = BTreeMap::<&str, Vec<&RecapActivity>>::new();
     for activity in &batch.activities {
-        if !activity.sources.is_empty() {
+        if !activity.sources.is_empty() || !activity.warnings.is_empty() {
             tasks.entry(&activity.task_id).or_default().push(activity);
         }
     }
@@ -163,7 +286,7 @@ fn request(
     let output = settings
         .request_output_tokens
         .min(16_000)
-        .min(settings.batch_output_tokens as u32)
+        .min((settings.batch_output_tokens / (validation::MAX_REPAIRS as u64 + 1)) as u32)
         .min(provider.context_tokens / 2);
     loop {
         if selected.is_empty() {
@@ -176,10 +299,11 @@ fn request(
                     "id": a.id, "task_id": a.task_id, "task_title": a.task_title,
                     "text": a.text, "first_observed_ms": a.start_ms, "last_observed_ms": a.end_ms,
                     "key_details": a.details.iter().map(|d| &d.text).collect::<Vec<_>>(),
+                    "citation_warnings": a.warnings,
                 })
             })
             .collect::<Vec<_>>();
-        let req =
+        let mut req =
             ChatRequest {
                 messages: vec![Message::System(PROMPT.into()), Message::User(json!({
                 "language": settings.language, "window_start_ms": batch.start_ms,
@@ -191,6 +315,7 @@ fn request(
                 temperature: Some(0.2),
                 ..Default::default()
             };
+        validation::configure(&mut req);
         if context::estimated_input_tokens(provider.kind, &req)
             <= settings
                 .batch_input_tokens
@@ -211,7 +336,7 @@ fn single_activity_summary(batch: &RecapBatch) -> Option<RecapSummary> {
     let text = activity.text.trim();
     if text.is_empty()
         || text.chars().count() > 600
-        || activity.sources.is_empty()
+        || (activity.sources.is_empty() && activity.warnings.is_empty())
         || !activity.details.is_empty()
     {
         return None;
@@ -219,11 +344,13 @@ fn single_activity_summary(batch: &RecapBatch) -> Option<RecapSummary> {
     Some(RecapSummary {
         overview: text.into(),
         overview_activity_ids: vec![activity.id.clone()],
+        warnings: activity.warnings.clone(),
         topics: vec![RecapTopic {
             task_id: activity.task_id.clone(),
             title: activity.task_title.clone(),
             text: text.into(),
             activity_ids: vec![activity.id.clone()],
+            warnings: activity.warnings.clone(),
         }],
     })
 }
@@ -259,30 +386,25 @@ pub(super) async fn generate(
             super::privacy::filter_activity(&filter, activity);
         }
         // A separate bounded generation run shares the daily generation budget.
-        // Extraction can verify evidence; this paraphrase gets one attempt.
+        // Item repairs retain the successful neighbors and share this run's budget.
         let run = format!("summary-{}", hex::encode(rand::random::<[u8; 16]>()));
         let result = async {
             if let Some(summary) = single_activity_summary(&input) {
-                return validate(summary, &input.activities);
+                return Ok(validate_value(&json!(summary), &input.activities));
             }
             let (req, included) = request(&input, &ctx.settings, provider)?;
             let response = complete(ctx, provider, &req, &run, "summary").await?;
-            if response.truncated {
-                return Err("RECAP_OUTPUT_TRUNCATED".into());
+            let report = validation::repair(
+                ctx, provider, req, response, &run, "summary_repair",
+                json!({"language":ctx.settings.language,"activities":included.iter().map(|activity| {
+                    super::evidence_agent::activity_value(activity, 1600)
+                }).collect::<Vec<_>>()}),
+                |value| validate_value(value, &included),
+            ).await?;
+            if report.value.overview.is_empty() && report.value.topics.is_empty() {
+                return Err(report.repair_error.clone().unwrap_or_else(|| report.first_error().unwrap_or("RECAP_INVALID_SUMMARY").into()));
             }
-            let text = response.text.trim();
-            if text.is_empty() {
-                return Err("RECAP_EMPTY_RESPONSE".into());
-            }
-            let text = if text.starts_with("```") {
-                text.split_once('\n')
-                    .map(|(_, body)| body.trim_end().trim_end_matches("```").trim())
-                    .unwrap_or(text)
-            } else {
-                text
-            };
-            let summary = serde_json::from_str(text).map_err(|_| "RECAP_INVALID_SUMMARY")?;
-            validate(summary, &included)
+            Ok(report)
         }
         .await;
         ctx.check()?; // Auth, privacy, source changes and cancellation never become cached errors.
@@ -291,7 +413,9 @@ pub(super) async fn generate(
         }
         ctx.progress(true, |p| {
             if p.attempts.last().is_some_and(|a| a.id.starts_with(&run)) {
-                p.validation(result.as_ref().err().map(String::as_str));
+                if let Err(error) = &result {
+                    p.validation(Some(error));
+                }
             }
         });
         // Corrections can arrive during a request without changing source revision.
@@ -304,7 +428,10 @@ pub(super) async fn generate(
             continue;
         }
         let (summary, error) = match result {
-            Ok(summary) => (Some(summary), None),
+            Ok(report) => {
+                let error = report.error();
+                (Some(report.value), error)
+            }
             Err(error) => {
                 super::runner::log_failure(&ctx.day, &run, "summary", &error);
                 // A failed force refresh may keep a still-current, successful summary.
@@ -326,6 +453,7 @@ pub(super) async fn generate(
                 .into_iter()
                 .filter(|a| a.id.starts_with(&run))
                 .collect(),
+            validation_version: validation::VERSION,
         };
         ctx.write("summary", &key, &value)?;
         let _ = ctx.app.emit("recap-changed", &ctx.day);
@@ -336,6 +464,26 @@ pub(super) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_topics_do_not_hide_valid_neighbors_and_unknown_ids_carry_warnings() {
+        let batch = batch();
+        let mut value = json!(draft());
+        value["topics"].as_array_mut().unwrap().push(json!({
+            "task_id":"task2","text":"Cross-task citation.","activity_ids":["a"]
+        }));
+        let result = validate_value(&value, &batch.activities);
+        assert_eq!(result.value.topics.len(), 1);
+        assert_eq!(result.value.overview, draft().overview);
+        assert_eq!(result.issues[0].target, "/topics/1");
+        value["topics"][1]["activity_ids"] = json!(["missing", "missing"]);
+        let result = validate_value(&value, &batch.activities);
+        assert_eq!(result.value.topics.len(), 2);
+        assert_eq!(result.value.topics[1].activity_ids, vec!["missing"]);
+        assert_eq!(
+            result.value.topics[1].warnings[0].reference_ids,
+            vec![json!("missing")]
+        );
+    }
     #[test]
     fn single_occurrence_reuses_text_and_citations_without_truncation() {
         let mut b = batch();
@@ -368,6 +516,7 @@ mod tests {
                 process_name: "app".into(),
                 window_title: "title".into(),
             }],
+            warnings: vec![],
         };
         RecapBatch {
             start_ms: 0,
@@ -385,6 +534,7 @@ mod tests {
             attempts: vec![],
             summary: None,
             summary_error: None,
+            validation_version: 0,
         }
     }
     fn draft() -> RecapSummary {
@@ -396,7 +546,9 @@ mod tests {
                 title: "Untrusted title".into(),
                 text: "Prepared cleanup.".into(),
                 activity_ids: vec!["a".into(), "c".into()],
+                warnings: vec![],
             }],
+            warnings: vec![],
         }
     }
     #[test]
@@ -444,6 +596,7 @@ mod tests {
             summary: Some(draft()),
             error: None,
             attempts: vec![],
+            validation_version: 0,
         };
         assert!(!should_generate(
             Some(&cache),
@@ -466,6 +619,7 @@ mod tests {
             summary: None,
             error: Some("AI_NETWORK_ERROR".into()),
             attempts: vec![],
+            validation_version: 0,
         };
         assert!(!should_generate(Some(&cache), "h", false, true, 1));
         assert!(should_generate(Some(&cache), "h", false, false, 1));

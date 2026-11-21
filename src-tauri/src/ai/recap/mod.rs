@@ -15,8 +15,10 @@ mod snapshot;
 mod summary;
 pub mod types;
 mod unified;
+mod validation;
 mod views;
 
+pub(crate) use privacy::filtered_warnings;
 pub(crate) use privacy::PrivacyFingerprint;
 #[cfg(test)]
 pub(crate) use runner::initial_request;

@@ -35,6 +35,21 @@ beforeEach(() => {
 });
 
 describe('daily recap page', () => {
+  it('retains an unverified activity next to valid content and warns in its detail view', async () => {
+    const original = day.batches[0].activities[0];
+    day.batches[0].activities.push({ ...original, id: 'unverified', task_id: 'uncertain', task_title: 'Uncertain task',
+      text: 'Retained uncertain content.', sources: [], warnings: [{ field: 'evidence_ids', reason: 'unknown_reference', reference_ids: [99] }] });
+    day.threads.push({ id: 'uncertain', title: 'Uncertain task', activity_ids: ['unverified'] });
+    render(<RecapView active isAuthenticated />);
+    expect(await screen.findByText('Inspected the form validation.')).toBeVisible();
+    expect(screen.getByText('Retained uncertain content.')).toBeVisible();
+    expect(screen.getByText('recap.unverifiedContent')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: /Uncertain task/ }));
+    expect(screen.getByText('Retained uncertain content.')).toBeVisible();
+    expect(screen.getByText('recap.unverifiedContent')).toBeVisible();
+    expect(screen.getByText('recap.unverifiedTime')).toBeVisible();
+    expect(screen.queryByRole('button', { name: /Editor/ })).not.toBeInTheDocument();
+  });
   it('shows daily mainlines above period recaps and returns to the same branch with focus', async () => {
     const original = day.batches[0].activities[0];
     day.batches[0].activities.push({ ...original, id: 'workflow', task_id: 'workflow', task_title: 'Configure workflow', text: 'Connected the notification workflow.' });

@@ -218,12 +218,18 @@ fn day_result(
         .into_iter()
         .filter(|b| query.batch_start_ms.is_none_or(|start| b.start_ms == start))
     {
+        let summary_warnings = batch
+            .summary
+            .as_ref()
+            .map(|summary| recap::filtered_warnings(filter, &summary.warnings))
+            .unwrap_or_default();
         let overview = batch
             .summary
             .and_then(|s| filter_joined_text(filter, mode, &s.overview).ok());
         periods.push(json!({
             "start_ms": batch.start_ms, "end_ms": batch.end_ms,
             "status": batch.status, "overview": overview,
+            "citation_warnings": summary_warnings,
         }));
         let member_directory =
             crate::ai::recap::activity_contract::member_directory(&batch.records, filter);
@@ -236,10 +242,13 @@ fn day_result(
                     .iter()
                     .filter_map(|detail| {
                         if detail.evidence_ids.is_empty()
-                            || !detail
-                                .evidence_ids
-                                .iter()
-                                .all(|id| activity.sources.iter().any(|s| s.id == *id))
+                            || !detail.evidence_ids.iter().all(|id| {
+                                activity.sources.iter().any(|s| s.id == *id)
+                                    || activity
+                                        .warnings
+                                        .iter()
+                                        .any(|warning| warning.reference_ids.contains(&json!(id)))
+                            })
                         {
                             return None;
                         }
@@ -272,6 +281,7 @@ fn day_result(
                     "member_ids": evidence.member_screenshot_ids,
                     "membership_status": evidence.membership_status,
                     "batch_start_ms": batch.start_ms, "sources": sources,
+                    "citation_warnings": recap::filtered_warnings(filter, &activity.warnings),
                 }))
             })();
             if let Ok(item) = clean {
@@ -355,6 +365,7 @@ mod tests {
                     overview: "Read the notes".into(),
                     overview_activity_ids: vec![],
                     topics: vec![],
+                    warnings: vec![],
                 }),
                 activities: vec![RecapActivity {
                     details: vec![],
@@ -367,7 +378,9 @@ mod tests {
                     sources: vec![source],
                     segments: vec![],
                     member_ids: vec![42],
+                    warnings: vec![],
                 }],
+                validation_version: 0,
             }],
         }
     }
@@ -453,6 +466,7 @@ mod tests {
                 keyword_score: Some(1000.0),
                 semantic_score: None,
                 match_evidence: None,
+                warnings: vec![],
             }],
             total: 1,
             complete: true,
