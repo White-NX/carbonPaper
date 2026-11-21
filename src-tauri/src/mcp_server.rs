@@ -808,6 +808,7 @@ mod privacy_filter_tests {
         OcrResult {
             id,
             screenshot_id: 1,
+            text_layout: None,
             text: text.to_string(),
             confidence: 0.99,
             box_coords: vec![

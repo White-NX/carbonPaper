@@ -264,6 +264,21 @@ pub struct MlOcrBlock {
     pub text: String,
     pub confidence: f32,
     pub points: [[f32; 2]; 4],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_layout: Option<MlOcrTextLayout>,
+}
+
+/// Selection geometry without duplicated token text, scores, or token quads.
+/// `centers` contains doubled CTC centers (start + end), before normalization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MlOcrTextLayout {
+    pub matrix: [[f32; 3]; 3],
+    pub source_size: [u32; 2],
+    pub input_width: u32,
+    pub valid_width: u32,
+    pub time_steps: u32,
+    pub centers: Vec<u32>,
+    pub text_lengths: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

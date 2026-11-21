@@ -109,6 +109,14 @@ fn encrypted(storage: &StorageState, value: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
+    populate_with_layout(storage, plaintext_image, None)
+}
+
+fn populate_with_layout(
+    storage: &StorageState,
+    plaintext_image: bool,
+    text_layout: Option<&crate::ml_protocol::MlOcrTextLayout>,
+) -> i64 {
     let credentials = &storage.credential_state;
     let directory = storage.data_dir.lock().unwrap().clone();
     credentials.cache_master_key_for_tests(vec![9; 32]);
@@ -135,7 +143,10 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
         encrypt_with_master_key(&key, &image).unwrap()
     };
     std::fs::write(directory.join(relative), data).unwrap();
-    let (ocr, ocr_key) = encrypted(storage, "私密备份搜索内容".as_bytes());
+    let fresh_ocr_key = text_layout.map(|_| storage.new_ocr_write_key().unwrap());
+    let legacy_ocr = text_layout
+        .is_none()
+        .then(|| encrypted(storage, "私密备份搜索内容".as_bytes()));
     {
         let guard = storage.db.lock().unwrap();
         let conn = guard.as_ref().unwrap();
@@ -145,12 +156,53 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
             .unwrap();
         conn.execute("INSERT INTO screenshots(id,image_path,image_hash,window_title_enc,content_key_encrypted,process_name,created_at,status)
             VALUES(7,?1,'image-fixture',?2,?3,?4,'2026-11-05 10:00:00','committed')", params![relative, title, wrap, process]).unwrap();
-        conn.execute("INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
-            VALUES(11,7,'',?1,?2,0.99,0,0,1,0,1,1,0,1)", params![ocr, ocr_key]).unwrap();
+        let ocr = if let Some(key) = fresh_ocr_key {
+            let record = crate::storage::ocr_blocks::Record {
+                id: 11,
+                text: "私密备份搜索内容".into(),
+                text_layout: text_layout.cloned(),
+                confidence: 0.99,
+                box_coords: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            };
+            crate::storage::ocr_blocks::insert_records(conn, 7, &[record], Some(&key), || {
+                storage.new_ocr_write_key()
+            })
+            .unwrap();
+            let records = [
+                (12, "discarded backup member"),
+                (13, "retained backup member"),
+            ]
+            .map(|(id, text)| crate::storage::ocr_blocks::Record {
+                id,
+                text: text.into(),
+                text_layout: None,
+                confidence: 0.95,
+                box_coords: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            });
+            crate::storage::ocr_blocks::insert_records(conn, 7, &records, None, || {
+                storage.new_ocr_write_key()
+            })
+            .unwrap();
+            conn.execute("DELETE FROM ocr_results WHERE id=12", [])
+                .unwrap();
+            Vec::new()
+        } else {
+            let (data, key) = legacy_ocr.unwrap();
+            conn.execute("INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
+                VALUES(11,7,'',?1,?2,0.99,0,0,1,0,1,1,0,1)", params![data,key]).unwrap();
+            data
+        };
+        let ocr_reference = conn
+            .query_row(
+                "SELECT text_key_ref FROM ocr_results_read WHERE id=11",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
         storage
             .index_batch_internal_on_conn(
                 conn,
-                vec![(11, ocr, ocr_key)],
+                vec![(11, ocr, ocr_reference)],
                 &credentials.get_hmac_key().unwrap(),
             )
             .unwrap();
@@ -208,7 +260,6 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
     storage
         .create_smart_cluster("Private new topic", 0.5, None, None)
         .unwrap();
-    while storage.compact_ocr_keys_batch().unwrap() != 0 {}
     cluster
 }
 
@@ -219,6 +270,7 @@ fn image_bytes() -> Vec<u8> {
 fn export(storage: &StorageState, path: &Path) -> BackupSummary {
     let _maintenance = storage.database_maintenance("test backup export");
     let _operation = storage.backup.begin();
+    storage.prepare_ocr_blocks_for_backup().unwrap();
     let directory = storage.data_dir.lock().unwrap().clone();
     let key = storage.database_key().unwrap();
     let master = Zeroizing::new(get_cached_master_key(&storage.credential_state).unwrap());
@@ -453,12 +505,51 @@ fn streamed_key_validation_rejects_corrupt_metadata_ocr_scope_and_ocr_content() 
         ),
         ("ocr_scope", "Invalid OCR key or payload binding"),
         ("ocr_content", "Decryption failed"),
+        ("ocr_block_scope", "Invalid OCR key or payload binding"),
+        ("ocr_block_content", "Invalid OCR key or payload binding"),
+        (
+            "legacy_ocr_content",
+            "Content authentication failed for ocr_results.text_enc",
+        ),
     ] {
         let root = TempDir::new().unwrap();
         let directory = root.path().join("source");
         let archive = root.path().join("previous.cpbackup");
         let source = storage(&directory);
         populate(&source, false);
+        // Cover legacy envelopes alongside explicit inline groups and blocks.
+        if matches!(
+            corrupt,
+            "ocr_scope" | "ocr_content" | "ocr_block_scope" | "ocr_block_content"
+        ) {
+            let key = source.new_ocr_write_key().unwrap();
+            let guard = source.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            if corrupt.starts_with("ocr_block_") {
+                let record = crate::storage::ocr_blocks::Record {
+                    id: 12,
+                    text: "grouped backup content".into(),
+                    text_layout: None,
+                    confidence: 0.99,
+                    box_coords: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                };
+                crate::storage::ocr_blocks::insert_records(conn, 7, &[record], Some(&key), || {
+                    source.new_ocr_write_key()
+                })
+                .unwrap();
+            } else {
+                let dataset = crate::storage::ocr_keys::dataset(conn).unwrap();
+                key.insert(conn, &dataset, 7).unwrap();
+                let data = key
+                    .encrypt(&dataset, 7, 12, b"grouped backup content")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,ocr_key_id) VALUES(12,7,'',?1,?2)",
+                    params![data, key.id],
+                )
+                .unwrap();
+            }
+        }
         std::fs::write(&archive, b"previous valid backup").unwrap();
         let _operation = source.backup.begin();
         let snapshot = source
@@ -477,7 +568,9 @@ fn streamed_key_validation_rejects_corrupt_metadata_ocr_scope_and_ocr_content() 
         .unwrap();
         let sql = match corrupt {
             "metadata" => "UPDATE screenshots SET window_title_enc=zeroblob(28) WHERE id=7",
-            "ocr_scope" => "UPDATE ocr_keys SET scope_tag=zeroblob(32)",
+            "ocr_scope" | "ocr_block_scope" => "UPDATE ocr_keys SET scope_tag=zeroblob(32)",
+            "ocr_content" => "UPDATE ocr_results SET text_enc=zeroblob(28) WHERE id=12",
+            "ocr_block_content" => "UPDATE ocr_blocks SET content_enc=zeroblob(28)",
             _ => "UPDATE ocr_results SET text_enc=zeroblob(28) WHERE id=11",
         };
         assert_eq!(conn.execute(sql, []).unwrap(), 1);
@@ -677,7 +770,39 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
     let root = TempDir::new().unwrap();
     let archive = root.path().join("portable.cpbackup");
     let source = storage(&root.path().join("source"));
-    let cluster = populate(&source, false);
+    let text_layout = crate::ml_protocol::MlOcrTextLayout {
+        matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+        source_size: [2, 2],
+        input_width: 32,
+        valid_width: 32,
+        time_steps: 8,
+        centers: (0..8).map(|i| 2 * i + 1).collect(),
+        text_lengths: vec![3; 8],
+    };
+    let cluster = populate_with_layout(&source, false, Some(&text_layout));
+    let dirty_key = {
+        let guard = source.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT ocr_block_slot FROM ocr_results WHERE id=11",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM ocr_block_gc", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        conn.query_row("SELECT block_id FROM ocr_block_gc", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
     let source_hmac = source.credential_state.get_hmac_key().unwrap();
     let source_db_key = source.database_key().unwrap();
     let source_dataset = source.processing_dataset_id().unwrap();
@@ -765,6 +890,18 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
         "私密备份搜索内容"
     );
     assert_eq!(
+        reopened.get_screenshot_ocr_results(7).unwrap()[0]
+            .text_layout
+            .as_ref(),
+        Some(&text_layout)
+    );
+    let restored_ocr = reopened.get_screenshot_ocr_results(7).unwrap();
+    assert_eq!(
+        restored_ocr.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![11, 13]
+    );
+    assert_eq!(restored_ocr[1].text, "retained backup member");
+    assert_eq!(
         reopened
             .get_smart_cluster_summary(cluster)
             .unwrap()
@@ -784,6 +921,27 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
         .is_empty());
     let guard = reopened.db.lock().unwrap();
     let conn = guard.as_ref().unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM ocr_blocks", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM ocr_block_gc", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM ocr_keys WHERE id=?1",
+            [dirty_key],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
     assert_eq!(
         conn.query_row("SELECT count(*) FROM app_bound_receipts", [], |r| r
             .get::<_, i64>(0))

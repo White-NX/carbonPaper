@@ -126,8 +126,7 @@ fn progress_database() -> Connection {
          INSERT INTO app_metadata VALUES
             ('storage_ocr_marker_done_v1','1'),
             ('storage_vector_block_cursor_v1','-1'),
-            ('storage_process_icon_cursor_v1','3'),
-            ('storage_ocr_key_cursor_v1','1');",
+            ('storage_process_icon_cursor_v1','3');",
     )
     .unwrap();
     conn
@@ -153,23 +152,18 @@ fn resumed_scan_retains_estimate_and_waits_for_protected_terminal_markers() {
     // Visiting the last IDs cannot report completion while CNG is unavailable.
     conn.execute_batch(
         "UPDATE app_metadata SET value='5' WHERE key='storage_process_icon_cursor_v1';
-         UPDATE app_metadata SET value='3' WHERE key='storage_ocr_key_cursor_v1';",
+         ",
     )
     .unwrap();
     let snapshot = Snapshot::read(&conn).unwrap();
     assert!(snapshot.pending());
     assert_eq!(snapshot.estimated_percent(), Some(99.0));
 
-    for key in [
-        super::super::process_icons::CURSOR,
-        super::super::ocr_keys::COMPACTION_CURSOR,
-    ] {
-        conn.execute(
-            "UPDATE app_metadata SET value=?2 WHERE key=?1",
-            params![key, i64::MAX.to_string()],
-        )
-        .unwrap();
-    }
+    conn.execute(
+        "UPDATE app_metadata SET value=?2 WHERE key=?1",
+        params![super::super::process_icons::CURSOR, i64::MAX.to_string()],
+    )
+    .unwrap();
     let snapshot = Snapshot::read(&conn).unwrap();
     assert!(!snapshot.pending());
     assert_eq!(snapshot.phase(Some("waiting_for_unlock")), "idle");

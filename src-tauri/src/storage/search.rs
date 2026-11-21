@@ -325,22 +325,22 @@ fn build_empty_search_sql(
 /// list down to its order. One constant makes that true by construction
 /// instead of by review.
 const SEARCH_RESULT_COLUMNS: &str =
-    "r.id, r.screenshot_id, r.text_enc,
+    "r.id, r.screenshot_id, CASE WHEN r.ocr_block_slot IS NULL THEN r.text_enc ELSE X'' END,
          cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
              k.screenshot_id,k.scope_tag,k.wrapped_key,
-             (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id')), r.confidence,
+             (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id'),r.ocr_block_slot), r.confidence,
          r.box_x1, r.box_y1, r.box_x2, r.box_y2,
          r.box_x3, r.box_y3, r.box_x4, r.box_y4,
          s.image_path, s.window_title_enc, cp_process(s.process_name),
          s.content_key_encrypted,
-         CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+         CAST(strftime('%s', COALESCE(r.created_at,(SELECT created_at FROM ocr_blocks WHERE id=r.ocr_key_id))) AS INTEGER) AS created_ts,
          CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
          s.category";
 
-const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, r.text_enc,
+const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, CASE WHEN r.ocr_block_slot IS NULL THEN r.text_enc ELSE X'' END,
      cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
          k.screenshot_id,k.scope_tag,k.wrapped_key,
-         (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id')),
+         (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id'),r.ocr_block_slot),
      CAST(strftime('%s', s.created_at) AS INTEGER)";
 
 /// Recall already chose a bounded set of OCR ids. Without statistics SQLite
@@ -396,12 +396,24 @@ fn decode_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSearchRow> 
         screenshot_id: row.get(1)?,
         text_enc: row.get(2)?,
         text_key_enc: row.get(3)?,
-        confidence: row.get(4)?,
+        confidence: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
         box_coords: vec![
-            vec![row.get(5)?, row.get(6)?],
-            vec![row.get(7)?, row.get(8)?],
-            vec![row.get(9)?, row.get(10)?],
-            vec![row.get(11)?, row.get(12)?],
+            vec![
+                row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
+            ],
+            vec![
+                row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(8)?.unwrap_or_default(),
+            ],
+            vec![
+                row.get::<_, Option<f64>>(9)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(10)?.unwrap_or_default(),
+            ],
+            vec![
+                row.get::<_, Option<f64>>(11)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
+            ],
         ],
         image_path: row.get(13)?,
         window_title_enc: row.get(14)?,
@@ -591,15 +603,18 @@ impl StorageState {
         stages: &mut SearchStages,
     ) -> Result<Vec<SearchResult>, String> {
         let sql_started = Instant::now();
+        let decoder = self.ocr_decoder();
         let raw_rows: Vec<RawSearchRow> = {
+            let _snapshot = super::ocr_keys::read_snapshot(conn)?;
             let mut stmt = conn
                 .prepare(sql)
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
-            let rows = stmt
+            let rows: Vec<RawSearchRow> = stmt
                 .query_map(param_refs, decode_search_row)
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
                 .filter_map(Result::ok)
                 .collect();
+            decoder.load_blocks(conn, rows.iter().filter_map(|r| r.text_key_enc.as_deref()))?;
             rows
         };
         stages.page_sql += sql_started.elapsed();
@@ -625,7 +640,6 @@ impl StorageState {
             .filter_map(|id| grouped.remove(&id))
             .collect();
 
-        let decoder = self.ocr_decoder();
         let decrypted = unwrap_batch_parallel(&self.credential_state, batches, |session, rows| {
             let unwrap = |ciphertext: &[u8]| session.unwrap_row_key(ciphertext);
             let mut screenshot_key = rows
@@ -633,10 +647,10 @@ impl StorageState {
                 .and_then(|row| row.screenshot_key_enc.as_ref())
                 .and_then(|encrypted| unwrap(encrypted).ok());
 
-            let results: Vec<SearchResult> = rows
+            let results: Result<Vec<SearchResult>, BackgroundReadError> = rows
                 .into_iter()
-                .map(|raw| {
-                    let text = match known_text.get(&raw.id) {
+                .map(|mut raw| {
+                    let mut text = match known_text.get(&raw.id) {
                         Some(text) => text.clone(),
                         None => match (raw.text_enc.as_ref(), raw.text_key_enc.as_ref()) {
                             (Some(data), Some(key)) => decoder
@@ -647,6 +661,19 @@ impl StorageState {
                             _ => String::new(),
                         },
                     };
+                    if let Some(key) = raw.text_key_enc.as_deref() {
+                        match decoder.metadata_with_unwrap(key, &unwrap) {
+                            Ok(Some(metadata)) => {
+                                raw.confidence = metadata.confidence;
+                                raw.box_coords = metadata.box_coords.map(Vec::from).to_vec();
+                            }
+                            Err(BackgroundReadError::AuthRequired) => {
+                                return Err(BackgroundReadError::AuthRequired)
+                            }
+                            Err(_) => text.clear(),
+                            Ok(None) => {}
+                        }
+                    }
                     let window_title =
                         match (raw.window_title_enc.as_ref(), screenshot_key.as_ref()) {
                             (Some(data), Some(key)) => decrypt_with_master_key(key, data)
@@ -655,7 +682,7 @@ impl StorageState {
                             _ => None,
                         };
 
-                    SearchResult {
+                    Ok(SearchResult {
                         id: raw.id,
                         screenshot_id: raw.screenshot_id,
                         text,
@@ -671,14 +698,14 @@ impl StorageState {
                         ),
                         timestamp: raw.screenshot_created_ts,
                         match_evidence: None,
-                    }
+                    })
                 })
                 .collect();
 
             if let Some(key) = screenshot_key.as_mut() {
                 Self::zeroize_bytes(key);
             }
-            Ok(results)
+            results
         })
         .map_err(describe_read_error)?;
 
@@ -767,8 +794,11 @@ impl StorageState {
     /// failing the search: it will score nothing and be dropped, which is the
     /// same outcome as never having proposed it. A locked session is different
     /// and does fail, because every remaining row would fail the same way.
-    fn decrypt_candidates(&self, rows: Vec<CandidateRow>) -> Result<Vec<VerifiedRow>, String> {
-        let decoder = self.ocr_decoder();
+    fn decrypt_candidates(
+        &self,
+        decoder: &super::ocr_keys::Decoder<'_>,
+        rows: Vec<CandidateRow>,
+    ) -> Result<Vec<VerifiedRow>, String> {
         unwrap_batch_parallel(&self.credential_state, rows, |session, row| {
             let text = decoder.decrypt_with_unwrap(&row.text_enc, &row.text_key_enc, &|c| {
                 session.unwrap_row_key(c)
@@ -1152,9 +1182,15 @@ impl StorageState {
             .map(|candidate| candidate.row_id)
             .collect();
         let sql_started = Instant::now();
-        let rows = self.load_candidate_rows(&conn, &ids, &mut telemetry.counts)?;
+        let decoder = self.ocr_decoder();
+        let rows = {
+            let _snapshot = super::ocr_keys::read_snapshot(&conn)?;
+            let rows = self.load_candidate_rows(&conn, &ids, &mut telemetry.counts)?;
+            decoder.load_blocks(&conn, rows.iter().map(|r| r.text_key_enc.as_slice()))?;
+            rows
+        };
         telemetry.stages.candidate_sql += sql_started.elapsed();
-        let verified = self.decrypt_candidates(rows)?;
+        let verified = self.decrypt_candidates(&decoder, rows)?;
         telemetry.counts.verified += verified.len();
 
         for row in verified {
@@ -1359,6 +1395,8 @@ mod tests {
              CREATE TABLE ocr_results (
                  id INTEGER PRIMARY KEY,
                  screenshot_id INTEGER NOT NULL,
+                 text TEXT,
+                 text_hash TEXT NOT NULL DEFAULT '',
                  text_enc BLOB,
                  text_key_encrypted BLOB,
                  confidence REAL NOT NULL DEFAULT 1,

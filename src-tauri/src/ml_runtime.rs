@@ -1362,6 +1362,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             text: result.text,
             confidence: result.confidence,
             box_coords: result.box_coords,
+            text_layout: result.text_layout,
         })
         .collect::<Vec<_>>();
         let enqueue_result = crate::capture::enqueue_ocr_postprocess(

@@ -29,6 +29,7 @@ mod layout;
 mod link_scoring;
 pub mod migration;
 mod mode;
+mod ocr_blocks;
 mod ocr_keys;
 mod policy;
 mod process;
