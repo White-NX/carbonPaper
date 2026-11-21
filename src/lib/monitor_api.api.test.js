@@ -60,7 +60,7 @@ describe('monitor_api command wrappers', () => {
 
   it('keeps an aborted search pending until its invoke finishes and discards the result', async () => {
     let finish;
-    invoke.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    invoke.mockResolvedValue().mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
     const controller = new AbortController();
     const settled = vi.fn();
     const request = searchScreenshots('charts', 'nl', { signal: controller.signal }).catch(settled);
