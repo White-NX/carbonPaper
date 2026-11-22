@@ -577,7 +577,9 @@ fn updated_cache(
                 .as_ref()
                 .is_some_and(|previous| !previous.items.is_empty())
         {
-            Err("RECAP_EMPTY_MAINLINE_UPDATE".into())
+            Err(report
+                .error()
+                .unwrap_or_else(|| "RECAP_EMPTY_MAINLINE_UPDATE".into()))
         } else {
             Ok(report)
         }

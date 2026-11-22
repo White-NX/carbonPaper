@@ -635,7 +635,15 @@ mod tests {
         let report = run(&host).await;
         assert!(host.requests.lock().unwrap().is_empty());
         assert_eq!(report.value.len(), 2);
-        assert_eq!(report.value[0].text, "Valid neighbor.");
+        assert_eq!(
+            report
+                .value
+                .iter()
+                .find(|activity| activity.task_title == "Known task")
+                .unwrap()
+                .text,
+            "Valid neighbor."
+        );
         assert_eq!(
             budget::code(report.repair_error.as_deref().unwrap()),
             "RECAP_RUN_INPUT_EXHAUSTED"
