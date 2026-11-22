@@ -276,7 +276,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div>
         <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-10 shrink-0 items-center gap-1.5">
           <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
-          <DateTimePicker dateOnly clearable={false} label={t('recap.date')} value={date} max={localDate()}
+          <DateTimePicker dateOnly applyOnSelect clearable={false} label={t('recap.date')} value={date} max={localDate()}
             highlightedDates={days} highlightLabel={t('recap.datesWithContent')} className="w-36 flex-none"
             onChange={(value) => { if (value && value <= localDate()) setDate(value); }} />
           <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />

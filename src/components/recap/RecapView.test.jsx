@@ -37,7 +37,7 @@ beforeEach(() => {
 });
 
 describe('daily recap page', () => {
-  it('marks saved recap dates in the date-only calendar and changes the day on confirmation', async () => {
+  it('marks saved recap dates and immediately changes the day while keeping the picker open', async () => {
     api.listRecapDays.mockResolvedValue([day.date, '2026-09-25']);
     render(<RecapView active isAuthenticated navigation={{ date: day.date }} />);
     await screen.findByText('Inspected the form validation.');
@@ -46,14 +46,22 @@ describe('daily recap page', () => {
     const picker = within(screen.getByRole('dialog', { name: 'recap.date' }));
     expect(picker.queryByRole('listbox')).not.toBeInTheDocument();
     expect(picker.queryByRole('button', { name: 'dateTimePicker.clear' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'common.cancel' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'dateTimePicker.confirm' })).not.toBeInTheDocument();
     expect(picker.getByRole('gridcell', { name: dateName(day.date) })).toHaveAccessibleDescription('recap.datesWithContent');
     expect(picker.getByRole('gridcell', { name: dateName('2026-09-25') })).toHaveAccessibleDescription('recap.datesWithContent');
     expect(picker.getByRole('gridcell', { name: dateName('2026-09-26') })).not.toHaveAccessibleDescription('recap.datesWithContent');
-    const reads = api.getRecapDay.mock.calls.length;
     fireEvent.click(picker.getByRole('gridcell', { name: dateName('2026-09-25') }));
-    expect(api.getRecapDay).toHaveBeenCalledTimes(reads);
-    fireEvent.click(picker.getByRole('button', { name: 'dateTimePicker.confirm' }));
     await waitFor(() => expect(api.getRecapDay).toHaveBeenLastCalledWith('2026-09-25', { includeRecords: false, includeAttempts: false }));
+    expect(screen.getByRole('dialog', { name: 'recap.date' })).toBeInTheDocument();
+    expect(picker.getByRole('gridcell', { name: dateName('2026-09-25') })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(picker.getByRole('gridcell', { name: dateName('2026-09-26') }));
+    await waitFor(() => expect(api.getRecapDay).toHaveBeenLastCalledWith('2026-09-26', { includeRecords: false, includeAttempts: false }));
+    fireEvent.click(picker.getByRole('button', { name: 'dateTimePicker.today' }));
+    await waitFor(() => expect(api.getRecapDay).toHaveBeenLastCalledWith(api.localDate(), { includeRecords: false, includeAttempts: false }));
+    expect(screen.getByRole('dialog', { name: 'recap.date' })).toBeInTheDocument();
+    expect(picker.getByRole('gridcell', { name: dateName(api.localDate()) })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(trigger);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
   });
@@ -315,7 +323,7 @@ describe('daily recap page', () => {
     fireEvent.click(screen.getByRole('button', { name: 'recap.date' }));
     const calendar = within(screen.getByRole('dialog', { name: 'recap.date' }));
     expect(calendar.getByRole('gridcell', { name: dateName(api.localDate()) })).toHaveAccessibleDescription('recap.datesWithContent');
-    fireEvent.click(calendar.getByRole('button', { name: 'common.cancel' }));
+    fireEvent.keyDown(document.activeElement, { key: 'Escape' });
     more();
     fireEvent.click(screen.getByRole('menuitem', { name: 'recap.delete' }));
     expect(screen.getByRole('dialog', { name: 'recap.deleteTitle' })).toBeVisible();

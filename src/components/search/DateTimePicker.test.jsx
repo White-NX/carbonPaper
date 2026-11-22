@@ -24,16 +24,18 @@ afterEach(() => {
 });
 
 describe('DateTimePicker', () => {
-  it('selects a local calendar date without time controls and describes highlighted dates', async () => {
+  it('immediately applies dates while keeping the calendar open and describing highlighted dates', async () => {
     const onChange = vi.fn();
     const user = userEvent.setup();
-    render(<DateTimePicker dateOnly clearable={false} label="Start" value="2026-02-17" min="2026-02-01" max="2026-02-28"
+    render(<DateTimePicker dateOnly applyOnSelect clearable={false} label="Start" value="2026-02-17" min="2026-02-01" max="2026-02-28"
       highlightedDates={['2026-02-17', '2026-02-18']} highlightLabel="Has recap content" onChange={onChange} />);
     expect(screen.getByRole('button', { name: 'Start' })).toHaveTextContent('02/17/2026');
     const picker = open();
     expect(picker.queryByRole('listbox', { name: 'dateTimePicker.hour' })).not.toBeInTheDocument();
     expect(picker.queryByRole('listbox', { name: 'dateTimePicker.minute' })).not.toBeInTheDocument();
     expect(picker.queryByRole('button', { name: 'dateTimePicker.clear' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'common.cancel' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'dateTimePicker.confirm' })).not.toBeInTheDocument();
     expect(picker.getByRole('gridcell', { name: dateName('2026-02-17') })).toHaveAttribute('aria-selected', 'true');
     expect(picker.getByRole('gridcell', { name: dateName('2026-02-17') })).toHaveAccessibleDescription('Has recap content');
     expect(picker.getByRole('gridcell', { name: dateName('2026-02-18') })).toHaveAccessibleDescription('Has recap content');
@@ -41,9 +43,14 @@ describe('DateTimePicker', () => {
     expect(picker.getByRole('gridcell', { name: dateName('2026-01-31') })).toBeDisabled();
     expect(picker.getByRole('gridcell', { name: dateName('2026-03-01') })).toBeDisabled();
     await user.click(picker.getByRole('gridcell', { name: dateName('2026-02-18') }));
-    expect(onChange).not.toHaveBeenCalled();
-    await user.click(picker.getByRole('button', { name: 'dateTimePicker.confirm' }));
     expect(onChange).toHaveBeenCalledExactlyOnceWith('2026-02-18');
+    expect(screen.getByRole('dialog', { name: 'Start' })).toBeInTheDocument();
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-18') })).toHaveAttribute('aria-selected', 'true');
+    await user.keyboard('{ArrowRight}{Enter}');
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(onChange).toHaveBeenLastCalledWith('2026-02-19');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-19') })).toHaveAttribute('aria-selected', 'true');
+    await user.keyboard('{Escape}');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Start' })).toHaveFocus();
   });

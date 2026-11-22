@@ -38,9 +38,9 @@ const moveMonth = (date, amount) => {
 const POPOVER_GAP = 6;
 const VIEWPORT_PADDING = 8;
 
-/** A local calendar whose date or date/time draft is applied on confirmation. */
+/** A local calendar with optional immediate date selection and confirmed date/time drafts. */
 export function DateTimePicker({ label, value, onChange, min, max, invalidMessage, anchorRef,
-  dateOnly = false, clearable = true, highlightedDates = [], highlightLabel, className = '' }) {
+  dateOnly = false, applyOnSelect = false, clearable = true, highlightedDates = [], highlightLabel, className = '' }) {
   const { t, i18n } = useTranslation();
   const id = useId();
   const container = useRef(null);
@@ -57,6 +57,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
   const lower = parseValue(min);
   const upper = parseValue(max);
   const currentValue = parseValue(value);
+  const applyDateOnSelect = dateOnly && applyOnSelect;
   const highlights = new Set(highlightedDates);
   const locale = i18n?.resolvedLanguage || i18n?.language;
   const dayFormatter = new Intl.DateTimeFormat(locale, { dateStyle: 'full' });
@@ -163,6 +164,13 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
     onChange(dateOnly ? dayKey(draft) : localValue(draft));
     close();
   };
+  const selectDate = (date) => {
+    if (!canSelect(date)) return;
+    setSelected(date);
+    setFocusDay(date);
+    setViewMonth(monthOf(date));
+    if (applyDateOnSelect) onChange(dayKey(date));
+  };
   const navigateMonth = (amount) => {
     const next = moveMonth(focusDay, amount);
     if (!canViewMonth(next)) return;
@@ -266,9 +274,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
                   onKeyDown={(event) => calendarKeyDown(event, date)}
                   onClick={() => {
                     focusPending.current = true;
-                    setSelected(date);
-                    setFocusDay(date);
-                    setViewMonth(monthOf(date));
+                    selectDate(date);
                   }}
                   className={cn('date-time-picker-day group relative flex h-10 items-center justify-center text-xs tabular-nums focus-visible:outline-none disabled:opacity-30',
                     (isSelected || isHighlighted) && 'font-medium',
@@ -295,15 +301,15 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
         {clearable && <Button size="xs" variant="ghost" onClick={() => { onChange(''); close(); }}>{t('dateTimePicker.clear')}</Button>}
         <Button size="xs" variant="ghost" disabled={!canSelect(dayOf(new Date()))} onClick={() => {
           const now = new Date();
-          setSelected(dayOf(now));
-          setFocusDay(dayOf(now));
-          setViewMonth(monthOf(now));
+          selectDate(dayOf(now));
           setHour(pad(now.getHours()));
           setMinute(pad(now.getMinutes()));
         }}>{t('dateTimePicker.today')}</Button>
-        <div className="flex-1" />
-        <Button size="xs" onClick={close}>{t('common.cancel')}</Button>
-        <Button size="xs" variant="primary" onClick={applySelection} disabled={Boolean(error)}>{t('dateTimePicker.confirm')}</Button>
+        {!applyDateOnSelect && <>
+          <div className="flex-1" />
+          <Button size="xs" onClick={close}>{t('common.cancel')}</Button>
+          <Button size="xs" variant="primary" onClick={applySelection} disabled={Boolean(error)}>{t('dateTimePicker.confirm')}</Button>
+        </>}
       </div>
     </div>
   );
