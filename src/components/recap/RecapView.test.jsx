@@ -18,6 +18,7 @@ vi.mock('../../lib/recap_api', async (original) => ({
 
 let day;
 let settings;
+const dateName = (date) => new Intl.DateTimeFormat('en', { dateStyle: 'full' }).format(new Date(date + 'T12:00'));
 beforeEach(() => {
   localStorage.clear();
   settings = { enabled: true, provider_id: null, language: 'en', batch_input_tokens: 36000, batch_output_tokens: 6000, daily_input_tokens: 216000, daily_output_tokens: 36000, screening_input_tokens: 2000000, screening: { enabled: false, base_url: 'https://api.typesafe.ai/v1', model: 'jev-1.13.0', has_api_key: true } };
@@ -29,12 +30,34 @@ beforeEach(() => {
   api.getRecapProgress.mockResolvedValue(null);
   api.getRecapRecords.mockResolvedValue({ items: day.batches[0].records, total: 1, next_cursor: null });
   api.getRecapDay.mockResolvedValue(day);
+  api.listRecapDays.mockResolvedValue([]);
   api.generateRecap.mockResolvedValue(day);
   api.correctRecap.mockResolvedValue(day);
   api.saveRecapSettings.mockImplementation(async (s) => s);
 });
 
 describe('daily recap page', () => {
+  it('marks saved recap dates in the date-only calendar and changes the day on confirmation', async () => {
+    api.listRecapDays.mockResolvedValue([day.date, '2026-09-25']);
+    render(<RecapView active isAuthenticated navigation={{ date: day.date }} />);
+    await screen.findByText('Inspected the form validation.');
+    const trigger = screen.getByRole('button', { name: 'recap.date' });
+    fireEvent.click(trigger);
+    const picker = within(screen.getByRole('dialog', { name: 'recap.date' }));
+    expect(picker.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'dateTimePicker.clear' })).not.toBeInTheDocument();
+    expect(picker.getByRole('gridcell', { name: dateName(day.date) })).toHaveAccessibleDescription('recap.datesWithContent');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-09-25') })).toHaveAccessibleDescription('recap.datesWithContent');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-09-26') })).not.toHaveAccessibleDescription('recap.datesWithContent');
+    const reads = api.getRecapDay.mock.calls.length;
+    fireEvent.click(picker.getByRole('gridcell', { name: dateName('2026-09-25') }));
+    expect(api.getRecapDay).toHaveBeenCalledTimes(reads);
+    fireEvent.click(picker.getByRole('button', { name: 'dateTimePicker.confirm' }));
+    await waitFor(() => expect(api.getRecapDay).toHaveBeenLastCalledWith('2026-09-25', { includeRecords: false, includeAttempts: false }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
   it.each(['mainline', 'overview'])('opens allowance settings from a non-blocking %s budget notice', async (target) => {
     const error = 'RECAP_DAILY_INPUT_EXHAUSTED: limit=432000, used=424969, requested=10978, available=7031';
     day.mainlines = { items: [{ id: 'saved', title: 'Saved goal', text: 'Saved daily progress.', task_ids: ['task'], sources: [] }] };
@@ -93,6 +116,26 @@ describe('daily recap page', () => {
     expect(screen.getByRole('heading', { name: 'Improve the project flow' })).toBeVisible();
     fireEvent.click(screen.getByRole('tab', { name: 'recap.records' }));
     expect(screen.queryByRole('region', { name: 'recap.mainlines.title' })).not.toBeInTheDocument();
+  });
+
+  it('reveals and focuses an overflow subtask when returning from its detail view', async () => {
+    const original = day.batches[0].activities[0];
+    for (let index = 2; index <= 4; index += 1) {
+      const id = `task-${index}`;
+      day.batches[0].activities.push({ ...original, id, task_id: id, task_title: `Subtask ${index}`, text: `Progress on subtask ${index}.` });
+      day.threads.push({ id, title: `Subtask ${index}`, activity_ids: [id] });
+    }
+    day.mainlines = { items: [{ id: 'project', title: 'Project', text: 'Daily progress.', task_ids: day.threads.map(thread => thread.id), sources: [] }] };
+    render(<RecapView active isAuthenticated />);
+    const mainlines = await screen.findByRole('region', { name: 'recap.mainlines.title' });
+    expect(within(mainlines).queryByRole('button', { name: /Subtask 4/ })).not.toBeInTheDocument();
+    fireEvent.click(within(mainlines).getByRole('button', { name: 'recap.mainlines.expandTasks' }));
+    fireEvent.click(within(mainlines).getByRole('button', { name: /Subtask 4/ }));
+    expect(screen.getByRole('heading', { name: 'Subtask 4' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.back' }));
+    const restored = within(screen.getByRole('region', { name: 'recap.mainlines.title' }));
+    expect(restored.getByRole('button', { name: /Subtask 4/ })).toHaveFocus();
+    expect(restored.getByRole('button', { name: 'recap.mainlines.collapseTasks' })).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('returns to another mainline branch and hides invalidated relationships on refresh', async () => {
@@ -269,6 +312,10 @@ describe('daily recap page', () => {
     api.listRecapDays.mockResolvedValue([api.localDate()]);
     render(<RecapView active isAuthenticated />);
     await screen.findByText('Inspected the form validation.');
+    fireEvent.click(screen.getByRole('button', { name: 'recap.date' }));
+    const calendar = within(screen.getByRole('dialog', { name: 'recap.date' }));
+    expect(calendar.getByRole('gridcell', { name: dateName(api.localDate()) })).toHaveAccessibleDescription('recap.datesWithContent');
+    fireEvent.click(calendar.getByRole('button', { name: 'common.cancel' }));
     more();
     fireEvent.click(screen.getByRole('menuitem', { name: 'recap.delete' }));
     expect(screen.getByRole('dialog', { name: 'recap.deleteTitle' })).toBeVisible();
@@ -284,7 +331,8 @@ describe('daily recap page', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(api.deleteRecap).toHaveBeenCalledWith(api.localDate());
     expect(await screen.findByText('recap.waitingDescription')).toBeVisible();
-    expect(document.querySelectorAll('#recap-dates option')).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'recap.date' }));
+    expect(within(screen.getByRole('dialog', { name: 'recap.date' })).getByRole('gridcell', { name: dateName(api.localDate()) })).not.toHaveAccessibleDescription('recap.datesWithContent');
     expect(screen.queryByText('Inspected the form validation.')).not.toBeInTheDocument();
   });
 
@@ -422,12 +470,17 @@ describe('daily recap page', () => {
     await waitFor(() => expect(api.correctRecap).toHaveBeenLastCalledWith(expect.any(String), { kind: 'undo' }));
   });
 
-  it('edits an occurrence locally and Escape closes only the dialog', async () => {
+  it('keeps the task open when Escape dismisses editing or the date picker', async () => {
     render(<RecapView active isAuthenticated />);
     await enterEvent();
     fireEvent.click(screen.getByRole('button', { name: 'recap.adjust' }));
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'recap.back' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.date' }));
+    expect(screen.getByRole('dialog', { name: 'recap.date' })).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement, { key: 'Escape' });
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'recap.back' })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: 'Escape' });

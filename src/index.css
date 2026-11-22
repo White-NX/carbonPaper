@@ -50,6 +50,14 @@
   background: var(--ide-border);
   content: '';
 }
+.recap-mainline-preview {
+  max-height: 32px;
+  overflow: hidden;
+  opacity: .55;
+  pointer-events: none;
+  user-select: none;
+  mask-image: linear-gradient(to bottom, #000, transparent);
+}
 @container recap-mainlines (max-width: 640px) {
   .recap-mainline-grid { grid-template-columns: 13px minmax(0, 1fr); gap: 14px 15px; }
   .recap-mainline-branches { grid-column: 2; padding-top: 0; }

@@ -71,6 +71,7 @@
     "corrected": "已更新事件关联。",
     "title": "每日回顾",
     "date": "回顾日期",
+    "datesWithContent": "有回顾内容",
     "previous": "前一天",
     "next": "后一天",
     "locked": "解锁后查看每日回顾",
@@ -319,7 +320,9 @@
       "updatesPending": "活动变化尚待整合，已保留此前仍有效的主线。",
       "updateFailed": "本次更新未完成，已保留此前仍有效的主线。",
       "sources": "查看关联记录",
-      "taskCount": "{{count}} 个子任务"
+      "taskCount": "{{count}} 个子任务",
+      "expandTasks": "展开其余 {{count}} 个子任务",
+      "collapseTasks": "收起"
     }
   },
   "appBound": {
@@ -1401,6 +1404,7 @@
   },
   "dateTimePicker": {
     "select": "选择日期和时间",
+    "selectDate": "选择日期",
     "calendar": "日历",
     "previousMonth": "上个月",
     "nextMonth": "下个月",
@@ -1412,7 +1416,8 @@
     "clear": "清除",
     "confirm": "确定",
     "invalidTime": "请输入有效的小时和分钟。",
-    "outOfRange": "请选择范围内的时间。"
+    "outOfRange": "请选择范围内的时间。",
+    "outOfDateRange": "请选择范围内的日期。"
   },
   "common": {
     "cancel": "取消",

@@ -71,6 +71,7 @@
     "corrected": "Event association updated.",
     "title": "Daily recap",
     "date": "Recap date",
+    "datesWithContent": "Has recap content",
     "previous": "Previous day",
     "next": "Next day",
     "locked": "Unlock to view your daily recap",
@@ -319,7 +320,9 @@
       "updatesPending": "Activity updates are awaiting integration. Previously accepted mainlines remain visible.",
       "updateFailed": "This update could not be completed. Previously accepted mainlines with valid sources remain visible.",
       "sources": "View connection sources",
-      "taskCount": "Subtasks · {{count}}"
+      "taskCount": "Subtasks · {{count}}",
+      "expandTasks": "Show remaining subtasks ({{count}})",
+      "collapseTasks": "Show fewer subtasks"
     }
   },
   "appBound": {
@@ -1401,6 +1404,7 @@
   },
   "dateTimePicker": {
     "select": "Choose date and time",
+    "selectDate": "Choose a date",
     "calendar": "Calendar",
     "previousMonth": "Previous month",
     "nextMonth": "Next month",
@@ -1412,7 +1416,8 @@
     "clear": "Clear",
     "confirm": "OK",
     "invalidTime": "Enter a valid hour and minute.",
-    "outOfRange": "Choose a time within the allowed range."
+    "outOfRange": "Choose a time within the allowed range.",
+    "outOfDateRange": "Choose a date within the allowed range."
   },
   "common": {
     "cancel": "Cancel",

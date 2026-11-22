@@ -6,6 +6,35 @@ import RecapMainlines from './RecapMainlines';
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
 
 describe('daily mainline branches', () => {
+  it.each([3, 6])('shows the first three of %i subtasks and makes overflow available on expansion', (count) => {
+    const threads = Array.from({ length: count }, (_, index) => ({ id: `task-${index}`, title: `Subtask ${index + 1}` }));
+    const item = { id: 'project', title: 'Project', text: 'Daily progress.', task_ids: [...threads.map(task => task.id), 'missing'], sources: [] };
+    const onTask = vi.fn();
+    render(<RecapMainlines mainlines={{ items: [item] }} threads={threads}
+      batches={[{ start_ms: 1000, end_ms: 2000, activities: threads.map(task => ({ task_id: task.id })) }]} time={String} onTask={onTask} />);
+    const taskButtons = () => screen.getAllByRole('button').filter(button => button.hasAttribute('data-recap-task'));
+    expect(taskButtons().map(button => button.dataset.recapTask)).toEqual(threads.slice(0, 3).map(task => task.id));
+    if (count === 3) {
+      expect(screen.queryByRole('button', { name: 'recap.mainlines.expandTasks' })).not.toBeInTheDocument();
+      return;
+    }
+    expect(screen.getByText(threads[3].title).closest('li')).toHaveAttribute('aria-hidden', 'true');
+    expect(screen.queryByRole('button', { name: /Subtask 4/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(threads[5].title)).not.toBeInTheDocument();
+    const expand = screen.getByRole('button', { name: 'recap.mainlines.expandTasks' });
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    expect(document.getElementById(expand.getAttribute('aria-controls'))).toBeInTheDocument();
+    fireEvent.click(expand);
+    expect(taskButtons()).toHaveLength(count);
+    fireEvent.click(screen.getByRole('button', { name: /Subtask 6/ }));
+    expect(onTask).toHaveBeenCalledWith('task-5', 'mainline:project');
+    const collapse = screen.getByRole('button', { name: 'recap.mainlines.collapseTasks' });
+    expect(collapse).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(collapse);
+    expect(taskButtons()).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: /Subtask 4/ })).not.toBeInTheDocument();
+  });
+
   it('keeps accepted content visible while an update is pending or fails', () => {
     const item = { id: 'saved', title: 'Saved goal', text: 'Previously accepted progress.', task_ids: ['task'], sources: [] };
     const props = { mainlines: { items: [item] }, pending: true, threads: [{ id: 'task', title: 'Saved task' }],

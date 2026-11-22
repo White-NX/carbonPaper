@@ -12,6 +12,7 @@ import { MenuItem, MenuPanel } from '../ui/Menu';
 import { CorrectionDialog, DiagnosticsDialog, RecapError, SourcesDialog } from './RecapDialogs';
 import { SourceThumbnail, useRecapSourceAction } from './RecapSources';
 import { PageHeader } from '../PageHeader';
+import { DateTimePicker } from '../search/DateTimePicker';
 import { RecapTabs } from './RecapTabs';
 import RecapRecords from './RecapRecords';
 import RecapRunStatus from './RecapRunStatus';
@@ -275,9 +276,9 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div>
         <div role="group" aria-label={t('recap.date')} className="recap-date-navigation flex h-10 shrink-0 items-center gap-1.5">
           <Button variant="ghost" icon={ChevronLeft} aria-label={t('recap.previous')} onClick={() => shift(-1)} />
-          <input type="date" aria-label={t('recap.date')} value={date} max={localDate()} list="recap-dates" onChange={(event) => { if (event.target.value && event.target.value <= localDate()) setDate(event.target.value); }}
-            className="recap-focus h-[30px] w-36 min-w-0 rounded-lg border border-ide-border bg-ide-bg px-2.5 text-xs tabular-nums text-ide-text" />
-          <datalist id="recap-dates">{days.map((value) => <option key={value} value={value} />)}</datalist>
+          <DateTimePicker dateOnly clearable={false} label={t('recap.date')} value={date} max={localDate()}
+            highlightedDates={days} highlightLabel={t('recap.datesWithContent')} className="w-36 flex-none"
+            onChange={(value) => { if (value && value <= localDate()) setDate(value); }} />
           <Button variant="ghost" icon={ChevronRight} aria-label={t('recap.next')} disabled={date >= localDate()} onClick={() => shift(1)} />
         </div>
       </div>
@@ -311,7 +312,7 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div> : !settings?.enabled || !hasContent || !day ? <Landing enabled={settings?.enabled} hasClosedPeriod={batches.length > 0} loading={(!settings || !day) && !loadError}
           error={loadError} running={running} onConfigure={configure} onGenerate={() => generate()} onRetry={refresh} />
           : <>
-            <RecapMainlines mainlines={day.mainlines} error={day.mainlines_error} pending={day.mainlines_pending} threads={day.threads} batches={batches} time={time} onTask={enterTask} onSources={setSources} onDetails={() => setDiagnostics(true)} onAdjust={configure} />
+            <RecapMainlines key={date} mainlines={day.mainlines} error={day.mainlines_error} pending={day.mainlines_pending} threads={day.threads} batches={batches} time={time} onTask={enterTask} onSources={setSources} onDetails={() => setDiagnostics(true)} onAdjust={configure} returnEntry={focusTask.current?.entry} />
             <h2 className="mb-6 text-sm font-semibold">{t('recap.periodRecaps')}</h2>
             <div className="recap-timeline">{batches.filter((batch) => batch.activities.length || batch.summary || batch.error || batch.summary_error || (batch.record_count ?? batch.records?.length) > 0).map((batch) => <Period key={batch.start_ms} batch={batch} time={time} onTask={enterTask} onDetails={() => setDiagnostics(true)} onAdjust={configure} />)}</div>
           </>}
