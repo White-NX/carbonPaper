@@ -2,6 +2,7 @@
 pub(crate) mod activity_contract;
 pub(crate) mod budget;
 mod evidence_agent;
+mod mainline_state;
 mod mainlines;
 mod privacy;
 mod progress;

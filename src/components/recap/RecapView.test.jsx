@@ -35,6 +35,27 @@ beforeEach(() => {
 });
 
 describe('daily recap page', () => {
+  it.each(['mainline', 'overview'])('opens allowance settings from a non-blocking %s budget notice', async (target) => {
+    const error = 'RECAP_DAILY_INPUT_EXHAUSTED: limit=432000, used=424969, requested=10978, available=7031';
+    day.mainlines = { items: [{ id: 'saved', title: 'Saved goal', text: 'Saved daily progress.', task_ids: ['task'], sources: [] }] };
+    if (target === 'mainline') { day.mainlines_error = error; day.mainlines_pending = true; }
+    else { day.batches[0].summary_error = error; }
+    render(<RecapView active isAuthenticated />);
+    expect(await screen.findByText('recap.budgetNotice.dailyDetail')).toBeVisible();
+    expect(screen.getByText('Saved daily progress.')).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.adjustBudget' }));
+    expect(openSettingsWindow).toHaveBeenCalledWith('organize', 'daily-recap');
+    expect(api.generateRecap).not.toHaveBeenCalled();
+  });
+  it('shows a retained mainline while the backend marks it as awaiting an update', async () => {
+    day.mainlines = { items: [{ id: 'saved', title: 'Saved goal', text: 'Saved daily progress.', task_ids: ['task'], sources: [] }] };
+    day.mainlines_pending = true;
+    render(<RecapView active isAuthenticated />);
+    expect(await screen.findByText('Saved daily progress.')).toBeVisible();
+    expect(screen.getByText('recap.mainlines.updatesPending')).toBeVisible();
+    expect(screen.getByText('Inspected the form validation.')).toBeVisible();
+  });
   it('retains an unverified activity next to valid content and warns in its detail view', async () => {
     const original = day.batches[0].activities[0];
     day.batches[0].activities.push({ ...original, id: 'unverified', task_id: 'uncertain', task_title: 'Uncertain task',

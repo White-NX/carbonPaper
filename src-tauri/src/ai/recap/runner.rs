@@ -314,7 +314,6 @@ impl RunContext {
     ) -> Result<RecapSettings, String> {
         let allowance = self.allowance(run, stage)?;
         allowance.requests.check(1)?;
-        allowance.input.check(1)?;
         allowance.output.check(1)?;
         let mut settings = self.settings.clone();
         settings.batch_input_tokens = allowance.input.available();
@@ -515,6 +514,7 @@ fn read_day_impl(
         mainlines: None,
         mainlines_error: None,
         mainlines_updated_at_ms: 0,
+        mainlines_pending: false,
         mainlines_attempts: vec![],
         usage: storage.recap_usage(&Local::now().date_naive().to_string())?,
         can_undo: !corrections.undo.is_empty(),
@@ -1211,13 +1211,8 @@ async fn generate_batch(
     let first_value = validation::parse_json(&response.text).unwrap_or(Value::Null);
     let first_report = validate(&first_value);
     if !first_report.issues.is_empty() || response.truncated {
-        let report = validation::repair(
-            ctx, provider, first, response, &run, "repair",
-            json!({"language":ctx.settings.language,"batch_start_ms":start,"batch_end_ms":end,
-                "existing_tasks":model_prior.threads.iter().map(|task| json!({"id":task.id,"title":task.title})).collect::<Vec<_>>(),
-                "evidence":selected.iter().map(|source| evidence_value(source,1800)).collect::<Vec<_>>() }),
-            validate,
-        ).await?;
+        let report =
+            validation::repair(ctx, provider, first, response, &run, "repair", validate).await?;
         if report.value.is_empty() {
             return Err(report
                 .repair_error
@@ -1310,22 +1305,52 @@ async fn generate_batch(
                     ctx.settings.request_limit(),
                 )
                 .await?;
-                let report = validation::repair(
-                    ctx, provider, second, response, &run, "repair",
-                    json!({"language":ctx.settings.language,"batch_start_ms":start,"batch_end_ms":end,
-                        "existing_tasks":model_prior.threads.iter().map(|task| json!({"id":task.id,"title":task.title})).collect::<Vec<_>>(),
-                        "evidence":second_evidence.iter().map(|source| evidence_value(source,1800)).collect::<Vec<_>>() }),
-                    |value| selection::validate_value(value, &second_evidence, &prior_tasks, &scope, start, end),
-                ).await?;
+                let report =
+                    validation::repair(ctx, provider, second, response, &run, "repair", |value| {
+                        selection::validate_value(
+                            value,
+                            &second_evidence,
+                            &prior_tasks,
+                            &scope,
+                            start,
+                            end,
+                        )
+                    })
+                    .await?;
                 let d = Draft {
-                    activities: report.draft.get("activities").and_then(Value::as_array).into_iter().flatten()
-                        .filter_map(|value| serde_json::from_value::<DraftActivity>(value.clone()).ok())
-                        .filter(|item| !selection::validate_value(&json!({"activities":[item]}), &second_evidence, &prior_tasks, &scope, start, end).value.is_empty())
+                    activities: report
+                        .draft
+                        .get("activities")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| {
+                            serde_json::from_value::<DraftActivity>(value.clone()).ok()
+                        })
+                        .filter(|item| {
+                            !selection::validate_value(
+                                &json!({"activities":[item]}),
+                                &second_evidence,
+                                &prior_tasks,
+                                &scope,
+                                start,
+                                end,
+                            )
+                            .value
+                            .is_empty()
+                        })
                         .collect(),
                     gaps: vec![],
                 };
                 let d = merge_supplement(&draft, d)?;
-                let merged = selection::validate_value(&json!(d), &selected, &prior_tasks, &scope, start, end);
+                let merged = selection::validate_value(
+                    &json!(d),
+                    &selected,
+                    &prior_tasks,
+                    &scope,
+                    start,
+                    end,
+                );
                 let error = report.error().or_else(|| merged.error());
                 let a = merged.value;
                 if a.is_empty() {
@@ -2077,6 +2102,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: Default::default(),
             can_undo: false,
@@ -2121,6 +2147,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: Default::default(),
             can_undo: false,
@@ -2162,6 +2189,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: Default::default(),
             can_undo: false,
@@ -2273,6 +2301,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: Default::default(),
             can_undo: false,

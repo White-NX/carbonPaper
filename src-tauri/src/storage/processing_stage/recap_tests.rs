@@ -544,6 +544,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
         mainlines: None,
         mainlines_error: None,
         mainlines_updated_at_ms: 0,
+        mainlines_pending: false,
         mainlines_attempts: vec![],
         usage: Default::default(),
         can_undo: false,

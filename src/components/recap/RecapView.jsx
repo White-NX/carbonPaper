@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { ArrowLeft, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, FileText, Merge, MoreHorizontal, Pencil, RefreshCw, Trash2, Undo2 } from 'lucide-react';
 import { grantAiRemoteConsent } from '../../lib/ai_api';
 import { calendarTimeFormatter } from '../../lib/calendar_time';
-import { cancelRecap, correctRecap, deleteRecap, generateRecap, localDate, resolveRecapNavigation } from '../../lib/recap_api';
+import { cancelRecap, correctRecap, deleteRecap, generateRecap, localDate, recapBudgetIssue, resolveRecapNavigation } from '../../lib/recap_api';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { openSettingsWindow } from '../../lib/settings_api';
 import useRecapDay from '../../hooks/useRecapDay';
@@ -19,6 +19,7 @@ import RecapApps from './RecapApps';
 import RecapMainlines from './RecapMainlines';
 import RecapKeyDetails from './RecapKeyDetails';
 import RecapWarnings from './RecapWarnings';
+import RecapBudgetNotice from './RecapBudgetNotice';
 
 function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false }) {
   const [open, setOpen] = useState(false);
@@ -54,7 +55,7 @@ function ActionMenu({ label, icon: Icon = MoreHorizontal, items, text = false })
   </div>;
 }
 
-function Period({ batch, time, onTask, onDetails }) {
+function Period({ batch, time, onTask, onDetails, onAdjust }) {
   const { t } = useTranslation();
   const topics = batch.summary?.topics?.length ? batch.summary.topics : [...new Map(batch.activities.map((activity) => [activity.task_id, activity])).values()].map((activity) => ({ task_id: activity.task_id, title: activity.task_title, text: activity.text,
     warnings: batch.activities.filter((entry) => entry.task_id === activity.task_id).flatMap((entry) => entry.warnings || []) }));
@@ -65,7 +66,8 @@ function Period({ batch, time, onTask, onDetails }) {
       {batch.summary?.overview && <p className={`${batch.apps?.length ? 'mb-2' : 'mb-5'} whitespace-pre-wrap text-sm leading-7`}>{batch.summary.overview}</p>}
       <RecapWarnings warnings={batch.summary?.warnings} className="mb-3" />
       <RecapApps apps={batch.apps} />
-      {problem ? <div className="mb-3 flex flex-wrap items-center gap-3"><RecapError error={problem} /><button className="recap-focus rounded text-xs text-ide-muted hover:text-ide-text" onClick={onDetails}>{t('recap.generationDetails')}</button></div>
+      {recapBudgetIssue(problem) ? <RecapBudgetNotice error={problem} target={batch.error ? 'recap.budgetNotice.period' : 'recap.budgetNotice.overview'} onAdjust={onAdjust} className="mb-3" />
+        : problem ? <div className="mb-3 flex flex-wrap items-center gap-3"><RecapError error={problem} /><button className="recap-focus rounded text-xs text-ide-muted hover:text-ide-text" onClick={onDetails}>{t('recap.generationDetails')}</button></div>
         : !batch.summary && topics.length > 0 && <p className="mb-3 text-xs text-ide-muted">{t('recap.overviewPending')}</p>}
       {topics.length > 0 ? <div className="divide-y divide-ide-border/60 border-y border-ide-border/60">
         {topics.map((topic) => <button key={topic.task_id} data-recap-task={topic.task_id} data-recap-entry={`${batch.start_ms}:${topic.task_id}`} onClick={() => onTask(topic.task_id, batch.start_ms)}
@@ -280,7 +282,9 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div>
       </div>
     </PageHeader>
-    {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3"><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></div>}
+    {issue && <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3">{recapBudgetIssue(issue)
+      ? <RecapBudgetNotice error={issue} target="recap.title" onAdjust={configure} />
+      : <><RecapError error={issue} /><Button variant="ghost" onClick={refresh}>{t('common.retry')}</Button></>}</div>}
     {consentNeeded && <div role="alert" className="flex shrink-0 flex-wrap items-center gap-3 border-b border-ide-border px-6 py-3 text-xs"><p className="flex-1 leading-relaxed">{t('recap.remoteConsent')}</p><Button disabled={Boolean(operation)} onClick={() => run('generate', async () => { await grantAiRemoteConsent(); await generateRecap(date); })}>{t('recap.allowRemote')}</Button></div>}
     {notice && <div role="status" className="flex shrink-0 items-center gap-3 border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{notice}<Button variant="ghost" icon={Undo2} onClick={undo} disabled={!day?.can_undo || Boolean(operation)}>{t('recap.undo')}</Button></div>}
     {navigationUnavailable && <div role="status" className="border-b border-ide-border px-6 py-2 text-xs text-ide-muted">{t('recap.eventUnavailable')}</div>}
@@ -307,9 +311,9 @@ export default function RecapView({ active, isAuthenticated, onSelectScreenshot,
         </div> : !settings?.enabled || !hasContent || !day ? <Landing enabled={settings?.enabled} hasClosedPeriod={batches.length > 0} loading={(!settings || !day) && !loadError}
           error={loadError} running={running} onConfigure={configure} onGenerate={() => generate()} onRetry={refresh} />
           : <>
-            <RecapMainlines mainlines={day.mainlines} error={day.mainlines_error} threads={day.threads} batches={batches} time={time} onTask={enterTask} onSources={setSources} onDetails={() => setDiagnostics(true)} />
+            <RecapMainlines mainlines={day.mainlines} error={day.mainlines_error} pending={day.mainlines_pending} threads={day.threads} batches={batches} time={time} onTask={enterTask} onSources={setSources} onDetails={() => setDiagnostics(true)} onAdjust={configure} />
             <h2 className="mb-6 text-sm font-semibold">{t('recap.periodRecaps')}</h2>
-            <div className="recap-timeline">{batches.filter((batch) => batch.activities.length || batch.summary || batch.error || batch.summary_error || (batch.record_count ?? batch.records?.length) > 0).map((batch) => <Period key={batch.start_ms} batch={batch} time={time} onTask={enterTask} onDetails={() => setDiagnostics(true)} />)}</div>
+            <div className="recap-timeline">{batches.filter((batch) => batch.activities.length || batch.summary || batch.error || batch.summary_error || (batch.record_count ?? batch.records?.length) > 0).map((batch) => <Period key={batch.start_ms} batch={batch} time={time} onTask={enterTask} onDetails={() => setDiagnostics(true)} onAdjust={configure} />)}</div>
           </>}
       </div>
     </div>}

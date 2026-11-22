@@ -444,6 +444,7 @@ pub struct RecapDay {
     pub mainlines: Option<RecapMainlines>,
     pub mainlines_error: Option<String>,
     pub mainlines_updated_at_ms: i64,
+    pub mainlines_pending: bool,
     pub mainlines_attempts: Vec<RecapAttempt>,
     pub usage: RecapUsage,
     pub can_undo: bool,

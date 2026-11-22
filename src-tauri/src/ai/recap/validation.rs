@@ -12,7 +12,6 @@ use super::{
 };
 use crate::ai::{
     config::ResolvedProvider,
-    context,
     provider::{ChatRequest, ChatResponse, Message},
 };
 
@@ -323,10 +322,6 @@ impl RepairHost for Host<'_> {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Keeps the original request, run identity and authorized repair evidence explicit."
-)]
 pub(super) async fn repair<T: Send>(
     ctx: &RunContext,
     provider: &ResolvedProvider,
@@ -334,7 +329,6 @@ pub(super) async fn repair<T: Send>(
     response: ChatResponse,
     run: &str,
     stage: &str,
-    repair_context: Value,
     validate: impl Fn(&Value) -> Report<T>,
 ) -> Result<Report<T>, String> {
     drive(
@@ -346,7 +340,6 @@ pub(super) async fn repair<T: Send>(
         },
         request,
         response,
-        repair_context,
         validate,
     )
     .await
@@ -356,11 +349,9 @@ async fn drive<T: Send>(
     host: &impl RepairHost,
     mut request: ChatRequest,
     mut response: ChatResponse,
-    repair_context: Value,
     validate: impl Fn(&Value) -> Report<T>,
 ) -> Result<Report<T>, String> {
     configure(&mut request);
-    let initial = request.clone();
     let parsed = parse_json(&response.text);
     let mut draft = parsed.as_ref().cloned().unwrap_or(Value::Null);
     let mut report = validate(&draft);
@@ -411,42 +402,8 @@ async fn drive<T: Send>(
         request.messages.push(Message::User(feedback.to_string()));
         request.max_tokens = Some(output);
         request.disable_tools = !request.tools.is_empty();
-        if context::estimated_input_tokens(host.provider().kind, &request)
-            > allowance.input.available().min(context::input_allowance(
-                &request,
-                host.provider().context_tokens,
-            ))
-        {
-            request.messages = vec![
-                initial.messages[0].clone(),
-                Message::User(
-                    json!({"recap_repair":true,"repair":feedback,"received_context":repair_context}).to_string(),
-                ),
-            ];
-        }
-        if context::estimated_input_tokens(host.provider().kind, &request)
-            > allowance.input.available().min(context::input_allowance(
-                &request,
-                host.provider().context_tokens,
-            ))
-        {
-            let context = context::input_allowance(&request, host.provider().context_tokens);
-            report.repair_error = Some(if context < allowance.input.available() {
-                budget::Limit {
-                    code: "AI_CONTEXT_LIMIT",
-                    limit: context,
-                    used: 0,
-                }
-                .error(context::estimated_input_tokens(
-                    host.provider().kind,
-                    &request,
-                ))
-            } else {
-                allowance.input.error(context::estimated_input_tokens(
-                    host.provider().kind,
-                    &request,
-                ))
-            });
+        if let Err(error) = budget::check_input(host.provider(), &request, allowance.input) {
+            report.repair_error = Some(error);
             break;
         }
         let result = host.complete(&request).await;
@@ -488,6 +445,7 @@ mod tests {
 
     struct MockHost {
         provider: ResolvedProvider,
+        input_limit: u64,
         responses: Mutex<VecDeque<ChatResponse>>,
         requests: Mutex<Vec<ChatRequest>>,
         outcomes: Mutex<Vec<(Option<String>, bool)>>,
@@ -496,6 +454,7 @@ mod tests {
     impl MockHost {
         fn new(responses: Vec<Value>) -> Self {
             Self {
+                input_limit: 128_000,
                 provider: ResolvedProvider {
                     kind: ProviderKind::OpenaiCompatible,
                     tool_calling: ToolCalling::Unsupported,
@@ -529,7 +488,7 @@ mod tests {
             Ok(Allowance {
                 input: budget::Limit {
                     code: "RECAP_RUN_INPUT_EXHAUSTED",
-                    limit: 128_000,
+                    limit: self.input_limit,
                     used: requests * 100,
                 },
                 output: budget::Limit {
@@ -602,7 +561,6 @@ mod tests {
                 text: value.to_string(),
                 ..Default::default()
             },
-            json!({"evidence":records}),
             |value| {
                 super::super::selection::validate_value(value, &records, &tasks, "day:0", 0, 100)
             },
@@ -668,6 +626,20 @@ mod tests {
         .unwrap();
         assert_eq!(draft["activities"][0]["text"], "valid");
         assert_eq!(draft["activities"][1]["text"], "repaired");
+    }
+
+    #[tokio::test]
+    async fn a_repair_over_budget_stops_before_submission_and_retains_valid_neighbors() {
+        let mut host = MockHost::new(vec![]);
+        host.input_limit = 1;
+        let report = run(&host).await;
+        assert!(host.requests.lock().unwrap().is_empty());
+        assert_eq!(report.value.len(), 2);
+        assert_eq!(report.value[0].text, "Valid neighbor.");
+        assert_eq!(
+            budget::code(report.repair_error.as_deref().unwrap()),
+            "RECAP_RUN_INPUT_EXHAUSTED"
+        );
     }
 
     #[tokio::test]

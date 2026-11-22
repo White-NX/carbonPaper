@@ -54,6 +54,17 @@
     "waitingDescription": "Completed periods are organized automatically. Come back later to revisit your day.",
     "generateFirst": "Generate recap",
     "generationDetails": "Generation details",
+    "adjustBudget": "Adjust allowance",
+    "budgetNotice": {
+      "dailyDetail": "Today's generation allowance is insufficient ({{requested}} tokens > {{available}} tokens). {{target}} has not been updated.",
+      "daily": "Today's generation allowance is insufficient. {{target}} has not been updated.",
+      "runDetail": "This run's generation allowance is insufficient ({{requested}} tokens > {{available}} tokens). {{target}} has not been updated.",
+      "run": "This run's generation allowance is insufficient. {{target}} has not been updated.",
+      "contextDetail": "The input exceeds the model's capacity ({{requested}} tokens > {{available}} tokens). {{target}} has not been updated.",
+      "context": "The input exceeds the model's capacity. {{target}} has not been updated.",
+      "period": "This period's recap",
+      "overview": "This period's overview"
+    },
     "eventHistory": "Related activity on this day",
     "eventUnavailable": "Event updated",
     "eventEmpty": "This event has no related activity left. Return to the daily recap to continue.",
@@ -284,6 +295,7 @@
       "RECAP_SEARCH_NOT_READY": "Semantic search is still being prepared. Keyword search is available.",
       "RECAP_SEARCH_MODEL_UNAVAILABLE": "Search by meaning is temporarily unavailable. Try again later or use keyword search.",
       "RECAP_INVALID_MAINLINES": "The model returned task connections that could not be used. Try again or view the period recaps.",
+      "RECAP_EMPTY_MAINLINE_UPDATE": "This update did not retain the existing mainlines. The previous content is still available.",
       "RECAP_EVIDENCE_LIMIT": "The evidence lookup limit was reached. Organization will continue with available information.",
       "RECAP_INVALID_TOOL_ARGUMENTS": "The model’s evidence request could not be used. Organization will continue with available information.",
       "RECAP_UNKNOWN_TOOL": "The model requested an unavailable evidence tool. Organization will continue with available information.",
@@ -304,6 +316,8 @@
       "count": "Main tasks · {{count}}",
       "pending": "Main tasks are awaiting an update. Period recaps remain available.",
       "unavailable": "Main tasks could not be updated. Period recaps remain available.",
+      "updatesPending": "Activity updates are awaiting integration. Previously accepted mainlines remain visible.",
+      "updateFailed": "This update could not be completed. Previously accepted mainlines with valid sources remain visible.",
       "sources": "View connection sources",
       "taskCount": "Subtasks · {{count}}"
     }

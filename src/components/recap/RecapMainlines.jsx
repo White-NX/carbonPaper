@@ -4,6 +4,8 @@ import { ChevronRight, GitBranch, Images } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Banner } from '../ui/Banner';
 import RecapWarnings from './RecapWarnings';
+import RecapBudgetNotice from './RecapBudgetNotice';
+import { recapBudgetIssue } from '../../lib/recap_api';
 
 function Mainline({ item, threads, batches, time, onTask, onSources }) {
   const { t } = useTranslation();
@@ -40,17 +42,19 @@ function Mainline({ item, threads, batches, time, onTask, onSources }) {
   </article>;
 }
 
-export default function RecapMainlines({ mainlines, error, threads, batches, time, onTask, onSources, onDetails }) {
+export default function RecapMainlines({ mainlines, error, pending = false, threads, batches, time, onTask, onSources, onDetails, onAdjust }) {
   const { t } = useTranslation();
   const items = mainlines?.items || [];
-  if (mainlines && !items.length && !error) return null;
+  if (mainlines && !items.length && !error && !pending) return null;
   if (!items.length && !batches.some(batch => batch.activities.length)) return null;
   return <section aria-label={t('recap.mainlines.title')} className="recap-mainlines mb-9 min-w-0">
     <div className="mb-4 flex items-center justify-between gap-4">
       <h2 className="flex items-center gap-2 text-sm font-semibold"><GitBranch aria-hidden="true" className="h-4 w-4 text-ide-accent" />{t('recap.mainlines.title')}</h2>
       {items.length > 0 && <span className="shrink-0 text-xs text-ide-muted">{t('recap.mainlines.count', { count: items.length })}</span>}
     </div>
-    {error && <Banner tone="warning" className="mb-4" action={<Button variant="ghost" size="xs" onClick={onDetails}>{t('recap.generationDetails')}</Button>}>{t('recap.mainlines.unavailable')}</Banner>}
+    {recapBudgetIssue(error) ? <RecapBudgetNotice error={error} target="recap.mainlines.title" onAdjust={onAdjust} className="mb-4" />
+      : error && <Banner tone="warning" className="mb-4" action={<Button variant="ghost" size="xs" onClick={onDetails}>{t('recap.generationDetails')}</Button>}>{t(items.length ? 'recap.mainlines.updateFailed' : 'recap.mainlines.unavailable')}</Banner>}
+    {pending && items.length > 0 && !error && <Banner tone="info" className="mb-4">{t('recap.mainlines.updatesPending')}</Banner>}
     {items.length ? <div>{items.map((item) => <Mainline key={item.id} item={item} threads={threads} batches={batches} time={time} onTask={onTask} onSources={onSources} />)}</div>
       : !error && <p className="text-xs leading-relaxed text-ide-muted">{t('recap.mainlines.pending')}</p>}
   </section>;

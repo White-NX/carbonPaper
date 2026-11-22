@@ -1,6 +1,6 @@
 //! Shared generation limits, safe diagnostics and durable retry decisions.
 use super::types::{digest, RecapSettings, RecapUsage};
-use crate::ai::config::ResolvedProvider;
+use crate::ai::{config::ResolvedProvider, context, provider::ChatRequest};
 use serde_json::json;
 
 pub(crate) const HARD_REQUEST_LIMIT: u64 = 32;
@@ -51,6 +51,41 @@ pub(crate) struct Allowance {
     pub input: Limit,
     pub output: Limit,
     pub requests: Limit,
+}
+
+/// Check the complete request before submission. A smaller remaining allowance
+/// must never turn a complete recap input into a sampled replacement.
+pub(crate) fn check_input(
+    provider: &ResolvedProvider,
+    request: &ChatRequest,
+    input: Limit,
+) -> Result<(), String> {
+    input
+        .tighter(Limit {
+            code: "AI_CONTEXT_LIMIT",
+            limit: context::input_allowance(request, provider.context_tokens),
+            used: 0,
+        })
+        .check(context::estimated_input_tokens(provider.kind, request))
+}
+
+/// Released reservations can restore enough daily balance without a settings
+/// change or a date rollover. Retry only when the rejected request now fits.
+pub(crate) fn balance_retry_due(error: Option<&str>, allowance: Allowance) -> bool {
+    let Some(error) = error else { return false };
+    let available = match code(error) {
+        "RECAP_DAILY_INPUT_EXHAUSTED" => allowance.input.available(),
+        "RECAP_DAILY_OUTPUT_EXHAUSTED" => allowance.output.available(),
+        _ => return false,
+    };
+    numeric_detail(error)
+        .and_then(|detail| {
+            detail
+                .split(", ")
+                .find_map(|field| field.strip_prefix("requested="))
+        })
+        .and_then(|requested| requested.parse::<u64>().ok())
+        .is_some_and(|requested| available >= requested)
 }
 
 pub(crate) fn is_mainline(stage: &str) -> bool {
@@ -202,6 +237,50 @@ pub(crate) fn retry_due(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_released_daily_reservation_retries_only_when_the_rejected_input_fits() {
+        let error = Limit {
+            code: "RECAP_DAILY_INPUT_EXHAUSTED",
+            limit: 1000,
+            used: 901,
+        }
+        .error(100);
+        let settings = RecapSettings {
+            batch_input_tokens: 1000,
+            batch_output_tokens: 1000,
+            daily_input_tokens: 1000,
+            daily_output_tokens: 1000,
+            ..Default::default()
+        };
+        let before = allowance(
+            &settings,
+            &RecapUsage {
+                input_tokens: 901,
+                ..Default::default()
+            },
+            &RecapUsage::default(),
+            16,
+            true,
+        );
+        assert!(!balance_retry_due(Some(&error), before));
+        let restored = allowance(
+            &settings,
+            &RecapUsage {
+                input_tokens: 900,
+                ..Default::default()
+            },
+            &RecapUsage::default(),
+            16,
+            true,
+        );
+        assert!(balance_retry_due(Some(&error), restored));
+        assert!(!balance_retry_due(None, restored));
+        assert!(!balance_retry_due(
+            Some("RECAP_REQUEST_LIMIT: limit=16, used=16, requested=1, available=0"),
+            restored
+        ));
+    }
 
     #[test]
     fn limits_distinguish_daily_run_requests_and_reserved_mainline_allowance() {

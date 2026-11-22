@@ -71,6 +71,7 @@ export function recapDiagnosticMainlines(day, progress) {
   const unsaved = live.some(attempt => !saved.some(old => old.id === attempt.id && old.status === attempt.status));
   let status = day?.mainlines_error ? 'summaryFailed' : day?.mainlines ? 'ready' : 'summaryPending';
   if (!day?.mainlines_error && day?.mainlines?.items?.some(item => item.warnings?.length)) status = 'partial';
+  if (!day?.mainlines_error && day?.mainlines_pending && day?.mainlines) status = 'updating';
   if (active) status = progress.stage;
   else if (unsaved && ['cancelled', 'paused', 'failed'].includes(progress.stage)) status = progress.stage;
   return { daily: true, start_ms: day?.calendar?.start_ms ?? 0, live, attempts, active, status, error: day?.mainlines_error };

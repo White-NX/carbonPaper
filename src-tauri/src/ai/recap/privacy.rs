@@ -19,6 +19,19 @@ pub(super) fn filter_activity(
     activity.warnings = filtered_warnings(filter, &activity.warnings);
 }
 
+pub(super) fn filter_mainlines(
+    filter: &crate::sensitive_filter::SensitiveFilterState,
+    mainlines: &mut super::types::RecapMainlines,
+) {
+    for item in &mut mainlines.items {
+        for text in [&mut item.title, &mut item.text] {
+            *text = crate::mcp_server::filter_identity(filter, filter.mode(), text)
+                .unwrap_or_else(|_| "[censored]".into());
+        }
+        item.warnings = filtered_warnings(filter, &item.warnings);
+    }
+}
+
 pub(crate) fn filtered_warnings(
     filter: &crate::sensitive_filter::SensitiveFilterState,
     warnings: &[super::types::RecapWarning],

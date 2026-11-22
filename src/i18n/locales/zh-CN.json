@@ -54,6 +54,17 @@
     "waitingDescription": "已结束的时段会自动整理。稍后回来，就能查看一天的经过。",
     "generateFirst": "生成回顾",
     "generationDetails": "生成详情",
+    "adjustBudget": "调整额度",
+    "budgetNotice": {
+      "dailyDetail": "今日生成额度不足（{{requested}} tokens > {{available}} tokens），{{target}}尚未更新。",
+      "daily": "今日生成额度不足，{{target}}尚未更新。",
+      "runDetail": "本次生成额度不足（{{requested}} tokens > {{available}} tokens），{{target}}尚未更新。",
+      "run": "本次生成额度不足，{{target}}尚未更新。",
+      "contextDetail": "本次输入超过模型容量（{{requested}} tokens > {{available}} tokens），{{target}}尚未更新。",
+      "context": "本次输入超过模型容量，{{target}}尚未更新。",
+      "period": "本时段回顾",
+      "overview": "本时段概述"
+    },
     "eventHistory": "这一天的相关经过",
     "eventUnavailable": "事件已更新",
     "eventEmpty": "这项事件已没有相关经过，可以返回当日回顾查看。",
@@ -284,6 +295,7 @@
       "RECAP_SEARCH_NOT_READY": "语义搜索仍在准备中，可继续按关键词查找。",
       "RECAP_SEARCH_MODEL_UNAVAILABLE": "暂时无法按含义查找，请稍后重试。关键词搜索仍可使用。",
       "RECAP_INVALID_MAINLINES": "模型返回的任务关联无法使用。请重试或查看分时段回顾。",
+      "RECAP_EMPTY_MAINLINE_UPDATE": "本次更新没有保留已有主线，原有内容仍可查看。",
       "RECAP_EVIDENCE_LIMIT": "已达到取证次数或内容上限，将根据已有信息继续整理。",
       "RECAP_INVALID_TOOL_ARGUMENTS": "模型的取证请求格式有误，将根据已有信息继续整理。",
       "RECAP_UNKNOWN_TOOL": "模型请求了无法使用的取证工具，将根据已有信息继续整理。",
@@ -304,6 +316,8 @@
       "count": "{{count}} 条主线",
       "pending": "全天主线待更新，可继续查看分时段回顾。",
       "unavailable": "全天主线暂时无法更新，可继续查看分时段回顾。",
+      "updatesPending": "活动变化尚待整合，已保留此前仍有效的主线。",
+      "updateFailed": "本次更新未完成，已保留此前仍有效的主线。",
       "sources": "查看关联记录",
       "taskCount": "{{count}} 个子任务"
     }

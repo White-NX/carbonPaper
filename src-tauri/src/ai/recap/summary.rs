@@ -15,7 +15,6 @@ use super::{
 };
 use crate::ai::{
     config::ResolvedProvider,
-    context,
     provider::{ChatRequest, Message},
 };
 use crate::sensitive_filter::SensitiveFilterState;
@@ -277,12 +276,10 @@ fn request(
         }
     }
     let mut selected = Vec::new();
-    for i in 0..80 {
+    for i in 0..tasks.values().map(Vec::len).max().unwrap_or(0) {
         for task in tasks.values() {
             if let Some(activity) = task.get(i) {
-                if selected.len() < 80 {
-                    selected.push((*activity).clone());
-                }
+                selected.push((*activity).clone());
             }
         }
     }
@@ -299,56 +296,45 @@ fn request(
         }
         .error(3));
     }
-    loop {
-        if selected.is_empty() {
-            return Err("AI_CONTEXT_LIMIT".into());
-        }
-        let activities = selected
-            .iter()
-            .map(|a| {
+    let activities = selected
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id, "task_id": a.task_id, "task_title": a.task_title,
+                "text": a.text, "first_observed_ms": a.start_ms, "last_observed_ms": a.end_ms,
+                "key_details": a.details.iter().map(|d| &d.text).collect::<Vec<_>>(),
+                "citation_warnings": a.warnings,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut req = ChatRequest {
+        messages: vec![
+            Message::System(PROMPT.into()),
+            Message::User(
                 json!({
-                    "id": a.id, "task_id": a.task_id, "task_title": a.task_title,
-                    "text": a.text, "first_observed_ms": a.start_ms, "last_observed_ms": a.end_ms,
-                    "key_details": a.details.iter().map(|d| &d.text).collect::<Vec<_>>(),
-                    "citation_warnings": a.warnings,
+                    "language": settings.language, "window_start_ms": batch.start_ms,
+                    "window_end_ms": batch.end_ms, "activities": activities,
+                    "omitted_activities": batch.activities.len().saturating_sub(selected.len()),
+                    "sampled_records": batch.coverage, "available_records": batch.records.len(),
                 })
-            })
-            .collect::<Vec<_>>();
-        let mut req =
-            ChatRequest {
-                messages: vec![Message::System(PROMPT.into()), Message::User(json!({
-                "language": settings.language, "window_start_ms": batch.start_ms,
-                "window_end_ms": batch.end_ms, "activities": activities,
-                "omitted_activities": batch.activities.len().saturating_sub(selected.len()),
-                "sampled_records": batch.coverage, "available_records": batch.records.len(),
-            }).to_string())],
-                max_tokens: Some(output),
-                temperature: Some(0.2),
-                ..Default::default()
-            };
-        validation::configure(&mut req);
-        if context::estimated_input_tokens(provider.kind, &req)
-            <= settings
-                .batch_input_tokens
-                .min(context::input_allowance(&req, provider.context_tokens))
-        {
-            return Ok((req, selected));
-        }
-        if selected.len() == 1 {
-            return Err(budget::Limit {
-                code: "RECAP_RUN_INPUT_EXHAUSTED",
-                limit: settings.batch_input_tokens,
-                used: 0,
-            }
-            .tighter(budget::Limit {
-                code: "AI_CONTEXT_LIMIT",
-                limit: context::input_allowance(&req, provider.context_tokens),
-                used: 0,
-            })
-            .error(context::estimated_input_tokens(provider.kind, &req)));
-        }
-        selected.pop();
-    }
+                .to_string(),
+            ),
+        ],
+        max_tokens: Some(output),
+        temperature: Some(0.2),
+        ..Default::default()
+    };
+    validation::configure(&mut req);
+    budget::check_input(
+        provider,
+        &req,
+        budget::Limit {
+            code: "RECAP_RUN_INPUT_EXHAUSTED",
+            limit: settings.batch_input_tokens,
+            used: 0,
+        },
+    )?;
+    Ok((req, selected))
 }
 
 /// A short, already cited occurrence needs no second paid paraphrase. Longer
@@ -406,7 +392,16 @@ pub(super) async fn generate(
                     chrono::Utc::now().timestamp_millis(),
                 )
             });
+        let renewed_balance = if let Some(cache) = cached
+            .as_ref()
+            .filter(|cache| cache.input_hash == hash && cache.error.is_some())
+        {
+            budget::balance_retry_due(cache.error.as_deref(), ctx.allowance("", "summary")?)
+        } else {
+            false
+        };
         if !renewed_budget
+            && !renewed_balance
             && !should_generate(
                 cached.as_ref(),
                 &hash,
@@ -433,17 +428,25 @@ pub(super) async fn generate(
             }
             let available = ctx.available_settings(&run, "summary")?;
             let (req, included) = request(&input, &available, provider)
-                .map_err(|error| ctx.refine_request_error(&run,"summary",error))?;
+                .map_err(|error| ctx.refine_request_error(&run, "summary", error))?;
             let response = complete(ctx, provider, &req, &run, "summary").await?;
             let report = validation::repair(
-                ctx, provider, req, response, &run, "summary_repair",
-                json!({"language":ctx.settings.language,"activities":included.iter().map(|activity| {
-                    super::evidence_agent::activity_value(activity, 1600)
-                }).collect::<Vec<_>>()}),
+                ctx,
+                provider,
+                req,
+                response,
+                &run,
+                "summary_repair",
                 |value| validate_value(value, &included),
-            ).await?;
+            )
+            .await?;
             if report.value.overview.is_empty() && report.value.topics.is_empty() {
-                return Err(report.repair_error.clone().unwrap_or_else(|| report.first_error().unwrap_or("RECAP_INVALID_SUMMARY").into()));
+                return Err(report.repair_error.clone().unwrap_or_else(|| {
+                    report
+                        .first_error()
+                        .unwrap_or("RECAP_INVALID_SUMMARY")
+                        .into()
+                }));
             }
             Ok(report)
         }
@@ -506,6 +509,7 @@ pub(super) async fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::context;
     #[test]
     fn invalid_topics_do_not_hide_valid_neighbors_and_unknown_ids_carry_warnings() {
         let batch = batch();
@@ -673,6 +677,40 @@ mod tests {
         assert!(!should_generate(Some(&cache), "h", false, true, 1));
         assert!(should_generate(Some(&cache), "h", false, false, 1));
     }
+    #[test]
+    fn an_over_budget_summary_keeps_its_complete_input_until_the_allowance_fits() {
+        let b = batch();
+        let provider = ResolvedProvider {
+            context_tokens: 128_000,
+            ..Default::default()
+        };
+        let settings = RecapSettings::default();
+        let (full, included) = request(&b, &settings, &provider).unwrap();
+        assert_eq!(included.len(), b.activities.len());
+        let estimate = context::estimated_input_tokens(provider.kind, &full);
+        let reduced = RecapSettings {
+            batch_input_tokens: estimate - 1,
+            ..settings
+        };
+        assert_eq!(
+            request(&b, &reduced, &provider).unwrap_err(),
+            budget::Limit {
+                code: "RECAP_RUN_INPUT_EXHAUSTED",
+                limit: estimate - 1,
+                used: 0,
+            }
+            .error(estimate)
+        );
+        let restored = RecapSettings {
+            batch_input_tokens: estimate,
+            ..reduced
+        };
+        assert_eq!(
+            request(&b, &restored, &provider).unwrap().1.len(),
+            b.activities.len()
+        );
+    }
+
     #[test]
     fn request_is_stable_bounded_and_only_validates_included_activities() {
         let provider = ResolvedProvider {

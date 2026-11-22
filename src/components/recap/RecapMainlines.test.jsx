@@ -6,6 +6,22 @@ import RecapMainlines from './RecapMainlines';
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key }) }));
 
 describe('daily mainline branches', () => {
+  it('keeps accepted content visible while an update is pending or fails', () => {
+    const item = { id: 'saved', title: 'Saved goal', text: 'Previously accepted progress.', task_ids: ['task'], sources: [] };
+    const props = { mainlines: { items: [item] }, pending: true, threads: [{ id: 'task', title: 'Saved task' }],
+      batches: [{ start_ms: 0, end_ms: 1, activities: [{ task_id: 'task' }] }], time: String, onTask: vi.fn(), onDetails: vi.fn() };
+    const { rerender } = render(<RecapMainlines {...props} />);
+    expect(screen.getByText(item.text)).toBeVisible();
+    expect(screen.getByText('recap.mainlines.updatesPending')).toBeVisible();
+    rerender(<RecapMainlines {...props} error="AI_NETWORK_ERROR" />);
+    expect(screen.getByText(item.text)).toBeVisible();
+    expect(screen.getByText('recap.mainlines.updateFailed')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'recap.generationDetails' }));
+    expect(props.onDetails).toHaveBeenCalledOnce();
+    rerender(<RecapMainlines {...props} pending={false} mainlines={{ items: [{ ...item, text: 'Updated progress.' }] }} />);
+    expect(screen.getByText('Updated progress.')).toBeVisible();
+    expect(screen.queryByText('recap.mainlines.updatesPending')).not.toBeInTheDocument();
+  });
   it('keeps an unverified mainline visible with a warning and no unknown source links', () => {
     const item = { id: 'music', title: 'Music', text: 'Unconfirmed music activity.', task_ids: ['music'], sources: [],
       warnings: [{ field: 'evidence_ids', reason: 'unknown_reference', reference_ids: [99] }] };

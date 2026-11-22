@@ -94,8 +94,6 @@ pub(super) struct EvidenceContext {
     end_ms: i64,
     seen: BTreeMap<i64, Evidence>,
     seen_activities: BTreeMap<String, RecapActivity>,
-    evidence_order: Vec<i64>,
-    activity_order: Vec<String>,
     calls: usize,
     call_limit: usize,
     reads: usize,
@@ -117,8 +115,6 @@ impl EvidenceContext {
             end_ms,
             seen: evidence.iter().map(|e| (e.id, e.clone())).collect(),
             seen_activities: included.iter().map(|a| (a.id.clone(), a.clone())).collect(),
-            evidence_order: evidence.iter().map(|e| e.id).collect(),
-            activity_order: included.iter().map(|a| a.id.clone()).collect(),
             calls: 0,
             call_limit: RecapSettings::default().tool_call_limit(),
             reads: 0,
@@ -312,18 +308,6 @@ impl EvidenceContext {
 
     fn accept(&mut self, reply: &Reply) {
         self.reads += reply.evidence.len();
-        // Keep the most recently requested clues ahead of initial sampling noise
-        // when a final request has to discard part of the received evidence.
-        let ids = reply.evidence.iter().map(|e| e.id).collect::<Vec<_>>();
-        self.evidence_order.retain(|id| !ids.contains(id));
-        self.evidence_order.splice(0..0, ids);
-        let ids = reply
-            .activities
-            .iter()
-            .map(|a| a.id.clone())
-            .collect::<Vec<_>>();
-        self.activity_order.retain(|id| !ids.contains(id));
-        self.activity_order.splice(0..0, ids);
         for evidence in &reply.evidence {
             self.seen
                 .entry(evidence.id)
@@ -377,83 +361,6 @@ fn charge(
             u.output_tokens
         }),
     );
-}
-
-/// A long native reasoning block can exceed the remaining cumulative budget.
-/// In that case start a final request with an explicit evidence bundle instead
-/// of orphaning tool results or editing provider-native reasoning in place.
-fn compact_final(
-    initial: &ChatRequest,
-    tools: &mut EvidenceContext,
-    provider: &ResolvedProvider,
-    input: u64,
-    output: u32,
-) -> Result<ChatRequest, String> {
-    let mut payload: Value = match &initial.messages[1] {
-        Message::User(text) => serde_json::from_str(text).map_err(|_| "RECAP_INTERNAL_ERROR")?,
-        _ => return Err("RECAP_INTERNAL_ERROR".into()),
-    };
-    let mut evidence = tools
-        .evidence_order
-        .iter()
-        .filter_map(|id| tools.seen.get(id))
-        .cloned()
-        .map(|mut e| {
-            e.text = selection::excerpt(&e.text, None, 1200);
-            e
-        })
-        .collect::<Vec<_>>();
-    let mut activities = tools
-        .activity_order
-        .iter()
-        .filter_map(|id| tools.seen_activities.get(id))
-        .cloned()
-        .collect::<Vec<_>>();
-    payload["instruction"] = json!("Return final JSON now using only this supplied evidence and corrected activities. No more tool calls or gaps. Keep unsupported task relationships separate.");
-    // Navigation-only directories cannot be used on this final turn.
-    if let Some(object) = payload.as_object_mut() {
-        object.remove("directory");
-    }
-    loop {
-        if let Some(directory) = payload.get_mut("tasks").and_then(Value::as_array_mut) {
-            directory.retain(|task| {
-                task.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| activities.iter().any(|a| a.task_id == id))
-            });
-        }
-        payload["evidence"] = json!(evidence
-            .iter()
-            .map(|e| evidence_value(e, 0, 1200))
-            .collect::<Vec<_>>());
-        payload["activities"] = json!(activities
-            .iter()
-            .map(|a| activity_value(a, 1600))
-            .collect::<Vec<_>>());
-        let mut request = initial.clone();
-        request.messages = vec![
-            initial.messages[0].clone(),
-            Message::User(payload.to_string()),
-        ];
-        request.max_tokens = Some(output);
-        request.disable_tools = !request.tools.is_empty();
-        if context::estimated_input_tokens(provider.kind, &request)
-            <= input.min(context::input_allowance(&request, provider.context_tokens))
-        {
-            tools.evidence_order = evidence.iter().map(|e| e.id).collect();
-            tools.activity_order = activities.iter().map(|a| a.id.clone()).collect();
-            tools.seen = evidence.into_iter().map(|e| (e.id, e)).collect();
-            tools.seen_activities = activities.into_iter().map(|a| (a.id.clone(), a)).collect();
-            return Ok(request);
-        }
-        if !evidence.is_empty() {
-            evidence.pop();
-        } else if activities.len() > 1 {
-            activities.pop();
-        } else {
-            return Err("RECAP_BUDGET_EXHAUSTED".into());
-        }
-    }
 }
 
 pub(super) async fn run(
@@ -546,7 +453,6 @@ async fn drive(
         settings,
     );
     tools.call_limit = settings.tool_call_limit();
-    let initial = request.clone();
     let (mut input, mut output) = (settings.batch_input_tokens, settings.batch_output_tokens);
     let mut rounds = 0;
     let mut requests = 0;
@@ -566,10 +472,9 @@ async fn drive(
             kind == "mainlines",
         );
         allowance.requests.check(1)?;
-        allowance.input.check(1)?;
         allowance.output.check(2)?;
         let estimate = context::estimated_input_tokens(provider.kind, &request);
-        let mut final_turn = !supported
+        let final_turn = !supported
             || rounds >= settings.evidence_rounds as usize
             || tools.calls >= settings.tool_call_limit()
             || requests >= request_limit - validation::MAX_REPAIRS as u64 - 1
@@ -583,43 +488,7 @@ async fn drive(
         if request.max_tokens == Some(0) {
             return Err(allowance.output.error(2));
         }
-        if context::estimated_input_tokens(provider.kind, &request)
-            > allowance
-                .input
-                .available()
-                .min(context::input_allowance(&request, provider.context_tokens))
-        {
-            let mut prefix = initial.clone();
-            if !supported {
-                prefix.tools.clear();
-                prefix.disable_tools = false;
-            }
-            request = compact_final(
-                &prefix,
-                &mut tools,
-                provider,
-                allowance.input.available(),
-                request.max_tokens.unwrap(),
-            )
-            .map_err(|error| {
-                if error == "RECAP_BUDGET_EXHAUSTED" {
-                    let context = context::input_allowance(&request, provider.context_tokens);
-                    if context < allowance.input.available() {
-                        budget::Limit {
-                            code: "AI_CONTEXT_LIMIT",
-                            limit: context,
-                            used: 0,
-                        }
-                        .error(estimate)
-                    } else {
-                        allowance.input.error(estimate)
-                    }
-                } else {
-                    error
-                }
-            })?;
-            final_turn = true;
-        }
+        budget::check_input(provider, &request, allowance.input)?;
         let stage = if requests == 0 {
             kind
         } else if kind == "mainlines" {
@@ -721,7 +590,7 @@ async fn drive(
                 Err("RECAP_EVIDENCE_LIMIT")
             };
             tools.calls += 1;
-            let (mut content, mut evidence, mut activities, mut error) = match result {
+            let (content, evidence, activities, error) = match result {
                 Ok(reply) => (
                     reply.value.to_string(),
                     reply.evidence,
@@ -740,16 +609,32 @@ async fn drive(
                 call_id: call.id.clone(),
                 content: content.clone(),
             });
-            if context::estimated_input_tokens(provider.kind, &candidate)
-                > input.min(context::input_allowance(
-                    &candidate,
-                    provider.context_tokens,
-                ))
-            {
-                error = Some("RECAP_EVIDENCE_LIMIT");
-                content = json!({"error":"RECAP_EVIDENCE_LIMIT","instruction":"Finish from evidence already supplied."}).to_string();
-                evidence.clear();
-                activities.clear();
+            let next = budget::allowance(
+                settings,
+                &host.daily_usage()?,
+                &RecapUsage {
+                    input_tokens: settings.batch_input_tokens.saturating_sub(input),
+                    output_tokens: settings.batch_output_tokens.saturating_sub(output),
+                    requests,
+                    ..Default::default()
+                },
+                request_limit,
+                kind == "mainlines",
+            );
+            candidate.max_tokens = Some(
+                u64::from(settings.request_output_tokens)
+                    .min(next.output.available() / 2)
+                    .min(u64::from(provider.context_tokens / 2)) as u32,
+            );
+            if let Err(error) = budget::check_input(provider, &candidate, next.input) {
+                host.record_call(RecapEvidenceCall {
+                    tool: limited(&call.name, 80),
+                    arguments: limited(&call.arguments, 1000),
+                    source_ids: vec![],
+                    activity_ids: vec![],
+                    error: Some(error.clone()),
+                });
+                return Err(error);
             }
             let call_record = RecapEvidenceCall {
                 tool: limited(&call.name, 80),
@@ -783,6 +668,7 @@ mod tests {
     struct TestHost {
         settings: RecapSettings,
         provider: ResolvedProvider,
+        daily_usage: RecapUsage,
         responses: Mutex<VecDeque<Result<ChatResponse, String>>>,
         requests: Mutex<Vec<ChatRequest>>,
         calls: Mutex<Vec<RecapEvidenceCall>>,
@@ -793,6 +679,9 @@ mod tests {
         }
         fn provider(&self) -> &ResolvedProvider {
             &self.provider
+        }
+        fn daily_usage(&self) -> Result<RecapUsage, String> {
+            Ok(self.daily_usage.clone())
         }
         fn check(&self) -> Result<(), String> {
             Ok(())
@@ -817,6 +706,7 @@ mod tests {
     fn host(responses: Vec<Result<ChatResponse, String>>, kind: ProviderKind) -> TestHost {
         TestHost {
             settings: RecapSettings::default(),
+            daily_usage: RecapUsage::default(),
             provider: ResolvedProvider {
                 kind,
                 base_url: "http://localhost/v1".into(),
@@ -972,8 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn final_compaction_preserves_new_connection_evidence_ahead_of_initial_noise() {
-        let host = host(vec![], ProviderKind::OpenaiCompatible);
+    fn newly_read_connection_evidence_is_retained_with_the_earlier_records() {
         let noise = record(1, 100, &"initial noise ".repeat(200));
         let prior_text = "prior OCR ".repeat(1200);
         let connection = "n8n and AstrBot support the same QQ notification workflow";
@@ -995,24 +884,40 @@ mod tests {
             ))
             .unwrap();
         tools.accept(&reply);
+        assert_eq!(tools.seen.len(), 2);
         assert!(tools.seen[&2].text.starts_with(connection));
+    }
 
-        let initial = initial();
-        let mut full = tools.clone();
-        let full_request =
-            compact_final(&initial, &mut full, &host.provider, 128_000, 32_000).unwrap();
-        assert_eq!(full.seen.len(), 2);
-        let input = context::estimated_input_tokens(host.provider.kind, &full_request) - 1;
-        let request = compact_final(&initial, &mut tools, &host.provider, input, 32_000).unwrap();
-        assert_eq!(tools.seen.keys().copied().collect::<Vec<_>>(), vec![2]);
-        let Message::User(text) = &request.messages[1] else {
-            panic!("missing compacted evidence payload");
-        };
-        let payload: Value = serde_json::from_str(text).unwrap();
-        assert!(payload["evidence"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains(connection));
+    #[tokio::test]
+    async fn oversized_input_is_rejected_before_any_model_request() {
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            for daily in [false, true] {
+                let mut host = host(vec![], kind);
+                if daily {
+                    host.daily_usage.input_tokens = host.settings.daily_input_tokens - 100;
+                } else {
+                    host.settings.batch_input_tokens = 100;
+                }
+                let mut request = initial();
+                request.messages[1] = Message::User(
+                    json!({"evidence":"important content ".repeat(1000)}).to_string(),
+                );
+                let tools = EvidenceContext::new(Arc::new(vec![]), vec![], 0, 200, &[], &[]);
+                let error = drive(&host, request, "mainlines", tools)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    budget::code(&error),
+                    if daily {
+                        "RECAP_DAILY_INPUT_EXHAUSTED"
+                    } else {
+                        "RECAP_RUN_INPUT_EXHAUSTED"
+                    }
+                );
+                assert!(host.requests.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test]
@@ -1134,13 +1039,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_compacted_final_turn_can_drop_ignored_tool_choice_without_executing_more_calls() {
+    async fn oversized_native_history_stops_without_a_smaller_model_request() {
         let first = ChatResponse {
             tool_calls: vec![call("read_day_evidence", json!({"evidence_ids":[1]}))],
             reasoning: json!("reasoning ".repeat(20_000)),
             usage: Some(Usage {
                 input_tokens: 1000,
                 output_tokens: 10_000,
+            }),
+            ..Default::default()
+        };
+        let mut host = host(vec![Ok(first)], ProviderKind::OpenaiCompatible);
+        host.settings.batch_input_tokens = 12_000;
+        let source = record(1, 100, "connection evidence");
+        let tools = EvidenceContext::new(
+            Arc::new(vec![source.clone()]),
+            vec![],
+            0,
+            200,
+            &[source],
+            &[],
+        );
+        let error = drive(&host, initial(), "mainlines", tools)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(budget::code(&error), "RECAP_RUN_INPUT_EXHAUSTED");
+        assert_eq!(host.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_final_turn_can_drop_ignored_tool_choice_without_executing_more_calls() {
+        let first = ChatResponse {
+            tool_calls: vec![call("read_day_evidence", json!({"evidence_ids":[1]}))],
+            reasoning: json!("check the connection"),
+            usage: Some(Usage {
+                input_tokens: 1000,
+                output_tokens: 1000,
             }),
             ..Default::default()
         };
@@ -1152,7 +1087,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let final_answer = ChatResponse {
+        let answer = ChatResponse {
             text: "{\"items\":[]}".into(),
             usage: Some(Usage {
                 input_tokens: 100,
@@ -1161,14 +1096,11 @@ mod tests {
             ..Default::default()
         };
         let mut host = host(
-            vec![Ok(first), Ok(ignored), Ok(final_answer)],
+            vec![Ok(first), Ok(ignored), Ok(answer)],
             ProviderKind::OpenaiCompatible,
         );
-        host.settings.batch_input_tokens = 12_000;
+        host.settings.evidence_rounds = 1;
         let source = record(1, 100, "connection evidence");
-        let mut request = initial();
-        request.messages[1] =
-            Message::User(json!({"evidence":[evidence_value(&source,0,900)]}).to_string());
         let tools = EvidenceContext::new(
             Arc::new(vec![source.clone()]),
             vec![],
@@ -1177,14 +1109,10 @@ mod tests {
             &[source],
             &[],
         );
-        let outcome = drive(&host, request, "mainlines", tools).await.unwrap();
+        let outcome = drive(&host, initial(), "mainlines", tools).await.unwrap();
         let requests = host.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert_eq!(
-            requests[1].messages.len(),
-            2,
-            "compaction bundles evidence without orphaned tool turns"
-        );
+        assert_eq!(requests[1].messages.len(), 4, "native history stays intact");
         assert!(requests[1].disable_tools);
         assert!(requests[2].tools.is_empty());
         assert_eq!(
