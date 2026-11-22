@@ -1,11 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { correctRecap, deleteRecap, generateRecap, getRecapDay, getSnapshotRecapContext, getRecapRecords, getRecapProgress, getRecapUsage, groupRecapActivities, recapErrorKey, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex, resolveRecapNavigation } from './recap_api';
+import { correctRecap, deleteRecap, generateRecap, getRecapDay, getSnapshotRecapContext, getRecapRecords, getRecapProgress, getRecapUsage, groupRecapActivities, recapBudgetIssue, recapErrorKey, sourceResult, searchRecaps, prepareRecapSearch, cancelRecapSearchIndex, resolveRecapNavigation } from './recap_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((action) => action()) }));
 
 describe('recap API and occurrence display', () => {
+  it('extracts only safe token counts for budget notices', () => {
+    expect(recapBudgetIssue('RECAP_DAILY_INPUT_EXHAUSTED: limit=432000, used=424969, requested=10978, available=7031'))
+      .toEqual({ scope: 'daily', requested: 10978, available: 7031 });
+    expect(recapBudgetIssue('RECAP_REQUEST_LIMIT: limit=16, used=16, requested=1, available=0')).toBeNull();
+    expect(recapBudgetIssue('AI_NETWORK_ERROR: private response')).toBeNull();
+    expect(recapBudgetIssue('RECAP_DAILY_INPUT_EXHAUSTED: private response')).toEqual({ scope: 'daily' });
+    expect(recapBudgetIssue('RECAP_DAILY_INPUT_EXHAUSTED: limit=9007199254740999, used=0, requested=9007199254740999, available=0')).toEqual({ scope: 'daily' });
+    expect(recapBudgetIssue('RECAP_RUN_INPUT_EXHAUSTED: limit=100, used=0, requested=1, available=100')).toEqual({ scope: 'run' });
+  });
   it('reads snapshot associations without prompting or generating a recap', async () => {
     const context = { status: 'ready', items: [] };
     invoke.mockResolvedValueOnce(context);

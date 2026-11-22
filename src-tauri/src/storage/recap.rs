@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 
 use super::{BackgroundReadError, StorageState};
-use crate::ai::recap::{PrivacyFingerprint, RecapSettings, RecapUsage};
+use crate::ai::recap::{budget, PrivacyFingerprint, RecapSettings, RecapUsage};
 use crate::calendar::CalendarDay;
 
 const PAYLOAD_KEYS_SQL: &str =
@@ -743,7 +743,9 @@ impl StorageState {
         settings: &RecapSettings,
         generation: u64,
     ) -> Result<i64, String> {
-        self.recap_reserve_with_limit(day, role, run, input, output, settings, generation, 2)
+        self.recap_reserve_with_limit(
+            day, role, run, input, output, settings, generation, 2, false,
+        )
     }
 
     /// Evidence agents share the same cumulative token and daily limits. A
@@ -762,6 +764,7 @@ impl StorageState {
         settings: &RecapSettings,
         generation: u64,
         request_limit: u64,
+        mainline: bool,
     ) -> Result<i64, String> {
         let mut guard = self.get_connection_named("recap_reserve")?;
         if generation != self.db_generation() {
@@ -782,22 +785,51 @@ impl StorageState {
             })
             .map_err(|e| e.to_string())
         };
-        let daily = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE day=? AND role=?",day)?;
-        let batch = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE run_id=? AND role=?",run)?;
+        let daily = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE day=? AND role=? AND settled>=0",day)?;
+        let batch = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE run_id=? AND role=? AND settled>=0",run)?;
         if role == "screening" {
-            if daily.0.saturating_add(input) > settings.screening_input_tokens {
-                return Err("RECAP_BUDGET_EXHAUSTED".into());
+            budget::Limit {
+                code: "RECAP_SCREENING_INPUT_EXHAUSTED",
+                limit: settings.screening_input_tokens,
+                used: daily.0,
             }
-        } else if batch.2 >= request_limit.min(16)
-            || batch.0.saturating_add(input) > settings.batch_input_tokens
-            || batch.1.saturating_add(output) > settings.batch_output_tokens
-            || daily.0.saturating_add(input) > settings.daily_input_tokens
-            || daily.1.saturating_add(output) > settings.daily_output_tokens
-        {
-            return Err("RECAP_BUDGET_EXHAUSTED".into());
+            .check(input)?;
+        } else {
+            let allowance = budget::allowance(
+                settings,
+                &RecapUsage {
+                    input_tokens: daily.0,
+                    output_tokens: daily.1,
+                    requests: daily.2,
+                    ..Default::default()
+                },
+                &RecapUsage {
+                    input_tokens: batch.0,
+                    output_tokens: batch.1,
+                    requests: batch.2,
+                    ..Default::default()
+                },
+                request_limit,
+                mainline,
+            );
+            allowance.requests.check(1)?;
+            budget::Limit {
+                code: "RECAP_DAILY_INPUT_EXHAUSTED",
+                limit: settings.daily_input_tokens,
+                used: daily.0,
+            }
+            .check(input)?;
+            budget::Limit {
+                code: "RECAP_DAILY_OUTPUT_EXHAUSTED",
+                limit: settings.daily_output_tokens,
+                used: daily.1,
+            }
+            .check(output)?;
+            allowance.input.check(input)?;
+            allowance.output.check(output)?;
         }
-        let input = i64::try_from(input).map_err(|_| "RECAP_BUDGET_EXHAUSTED")?;
-        let output = i64::try_from(output).map_err(|_| "RECAP_BUDGET_EXHAUSTED")?;
+        let input = i64::try_from(input).map_err(|_| "RECAP_INVALID_SETTINGS")?;
+        let output = i64::try_from(output).map_err(|_| "RECAP_INVALID_SETTINGS")?;
         tx.execute("INSERT INTO recap_usage(day,role,run_id,input_tokens,output_tokens) VALUES (?,?,?,?,?)",params![day,role,run,input,output]).map_err(|e| e.to_string())?;
         let id = tx.last_insert_rowid();
         tx.commit().map_err(|e| e.to_string())?;
@@ -829,13 +861,54 @@ impl StorageState {
         Ok(())
     }
 
+    /// Called only when the guarded request future never reached submission.
+    /// Submitted failures and unknown usage keep their conservative reservation.
+    pub(crate) fn recap_release_unsubmitted(&self, id: i64, generation: u64) -> Result<(), String> {
+        let guard = self.get_connection_named("recap_release_unsubmitted")?;
+        if generation != self.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            // Preserve the reservation identity so a late duplicate release
+            // cannot target a newer request that reused its row ID.
+            .execute("UPDATE recap_usage SET input_tokens=0,output_tokens=0,settled=-1 WHERE id=? AND settled=0", [id])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub(crate) fn recap_usage(&self, day: &str) -> Result<RecapUsage, String> {
         self.with_read_connection_named("recap_usage", |conn| conn.query_row(
             "SELECT coalesce(sum(CASE WHEN role='generation' THEN input_tokens ELSE 0 END),0),
              coalesce(sum(CASE WHEN role='generation' THEN output_tokens ELSE 0 END),0),
-             coalesce(sum(CASE WHEN role='screening' THEN input_tokens ELSE 0 END),0),count(*) FROM recap_usage WHERE day=?", [day],
-            |r| Ok(RecapUsage {input_tokens:r.get::<_,i64>(0)?.max(0) as u64,output_tokens:r.get::<_,i64>(1)?.max(0) as u64,screening_input_tokens:r.get::<_,i64>(2)?.max(0) as u64,requests:r.get::<_,i64>(3)?.max(0) as u64})
+             coalesce(sum(CASE WHEN role='screening' THEN input_tokens ELSE 0 END),0),count(*),
+             coalesce(sum(CASE WHEN role='generation' AND settled=0 THEN input_tokens ELSE 0 END),0),
+             coalesce(sum(CASE WHEN role='generation' AND settled=0 THEN output_tokens ELSE 0 END),0),
+             coalesce(sum(CASE WHEN settled=0 THEN 1 ELSE 0 END),0),
+             coalesce(sum(CASE WHEN role='screening' AND settled=0 THEN input_tokens ELSE 0 END),0)
+             FROM recap_usage WHERE day=? AND settled>=0", [day],
+            |r| Ok(RecapUsage {input_tokens:r.get::<_,i64>(0)?.max(0) as u64,output_tokens:r.get::<_,i64>(1)?.max(0) as u64,screening_input_tokens:r.get::<_,i64>(2)?.max(0) as u64,requests:r.get::<_,i64>(3)?.max(0) as u64,
+                unconfirmed_input_tokens:r.get::<_,i64>(4)?.max(0) as u64,unconfirmed_output_tokens:r.get::<_,i64>(5)?.max(0) as u64,
+                unconfirmed_requests:r.get::<_,i64>(6)?.max(0) as u64,unconfirmed_screening_input_tokens:r.get::<_,i64>(7)?.max(0) as u64})
         ).map_err(|e| e.to_string()))
+    }
+
+    pub(crate) fn recap_run_usage(&self, run: &str) -> Result<RecapUsage, String> {
+        self.with_read_connection_named("recap_run_usage", |conn| {
+            conn.query_row(
+                "SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*)
+                 FROM recap_usage WHERE run_id=?1 AND role='generation' AND settled>=0",
+                [run],
+                |row| {
+                    Ok(RecapUsage {
+                        input_tokens: row.get::<_, i64>(0)?.max(0) as u64,
+                        output_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                        requests: row.get::<_, i64>(2)?.max(0) as u64,
+                        ..Default::default()
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -1374,9 +1447,11 @@ mod tests {
             .unwrap();
         assert_eq!(s.recap_usage("day").unwrap().input_tokens, 7000);
         assert_eq!(
-            s.recap_reserve("day", "generation", "two", 4000, 1000, &settings, g)
-                .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            budget::code(
+                &s.recap_reserve("day", "generation", "two", 4000, 1000, &settings, g)
+                    .unwrap_err()
+            ),
+            "RECAP_DAILY_INPUT_EXHAUSTED"
         );
         // Some compatible endpoints report absent usage fields as zero. Such
         // responses must not turn potentially billable work into a free run.
@@ -1390,9 +1465,11 @@ mod tests {
         s.recap_reserve("day", "generation", "one", 1000, 100, &settings, g)
             .unwrap();
         assert_eq!(
-            s.recap_reserve("day", "generation", "one", 1, 1, &settings, g)
-                .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            budget::code(
+                &s.recap_reserve("day", "generation", "one", 1, 1, &settings, g)
+                    .unwrap_err()
+            ),
+            "RECAP_REQUEST_LIMIT"
         );
         s.recap_reserve("day", "screening", "one", 3000, 0, &settings, g)
             .unwrap();
@@ -1404,7 +1481,7 @@ mod tests {
         let (_temp, s) = storage();
         let settings = RecapSettings::default();
         let generation = s.db_generation();
-        for _ in 0..16 {
+        for _ in 0..budget::HARD_REQUEST_LIMIT {
             s.recap_reserve_with_limit(
                 "day",
                 "generation",
@@ -1414,27 +1491,31 @@ mod tests {
                 &settings,
                 generation,
                 u64::MAX,
+                false,
             )
             .unwrap();
         }
         assert_eq!(
-            s.recap_reserve_with_limit(
-                "day",
-                "generation",
-                "agent-run",
-                1,
-                1,
-                &settings,
-                generation,
-                u64::MAX
-            )
-            .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            budget::code(
+                &s.recap_reserve_with_limit(
+                    "day",
+                    "generation",
+                    "agent-run",
+                    1,
+                    1,
+                    &settings,
+                    generation,
+                    u64::MAX,
+                    false,
+                )
+                .unwrap_err()
+            ),
+            "RECAP_REQUEST_LIMIT"
         );
         let usage = s.recap_usage("day").unwrap();
         assert_eq!(
             (usage.requests, usage.input_tokens, usage.output_tokens),
-            (16, 1600, 1600)
+            (32, 3200, 3200)
         );
         let limited = RecapSettings {
             batch_input_tokens: 1000,
@@ -1449,22 +1530,188 @@ mod tests {
             &limited,
             generation,
             16,
+            false,
         )
         .unwrap();
         assert_eq!(
-            s.recap_reserve_with_limit(
+            budget::code(
+                &s.recap_reserve_with_limit(
+                    "day",
+                    "generation",
+                    "bounded-run",
+                    101,
+                    1,
+                    &limited,
+                    generation,
+                    16,
+                    false,
+                )
+                .unwrap_err()
+            ),
+            "RECAP_RUN_INPUT_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn unsubmitted_reservations_release_allowance_and_confirmed_usage_is_preserved() {
+        let (_temp, storage) = storage();
+        let settings = RecapSettings::default();
+        let generation = storage.db_generation();
+        let pending = storage
+            .recap_reserve(
                 "day",
                 "generation",
-                "bounded-run",
-                101,
-                1,
-                &limited,
+                "unsubmitted",
+                1000,
+                100,
+                &settings,
                 generation,
-                16
             )
-            .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            .unwrap();
+        let usage = storage.recap_usage("day").unwrap();
+        assert_eq!(usage.unconfirmed_requests, 1);
+        assert_eq!(usage.unconfirmed_input_tokens, 1000);
+        storage
+            .recap_release_unsubmitted(pending, generation)
+            .unwrap();
+        assert_eq!(storage.recap_usage("day").unwrap().requests, 0);
+        let confirmed = storage
+            .recap_reserve(
+                "day",
+                "generation",
+                "submitted",
+                1000,
+                100,
+                &settings,
+                generation,
+            )
+            .unwrap();
+        assert_ne!(pending, confirmed);
+        storage
+            .recap_release_unsubmitted(pending, generation)
+            .unwrap();
+        assert_eq!(storage.recap_run_usage("submitted").unwrap().requests, 1);
+        storage
+            .recap_settle(confirmed, 200, 50, generation)
+            .unwrap();
+        storage
+            .recap_release_unsubmitted(confirmed, generation)
+            .unwrap();
+        let usage = storage.recap_usage("day").unwrap();
+        assert_eq!(
+            (usage.requests, usage.input_tokens, usage.output_tokens),
+            (1, 200, 50)
         );
+        assert_eq!(usage.unconfirmed_requests, 0);
+    }
+
+    #[test]
+    fn mainlines_can_spend_reserved_headroom_and_configuration_controls_request_counts() {
+        let (_temp, storage) = storage();
+        let settings = RecapSettings {
+            daily_input_tokens: 10_000,
+            daily_output_tokens: 1000,
+            batch_input_tokens: 10_000,
+            batch_output_tokens: 1000,
+            mainline_reserve_percent: 10,
+            ..Default::default()
+        };
+        let generation = storage.db_generation();
+        storage
+            .recap_reserve_with_limit(
+                "day",
+                "generation",
+                "period",
+                9000,
+                900,
+                &settings,
+                generation,
+                16,
+                false,
+            )
+            .unwrap();
+        let error = storage
+            .recap_reserve_with_limit(
+                "day",
+                "generation",
+                "period2",
+                100,
+                10,
+                &settings,
+                generation,
+                16,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(budget::code(&error), "RECAP_MAINLINE_HEADROOM");
+        storage
+            .recap_reserve_with_limit(
+                "day",
+                "generation",
+                "mainlines",
+                1000,
+                100,
+                &settings,
+                generation,
+                16,
+                true,
+            )
+            .unwrap();
+        let usage = storage.recap_usage("day").unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10_000, 1000));
+        let shared = RecapSettings {
+            mainline_reserve_percent: 0,
+            ..settings
+        };
+        storage
+            .recap_reserve_with_limit(
+                "shared",
+                "generation",
+                "shared",
+                10_000,
+                1000,
+                &shared,
+                generation,
+                16,
+                false,
+            )
+            .unwrap();
+        for rounds in [12, 24] {
+            let settings = RecapSettings {
+                evidence_rounds: rounds,
+                ..Default::default()
+            };
+            let run = format!("depth-{rounds}");
+            for _ in 0..settings.request_limit() {
+                storage
+                    .recap_reserve_with_limit(
+                        "depth",
+                        "generation",
+                        &run,
+                        1,
+                        1,
+                        &settings,
+                        generation,
+                        settings.request_limit(),
+                        false,
+                    )
+                    .unwrap();
+            }
+            let error = storage
+                .recap_reserve_with_limit(
+                    "depth",
+                    "generation",
+                    &run,
+                    1,
+                    1,
+                    &settings,
+                    generation,
+                    settings.request_limit(),
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(budget::code(&error), "RECAP_REQUEST_LIMIT");
+        }
     }
 
     #[test]

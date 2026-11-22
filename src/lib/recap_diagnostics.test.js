@@ -27,6 +27,13 @@ describe('recap diagnostics state', () => {
     expect(period.status).toBe('summarizing');
   });
 
+  it('marks a retained mainline as awaiting updates and reports a failed update separately', () => {
+    const day = { batches: [batch], mainlines: { items: [{ id: 'saved' }] }, mainlines_pending: true };
+    expect(recapDiagnosticMainlines(day, null).status).toBe('updating');
+    expect(recapDiagnosticMainlines({ ...day, mainlines_error: 'AI_NETWORK_ERROR' }, null).status).toBe('summaryFailed');
+    expect(recapDiagnosticMainlines({ ...day, mainlines_pending: false }, null).status).toBe('ready');
+  });
+
   it('replaces obsolete requests during full regeneration without duplicating saved attempts', () => {
     const retry = { ...initial, id: 'new' };
     const progress = { stage: 'ready', finished_at_ms: 100, attempts: [retry] };

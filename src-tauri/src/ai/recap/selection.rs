@@ -1,5 +1,7 @@
 use super::types::*;
+use super::validation::{self, Report};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Preserve beginnings, changes and endings, rather than only an OCR prefix.
@@ -195,48 +197,156 @@ pub fn parse_draft(text: &str) -> Result<Draft, String> {
     Ok(draft)
 }
 
+#[cfg(test)]
 pub fn validate_draft(
     draft: &Draft,
     evidence: &[Evidence],
     prior_tasks: &HashSet<String>,
     day: &str,
 ) -> Result<Vec<RecapActivity>, String> {
+    let report = validate_value(
+        &json!(draft),
+        evidence,
+        prior_tasks,
+        day,
+        i64::MIN,
+        i64::MAX,
+    );
+    if let Some(error) = report.first_error() {
+        return Err(error.into());
+    }
+    Ok(report.value)
+}
+
+pub(super) fn validate_value(
+    draft: &Value,
+    evidence: &[Evidence],
+    prior_tasks: &HashSet<String>,
+    day: &str,
+    start: i64,
+    end: i64,
+) -> Report<Vec<RecapActivity>> {
+    let mut report = Report::new(vec![]);
+    let Some(items) = draft.get("activities").and_then(Value::as_array) else {
+        report.issues.push(validation::issue(
+            "",
+            "activities",
+            "RECAP_INVALID_STRUCTURE",
+            "invalid_field",
+        ));
+        return report;
+    };
+    if items.len() > 80 {
+        for index in 80..items.len() {
+            if !items[index].is_null() {
+                report.issues.push(validation::issue(
+                    &format!("/activities/{index}"),
+                    "activity",
+                    "RECAP_RESPONSE_TOO_LARGE",
+                    "too_many_items",
+                ));
+            }
+        }
+    }
+    if let Some(gaps) = draft.get("gaps") {
+        if serde_json::from_value::<Vec<Gap>>(gaps.clone()).is_err()
+            || gaps.as_array().is_some_and(|gaps| gaps.len() > 3)
+        {
+            report.issues.push(validation::issue(
+                "/gaps",
+                "gaps",
+                "RECAP_INVALID_STRUCTURE",
+                "invalid_field",
+            ));
+        }
+    }
     let sources: HashMap<i64, &Evidence> = evidence.iter().map(|e| (e.id, e)).collect();
-    let mut out = Vec::new();
-    for item in &draft.activities {
+    let received = sources.keys().copied().collect::<HashSet<_>>();
+    let allowed = evidence
+        .iter()
+        .filter(|source| {
+            source.timestamp_ms >= start
+                && source.timestamp_ms < end
+                && !source.text.trim().is_empty()
+        })
+        .map(|source| source.id)
+        .collect::<HashSet<_>>();
+    for (index, value) in items.iter().take(80).enumerate() {
+        if value.is_null() {
+            continue;
+        }
+        let target = format!("/activities/{index}");
+        let mut base = value.clone();
+        let detail_values = base
+            .as_object_mut()
+            .and_then(|object| object.remove("details"));
+        let Ok(mut item) = serde_json::from_value::<DraftActivity>(base) else {
+            report.issues.push(validation::issue(
+                &target,
+                "activity",
+                "RECAP_INVALID_ACTIVITY",
+                "invalid_field",
+            ));
+            continue;
+        };
+        let mut detail_errors = Vec::new();
+        let mut parsed_details = Vec::new();
+        if let Some(value) = detail_values {
+            if let Some(details) = value.as_array() {
+                if details.len() > 3 {
+                    detail_errors.push(validation::issue(
+                        &target,
+                        "details",
+                        "RECAP_INVALID_DETAIL",
+                        "too_many_items",
+                    ));
+                }
+                for (detail_index, value) in details.iter().take(3).enumerate() {
+                    match serde_json::from_value::<RecapDetail>(value.clone()) {
+                        Ok(detail) => parsed_details.push((detail_index, detail)),
+                        Err(_) => detail_errors.push(validation::issue(
+                            &target,
+                            &format!("details[{detail_index}]"),
+                            "RECAP_INVALID_DETAIL",
+                            "invalid_field",
+                        )),
+                    }
+                }
+            } else {
+                detail_errors.push(validation::issue(
+                    &target,
+                    "details",
+                    "RECAP_INVALID_DETAIL",
+                    "invalid_field",
+                ));
+            }
+        }
         if item.text.trim().is_empty()
             || item.task_title.trim().is_empty()
             || item.text.chars().count() > 1600
             || item.task_title.chars().count() > 120
-            || item.evidence_ids.is_empty()
-            || item.evidence_ids.len() > 128
         {
-            return Err("RECAP_INVALID_ACTIVITY".into());
+            report.issues.push(validation::issue(
+                &target,
+                "text_or_title",
+                "RECAP_INVALID_ACTIVITY",
+                "invalid_text",
+            ));
+            continue;
         }
-        if item.details.len() > 3
-            || item.details.iter().any(|detail| {
-                detail.text.trim().is_empty()
-                    || detail.text.chars().count() > 300
-                    || detail.evidence_ids.is_empty()
-                    || detail.evidence_ids.len() > 12
-                    || detail
-                        .evidence_ids
-                        .iter()
-                        .any(|id| !item.evidence_ids.contains(id))
-            })
-        {
-            return Err("RECAP_INVALID_DETAIL".into());
-        }
+        let mut issues = validation::check_ids(
+            &mut item.evidence_ids,
+            &received,
+            &allowed,
+            &target,
+            "evidence_ids",
+            128,
+        );
         let mut selected = item
             .evidence_ids
             .iter()
-            .map(|id| {
-                sources
-                    .get(id)
-                    .copied()
-                    .ok_or("RECAP_INVALID_CITATION".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|id| sources.get(id).copied().filter(|_| allowed.contains(id)))
+            .collect::<Vec<_>>();
         selected.sort_by_key(|e| (e.timestamp_ms, e.id));
         selected.dedup_by_key(|e| e.id);
         let task_id = match item.task_id.as_deref().filter(|s| !s.is_empty()) {
@@ -244,13 +354,21 @@ pub fn validate_draft(
             Some(id) if id.starts_with("new:") && id.len() <= 96 => {
                 format!("task-{}", &digest(&format!("{day}\n{id}"))[..20])
             }
-            Some(_) => return Err("RECAP_INVALID_TASK".into()),
+            Some(_) => {
+                let mut error =
+                    validation::issue(&target, "task_id", "RECAP_INVALID_TASK", "unknown_task");
+                error.available_references = prior_tasks.iter().map(|id| json!(id)).collect();
+                error.available_references.sort_by_key(Value::to_string);
+                report.issues.extend(issues);
+                report.issues.push(error);
+                continue;
+            }
             None => format!(
                 "task-{}",
                 &digest(&format!(
                     "{day}\n{}\n{}",
                     item.task_title.trim(),
-                    selected[0].id
+                    item.evidence_ids.first().copied().unwrap_or_default()
                 ))[..20]
             ),
         };
@@ -261,26 +379,96 @@ pub fn validate_draft(
             groups.entry(&e.segment).or_default().push(e);
         }
         if groups.len() > 1 {
-            return Err("RECAP_MIXED_SEGMENTS".into());
+            issues.push(validation::issue(
+                &target,
+                "evidence_ids",
+                "RECAP_MIXED_SEGMENTS",
+                "mixed_segments",
+            ));
         }
-        for (segment, group) in groups {
-            out.push(RecapActivity {
-                details: item.details.clone(),
-                id: format!("activity-{}-{}", group[0].id, &digest(&task_id)[..8]),
-                task_id: task_id.clone(),
-                task_title: item.task_title.trim().into(),
-                text: item.text.trim().into(),
-                start_ms: group[0].timestamp_ms,
-                end_ms: group.last().unwrap().timestamp_ms,
-                segments: vec![segment.to_string()],
-                member_ids: group.iter().map(|e| e.id).collect(),
-                sources: group.into_iter().map(SourceRef::from).collect(),
-            });
+        if issues.iter().any(|issue| !issue.retainable) {
+            report.issues.extend(issues);
+            continue;
         }
+        let mut warnings = issues
+            .iter()
+            .map(|issue| issue.warning())
+            .collect::<Vec<_>>();
+        let mut details = Vec::new();
+        issues.extend(detail_errors);
+        let detail_sources = item
+            .evidence_ids
+            .iter()
+            .copied()
+            .filter(|id| allowed.contains(id))
+            .collect();
+        for (detail_index, mut detail) in parsed_details {
+            let field = format!("details[{detail_index}].evidence_ids");
+            if detail.text.trim().is_empty() || detail.text.chars().count() > 300 {
+                issues.push(validation::issue(
+                    &target,
+                    &format!("details[{detail_index}].text"),
+                    "RECAP_INVALID_DETAIL",
+                    "invalid_text",
+                ));
+                continue;
+            }
+            let mut detail_issues = validation::check_ids(
+                &mut detail.evidence_ids,
+                &received,
+                &detail_sources,
+                &target,
+                &field,
+                12,
+            );
+            for error in &mut detail_issues {
+                if !error.retainable {
+                    error.code = "RECAP_INVALID_DETAIL".into();
+                }
+            }
+            if detail_issues.iter().all(|issue| issue.retainable) {
+                warnings.extend(detail_issues.iter().map(|issue| issue.warning()));
+                details.push(detail);
+            }
+            issues.extend(detail_issues);
+        }
+        let group = groups.into_values().next().unwrap_or_default();
+        let id = group.first().map_or_else(
+            || {
+                format!(
+                    "unverified-{}",
+                    &digest(&format!(
+                        "{day}\n{task_id}\n{}\n{}",
+                        item.text.trim(),
+                        json!(item.evidence_ids)
+                    ))[..20]
+                )
+            },
+            |source| format!("activity-{}-{}", source.id, &digest(&task_id)[..8]),
+        );
+        report.value.push(RecapActivity {
+            details,
+            id,
+            task_id,
+            task_title: item.task_title.trim().into(),
+            text: item.text.trim().into(),
+            start_ms: group.first().map_or(start, |source| source.timestamp_ms),
+            end_ms: group.last().map_or(start, |source| source.timestamp_ms),
+            segments: group
+                .first()
+                .map(|source| vec![source.segment.clone()])
+                .unwrap_or_default(),
+            member_ids: group.iter().map(|source| source.id).collect(),
+            sources: group.into_iter().map(SourceRef::from).collect(),
+            warnings,
+        });
+        report.issues.extend(issues);
     }
-    out.sort_by_key(|a| (a.start_ms, a.id.clone()));
-    out.dedup_by(|a, b| a.id == b.id);
-    Ok(out)
+    report
+        .value
+        .sort_by_key(|activity| (activity.start_ms, activity.id.clone()));
+    report.value.dedup_by(|a, b| a.id == b.id);
+    report
 }
 
 #[cfg(test)]

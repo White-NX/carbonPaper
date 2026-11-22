@@ -16,6 +16,39 @@ pub(super) fn filter_activity(
         *text = crate::mcp_server::filter_identity(filter, filter.mode(), text)
             .unwrap_or_else(|_| "[censored]".into());
     }
+    activity.warnings = filtered_warnings(filter, &activity.warnings);
+}
+
+pub(super) fn filter_mainlines(
+    filter: &crate::sensitive_filter::SensitiveFilterState,
+    mainlines: &mut super::types::RecapMainlines,
+) {
+    for item in &mut mainlines.items {
+        for text in [&mut item.title, &mut item.text] {
+            *text = crate::mcp_server::filter_identity(filter, filter.mode(), text)
+                .unwrap_or_else(|_| "[censored]".into());
+        }
+        item.warnings = filtered_warnings(filter, &item.warnings);
+    }
+}
+
+pub(crate) fn filtered_warnings(
+    filter: &crate::sensitive_filter::SensitiveFilterState,
+    warnings: &[super::types::RecapWarning],
+) -> Vec<super::types::RecapWarning> {
+    warnings
+        .iter()
+        .cloned()
+        .map(|mut warning| {
+            for reference in &mut warning.reference_ids {
+                if let serde_json::Value::String(text) = reference {
+                    *text = crate::mcp_server::filter_identity(filter, filter.mode(), text)
+                        .unwrap_or_else(|_| "[censored]".into());
+                }
+            }
+            warning
+        })
+        .collect()
 }
 
 pub(crate) struct PrivacyFingerprint {

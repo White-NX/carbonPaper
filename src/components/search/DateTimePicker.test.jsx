@@ -24,6 +24,37 @@ afterEach(() => {
 });
 
 describe('DateTimePicker', () => {
+  it('immediately applies dates while keeping the calendar open and describing highlighted dates', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    render(<DateTimePicker dateOnly applyOnSelect clearable={false} label="Start" value="2026-02-17" min="2026-02-01" max="2026-02-28"
+      highlightedDates={['2026-02-17', '2026-02-18']} highlightLabel="Has recap content" onChange={onChange} />);
+    expect(screen.getByRole('button', { name: 'Start' })).toHaveTextContent('02/17/2026');
+    const picker = open();
+    expect(picker.queryByRole('listbox', { name: 'dateTimePicker.hour' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('listbox', { name: 'dateTimePicker.minute' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'dateTimePicker.clear' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'common.cancel' })).not.toBeInTheDocument();
+    expect(picker.queryByRole('button', { name: 'dateTimePicker.confirm' })).not.toBeInTheDocument();
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-17') })).toHaveAttribute('aria-selected', 'true');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-17') })).toHaveAccessibleDescription('Has recap content');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-18') })).toHaveAccessibleDescription('Has recap content');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-19') })).not.toHaveAccessibleDescription('Has recap content');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-01-31') })).toBeDisabled();
+    expect(picker.getByRole('gridcell', { name: dateName('2026-03-01') })).toBeDisabled();
+    await user.click(picker.getByRole('gridcell', { name: dateName('2026-02-18') }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith('2026-02-18');
+    expect(screen.getByRole('dialog', { name: 'Start' })).toBeInTheDocument();
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-18') })).toHaveAttribute('aria-selected', 'true');
+    await user.keyboard('{ArrowRight}{Enter}');
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(onChange).toHaveBeenLastCalledWith('2026-02-19');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-19') })).toHaveAttribute('aria-selected', 'true');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start' })).toHaveFocus();
+  });
+
   it('opens beside the range panel and switches sides when the window narrows', () => {
     vi.stubGlobal('innerWidth', 1200);
     vi.stubGlobal('innerHeight', 600);

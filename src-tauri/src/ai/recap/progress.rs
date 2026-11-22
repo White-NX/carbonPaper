@@ -114,6 +114,13 @@ impl RecapProgress {
             attempt.error = error.map(str::to_string);
         }
     }
+
+    pub fn validation_warning(&mut self, code: &str) {
+        if let Some(attempt) = self.attempts.last_mut() {
+            attempt.status = "partial".into();
+            attempt.error = Some(code.into());
+        }
+    }
 }
 
 fn append_preview(preview: &mut String, total: &mut usize, text: &str) {

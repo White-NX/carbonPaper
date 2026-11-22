@@ -6,6 +6,7 @@ import { Dialog } from '../Dialog';
 import { SourceThumbnail } from '../recap/RecapSources';
 import { SourcesDialog } from '../recap/RecapDialogs';
 import RecapKeyDetails from '../recap/RecapKeyDetails';
+import RecapWarnings from '../recap/RecapWarnings';
 import { buildSnippet } from '../../lib/search_snippet';
 
 function Highlight({ text, tokens }) {
@@ -36,6 +37,7 @@ export function RecapSearchResultRow({ item, time, queryTokens, onDetails, onOpe
           <span className="mt-1.5 line-clamp-2 block break-words text-[13px] leading-6 text-ide-text"><Highlight text={buildSnippet(item.text, queryTokens)} tokens={queryTokens} /></span>
           {detail && <span className="mt-1.5 line-clamp-2 block border-l-2 border-ide-accent/30 pl-2 text-xs leading-5 text-ide-muted"><Highlight text={buildSnippet(detail.text, queryTokens)} tokens={queryTokens} /></span>}
         </button>
+        <RecapWarnings warnings={item.warnings} compact />
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ide-muted">
           <span>{t('recap.search.sources', { count: sources.length })}</span><span>{processes.join(' · ')}</span>
           {item.keyword_rank != null && <span>{t(item.match_evidence?.match_type === 'approximate'
@@ -59,7 +61,8 @@ export function RecapSearchResultDetails({ item, action, time, onClose, onOpenDa
       <p className="mb-2 text-xs tabular-nums text-ide-muted">{item.date} · {time(item.start_ms)}{item.end_ms !== item.start_ms && `–${time(item.end_ms)}`}</p>
       <h2 className="break-words text-xl font-semibold leading-relaxed">{item.task_title}</h2>
       <p className="mt-4 whitespace-pre-wrap break-words text-sm leading-7">{item.text}</p>
-      <RecapKeyDetails details={item.details} sources={item.sources} onSources={setSources} />
+      <RecapWarnings warnings={item.warnings} className="mt-3" />
+      <RecapKeyDetails details={item.details} sources={item.sources} warnings={item.warnings} onSources={setSources} />
       <div className="mt-6 border-t border-ide-border pt-5">
         <div className="mb-3 flex items-center justify-between gap-3"><h3 className="text-xs font-semibold">{t('recap.sources')}</h3>
           <Button size="xs" variant="ghost" onClick={() => setSources(item.sources)}>{t('recap.viewSources', { count: item.sources.length })}</Button>

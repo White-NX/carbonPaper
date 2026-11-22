@@ -1,6 +1,8 @@
 //! Bounded, evidence-backed daily recaps. Classification is optional.
 pub(crate) mod activity_contract;
+pub(crate) mod budget;
 mod evidence_agent;
+mod mainline_state;
 mod mainlines;
 mod privacy;
 mod progress;
@@ -15,8 +17,10 @@ mod snapshot;
 mod summary;
 pub mod types;
 mod unified;
+mod validation;
 mod views;
 
+pub(crate) use privacy::filtered_warnings;
 pub(crate) use privacy::PrivacyFingerprint;
 #[cfg(test)]
 pub(crate) use runner::initial_request;

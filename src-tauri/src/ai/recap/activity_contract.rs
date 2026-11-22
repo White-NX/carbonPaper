@@ -68,8 +68,15 @@ impl ActivityEvidence {
             "filtered"
         };
         Self {
-            time_semantics: "evidence_observation_span".into(),
-            observation_kind: if activity.start_ms == activity.end_ms {
+            time_semantics: if activity.sources.is_empty() {
+                "unverified_period"
+            } else {
+                "evidence_observation_span"
+            }
+            .into(),
+            observation_kind: if activity.sources.is_empty() {
+                "unverified"
+            } else if activity.start_ms == activity.end_ms {
                 "instant"
             } else {
                 "span"
@@ -103,6 +110,7 @@ mod tests {
                 window_title: "Notes".into(),
             }],
             member_ids: members,
+            warnings: vec![],
         }
     }
 

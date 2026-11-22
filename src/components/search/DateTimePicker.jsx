@@ -1,6 +1,8 @@
 import React, { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { CalendarDays, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { cn } from '../../lib/utils';
 import { Button } from '../ui/Button';
 import { CalendarMonthSelect } from './CalendarMonthSelect';
 import { TimeWheel } from './TimeWheel';
@@ -11,7 +13,7 @@ const dayKey = (date) => [String(date.getFullYear()).padStart(4, '0'), pad(date.
 const localValue = (date) => dayKey(date) + 'T' + pad(date.getHours()) + ':' + pad(date.getMinutes());
 const parseValue = (value) => {
   if (!value) return null;
-  const date = new Date(value);
+  const date = new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? value + 'T00:00' : value);
   return Number.isFinite(date.getTime()) ? date : null;
 };
 const dayOf = (date) => {
@@ -36,8 +38,9 @@ const moveMonth = (date, amount) => {
 const POPOVER_GAP = 6;
 const VIEWPORT_PADDING = 8;
 
-/** A local-time calendar whose draft is applied only by its own confirmation. */
-export function DateTimePicker({ label, value, onChange, min, max, invalidMessage, anchorRef }) {
+/** A local calendar with optional immediate date selection and confirmed date/time drafts. */
+export function DateTimePicker({ label, value, onChange, min, max, invalidMessage, anchorRef,
+  dateOnly = false, applyOnSelect = false, clearable = true, highlightedDates = [], highlightLabel, className = '' }) {
   const { t, i18n } = useTranslation();
   const id = useId();
   const container = useRef(null);
@@ -54,11 +57,14 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
   const lower = parseValue(min);
   const upper = parseValue(max);
   const currentValue = parseValue(value);
+  const applyDateOnSelect = dateOnly && applyOnSelect;
+  const highlights = new Set(highlightedDates);
   const locale = i18n?.resolvedLanguage || i18n?.language;
   const dayFormatter = new Intl.DateTimeFormat(locale, { dateStyle: 'full' });
   const monthFormatter = new Intl.DateTimeFormat(locale, { month: 'long' });
   const valueFormatter = new Intl.DateTimeFormat(locale, {
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    ...(dateOnly ? {} : { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
   });
 
   const close = () => {
@@ -92,7 +98,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
   useEffect(() => {
     if (!open) return undefined;
     const outside = (event) => {
-      if (!container.current?.contains(event.target)) setOpen(false);
+      if (!container.current?.contains(event.target) && !popover.current?.contains(event.target)) setOpen(false);
     };
     document.addEventListener('mousedown', outside);
     return () => document.removeEventListener('mousedown', outside);
@@ -140,23 +146,30 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
 
   useLayoutEffect(() => {
     if (open && position && focusPending.current) {
-      container.current?.querySelector('[data-date="' + dayKey(focusDay) + '"]')?.focus({ preventScroll: true });
+      popover.current?.querySelector('[data-date="' + dayKey(focusDay) + '"]')?.focus({ preventScroll: true });
       focusPending.current = false;
     }
   }, [open, focusDay, viewMonth, position]);
 
   const draft = new Date(selected);
   const numericTime = /^\d{1,2}$/.test(hour) && Number(hour) <= 23 && /^\d{1,2}$/.test(minute) && Number(minute) <= 59;
-  draft.setHours(Number(hour), Number(minute), 0, 0);
-  const validTime = numericTime && draft.getHours() === Number(hour) && draft.getMinutes() === Number(minute)
-    && dayKey(draft) === dayKey(selected);
+  if (!dateOnly) draft.setHours(Number(hour), Number(minute), 0, 0);
+  const validTime = dateOnly || (numericTime && draft.getHours() === Number(hour) && draft.getMinutes() === Number(minute)
+    && dayKey(draft) === dayKey(selected));
+  const outOfRange = dateOnly ? !canSelect(draft) : (lower && draft < lower) || (upper && draft > upper);
   const error = !validTime ? t('dateTimePicker.invalidTime')
-    : (lower && draft < lower) || (upper && draft > upper)
-      ? invalidMessage || t('dateTimePicker.outOfRange') : null;
+    : outOfRange ? invalidMessage || t(dateOnly ? 'dateTimePicker.outOfDateRange' : 'dateTimePicker.outOfRange') : null;
   const applySelection = () => {
     if (error) return;
-    onChange(localValue(draft));
+    onChange(dateOnly ? dayKey(draft) : localValue(draft));
     close();
+  };
+  const selectDate = (date) => {
+    if (!canSelect(date)) return;
+    setSelected(date);
+    setFocusDay(date);
+    setViewMonth(monthOf(date));
+    if (applyDateOnSelect) onChange(dayKey(date));
   };
   const navigateMonth = (amount) => {
     const next = moveMonth(focusDay, amount);
@@ -200,25 +213,10 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
     return { value: month, label: monthFormatter.format(date), disabled: !canViewMonth(date) };
   });
 
-  return <div className="relative min-w-0 flex-1" ref={container}
-    onKeyDown={(event) => {
-      if (open && event.key === 'Escape') {
-        event.preventDefault();
-        event.stopPropagation();
-        close();
-      }
-    }}>
-    <button type="button" ref={trigger} aria-label={label} aria-haspopup="dialog"
-      aria-expanded={open} aria-controls={open ? id : undefined}
-      onClick={() => open ? close() : openCalendar()}
-      className="flex w-full items-center justify-between gap-2 rounded border border-ide-border bg-ide-bg px-2 py-1.5 text-xs text-ide-text hover:border-ide-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60">
-      <span className={currentValue ? 'truncate tabular-nums' : 'truncate text-ide-muted'}>
-        {currentValue ? valueFormatter.format(currentValue) : t('dateTimePicker.select')}
-      </span>
-      <CalendarDays className="h-3.5 w-3.5 shrink-0 text-ide-muted" aria-hidden="true" />
-    </button>
-    {open && <div ref={popover} id={id} role="dialog" aria-label={label} aria-describedby={error ? id + '-error' : undefined}
-      className="fixed z-40 max-h-[calc(100vh-1rem)] w-[424px] max-w-[calc(100vw-1rem)] overflow-y-auto rounded-lg border border-ide-border bg-ide-panel p-3 text-ide-text shadow-xl custom-scrollbar"
+  const calendar = open && (
+    <div ref={popover} id={id} role="dialog" aria-label={label} aria-describedby={error ? id + '-error' : undefined}
+      className={cn('fixed z-40 max-h-[calc(100vh-1rem)] max-w-[calc(100vw-1rem)] overflow-y-auto rounded-lg border border-ide-border bg-ide-panel p-3 text-ide-text shadow-xl custom-scrollbar',
+        dateOnly ? 'w-[312px]' : 'w-[424px]')}
       style={position || { visibility: 'hidden' }}
       onBlur={(event) => {
         if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
@@ -230,7 +228,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
           setFocusDay(new Date(focusDay));
         }
       }}>
-      <div className="grid grid-cols-[minmax(0,1fr)_100px] gap-4">
+      <div className={dateOnly ? undefined : 'grid grid-cols-[minmax(0,1fr)_100px] gap-4'}>
         <div className="min-w-0">
           <div className="mb-3 flex items-center gap-1.5">
             <Button variant="ghost" size="xs" className="h-8 w-6 p-0"
@@ -268,46 +266,73 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
               {days.slice(week * 7, week * 7 + 7).map((date) => {
                 const key = dayKey(date);
                 const isSelected = key === dayKey(selected);
+                const isHighlighted = highlights.has(key);
                 return <button type="button" role="gridcell" key={key} data-date={key}
                   aria-label={dayFormatter.format(date)} aria-selected={isSelected}
+                  aria-describedby={isHighlighted && highlightLabel ? id + '-highlight' : undefined}
                   disabled={!canSelect(date)} tabIndex={key === dayKey(focusDay) ? 0 : -1}
                   onKeyDown={(event) => calendarKeyDown(event, date)}
                   onClick={() => {
                     focusPending.current = true;
-                    setSelected(date);
-                    setFocusDay(date);
-                    setViewMonth(monthOf(date));
+                    selectDate(date);
                   }}
-                  className={['my-0.5 flex h-8 items-center justify-center rounded text-xs tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60 disabled:opacity-30',
-                    isSelected ? 'bg-ide-accent font-medium text-white' : 'hover:bg-ide-hover',
-                    !isSelected && date.getMonth() !== viewMonth.getMonth() ? 'text-ide-muted' : '',
-                    !isSelected && key === today ? 'ring-1 ring-inset ring-ide-accent/50' : ''].join(' ')}>
-                  {date.getDate()}
+                  className={cn('date-time-picker-day group relative flex h-10 items-center justify-center text-xs tabular-nums focus-visible:outline-none disabled:opacity-30',
+                    (isSelected || isHighlighted) && 'font-medium',
+                    !isSelected && date.getMonth() !== viewMonth.getMonth() && 'text-ide-muted')}>
+                  <span className={cn('date-time-picker-day-face flex aspect-square w-8 max-w-full shrink-0 items-center justify-center rounded-full transition-colors motion-reduce:transition-none group-focus-visible:ring-2 group-focus-visible:ring-ide-accent/60',
+                    isSelected && 'bg-ide-accent text-white',
+                    !isSelected && key === today && 'ring-1 ring-inset ring-ide-accent/50')}>{date.getDate()}</span>
+                  {isHighlighted && <span aria-hidden="true" className="date-time-picker-day-marker pointer-events-none absolute bottom-0 h-0.5 w-1.5 rounded-full" />}
                 </button>;
               })}
             </div>)}
           </div>
+          {highlightLabel && <div className="mt-2 flex items-center gap-1.5 text-[11px] text-ide-muted">
+            <span aria-hidden="true" className="date-time-picker-day-marker h-0.5 w-1.5 shrink-0 rounded-full" /><span id={id + '-highlight'}>{highlightLabel}</span>
+          </div>}
         </div>
-        <div className="grid min-w-0 grid-cols-2 gap-1 border-l border-ide-border pl-3">
+        {!dateOnly && <div className="grid min-w-0 grid-cols-2 gap-1 border-l border-ide-border pl-3">
           <TimeWheel label={t('dateTimePicker.hour')} value={Number(hour)} max={23} onChange={(value) => setHour(pad(value))} />
           <TimeWheel label={t('dateTimePicker.minute')} value={Number(minute)} max={59} onChange={(value) => setMinute(pad(value))} />
-        </div>
+        </div>}
       </div>
       {error && <p id={id + '-error'} role="alert" className="mt-2 text-[11px] text-ide-error">{error}</p>}
       <div className="mt-3 flex items-center gap-1">
-        <Button size="xs" variant="ghost" onClick={() => { onChange(''); close(); }}>{t('dateTimePicker.clear')}</Button>
+        {clearable && <Button size="xs" variant="ghost" onClick={() => { onChange(''); close(); }}>{t('dateTimePicker.clear')}</Button>}
         <Button size="xs" variant="ghost" disabled={!canSelect(dayOf(new Date()))} onClick={() => {
           const now = new Date();
-          setSelected(dayOf(now));
-          setFocusDay(dayOf(now));
-          setViewMonth(monthOf(now));
+          selectDate(dayOf(now));
           setHour(pad(now.getHours()));
           setMinute(pad(now.getMinutes()));
         }}>{t('dateTimePicker.today')}</Button>
-        <div className="flex-1" />
-        <Button size="xs" onClick={close}>{t('common.cancel')}</Button>
-        <Button size="xs" variant="primary" onClick={applySelection} disabled={Boolean(error)}>{t('dateTimePicker.confirm')}</Button>
+        {!applyDateOnSelect && <>
+          <div className="flex-1" />
+          <Button size="xs" onClick={close}>{t('common.cancel')}</Button>
+          <Button size="xs" variant="primary" onClick={applySelection} disabled={Boolean(error)}>{t('dateTimePicker.confirm')}</Button>
+        </>}
       </div>
-    </div>}
+    </div>
+  );
+
+  return <div className={cn('relative min-w-0 flex-1', className)} ref={container}
+    onKeyDown={(event) => {
+      if (open && event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }
+    }}>
+    <button type="button" ref={trigger} aria-label={label} aria-haspopup="dialog"
+      aria-expanded={open} aria-controls={open ? id : undefined}
+      onClick={() => open ? close() : openCalendar()}
+      className={cn('flex w-full items-center justify-between gap-2 rounded border border-ide-border bg-ide-bg px-2 py-1.5 text-xs text-ide-text hover:border-ide-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/60',
+        dateOnly && 'h-[30px] rounded-lg px-2.5 py-0')}>
+      <span className={currentValue ? 'truncate tabular-nums' : 'truncate text-ide-muted'}>
+        {currentValue ? valueFormatter.format(currentValue) : t(dateOnly ? 'dateTimePicker.selectDate' : 'dateTimePicker.select')}
+      </span>
+      <CalendarDays className={cn('h-3.5 w-3.5 shrink-0', dateOnly ? 'text-ide-accent' : 'text-ide-muted')} aria-hidden="true" />
+    </button>
+    {/* Date-only panels escape the recap header's container and clipping bounds. */}
+    {dateOnly && calendar ? createPortal(calendar, document.body) : calendar}
   </div>;
 }

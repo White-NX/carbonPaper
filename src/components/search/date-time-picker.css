@@ -8,6 +8,20 @@
   appearance: none;
 }
 
+.date-time-picker-day:enabled:not([aria-selected="true"]):hover .date-time-picker-day-face {
+  background: var(--ide-hover);
+}
+
+.date-time-picker-day-marker {
+  background: color-mix(in srgb, var(--ide-accent) 20%, var(--ide-muted));
+  opacity: 0.65;
+}
+
+.date-time-picker-day[aria-selected="true"] .date-time-picker-day-marker {
+  background: var(--ide-accent);
+  opacity: 0.85;
+}
+
 .date-time-month-options {
   scrollbar-width: thin;
   scrollbar-color: var(--ide-border) transparent;
