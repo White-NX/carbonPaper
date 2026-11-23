@@ -1482,11 +1482,24 @@
     "actions": "快照操作",
     "snapshotActions": "查看与编辑快照",
     "toolsLabel": "编辑工具",
-    "tools": { "select": "选择与移动", "brush": "画笔", "erase": "橡皮", "text": "文字", "mosaic": "马赛克" },
+    "tools": {
+      "select": "选择与移动",
+      "brush": "画笔",
+      "erase": "橡皮",
+      "text": "文字",
+      "mosaic": "马赛克"
+    },
     "options": "{{tool}}选项",
     "color": "颜色",
     "customColor": "自定义颜色",
-    "colors": { "e04e55": "红色", "f2aa3b": "橙色", "3fbb7d": "绿色", "458ee8": "蓝色", "ffffff": "白色", "20242d": "黑色" },
+    "colors": {
+      "e04e55": "红色",
+      "f2aa3b": "橙色",
+      "3fbb7d": "绿色",
+      "458ee8": "蓝色",
+      "ffffff": "白色",
+      "20242d": "黑色"
+    },
     "thickness": "粗细",
     "eraseRange": "范围",
     "grain": "颗粒",
@@ -1497,7 +1510,12 @@
     "editMosaic": "编辑马赛克",
     "placeholder": "输入文字…",
     "rotate": "拖动旋转对象",
-    "corners": { "nw": "左上缩放控制点", "ne": "右上缩放控制点", "se": "右下缩放控制点", "sw": "左下缩放控制点" },
+    "corners": {
+      "nw": "左上缩放控制点",
+      "ne": "右上缩放控制点",
+      "se": "右下缩放控制点",
+      "sw": "左下缩放控制点"
+    },
     "deleteObject": "删除选中对象",
     "history": "编辑历史与保存",
     "undo": "撤销 (Ctrl+Z)",
