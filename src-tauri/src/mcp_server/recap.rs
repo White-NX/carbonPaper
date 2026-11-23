@@ -98,7 +98,7 @@ pub(super) async fn tool_get_recap_days(
         }
         let storage = app.state::<Arc<StorageState>>();
         let generation = storage.db_generation();
-        let mut result = dates_result(storage.recap_list_days()?, &query, limit);
+        let mut result = dates_result(recap::read_days(&app)?, &query, limit);
         let mut calendars = serde_json::Map::new();
         for date in result["items"]
             .as_array()
@@ -638,5 +638,74 @@ mod tests {
         }
         assert!(serde_json::from_value::<DaysQuery>(json!({"offset":-1})).is_err());
         assert!(serde_json::from_value::<DayQuery>(json!({})).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recap_dates_paginate_actual_content_without_visited_empty_or_failed_days() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = crate::credential_manager::cng_tests::recap::storage_credentials(
+            temp.path().to_path_buf(),
+        );
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        storage.initialize().unwrap();
+        let privacy = recap::PrivacyFingerprint::new(Default::default()).unwrap();
+        for (date, status) in [
+            ("2010-07-28", "visited"),
+            ("2026-10-01", "ready"),
+            ("2026-10-02", "partial"),
+            ("2026-10-03", "empty"),
+            ("2026-10-04", "failed"),
+        ] {
+            let (start, end) = recap::day_bounds(date).unwrap();
+            let (revision, _, _) = storage
+                .recap_day_revision(date, start, end, &privacy)
+                .unwrap();
+            if status == "visited" {
+                continue;
+            }
+            let mut batch = fixture().batches.remove(0);
+            batch.start_ms = start;
+            batch.end_ms = end;
+            batch.status = status.into();
+            if matches!(status, "empty" | "failed") {
+                batch.activities.clear();
+                batch.summary = None;
+            }
+            if matches!(status, "partial" | "failed") {
+                batch.error = Some("AI_REQUEST_FAILED".into());
+            }
+            storage
+                .recap_write(
+                    "batch",
+                    date,
+                    date,
+                    revision,
+                    storage.db_generation(),
+                    &batch,
+                )
+                .unwrap();
+        }
+        let mut query: DaysQuery = serde_json::from_value(json!({"limit":1})).unwrap();
+        let limit = query.validate().unwrap();
+        let first = dates_result(
+            storage.recap_list_days(privacy.as_str()).unwrap(),
+            &query,
+            limit,
+        );
+        assert_eq!(first["items"], json!(["2026-10-02"]));
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["returned_count"], 1);
+        assert_eq!(first["next_offset"], 1);
+        query.page.offset = 1;
+        let last = dates_result(
+            storage.recap_list_days(privacy.as_str()).unwrap(),
+            &query,
+            limit,
+        );
+        assert_eq!(last["items"], json!(["2026-10-01"]));
+        assert_eq!(last["total"], 2);
+        assert!(last["next_offset"].is_null());
+        storage.shutdown().unwrap();
     }
 }

@@ -38,6 +38,7 @@ mod processing_stage;
 mod protected;
 mod protected_migration;
 mod recap;
+mod recap_content;
 mod recap_protected;
 mod recap_search;
 mod rewrite_budget;
@@ -973,7 +974,7 @@ mod tests {
                 assert!(reader_storage.count_smart_cluster_pending().is_ok());
                 assert!(reader_storage.edited_ocr_status(3).unwrap().is_none());
                 assert!(reader_storage.recap_config_revision().is_ok());
-                assert!(reader_storage.recap_list_days().is_ok());
+                assert!(reader_storage.recap_list_days("fixture").is_ok());
                 finished_tx.send(()).unwrap();
             });
             let finished = finished_rx.recv_timeout(THREAD_TIMEOUT);

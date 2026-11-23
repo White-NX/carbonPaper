@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 
-use super::{BackgroundReadError, StorageState};
+use super::{recap_content, BackgroundReadError, StorageState};
 use crate::ai::recap::{budget, PrivacyFingerprint, RecapSettings, RecapUsage};
 use crate::calendar::CalendarDay;
 
@@ -61,6 +61,7 @@ impl StorageState {
              INSERT OR IGNORE INTO recap_summary_jobs(day,version)
                 SELECT DISTINCT day,1 FROM recap_payloads WHERE kind='corrections';"
         ).map_err(|e| e.to_string())?;
+        recap_content::initialize(conn)?;
         // Batch checkpoints also queue relationship updates after interruption,
         // without advancing the correction version used by protected runs.
         conn.execute_batch(
@@ -448,6 +449,7 @@ impl StorageState {
         check: impl FnOnce(&Connection) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut bytes = serde_json::to_vec(value).map_err(|_| "RECAP_INVALID_CACHE")?;
+        let content = (kind == "batch").then(|| recap_content::has_content(&bytes));
         let encrypted = self.encrypt_payload_with_row_key(&bytes);
         Self::zeroize_bytes(&mut bytes);
         let (data, row_key) = encrypted?;
@@ -456,6 +458,8 @@ impl StorageState {
             return Err("RECAP_SOURCE_CHANGED".into());
         }
         let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let conn = &*tx;
         check(conn)?;
         if revision >= 0
             && !conn
@@ -471,7 +475,10 @@ impl StorageState {
         conn.execute("INSERT INTO recap_payloads(kind,key,day,revision,data,row_key) VALUES (?1,?2,?3,?4,?5,?6)
             ON CONFLICT(kind,key) DO UPDATE SET day=excluded.day,revision=excluded.revision,data=excluded.data,row_key=excluded.row_key",
             params![kind,key,day,revision,data,row_key]).map_err(|e| e.to_string())?;
-        Ok(())
+        if let Some(content) = content {
+            recap_content::record_content(conn, key, content)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Resolve a snapshot against saved calendars, including dates older than
@@ -516,20 +523,6 @@ impl StorageState {
                 .collect(),
             only_deleted,
         }))
-    }
-
-    pub(crate) fn recap_list_days(&self) -> Result<Vec<String>, String> {
-        self.with_read_connection_named("recap_list_days", |conn| {
-        let mut stmt = conn
-            .prepare("SELECT day FROM recap_days WHERE day NOT IN (SELECT day FROM recap_deleted_days) ORDER BY day DESC LIMIT 730")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string());
-        rows
-        })
     }
 
     pub(crate) fn recap_delete_day(&self, day: &str, generation: u64) -> Result<(), String> {
@@ -1010,6 +1003,247 @@ mod tests {
     }
 
     #[test]
+    fn recap_dates_ignore_empty_metadata_before_applying_the_calendar_limit() {
+        let (_temp, s) = storage();
+        {
+            let guard = s.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<800)
+                 INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash)
+                    SELECT date('2024-01-01','+'||x||' days'),0,1,'privacy' FROM n;
+                 INSERT INTO recap_days VALUES('2010-07-28',0,1,0,'privacy',1);
+                 INSERT INTO recap_days VALUES('2010-07-29',0,1,1,'privacy',1);
+                 INSERT INTO recap_days VALUES('2010-07-30',0,1,0,'other-privacy',1);
+                 INSERT INTO recap_days VALUES('2010-07-31',0,1,0,'privacy',1);
+                 INSERT INTO recap_days VALUES('2010-08-01',0,1,0,'privacy',1);
+                 INSERT INTO recap_payloads VALUES('batch','content','2010-07-28',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','same-day','2010-07-28',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','stale','2010-07-29',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','private','2010-07-30',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','deleted','2010-07-31',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','empty','2010-08-01',0,x'00',x'00');
+                 INSERT INTO recap_deleted_days VALUES('2010-07-31');",
+            )
+            .unwrap();
+            for key in ["content", "same-day", "stale", "private", "deleted"] {
+                recap_content::record_content(conn, key, true).unwrap();
+            }
+            recap_content::record_content(conn, "empty", false).unwrap();
+            let plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    recap_content::CONTENT_DAYS_SQL
+                ))
+                .unwrap()
+                .query_map(["privacy"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains("USING COVERING INDEX idx_recap_payload_day_kind_revision_key"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+        assert_eq!(s.recap_list_days("privacy").unwrap(), vec!["2010-07-28"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recap_dates_require_content_across_rewrites_legacy_backfill_and_deletion() {
+        use crate::ai::recap::{RecapActivity, RecapBatch, SourceRef};
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = crate::credential_manager::cng_tests::recap::storage_credentials(
+            temp.path().to_path_buf(),
+        );
+        let s = StorageState::new(temp.path().to_path_buf(), credentials.clone());
+        s.initialize().unwrap();
+        let privacy = privacy(true);
+        let visited = "2010-07-28";
+        let (start, end) = crate::ai::recap::day_bounds(visited).unwrap();
+        s.recap_day_revision(visited, start, end, &privacy).unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+
+        let date = "2026-10-01";
+        let (start, end) = crate::ai::recap::day_bounds(date).unwrap();
+        let (revision, _, _) = s.recap_day_revision(date, start, end, &privacy).unwrap();
+        let generation = s.db_generation();
+        let source = SourceRef {
+            id: 42,
+            timestamp_ms: start + 1000,
+            process_name: "editor.exe".into(),
+            window_title: "Example document".into(),
+        };
+        s.recap_write(
+            "index",
+            date,
+            date,
+            revision,
+            generation,
+            &vec![source.clone()],
+        )
+        .unwrap();
+        let mut batch = RecapBatch {
+            start_ms: start,
+            end_ms: end,
+            status: "empty".into(),
+            records: vec![source.clone()],
+            ..Default::default()
+        };
+        s.recap_write("batch", date, date, revision, generation, &batch)
+            .unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+        batch.status = "failed".into();
+        batch.error = Some("AI_REQUEST_FAILED".into());
+        s.recap_write("batch", date, date, revision, generation, &batch)
+            .unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+        batch.status = "partial".into();
+        batch.activities.push(RecapActivity {
+            id: "activity".into(),
+            task_id: "task".into(),
+            task_title: "Read the notes".into(),
+            text: "Reviewed the document.".into(),
+            start_ms: source.timestamp_ms,
+            end_ms: source.timestamp_ms,
+            sources: vec![source],
+            ..Default::default()
+        });
+        s.recap_write("batch", date, date, revision, generation, &batch)
+            .unwrap();
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+
+        // Failure to persist a flag must also roll back the payload replacement.
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_recap_content BEFORE INSERT ON recap_batch_content BEGIN
+             SELECT RAISE(ABORT,'injected content flag failure'); END;",
+            )
+            .unwrap();
+        let empty = RecapBatch {
+            status: "empty".into(),
+            ..Default::default()
+        };
+        assert!(s
+            .recap_write("batch", date, date, revision, generation, &empty)
+            .is_err());
+        assert_eq!(
+            s.recap_read::<RecapBatch>("batch", date, Some(revision))
+                .unwrap()
+                .unwrap()
+                .activities
+                .len(),
+            1
+        );
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_recap_content;")
+            .unwrap();
+
+        // Legacy empty and failed checkpoints must stay absent after upgrade.
+        for (other_date, status) in [("2026-10-02", "empty"), ("2026-10-03", "failed")] {
+            let (other_start, other_end) = crate::ai::recap::day_bounds(other_date).unwrap();
+            let (other_revision, _, _) = s
+                .recap_day_revision(other_date, other_start, other_end, &privacy)
+                .unwrap();
+            let other = RecapBatch {
+                start_ms: other_start,
+                end_ms: other_end,
+                status: status.into(),
+                error: (status == "failed").then(|| "AI_REQUEST_FAILED".into()),
+                ..Default::default()
+            };
+            s.recap_write(
+                "batch",
+                other_date,
+                other_date,
+                other_revision,
+                generation,
+                &other,
+            )
+            .unwrap();
+        }
+        // Simulate upgrading a database whose encrypted batches lack flags.
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("DELETE FROM recap_batch_content", [])
+            .unwrap();
+        let session = credentials.snapshot_import_state();
+        credentials.invalidate_session();
+        credentials.revoke_background_lease();
+        assert_eq!(
+            s.recap_list_days(privacy.as_str()).unwrap_err(),
+            "AUTH_REQUIRED"
+        );
+        assert_eq!(
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .query_row("SELECT count(*) FROM recap_batch_content", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        credentials.restore_import_state(session);
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+        s.shutdown().unwrap();
+        s.initialize().unwrap();
+        // Indexed dates remain discoverable without unwrapping any row keys.
+        let session = credentials.snapshot_import_state();
+        credentials.invalidate_session();
+        credentials.revoke_background_lease();
+        assert!(!s.is_silent_read_authorized());
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+        credentials.restore_import_state(session);
+
+        let changed_privacy = self::privacy(false);
+        let (new_revision, _, _) = s
+            .recap_day_revision(date, start, end, &changed_privacy)
+            .unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+        assert!(s
+            .recap_list_days(changed_privacy.as_str())
+            .unwrap()
+            .is_empty());
+        s.recap_write("batch", date, date, new_revision, s.db_generation(), &batch)
+            .unwrap();
+        assert_eq!(
+            s.recap_list_days(changed_privacy.as_str()).unwrap(),
+            vec![date]
+        );
+        s.recap_delete_day(date, s.db_generation()).unwrap();
+        assert!(s
+            .recap_list_days(changed_privacy.as_str())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM recap_batch_content WHERE key=?",
+                    [date],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        s.shutdown().unwrap();
+    }
+
+    #[test]
     fn snapshot_recap_scope_uses_recorded_bounds_and_excludes_deleted_sources() {
         let (_temp, s) = storage();
         let timestamp_ms = 1_767_225_600_000_i64;
@@ -1203,6 +1437,7 @@ mod tests {
                 INSERT INTO recap_payloads VALUES('batch','other','2026-01-02',0,x'00',x'00');",
             )
             .unwrap();
+            recap_content::record_content(conn, "other", true).unwrap();
             for kind in [
                 "batch",
                 "summary",
@@ -1248,7 +1483,7 @@ mod tests {
         assert!(!s
             .recap_revision_matches("2026-01-01", 7, generation)
             .unwrap());
-        assert_eq!(s.recap_list_days().unwrap(), vec!["2026-01-02"]);
+        assert_eq!(s.recap_list_days("privacy").unwrap(), vec!["2026-01-02"]);
         s.recap_allow_generation("2026-01-01", generation).unwrap();
         assert!(!s.recap_is_deleted("2026-01-01").unwrap());
         assert_eq!(

@@ -153,14 +153,16 @@ pub async fn recap_save_settings(
     Ok(settings.view())
 }
 
-/// Authentication: required. Returns saved source dates, newest first.
+/// Authentication: required. Returns dates with current recap content, newest first.
 #[tauri::command]
 pub async fn recap_list_days(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<Vec<String>, String> {
     check_auth_required(&credential_state)?;
-    storage_state.recap_list_days()
+    tokio::task::spawn_blocking(move || recap::read_days(&app))
+        .await
+        .map_err(|_| "RECAP_WORKER_FAILED")?
 }
 
 /// Authentication: required. Invalidated source payloads are never returned.

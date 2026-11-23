@@ -34,4 +34,4 @@ pub use snapshot::{read_snapshot_context, SnapshotRecapContext};
 pub use types::*;
 pub use unified::{search as search_unified, UnifiedSearchQuery, UnifiedSearchResult};
 pub(crate) use views::with_current_day;
-pub use views::{read_day_view, read_records, RecapRecordPage};
+pub use views::{read_day_view, read_days, read_records, RecapRecordPage};
