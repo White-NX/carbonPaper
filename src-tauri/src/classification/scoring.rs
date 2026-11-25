@@ -71,6 +71,14 @@ static DEFAULTS: LazyLock<Defaults> = LazyLock::new(|| {
     serde_json::from_str(include_str!("defaults.json")).expect("embedded classification defaults")
 });
 
+/// A process prior is inexpensive and available while inference is suppressed.
+pub(crate) fn process_category(process: &str) -> Option<&'static str> {
+    DEFAULTS
+        .process_prior
+        .get(&normalize_process(process))
+        .map(String::as_str)
+}
+
 pub(crate) fn validate_anchors(anchors: &Anchors) -> Result<(), String> {
     for (category, rows) in anchors {
         if category.trim().is_empty() || category.len() > 256 {

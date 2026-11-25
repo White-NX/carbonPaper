@@ -873,6 +873,7 @@ impl StorageState {
         super::migration::dedup::migrate(conn)?;
         super::compaction::initialize(conn)?;
         Self::init_recap_tables(conn)?;
+        super::usage::initialize(conn)?;
         let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
         if recovered > 0 {
             tracing::info!(

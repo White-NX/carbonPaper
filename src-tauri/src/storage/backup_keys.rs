@@ -93,6 +93,11 @@ const DOMAINS: &[Domain] = &[
         wrapping: "wrapped_key",
         payloads: &[],
     },
+    Domain {
+        table: "usage_intervals_legacy",
+        wrapping: "identity_key_enc",
+        payloads: &["identity_enc"],
+    },
 ];
 
 fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
@@ -374,6 +379,13 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
             true,
         ),
         ("tasks", "'task_label:'||id", "label", true),
+        ("usage_apps", "'usage_app:'||token", "info_enc", false),
+        (
+            "usage_contexts",
+            "'usage_context:'||token",
+            "info_enc",
+            false,
+        ),
         (
             "protected_process_names",
             "'process:'||token",
@@ -422,6 +434,9 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
             } else {
                 let value: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
                 if !carbonpaper_app_bound::payload::is_sealed(&value) {
+                    if matches!(table, "usage_apps" | "usage_contexts") {
+                        return Err("Unprotected usage catalog in backup".into());
+                    }
                     continue;
                 }
                 value
@@ -434,6 +449,113 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn usage_backup_validation_requires_keys_and_authenticates_catalog_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::usage::initialize(&conn).unwrap();
+        let key =
+            CipherKey::new("a".repeat(32), "b".repeat(32), "metadata".into(), &[7; 32]).unwrap();
+        let app = key.seal("usage_app:app", b"private application").unwrap();
+        let context = key
+            .seal("usage_context:context", b"private title and URL")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO usage_apps(id,token,info_enc) VALUES(1,'app',?1)",
+            [&app],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO usage_contexts(id,token,app_id,category,info_enc) VALUES(1,'context',1,'游戏',?1)",[&context]).unwrap();
+        assert!(validate_protected(&conn, &HashMap::new()).is_err());
+        let keys = HashMap::from([(key.id.clone(), key)]);
+        validate_protected(&conn, &keys).unwrap();
+        conn.execute("UPDATE usage_contexts SET info_enc=?1", [&app])
+            .unwrap();
+        assert!(validate_protected(&conn, &keys).is_err());
+        conn.execute(
+            "UPDATE usage_contexts SET info_enc=?1",
+            [b"plaintext".as_slice()],
+        )
+        .unwrap();
+        assert!(validate_protected(&conn, &keys).is_err());
+    }
+
+    #[test]
+    fn preserved_usage_row_keys_round_trip_through_a_portable_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_with_schema(directory.path().into());
+        let guard = storage
+            .get_connection_named("usage.legacy.backup.test")
+            .unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_intervals_legacy (
+                id INTEGER PRIMARY KEY,identity_enc BLOB NOT NULL,identity_key_enc BLOB NOT NULL);",
+        )
+        .unwrap();
+        let row_key = [19; 32];
+        let encrypted = encrypt_with_master_key(&row_key, b"legacy private identity").unwrap();
+        let wrapped = wrap_storage_domain_key(&storage.credential_state, &row_key).unwrap();
+        conn.execute(
+            "INSERT INTO usage_intervals_legacy VALUES(1,?1,?2)",
+            params![encrypted, wrapped],
+        )
+        .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut bytes = ZeroizingBuffer::new();
+        write_bundle(
+            conn,
+            &storage.credential_state,
+            &[1; 32],
+            &[2; 32],
+            &mut bytes,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
+        let bundle = Bundle::parse(&bytes).unwrap();
+        let legacy_domain = DOMAINS
+            .iter()
+            .position(|domain| domain.table == "usage_intervals_legacy")
+            .unwrap();
+        let slot = (0..bundle.count)
+            .map(|index| bundle.slot(index))
+            .find(|slot| slot[0] as usize == legacy_domain)
+            .unwrap();
+        assert_eq!(&slot[41..73], &row_key);
+
+        let restored = CredentialManagerState::new(directory.path().join("restored"));
+        restored.fixture_public_key(b"usage-backup-restored-recipient");
+        rewrap(
+            conn,
+            &bundle,
+            &restored,
+            directory.path(),
+            &cancelled,
+            &[],
+            |_, _| {},
+        )
+        .unwrap();
+        let (saved, rewrapped): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT identity_enc,identity_key_enc FROM usage_intervals_legacy WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, encrypted);
+        assert_ne!(rewrapped, wrapped);
+        let recovered = Zeroizing::new(unwrap_storage_domain_key(&restored, &rewrapped).unwrap());
+        assert_eq!(recovered.as_slice(), row_key);
+        assert_eq!(
+            decrypt_with_master_key(&recovered, &saved).unwrap(),
+            b"legacy private identity"
+        );
+    }
 }
 
 pub(super) fn write_bundle<F: FnMut(u64, u64)>(

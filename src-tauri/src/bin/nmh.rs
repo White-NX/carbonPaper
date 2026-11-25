@@ -82,6 +82,7 @@ fn main() {
         &stdout_mutex,
         &serde_json::json!({
             "type": "nmh_ready",
+            "usage_metadata": true,
             "browser_exe": browser.as_ref().map(|b| b.exe_name.clone()),
             "browser_pid": browser.as_ref().map(|b| b.pid),
             "browser_exe_path": browser.as_ref().map(|b| b.exe_path.clone()),
@@ -378,6 +379,41 @@ fn handle_message(
     let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match msg_type {
+        "usage_metadata" => {
+            if serde_json::to_vec(&msg).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+                return serde_json::json!({"status":"error","error":"Usage metadata is too large"});
+            }
+            if let Err(error) = ctx.client.ensure_channel(pipe_name, auth_token) {
+                return serde_json::json!({"status":"error","error":format!("Cannot connect to CarbonPaper: {error}")});
+            }
+            let Some(browser) = ctx.browser.as_ref() else {
+                return serde_json::json!({"status":"error","error":"Cannot verify browser identity"});
+            };
+            if !ctx.registered.load(Ordering::SeqCst) {
+                let response = send_to_pipe(
+                    &ctx.client,
+                    pipe_name,
+                    &build_register_request(auth_token, &ctx.cmd_pipe_name, browser),
+                );
+                if response.get("status").and_then(|s| s.as_str()) != Some("success") {
+                    return response;
+                }
+                ctx.registered.store(true, Ordering::SeqCst);
+            }
+            let response = send_to_pipe(
+                &ctx.client,
+                pipe_name,
+                &serde_json::json!({
+                    "command":"usage_browser_metadata","ipc_protocol_version":IPC_PROTOCOL_VERSION,
+                    "auth_token":auth_token,"nmh_pid":std::process::id(),
+                    "metadata": {"focused":msg.get("focused"),"private":msg.get("private"),"title":msg.get("title"),"url":msg.get("url")}
+                }),
+            );
+            if response.get("status").and_then(|s| s.as_str()) == Some("error") {
+                ctx.registered.store(false, Ordering::SeqCst);
+            }
+            response
+        }
         "save_screenshot" => {
             // Complete message with all data
             let image_data = match msg.get("image_data").and_then(|v| v.as_str()) {

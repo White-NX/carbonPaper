@@ -96,6 +96,7 @@ impl NmhPipeServer {
             .map_err(|e| format!("Cannot create NMH bootstrap pipe: {e}"))?;
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
+        let close_app = app.clone();
         let handler: nmh_pipe::RequestHandler = Arc::new(move |peer, request| {
             let storage = storage.clone();
             let capture = capture_state.clone();
@@ -104,9 +105,13 @@ impl NmhPipeServer {
                 async move { process_nmh_request(&request, &peer, storage, capture, app).await },
             )
         });
-        let on_close: nmh_pipe::CloseHandler = Arc::new(|peer| {
+        let on_close: nmh_pipe::CloseHandler = Arc::new(move |peer| {
             let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             remove_peer_sessions(&mut sessions, peer, None);
+            use tauri::Manager;
+            if let Some(usage) = close_app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+                usage.clear_browser(peer.pid);
+            }
         });
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
@@ -256,7 +261,50 @@ async fn process_nmh_request(
             let cmd_pipe_name = req["cmd_pipe_name"].as_str().unwrap_or("");
             let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             remove_peer_sessions(&mut sessions, peer, Some(cmd_pipe_name));
+            use tauri::Manager;
+            if let Some(usage) = app_handle.try_state::<Arc<crate::usage::UsageRuntime>>() {
+                usage.clear_browser(peer.pid);
+            }
             StorageResponse::success(serde_json::json!({"unregistered": true}))
+        }
+        "usage_browser_metadata" => {
+            let session = {
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(session) = sessions.iter_mut().find(|s| s.nmh_peer == *peer) else {
+                    return StorageResponse::error(
+                        "NMH usage metadata requires a registered session",
+                    );
+                };
+                session.last_seen_ms = chrono::Utc::now().timestamp_millis();
+                session.clone()
+            };
+            let browser = match windows_platform::inspect_process(session.browser_pid) {
+                Ok(browser)
+                    if browser.created_at == session.browser_created_at
+                        && browser
+                            .image
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&session.browser_exe_path) =>
+                {
+                    browser
+                }
+                _ => return StorageResponse::error("NMH browser identity changed"),
+            };
+            if !is_extension_enhanced_browser(&session.browser_exe_name) {
+                return StorageResponse::success(serde_json::json!({"accepted":false}));
+            }
+            let data = match req.get("metadata") {
+                Some(data) if data.is_object() => data,
+                _ => return StorageResponse::error("Missing usage browser metadata"),
+            };
+            use tauri::Manager;
+            match app_handle
+                .state::<Arc<crate::usage::UsageRuntime>>()
+                .browser_metadata(peer.pid, browser.pid, data)
+            {
+                Ok(()) => StorageResponse::success(serde_json::json!({"accepted":true})),
+                Err(error) => StorageResponse::error(&error),
+            }
         }
         "save_extension_screenshot" => {
             // Only the OS-verified owner can refresh this session.

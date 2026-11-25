@@ -497,10 +497,10 @@ impl CaptureState {
 
 /// Information about the currently focused window (handle, title, rect, PID).
 pub struct ActiveWindowInfo {
-    hwnd_raw: isize,
-    title: String,
+    pub(crate) hwnd_raw: isize,
+    pub(crate) title: String,
     rect: RECT,
-    pid: u32,
+    pub(crate) pid: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -777,7 +777,10 @@ pub fn get_process_name_from_path(path: &str) -> String {
 fn get_process_command_line(pid: u32) -> Option<String> {
     use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
     let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessRefreshKind::new().with_cmd(UpdateKind::Always));
+    sys.refresh_process_specifics(
+        Pid::from_u32(pid),
+        ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+    );
     sys.process(Pid::from_u32(pid)).and_then(|p| {
         let cmd = p.cmd();
         if cmd.is_empty() {
@@ -794,6 +797,14 @@ fn get_process_command_line(pid: u32) -> Option<String> {
     })
 }
 
+pub(crate) fn process_has_privacy_flag(pid: u32) -> bool {
+    get_process_command_line(pid).is_some_and(|command| {
+        ["--incognito", "-inprivate", "-private", "--private-window"]
+            .iter()
+            .any(|flag| command.contains(flag))
+    })
+}
+
 // ==================== Window Exclusion ====================
 
 fn is_window_protected(hwnd_raw: isize) -> bool {
@@ -807,6 +818,27 @@ fn is_window_protected(hwnd_raw: isize) -> bool {
 }
 
 fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
+    let process = if settings.user_excluded_processes.is_empty() {
+        String::new()
+    } else {
+        get_process_path_from_pid(info.pid)
+            .map(|p| get_process_name_from_path(&p))
+            .unwrap_or_default()
+    };
+    if usage_window_excluded(info, settings, &process) {
+        return true;
+    }
+    let title_lower = info.title.to_lowercase();
+    let browser_keywords = ["edge", "chrome", "firefox", "browser", "浏览器"];
+    browser_keywords.iter().any(|bk| title_lower.contains(bk)) && process_has_privacy_flag(info.pid)
+}
+
+/// Uses the recorder's cached process identity; never enumerates processes.
+pub(crate) fn usage_window_excluded(
+    info: &ActiveWindowInfo,
+    settings: &ExclusionSettings,
+    process: &str,
+) -> bool {
     // Empty title
     if info.title.is_empty() {
         return true;
@@ -842,27 +874,7 @@ fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
     }
 
     // User-defined process name exclusion
-    if !settings.user_excluded_processes.is_empty() {
-        if let Some(path) = get_process_path_from_pid(info.pid) {
-            let pname = get_process_name_from_path(&path);
-            if !pname.is_empty() && settings.user_excluded_processes.contains(&pname) {
-                return true;
-            }
-        }
-    }
-
-    // Browser incognito command line check
-    let browser_keywords = ["edge", "chrome", "firefox", "browser", "浏览器"];
-    if browser_keywords.iter().any(|bk| title_lower.contains(bk)) {
-        if let Some(cmd_line) = get_process_command_line(info.pid) {
-            let privacy_flags = ["--incognito", "-inprivate", "-private", "--private-window"];
-            if privacy_flags.iter().any(|flag| cmd_line.contains(flag)) {
-                return true;
-            }
-        }
-    }
-
-    false
+    settings.user_excluded_processes.contains(process)
 }
 
 // ==================== dHash ====================
@@ -921,6 +933,7 @@ struct CapturedImage {
     width: u32,
     height: u32,
     rgb_image: Arc<RgbImage>,
+    observed_at: std::time::Instant,
 }
 
 pub(crate) fn encode_rgb_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
@@ -1335,6 +1348,7 @@ fn capture_foreground_window(
             width: final_w,
             height: final_h,
             rgb_image: Arc::new(rgb_image),
+            observed_at: crate::usage::frame_observed_at(&frame),
         };
 
         session.last_image = Some(captured.clone());
@@ -1344,7 +1358,7 @@ fn capture_foreground_window(
 
 // ==================== Process Icon Extraction ====================
 
-fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
+pub(crate) fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::Shell::ExtractIconExW;
     use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
@@ -1713,6 +1727,14 @@ pub async fn run_capture_loop(
         };
 
         // dHash dedup
+        if let Some(usage) = app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+            usage.observe_normal(
+                window_info.hwnd_raw,
+                window_info.pid,
+                &captured.rgb_image,
+                captured.observed_at,
+            );
+        }
         let current_hash = compute_dhash(&captured.rgb_image, 16);
         let preserve_office_context = scan_reason == "focus_change"
             && current_window_fingerprint.office_document_hwnd.is_some();

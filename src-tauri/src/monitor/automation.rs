@@ -28,6 +28,7 @@ pub(super) struct AutomationState {
 
 #[derive(Default)]
 pub(super) struct Policy {
+    pub requested_start: bool,
     pub manual_stop: bool,
     pub manual_pause: bool,
     pub timed_pause: Option<TimedPause>,
@@ -130,11 +131,16 @@ impl Policy {
     }
 
     pub fn request_start(&mut self) {
+        self.requested_start = true;
         self.manual_stop = false;
         self.manual_pause = false;
         self.timed_pause = None;
         self.error = None;
         self.unexpected_stops.clear();
+    }
+
+    pub fn usage_paused(&self) -> bool {
+        self.manual_pause && !self.timed_pause_expired(Instant::now())
     }
 
     pub fn finish_action(&mut self, result: &Result<String, String>, source: ControlSource) {
@@ -365,6 +371,29 @@ mod tests {
         ] {
             assert_eq!(policy.automatic_action(blocked), None);
         }
+    }
+
+    #[test]
+    fn usage_follows_explicit_pause_and_expires_it_while_screenshots_are_power_blocked() {
+        let mut policy = Policy::default();
+        policy.request_start();
+        assert!(policy.requested_start);
+        assert!(!policy.usage_paused());
+        policy.user_action(MonitorAction::PauseFor(15), false);
+        assert!(policy.usage_paused());
+        policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        assert!(!policy.usage_paused());
+        policy.user_action(MonitorAction::Pause, false);
+        policy.finish_action(
+            &Ok("power stopped screenshots".into()),
+            ControlSource::Automatic,
+        );
+        assert!(policy.usage_paused());
+        policy.user_action(MonitorAction::Stop, false);
+        assert!(policy.manual_stop);
+        policy.request_start();
+        assert!(!policy.manual_stop);
+        assert!(!policy.usage_paused());
     }
 
     #[test]

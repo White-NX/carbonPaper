@@ -70,6 +70,19 @@ impl MonitorState {
         self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_IDLE
     }
 
+    /// Lightweight usage follows native user intent even when battery/game
+    /// policy or unavailable OCR models suppress the screenshot pipeline.
+    pub(crate) fn usage_recording_intended(&self) -> bool {
+        let policy = self
+            .automation
+            .policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !policy.manual_stop
+            && !policy.usage_paused()
+            && (policy.requested_start || get_monitor_autostart() || self.is_running())
+    }
+
     pub(crate) fn pause_until_ms(&self) -> Option<i64> {
         self.automation
             .policy

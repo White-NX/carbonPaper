@@ -41,6 +41,9 @@ pub fn restart_app(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
+    if let Some(usage) = app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+        usage.stop();
+    }
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {
@@ -82,6 +85,9 @@ pub async fn exit_app(
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
     IS_QUITTING.store(true, Ordering::Relaxed);
+    if let Some(usage) = app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+        usage.stop();
+    }
     monitor_state.stopping.store(true, Ordering::SeqCst);
     capture_state.stopped.store(true, Ordering::SeqCst);
     capture_state.paused.store(false, Ordering::SeqCst);

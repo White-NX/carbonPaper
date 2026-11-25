@@ -30,4 +30,5 @@ pub mod migration;
 pub mod recap;
 pub mod smart_cluster;
 pub mod storage;
+pub mod usage;
 pub mod utility;

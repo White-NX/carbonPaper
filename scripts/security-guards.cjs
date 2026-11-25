@@ -3,6 +3,8 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMMAND_TIERS = {
+  'commands::usage::usage_get_day': 'session_required',
+  'commands::usage::usage_get_app_details': 'session_required',
   'commands::recap::recap_search': 'session_required',
   'commands::recap::recap_search_status': 'session_required',
   'commands::recap::recap_prepare_search': 'session_required',

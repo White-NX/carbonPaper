@@ -54,6 +54,7 @@ mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
 mod types;
+mod usage;
 mod vector_blocks;
 mod vector_query_metrics;
 pub(crate) mod wire_time;
@@ -80,6 +81,7 @@ pub(crate) use screenshot_reader::ScreenshotReader;
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use timeline::TimelineRecord;
 pub use types::*;
+pub(crate) use usage::UsageWriter;
 pub(crate) use vector_query_metrics::VectorQueryMetrics;
 
 use crate::credential_manager::{
