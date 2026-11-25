@@ -425,6 +425,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
         novelty: 0.,
         span_ms: 0,
         screening: Default::default(),
+        supplied_ranges: vec![],
     };
     let batch = recap::RecapBatch {
         start_ms: calendar.period_boundaries_ms[0],

@@ -7,8 +7,8 @@ use tauri::{Emitter, Manager};
 
 use super::protected::{self, ProtectedRun};
 use super::{
-    evidence_agent, history, mainlines, progress::ProgressState, screening, selection, summary,
-    types::*, validation, PrivacyFingerprint,
+    delivery, evidence_agent, history, mainlines, progress::ProgressState, screening, selection,
+    summary, types::*, validation, PrivacyFingerprint,
 };
 use crate::ai::{
     config::{is_local_url, AiSettings, ResolvedProvider},
@@ -590,6 +590,7 @@ fn read_evidence(ctx: &RunContext, ids: &[i64]) -> Result<Vec<Evidence>, String>
                 page_url: url,
                 text,
                 segment: String::new(),
+                supplied_ranges: vec![],
                 context: document_identity,
                 novelty: 0.0,
                 span_ms: 0,
@@ -786,13 +787,12 @@ pub(crate) fn initial_request(
             .rev()
             .find(|old| old.context == e.context)
             .map(|old| old.text.as_str());
-        let mut sample = e.clone();
-        sample.text = selection::excerpt(&e.text, previous, 900);
+        let mut sample = delivery::sample(e, previous, 900);
         values.push(evidence_value(&sample, 900));
         payload["evidence"] = json!(values);
         if context::estimated_input_tokens(provider.kind, &make_request(&payload)) > allowance {
             values.pop();
-            sample.text = selection::excerpt(&e.text, previous, 240);
+            sample = delivery::sample(e, previous, 240);
             values.push(evidence_value(&sample, 240));
             payload["evidence"] = json!(values);
             if context::estimated_input_tokens(provider.kind, &make_request(&payload)) > allowance {
@@ -2081,6 +2081,7 @@ mod tests {
             page_url: String::new(),
             text: "Screen text. ".repeat(80),
             segment: format!("segment-{id}"),
+            supplied_ranges: vec![],
             context: id.to_string(),
             novelty: 1.0,
             span_ms: 0,

@@ -1,6 +1,7 @@
 //! Bounded, evidence-backed daily recaps. Classification is optional.
 pub(crate) mod activity_contract;
 pub(crate) mod budget;
+mod delivery;
 mod evidence_agent;
 mod history;
 mod mainline_state;

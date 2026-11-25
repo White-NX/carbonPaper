@@ -299,6 +299,7 @@ fn filter_capture(
             novelty: 0.,
             span_ms: 0,
             screening: Default::default(),
+            supplied_ranges: vec![],
         })
     })();
     Ok(filtered.ok())
@@ -365,6 +366,7 @@ pub(super) fn ingest(app: &AppHandle) -> Result<(), String> {
                     novelty: 0.,
                     span_ms: 0,
                     screening: Default::default(),
+                    supplied_ranges: vec![],
                 },
                 source: SourceVersion {
                     id: receipt.screenshot_id,
