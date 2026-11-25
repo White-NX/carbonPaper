@@ -1,9 +1,11 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import UsageStatisticsView from './UsageStatisticsView';
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n: { language: 'en' } }) }));
+const { i18n } = vi.hoisted(() => ({ i18n: { language: 'en' } }));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n }) }));
+beforeEach(() => { i18n.language = 'en'; });
 const date = '2026-11-24';
 const start = Date.UTC(2026, 10, 24);
 const app = { id: 'endfield.exe', process_name: 'endfield.exe', name: 'Endfield', category: '游戏', total_ms: 3600000, visits: 1, longest_ms: 3600000 };
@@ -13,6 +15,34 @@ const day = { date, generation: 7, calendar: { start_ms: start, end_ms: start + 
   hours: Array.from({ length: 24 }, (_, index) => ({ start_ms: start + index * 3600000, end_ms: start + (index + 1) * 3600000, total_ms: index === 0 ? 3600000 : 0, categories: index === 0 ? [{ category: '游戏', total_ms: 3600000 }] : [] })),
   intervals: [{ state: 'active', app_id: app.id, category: '游戏', start_ms: start, end_ms: start + 3600000 }, { state: 'unknown', start_ms: start + 3600000, end_ms: start + 7200000 }],
 };
+
+describe('usage statistics hourly calendars', () => {
+  it.each(['zh-CN', 'en'])('keeps numeric hour ticks and offset labels across DST changes in %s', (locale) => {
+    i18n.language = locale;
+    const onViewSnapshots = vi.fn();
+    const props = { today: date, loading: false, selectDate: vi.fn(), selectApp: vi.fn(), clearApp: vi.fn(), refresh: vi.fn(), onViewSnapshots };
+    const transitions = [
+      { date: '2026-03-08', start: '2026-03-08T05:00:00Z', end: '2026-03-09T04:00:00Z', offsets: [-18000, -14400], ticks: ['00', '07', '13', '19', '23'], before: 'GMT-5', after: 'GMT-4', nextHour: '03:00' },
+      { date: '2026-11-01', start: '2026-11-01T04:00:00Z', end: '2026-11-02T05:00:00Z', offsets: [-14400, -18000], ticks: ['00', '05', '11', '17', '23'], before: 'GMT-4', after: 'GMT-5', nextHour: '01:00' },
+    ];
+    const { container, rerender } = render(<UsageStatisticsView {...props} date={date} day={day} />);
+    for (const transition of transitions) {
+      const startMs = Date.parse(transition.start); const endMs = Date.parse(transition.end);
+      const hours = Array.from({ length: (endMs - startMs) / 3600000 }, (_, index) => ({ start_ms: startMs + index * 3600000, end_ms: startMs + (index + 1) * 3600000, total_ms: 0, categories: [] }));
+      rerender(<UsageStatisticsView {...props} date={transition.date} day={{ ...day, date: transition.date, hours, first_ms: startMs, last_ms: startMs + 3600000, intervals: [],
+        calendar: { start_ms: startMs, end_ms: endMs, time_zone: 'America/New_York', start_utc_offset_seconds: transition.offsets[0], end_utc_offset_seconds: transition.offsets[1] },
+      }} />);
+      const ticks = [...container.querySelectorAll('.usage-hour-tick')].map((tick) => tick.textContent).filter(Boolean);
+      expect(ticks).toEqual(transition.ticks);
+      const buttons = container.querySelectorAll('.usage-hour');
+      expect(buttons[1]).toHaveAttribute('aria-label', expect.stringContaining(transition.before));
+      expect(buttons[2]).toHaveAttribute('aria-label', expect.stringContaining(transition.after));
+      expect(buttons[2]).toHaveAttribute('aria-label', expect.stringContaining(transition.nextHour));
+      fireEvent.click(buttons[2]);
+      expect(onViewSnapshots).toHaveBeenLastCalledWith(startMs + 2 * 3600000);
+    }
+  });
+});
 
 describe('usage statistics navigation', () => {
   it('keeps initials behind transparent icons out of the tile and recovers after an icon source changes', () => {

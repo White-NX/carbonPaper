@@ -26,6 +26,16 @@ describe('saved recap calendars', () => {
     expect(time(fixture.captured_at_ms)).toBe('00:30');
   });
 
+  it('extracts numeric hour ticks using the recorded legacy calendar rules', () => {
+    const calendar = { rule: 'recorded_bounds', time_zone: null, start_utc_offset_seconds: 28800, end_utc_offset_seconds: 28800 };
+    const hour = calendarTimeFormatter('zh-CN', calendar, 'hour');
+    expect(hour(fixture.captured_at_ms)).toBe('00');
+    expect(hour(null)).toBe('');
+    expect(calendarTimeFormatter('zh-CN', {
+      ...calendar, start_utc_offset_seconds: -18000, end_utc_offset_seconds: -14400,
+    }, 'hour')(Date.parse('2026-03-08T07:00:00Z'))).toBe('07');
+  });
+
   it('labels UTC when a legacy clock transition rule is unavailable', () => {
     const time = calendarTimeFormatter('en-US', {
       rule: 'recorded_bounds', time_zone: null,

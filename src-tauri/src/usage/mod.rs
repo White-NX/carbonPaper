@@ -161,7 +161,12 @@ impl UsageRuntime {
         }
     }
     pub(crate) fn stop(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        {
+            // Serialize shutdown with wait's predicate check and atomic unlock.
+            let _guard = self.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+            self.shutdown.store(true, Ordering::Release);
+            self.wake.1.notify_all();
+        }
         if let Some(task) = self
             .category_task
             .lock()
@@ -170,7 +175,6 @@ impl UsageRuntime {
         {
             task.abort();
         }
-        self.wake.1.notify_all();
         if let Some(thread) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = thread.join();
         }
@@ -599,6 +603,55 @@ fn title_matches_page(window: &str, page: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_cannot_notify_between_shutdown_check_and_condvar_wait() {
+        use std::sync::mpsc;
+
+        let runtime = Arc::new(UsageRuntime::default());
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (enter_wait_tx, enter_wait_rx) = mpsc::channel();
+        let (wait_result_tx, wait_result_rx) = mpsc::channel();
+        let waiter = runtime.clone();
+        *runtime.thread.lock().unwrap() = Some(thread::spawn(move || {
+            let guard = waiter.wake.0.lock().unwrap();
+            assert!(!waiter.shutdown.load(Ordering::Acquire));
+            // Hold the predicate lock at the exact point before entering the wait.
+            checked_tx.send(()).unwrap();
+            enter_wait_rx.recv().unwrap();
+            let (guard, result) = waiter
+                .wake
+                .1
+                .wait_timeout(guard, Duration::from_secs(2))
+                .unwrap();
+            drop(guard);
+            wait_result_tx.send(result.timed_out()).unwrap();
+        }));
+        checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (stopping_tx, stopping_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stopping = runtime.clone();
+        let stopper = thread::spawn(move || {
+            stopping_tx.send(()).unwrap();
+            stopping.stop();
+            stopped_tx.send(()).unwrap();
+        });
+        stopping_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let _ = stopped_rx.recv_timeout(Duration::from_millis(100));
+        let shutdown_before_wait = runtime.shutdown.load(Ordering::Acquire);
+        enter_wait_tx.send(()).unwrap();
+        let timed_out = wait_result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stopped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stopper.join().unwrap();
+
+        assert!(
+            !shutdown_before_wait,
+            "shutdown must acquire the predicate lock"
+        );
+        assert!(!timed_out, "stop must wake the waiter before joining it");
+        runtime.wait(Duration::from_secs(2));
+    }
+
     #[test]
     fn any_supported_activity_keeps_the_three_minute_clock_running() {
         assert_eq!(activity_age(Some(250_000), None, Some(9_000)), Some(9_000));

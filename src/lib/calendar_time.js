@@ -1,5 +1,5 @@
-/** Format a saved recap in the calendar that originally defined its day. */
-export function calendarTimeFormatter(locale, calendar) {
+/** Format a saved calendar time, optionally selecting an Intl date/time part. */
+export function calendarTimeFormatter(locale, calendar, part) {
   const options = { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' };
   let shiftMs = 0;
   if (calendar?.time_zone) {
@@ -16,5 +16,9 @@ export function calendarTimeFormatter(locale, calendar) {
     }
   }
   const formatter = new Intl.DateTimeFormat(locale, options);
-  return (ms) => Number.isFinite(ms) ? formatter.format(new Date(ms + shiftMs)) : '';
+  return (ms) => {
+    if (!Number.isFinite(ms)) return '';
+    const date = new Date(ms + shiftMs);
+    return part ? formatter.formatToParts(date).find((entry) => entry.type === part)?.value || '' : formatter.format(date);
+  };
 }

@@ -42,8 +42,9 @@ function Week({ days, date, today, selectDate }) {
 }
 
 function Hours({ day, selectedApp, time, onViewSnapshots }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const selected = useMemo(() => usageHourlySelection(day, selectedApp?.id), [day, selectedApp?.id]);
+  const hourTick = useMemo(() => calendarTimeFormatter(i18n.language, day.calendar, 'hour'), [i18n.language, day.calendar]);
   return <figure className="usage-hours-figure">
     <div className="usage-label"><figcaption>{t('usage.hourlyMinutes')}</figcaption><span>{selectedApp ? selectedApp.name : t('usage.allApps')}</span></div>
     <div className="usage-hours-axis"><span>60</span><span>30</span><span>0</span></div>
@@ -56,7 +57,7 @@ function Hours({ day, selectedApp, time, onViewSnapshots }) {
         return <button key={hour.start_ms} type="button" className="usage-hour" aria-label={label} title={label} onClick={() => onViewSnapshots?.(hour.start_ms)}>
           <span className="usage-hour-stack">{segments.filter((segment) => segment.total_ms > 0).map((segment, part) => <i key={`${segment.category}:${part}`}
             style={{ height: `${segment.total_ms / 3600000 * 100}%`, background: segment.category ? color(segment.category) : 'var(--ide-active)' }} />)}</span>
-          <span className="usage-hour-tick">{index % 6 === 0 || index === day.hours.length - 1 ? time(hour.start_ms).slice(0, 2) : ''}</span>
+          <span className="usage-hour-tick">{index % 6 === 0 || index === day.hours.length - 1 ? hourTick(hour.start_ms) : ''}</span>
         </button>;
       })}
     </div>
