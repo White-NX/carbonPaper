@@ -27,6 +27,17 @@ pub(super) fn supplied(evidence: &Evidence) -> Vec<(usize, usize)> {
     }
 }
 
+pub(super) fn append(existing: &mut Evidence, added: &Evidence) {
+    debug_assert_eq!(existing.id, added.id);
+    let mut ranges = supplied(existing);
+    ranges.extend(supplied(added));
+    existing.supplied_ranges = merge(ranges);
+    if !added.text.is_empty() && existing.text != added.text {
+        existing.text =
+            super::types::limited(&format!("{}\n{}", added.text, existing.text), 12_000);
+    }
+}
+
 pub(super) fn subtract(wanted: &[(usize, usize)], known: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
     for &(start, end) in wanted {

@@ -111,6 +111,7 @@ fn request() -> ChatRequest {
             parameters: json!({"type":"object"}),
         }],
         disable_tools: false,
+        prompt_only_final: false,
         ..Default::default()
     }
 }

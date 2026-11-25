@@ -134,7 +134,7 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                 })
             })
             .collect();
-        if request.disable_tools {
+        if request.disable_tools && !request.prompt_only_final {
             body["tool_choice"] = json!({"type": "none"});
         }
     }

@@ -676,12 +676,7 @@ fn request(payload: &Value, max_output: u32) -> ChatRequest {
     let mut payload = payload.clone();
     let mut stable = serde_json::Map::new();
     if let Some(object) = payload.as_object_mut() {
-        for key in [
-            "language",
-            "calendar",
-            "existing_tasks",
-            "existing_tasks_omitted",
-        ] {
+        for key in ["language", "calendar", "existing_tasks"] {
             if let Some(value) = object.remove(key) {
                 stable.insert(key.into(), value);
             }
@@ -711,6 +706,7 @@ fn request(payload: &Value, max_output: u32) -> ChatRequest {
         max_tokens: Some(max_output),
         temperature: Some(0.2),
         disable_tools: false,
+        prompt_only_final: false,
     };
     validation::configure(&mut request);
     request
@@ -1020,38 +1016,8 @@ fn remaining_budget(
     )
 }
 
-fn repair_request(
-    mut payload: Value,
-    selected: &[Evidence],
-    provider: &ResolvedProvider,
-    input: u64,
-    output: u32,
-) -> Result<(ChatRequest, Vec<Evidence>), String> {
-    if output == 0 {
-        return Err("RECAP_BUDGET_EXHAUSTED".into());
-    }
-    let mut selected = selected.to_vec();
-    loop {
-        payload["evidence"] = json!(selected
-            .iter()
-            .map(|e| evidence_value(e, 360))
-            .collect::<Vec<_>>());
-        let req = request(&payload, output);
-        if context::estimated_input_tokens(provider.kind, &req)
-            <= input.min(context::input_allowance(&req, provider.context_tokens))
-        {
-            return Ok((req, selected));
-        }
-        if selected.len() <= 1 {
-            return Err("AI_CONTEXT_LIMIT".into());
-        }
-        selected.pop();
-    }
-}
-
-/// Continue the exact first request when it fits. Only the new evidence and
-/// validation feedback are appended; never rewrite the cached system or the
-/// original evidence directory. Tight budgets retain the bounded fallback.
+/// Continue the exact received history. Fit only the new evidence to the
+/// remaining budget; an unfittable continuation never rebuilds a cold prompt.
 #[expect(
     clippy::too_many_arguments,
     reason = "Keeps evidence sets, provider capabilities and request budgets explicit."
@@ -1069,16 +1035,33 @@ fn followup_request(
     if output == 0 {
         return Err("RECAP_BUDGET_EXHAUSTED".into());
     }
-    let mut appended = payload.clone();
-    appended.as_object_mut().unwrap().remove("validated_draft");
-    appended["additional_evidence"] = json!(extra
-        .iter()
-        .map(|e| evidence_value(e, 1800))
-        .collect::<Vec<_>>());
-    let tail = request(&appended, output);
+    if !response.tool_calls.is_empty() {
+        return Err("RECAP_INVALID_RESPONSE".into());
+    }
+    let mut appended = payload;
+    let object = appended.as_object_mut().ok_or("RECAP_INVALID_STRUCTURE")?;
+    for key in [
+        "validated_draft",
+        "existing_tasks",
+        "existing_tasks_omitted",
+        "language",
+        "calendar",
+    ] {
+        object.remove(key);
+    }
+    let answer = object
+        .get("answer_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(4000)
+        .min(u64::from(output));
+    object.insert("answer_tokens".into(), json!(answer));
+    object.insert("max_activities".into(), json!((answer / 256).clamp(1, 80)));
+    object.insert("controller_state".into(), json!("final"));
+    object.insert("additional_evidence".into(), json!([]));
     let mut continuation = first.clone();
     continuation.max_tokens = Some(output);
     continuation.disable_tools = !continuation.tools.is_empty();
+    continuation.prompt_only_final = continuation.disable_tools;
     continuation.messages.push(Message::Assistant {
         text: response.text.clone(),
         tool_calls: vec![],
@@ -1086,17 +1069,61 @@ fn followup_request(
     });
     continuation
         .messages
-        .push(tail.messages.last().unwrap().clone());
-    if response.tool_calls.is_empty()
-        && context::estimated_input_tokens(provider.kind, &continuation)
-            <= input.min(context::input_allowance(
-                &continuation,
-                provider.context_tokens,
-            ))
-    {
-        return Ok((continuation, selected.to_vec()));
+        .push(Message::User(appended.to_string()));
+    let limit = input.min(context::input_allowance(
+        &continuation,
+        provider.context_tokens,
+    ));
+    if context::estimated_input_tokens(provider.kind, &continuation) > limit {
+        return Err("AI_CONTEXT_LIMIT".into());
     }
-    repair_request(payload, selected, provider, input, output)
+    for cap in [1800, 900, 360, 120] {
+        let mut ids = HashSet::new();
+        let mut samples = extra
+            .iter()
+            .filter(|e| ids.insert(e.id))
+            .filter_map(|e| {
+                let wanted = delivery::sample(e, None, cap);
+                let sample = delivery::unread(
+                    e,
+                    &wanted.supplied_ranges,
+                    selected.iter().find(|old| old.id == e.id),
+                );
+                (!sample.text.is_empty()).then_some(sample)
+            })
+            .collect::<Vec<_>>();
+        loop {
+            if !extra.is_empty() && samples.is_empty() {
+                break;
+            }
+            appended["additional_evidence"] = json!(samples
+                .iter()
+                .map(|e| {
+                    // The delta is already bounded. Do not excerpt it a second
+                    // time or lose the correspondence with its original ranges.
+                    let mut value = evidence_value(e, usize::MAX);
+                    value["text_ranges"] = json!(e.supplied_ranges);
+                    value
+                })
+                .collect::<Vec<_>>());
+            *continuation.messages.last_mut().unwrap() = Message::User(appended.to_string());
+            if context::estimated_input_tokens(provider.kind, &continuation) <= limit {
+                let mut received = selected.to_vec();
+                for sample in samples {
+                    if let Some(old) = received.iter_mut().find(|old| old.id == sample.id) {
+                        delivery::append(old, &sample);
+                    } else {
+                        received.push(sample);
+                    }
+                }
+                return Ok((continuation, received));
+            }
+            if samples.pop().is_none() {
+                break;
+            }
+        }
+    }
+    Err("AI_CONTEXT_LIMIT".into())
 }
 
 async fn generate_batch(
@@ -1271,16 +1298,18 @@ async fn generate_batch(
                 } else {
                     e.segment = format!("segment-{}", e.id);
                 }
-                e.text = selection::excerpt(&e.text, None, 1800);
-                if !has_new_text(&first, &e) {
+                let wanted = delivery::sample(&e, None, 1800);
+                if delivery::unread(
+                    &e,
+                    &wanted.supplied_ranges,
+                    selected.iter().find(|old| old.id == e.id),
+                )
+                .text
+                .is_empty()
+                {
                     continue;
                 }
-                additional_evidence.push(e.clone());
-                if let Some(existing) = selected.iter_mut().find(|old| old.id == e.id) {
-                    *existing = e;
-                } else {
-                    selected.push(e);
-                }
+                additional_evidence.push(e);
             }
         }
         if !additional_evidence.is_empty() {
@@ -1306,6 +1335,7 @@ async fn generate_batch(
                     ctx.settings.request_limit(),
                 )
                 .await?;
+                selected = second_evidence.clone();
                 let report =
                     validation::repair(ctx, provider, second, response, &run, "repair", |value| {
                         selection::validate_value(
@@ -1468,26 +1498,6 @@ fn finish_batch(
     .into();
     batch.validation_version = validation::VERSION;
     Ok(batch)
-}
-
-/// Compare against the actual excerpt sent, not the full local source.
-fn has_new_text(first: &ChatRequest, extra: &Evidence) -> bool {
-    if extra.text.trim().is_empty() {
-        return false;
-    }
-    let sent = first.messages.iter().find_map(|message| match message {
-        Message::User(text) => serde_json::from_str::<Value>(text).ok(),
-        _ => None,
-    });
-    !sent
-        .as_ref()
-        .and_then(|v| v["evidence"].as_array())
-        .is_some_and(|items| {
-            items.iter().any(|v| {
-                v["id"].as_i64() == Some(extra.id)
-                    && v["text"].as_str() == Some(extra.text.as_str())
-            })
-        })
 }
 
 fn merge_supplement(first: &Draft, supplement: Draft) -> Result<Draft, String> {
@@ -2014,13 +2024,23 @@ mod tests {
     #[test]
     fn supplement_requires_new_visible_text_and_preserves_valid_first_activities() {
         let mut source = evidence(1);
-        source.text = "Already sent".into();
-        let req = request(&json!({"evidence":[evidence_value(&source, 900)]}), 4000);
-        assert!(!has_new_text(&req, &source));
-        source.text.push_str(" with a new result");
-        assert!(has_new_text(&req, &source));
+        source.text = "Already sent with a new result".into();
+        let sent = delivery::sample(&source, None, 12);
+        assert!(
+            delivery::unread(&source, &sent.supplied_ranges, Some(&sent))
+                .text
+                .is_empty()
+        );
+        let wanted = delivery::sample(&source, None, 1800);
+        assert_eq!(
+            delivery::unread(&source, &wanted.supplied_ranges, Some(&sent)).text,
+            " with a new result"
+        );
         source.text = "  ".into();
-        assert!(!has_new_text(&req, &source));
+        let wanted = delivery::sample(&source, None, 1800);
+        assert!(delivery::unread(&source, &wanted.supplied_ranges, None)
+            .text
+            .is_empty());
         let first = selection::parse_draft(r#"{"activities":[{"task_id":"new:1","task_title":"Task","text":"Read notes","evidence_ids":[1]}],"gaps":[{"question":"Result?","evidence_ids":[2]}]}"#).unwrap();
         let supplement = selection::parse_draft(r#"{"activities":[{"task_id":"new:1","task_title":"Task","text":"Viewed result","evidence_ids":[2]}]}"#).unwrap();
         let merged = merge_supplement(&first, supplement).unwrap();
@@ -2248,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_output_can_be_replaced_with_a_bounded_cited_recap() {
+    fn bounded_supplements_keep_the_prefix_and_only_grant_received_citations() {
         let provider = provider();
         let error = response_draft(&ChatResponse {
             text: "{\"activities\":[".into(),
@@ -2257,13 +2277,37 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error, "RECAP_OUTPUT_TRUNCATED");
-        let selected = (1..=50).map(evidence).collect::<Vec<_>>();
+        let selected = vec![delivery::sample(&evidence(1), None, 12)];
+        let first = request(&json!({"evidence":[evidence_value(&selected[0],12)]}), 4000);
+        let previous = ChatResponse {
+            text: "{\"activities\":[]}".into(),
+            ..Default::default()
+        };
+        let extra = (2..=50).map(evidence).collect::<Vec<_>>();
         let payload = json!({"repair_required":true,"validation_error":error});
-        let (request, included) =
-            repair_request(payload, &selected, &provider, 2400, 2000).unwrap();
-        assert!(included.len() < selected.len());
-        assert!(!included.is_empty());
-        assert!(context::estimated_input_tokens(provider.kind, &request) <= 2400);
+        let (base, _) = followup_request(
+            &first,
+            &previous,
+            payload.clone(),
+            &selected,
+            &[],
+            &provider,
+            30_000,
+            2000,
+        )
+        .unwrap();
+        let limit = context::estimated_input_tokens(provider.kind, &base) + 600;
+        let (request, included) = followup_request(
+            &first, &previous, payload, &selected, &extra, &provider, limit, 2000,
+        )
+        .unwrap();
+        assert!(included.len() < extra.len());
+        assert!(included.len() > selected.len());
+        assert_eq!(
+            &request.messages[..first.messages.len()],
+            first.messages.as_slice()
+        );
+        assert!(context::estimated_input_tokens(provider.kind, &request) <= limit);
         let Message::User(body) = request.messages.last().unwrap() else {
             panic!("missing repair request")
         };
@@ -2273,7 +2317,7 @@ mod tests {
         let response = ChatResponse {
             text: json!({"activities":[{
                 "task_id":"new:1", "task_title":"Read example", "text":"Viewed the example.",
-                "evidence_ids":[included[0].id]
+                "evidence_ids":[included[1].id]
             }]})
             .to_string(),
             ..Default::default()
@@ -2344,7 +2388,7 @@ mod tests {
             reasoning: json!("provider-native reasoning"),
             ..Default::default()
         };
-        let selected = vec![evidence(1), evidence(2)];
+        let selected = vec![delivery::sample(&evidence(1), None, 900)];
         let (second, included) = followup_request(
             &initial,
             &response,
@@ -2380,7 +2424,7 @@ mod tests {
             text: "x".repeat(50_000),
             ..Default::default()
         };
-        let (compact, _) = followup_request(
+        let error = followup_request(
             &initial,
             &large,
             json!({}),
@@ -2390,13 +2434,12 @@ mod tests {
             3000,
             2000,
         )
-        .unwrap();
-        assert_eq!(compact.messages.len(), 3);
-        assert!(context::estimated_input_tokens(provider.kind, &compact) <= 3000);
+        .unwrap_err();
+        assert_eq!(error, "AI_CONTEXT_LIMIT");
     }
 
     #[test]
-    fn changing_batch_times_and_recent_history_preserves_the_stable_context_message() {
+    fn changing_batch_data_preserves_the_stable_context_message() {
         let mut payload = json!({"language":"zh-CN", "calendar":{"date":"2026-11-25"},
             "existing_tasks":[{"id":"task-1","title":"Atlas project"}],
             "existing_tasks_omitted":0, "batch_start_ms":100, "batch_end_ms":200,
@@ -2405,6 +2448,7 @@ mod tests {
         payload["batch_start_ms"] = json!(200);
         payload["batch_end_ms"] = json!(300);
         payload["task_history"][0]["text"] = json!("New progress");
+        payload["existing_tasks_omitted"] = json!(1);
         let later = request(&payload, 4000);
         assert_eq!(&first.messages[..2], &later.messages[..2]);
         assert!(matches!(&first.messages[1], Message::Context(_)));
@@ -2416,21 +2460,101 @@ mod tests {
         assert_eq!(stable["existing_tasks"][0]["id"], "task-1");
         assert!(stable.get("task_history").is_none());
         assert!(stable.get("batch_start_ms").is_none());
+        assert!(stable.get("existing_tasks_omitted").is_none());
+        let Message::User(batch) = later.messages.last().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(batch).unwrap()["existing_tasks_omitted"],
+            1
+        );
     }
 
     #[test]
-    fn repair_stops_when_the_remaining_budget_cannot_hold_a_request() {
+    fn supplement_stops_when_the_remaining_budget_cannot_hold_the_received_history() {
+        let first = request(&json!({}), 1000);
+        let response = ChatResponse::default();
         assert_eq!(
-            repair_request(json!({}), &[evidence(1)], &provider(), 0, 1000).unwrap_err(),
+            followup_request(&first, &response, json!({}), &[], &[], &provider(), 0, 1000)
+                .unwrap_err(),
             "AI_CONTEXT_LIMIT"
         );
         assert_eq!(
-            repair_request(json!({}), &[evidence(1)], &provider(), 5000, 0).unwrap_err(),
+            followup_request(&first, &response, json!({}), &[], &[], &provider(), 5000, 0)
+                .unwrap_err(),
             "RECAP_BUDGET_EXHAUSTED"
         );
         assert_eq!(
             response_draft(&ChatResponse::default()).unwrap_err(),
             "RECAP_EMPTY_RESPONSE"
+        );
+    }
+
+    #[test]
+    fn supplements_exclude_text_already_received_through_tools() {
+        let mut source = evidence(1);
+        source.text = "前".repeat(6000);
+        let first_sample = delivery::sample(&source, None, 900);
+        let mut received = first_sample.clone();
+        let tool_page = delivery::unread(&source, &[(0, 2400)], Some(&received));
+        delivery::append(&mut received, &tool_page);
+        let mut first = request(
+            &json!({"evidence":[evidence_value(&first_sample,900)]}),
+            4000,
+        );
+        evidence_agent::configure(&mut first, &provider(), false, &RecapSettings::default());
+        let call_id = "received-evidence-page".to_string();
+        first.messages.push(Message::Assistant {
+            text: String::new(),
+            tool_calls: vec![crate::ai::provider::ToolCall {
+                id: call_id.clone(),
+                name: "read_day_evidence".into(),
+                arguments: json!({"evidence_ids":[source.id],"offset_chars":0}).to_string(),
+            }],
+            reasoning: Value::Null,
+        });
+        first.messages.push(Message::ToolResult {
+            call_id,
+            content: json!({"records":[{
+                "id":source.id,
+                "text":tool_page.text,
+                "text_ranges":tool_page.supplied_ranges,
+                "offset_chars":tool_page.supplied_ranges[0].0,
+                "next_offset_chars":2400,
+            }],"unavailable_ids":[]})
+            .to_string(),
+        });
+        let response = ChatResponse {
+            text: "{\"activities\":[]}".into(),
+            ..Default::default()
+        };
+        let (second, included) = followup_request(
+            &first,
+            &response,
+            json!({}),
+            &[received.clone()],
+            &[source],
+            &provider(),
+            30_000,
+            2000,
+        )
+        .unwrap();
+        let Message::User(text) = second.messages.last().unwrap() else {
+            panic!()
+        };
+        let value: Value = serde_json::from_str(text).unwrap();
+        let ranges: Vec<(usize, usize)> =
+            serde_json::from_value(value["additional_evidence"][0]["text_ranges"].clone()).unwrap();
+        assert!(!ranges.is_empty());
+        for (start, end) in ranges {
+            assert!(delivery::supplied(&received)
+                .iter()
+                .all(|&(a, b)| end <= a || start >= b));
+        }
+        assert_eq!(included.len(), 1);
+        assert_eq!(
+            &second.messages[..first.messages.len()],
+            first.messages.as_slice()
         );
     }
 
