@@ -30,7 +30,7 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
         .iter()
         .map(|message| match message {
             Message::System(text) => json!({ "role": "system", "content": text }),
-            Message::User(text) => json!({ "role": "user", "content": text }),
+            Message::User(text) | Message::Context(text) => json!({ "role": "user", "content": text }),
             Message::Assistant {
                 text,
                 tool_calls,

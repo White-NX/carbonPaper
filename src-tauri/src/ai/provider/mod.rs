@@ -29,6 +29,10 @@ pub enum Message {
     // Replayed frontend history cannot supply system instructions.
     #[serde(skip_deserializing)]
     System(String),
+    /// Backend-supplied quoted context whose boundary can be cached separately
+    /// from the current user input. It carries no system-instruction authority.
+    #[serde(skip_deserializing)]
+    Context(String),
     User(String),
     Assistant {
         text: String,

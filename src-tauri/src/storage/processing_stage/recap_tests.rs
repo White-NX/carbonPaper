@@ -564,7 +564,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
         second,
     )
     .unwrap();
-    let crate::ai::provider::Message::User(payload) = &request.messages[1] else {
+    let crate::ai::provider::Message::Context(payload) = &request.messages[1] else {
         panic!()
     };
     let payload: Value = serde_json::from_str(payload).unwrap();

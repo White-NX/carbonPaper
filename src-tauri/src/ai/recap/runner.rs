@@ -7,8 +7,8 @@ use tauri::{Emitter, Manager};
 
 use super::protected::{self, ProtectedRun};
 use super::{
-    evidence_agent, mainlines, progress::ProgressState, screening, selection, summary, types::*,
-    validation, PrivacyFingerprint,
+    evidence_agent, history, mainlines, progress::ProgressState, screening, selection, summary,
+    types::*, validation, PrivacyFingerprint,
 };
 use crate::ai::{
     config::{is_local_url, AiSettings, ResolvedProvider},
@@ -662,6 +662,7 @@ Factual grounding (apply silently):
 - Cite only evidence whose text you received, not directory-only records. Empty or withheld text supports no detailed claims. If support is insufficient, use a narrower description or omit the claim.
 - Viewing a document, plan or code supports viewing it; claim authorship, sending, execution or completion only with direct support. Attribute reported results briefly, e.g. "The assistant reported passing tests." Never invent time spent, intent, offline activity or productivity.
 - The local directory is incomplete when directory_omitted is positive; missing evidence does not establish inactivity. Existing task names are navigation hints, not facts.
+- existing_tasks is a navigation directory. task_history supplies only selected earlier excerpts to help identify tasks; use read_task_activities for a specific missing relationship. Omitted task history supplies no facts. Earlier text must never become an occurrence in the current batch.
 
 Grouping and output:
 - Group by concrete task, not application. Different apps may serve the same task, and one app may host different tasks. Reuse an existing task_id only when evidence supports the same task; otherwise assign a new identifier and reuse it for that task's occurrences. Each activity describes one natural occurrence; keep interruptions separate.
@@ -672,6 +673,19 @@ Grouping and output:
 fn request(payload: &Value, max_output: u32) -> ChatRequest {
     let rules=" For a new task use task_id new:1, new:2, etc.; reuse that identifier for its other occurrences within this response. Distinct tasks must have distinct identifiers even when titles coincide. Each activity's evidence_ids MUST belong to exactly one segment from the supplied evidence. For a task spanning segments, create one activity per segment and reuse its task_id. Existing task IDs are preserved exactly.";
     let mut payload = payload.clone();
+    let mut stable = serde_json::Map::new();
+    if let Some(object) = payload.as_object_mut() {
+        for key in [
+            "language",
+            "calendar",
+            "existing_tasks",
+            "existing_tasks_omitted",
+        ] {
+            if let Some(value) = object.remove(key) {
+                stable.insert(key.into(), value);
+            }
+        }
+    }
     // Leave space for JSON, citations and reasoning instead of asking for 80
     // full occurrences even when only a small response can fit.
     if let Some(object) = payload.as_object_mut() {
@@ -689,6 +703,7 @@ fn request(payload: &Value, max_output: u32) -> ChatRequest {
     let mut request = ChatRequest {
         messages: vec![
             Message::System(format!("{PROMPT}{rules} Keep the entire response within the output limit. Aim for at most answer_tokens tokens of recap JSON; the larger request output allowance also accommodates thinking. Return at most max_activities activities, prioritizing representative supported occurrences when necessary. Use short titles (at most 120 characters) and one short sentence per activity (at most 1600 characters). Finish the JSON object even if some occurrences must be omitted.")),
+            Message::Context(Value::Object(stable).to_string()),
             Message::User(payload.to_string()),
         ],
         tools: vec![],
@@ -734,29 +749,9 @@ pub(crate) fn initial_request(
         provider.context_tokens,
     ));
     let order = selection::selection_order(records, start as u64);
-    let mut tasks = prior
-        .threads
-        .iter()
-        .take(64)
-        .map(|t| {
-            let ids = prior
-                .batches
-                .iter()
-                .flat_map(|b| &b.activities)
-                .filter(|a| a.task_id == t.id)
-                .flat_map(|a| a.sources.iter().map(|s| s.id))
-                .take(3)
-                .collect::<Vec<_>>();
-            let mut occurrences = prior.batches.iter().flat_map(|b| &b.activities)
-                .filter(|a| a.task_id == t.id).collect::<Vec<_>>();
-            occurrences.sort_by_key(|a| std::cmp::Reverse(a.start_ms));
-            let recent = occurrences.iter().take(2).map(|a| json!({
-                "text":limited(&a.text,300),"time_ms":a.start_ms,
-                "key_details":a.details.iter().take(2).map(|d| limited(&d.text,200)).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>();
-            json!({"id":t.id,"title":t.title,"source_ids":ids,"recent_activity":recent})
-        })
-        .collect::<Vec<_>>();
+    let history = history::select(prior, records, start, allowance / 8);
+    let mut tasks = history.directory;
+    let mut task_history = history.entries;
     let mut segments = HashSet::new();
     let mut directory=order.iter().filter_map(|i| {let e=&records[*i];segments.insert(&e.segment).then(||json!({"id":e.id,"segment":e.segment,"time_ms":e.timestamp_ms,"title":limited(&e.window_title,80)}))}).take(128).collect::<Vec<_>>();
     let end = prior
@@ -765,17 +760,21 @@ pub(crate) fn initial_request(
         .into_iter()
         .find(|(a, _)| *a == start)
         .map(|(_, b)| b);
-    let mut payload = json!({"language":settings.language,"calendar":prior.calendar,"batch_start_ms":start,"batch_end_ms":end,"include_key_details":settings.include_key_details,"answer_tokens":settings.answer_tokens,"existing_tasks":tasks,"directory":directory,"directory_omitted":records.len().saturating_sub(directory.len()),"evidence":[]});
+    let mut payload = json!({"language":settings.language,"calendar":prior.calendar,"batch_start_ms":start,"batch_end_ms":end,"include_key_details":settings.include_key_details,"answer_tokens":settings.answer_tokens,"existing_tasks":tasks,"existing_tasks_omitted":history.omitted_tasks,"task_history":task_history,"directory":directory,"directory_omitted":records.len().saturating_sub(directory.len()),"evidence":[]});
     while context::estimated_input_tokens(provider.kind, &make_request(&payload)) > allowance / 2
-        && (!directory.is_empty() || !tasks.is_empty())
+        && (!task_history.is_empty() || !directory.is_empty() || !tasks.is_empty())
     {
-        if !directory.is_empty() {
+        if !task_history.is_empty() {
+            task_history.pop();
+        } else if !directory.is_empty() {
             directory.pop();
         } else {
             tasks.pop();
         }
         payload["directory"] = json!(directory);
         payload["existing_tasks"] = json!(tasks);
+        payload["existing_tasks_omitted"] = json!(prior.threads.len().saturating_sub(tasks.len()));
+        payload["task_history"] = json!(task_history);
         payload["directory_omitted"] = json!(records.len().saturating_sub(directory.len()));
     }
     let mut selected = Vec::new();
@@ -1085,7 +1084,9 @@ fn followup_request(
         tool_calls: vec![],
         reasoning: response.reasoning.clone(),
     });
-    continuation.messages.push(tail.messages[1].clone());
+    continuation
+        .messages
+        .push(tail.messages.last().unwrap().clone());
     if response.tool_calls.is_empty()
         && context::estimated_input_tokens(provider.kind, &continuation)
             <= input.min(context::input_allowance(
@@ -2163,7 +2164,7 @@ mod tests {
                 context::estimated_input_tokens(provider.kind, &first)
                     <= context::input_allowance(&first, context)
             );
-            let Message::User(body) = &first.messages[1] else {
+            let Message::User(body) = first.messages.last().unwrap() else {
                 panic!("missing input")
             };
             let body: Value = serde_json::from_str(body).unwrap();
@@ -2262,7 +2263,7 @@ mod tests {
         assert!(included.len() < selected.len());
         assert!(!included.is_empty());
         assert!(context::estimated_input_tokens(provider.kind, &request) <= 2400);
-        let Message::User(body) = &request.messages[1] else {
+        let Message::User(body) = request.messages.last().unwrap() else {
             panic!("missing repair request")
         };
         let body: Value = serde_json::from_str(body).unwrap();
@@ -2326,7 +2327,7 @@ mod tests {
             output,
         )
         .unwrap();
-        assert_eq!(second.messages.len(), 4);
+        assert_eq!(second.messages.len(), first.messages.len() + 2);
         assert!(context::estimated_input_tokens(provider.kind, &second) <= input);
     }
 
@@ -2358,16 +2359,20 @@ mod tests {
         let first_body = provider::request_body_for_estimate(provider.kind, &initial);
         let next_body = provider::request_body_for_estimate(provider.kind, &second);
         assert_eq!(
-            &next_body["messages"].as_array().unwrap()[..2],
+            &next_body["messages"].as_array().unwrap()[..initial.messages.len()],
             first_body["messages"].as_array().unwrap()
         );
         assert_eq!(
-            next_body["messages"][2]["reasoning_content"],
+            next_body["messages"][initial.messages.len()]["reasoning_content"],
             response.reasoning
         );
         assert_eq!(included.len(), 2);
-        let tail: Value =
-            serde_json::from_str(next_body["messages"][3]["content"].as_str().unwrap()).unwrap();
+        let tail: Value = serde_json::from_str(
+            next_body["messages"][initial.messages.len() + 1]["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(tail["additional_evidence"][0]["id"], 2);
         assert_eq!(tail["additional_evidence"].as_array().unwrap().len(), 1);
         let large = ChatResponse {
@@ -2385,8 +2390,31 @@ mod tests {
             2000,
         )
         .unwrap();
-        assert_eq!(compact.messages.len(), 2);
+        assert_eq!(compact.messages.len(), 3);
         assert!(context::estimated_input_tokens(provider.kind, &compact) <= 3000);
+    }
+
+    #[test]
+    fn changing_batch_times_and_recent_history_preserves_the_stable_context_message() {
+        let mut payload = json!({"language":"zh-CN", "calendar":{"date":"2026-11-25"},
+            "existing_tasks":[{"id":"task-1","title":"Atlas project"}],
+            "existing_tasks_omitted":0, "batch_start_ms":100, "batch_end_ms":200,
+            "task_history":[{"id":"old","text":"Earlier progress"}], "answer_tokens":4000});
+        let first = request(&payload, 4000);
+        payload["batch_start_ms"] = json!(200);
+        payload["batch_end_ms"] = json!(300);
+        payload["task_history"][0]["text"] = json!("New progress");
+        let later = request(&payload, 4000);
+        assert_eq!(&first.messages[..2], &later.messages[..2]);
+        assert!(matches!(&first.messages[1], Message::Context(_)));
+        assert_ne!(first.messages.last(), later.messages.last());
+        let Message::Context(stable) = &first.messages[1] else {
+            panic!()
+        };
+        let stable: Value = serde_json::from_str(stable).unwrap();
+        assert_eq!(stable["existing_tasks"][0]["id"], "task-1");
+        assert!(stable.get("task_history").is_none());
+        assert!(stable.get("batch_start_ms").is_none());
     }
 
     #[test]

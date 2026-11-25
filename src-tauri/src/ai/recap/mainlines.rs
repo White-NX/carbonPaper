@@ -498,20 +498,23 @@ fn update_request(
             .filter(|activity| changed.contains(&activity.id))
             .cloned()
             .collect::<Vec<_>>();
+        // Only a mainline touched by this delta needs representative old
+        // activities. Other accepted entries can be carried verbatim.
+        let affected = delta.affected_task_ids.iter().collect::<HashSet<_>>();
+        let history_tasks = previous
+            .items
+            .iter()
+            .filter(|item| item.task_ids.iter().any(|id| affected.contains(id)))
+            .flat_map(|item| &item.task_ids)
+            .collect::<HashSet<_>>();
         let mut represented = HashSet::new();
         for activity in &selected {
             if !changed.contains(&activity.id)
-                && previous
-                    .items
-                    .iter()
-                    .any(|item| item.task_ids.contains(&activity.task_id))
+                && history_tasks.contains(&activity.task_id)
                 && represented.insert(activity.task_id.clone())
             {
                 prioritized.push(activity.clone());
             }
-        }
-        if prioritized.is_empty() {
-            prioritized.extend(selected.iter().take(1).cloned());
         }
         selected = prioritized;
     }
@@ -530,12 +533,16 @@ fn update_request(
         }
         .error(2));
     }
-    let directory = tasks.iter().map(|(id, activities)| {
-        json!({"id":id,"title":activities[0].task_title,"occurrences":activities.len()})
-    }).collect::<Vec<_>>();
+    let directory = tasks
+        .iter()
+        .map(|(id, activities)| json!({"id":id,"title":activities[0].task_title}))
+        .collect::<Vec<_>>();
     let mut request = ChatRequest {
-        messages:vec![Message::System(format!("{PROMPT}{UPDATE_RULES}")),Message::User(json!({"language":settings.language,"calendar":day.calendar,"tasks":directory,
-            "previous_mainlines":previous_values,"activity_delta":delta,
+        messages:vec![Message::System(format!("{PROMPT}{UPDATE_RULES}")),
+            Message::Context(json!({"language":settings.language,"calendar":day.calendar,"tasks":directory}).to_string()),
+            Message::User(json!({"previous_mainlines":previous_values}).to_string()),
+            Message::User(json!({"activity_delta":delta,
+            "task_occurrences":tasks.iter().map(|(id, activities)|json!({"id":id,"occurrences":activities.len()})).collect::<Vec<_>>(),
             "activities":selected.iter().map(|a| activity_value(a,1600)).collect::<Vec<_>>(),
             "omitted_tasks":0,
             "omitted_activities":tasks.values().map(Vec::len).sum::<usize>().saturating_sub(selected.len())}).to_string())],
@@ -1092,14 +1099,20 @@ mod tests {
             Some(&delta),
         )
         .unwrap();
-        assert_eq!(included.len(), 3);
+        // A new directory-only task does not require resending every old task;
+        // a concrete relationship can be verified through the read-only tools.
+        assert_eq!(included.len(), 1);
         assert_eq!(included[0].id, "later-occurrence");
-        let Message::User(text) = &update.messages[1] else {
+        let Message::User(text) = update.messages.last().unwrap() else {
             panic!()
         };
         let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        let Message::User(previous_text) = &update.messages[2] else {
+            panic!()
+        };
+        let previous_payload: serde_json::Value = serde_json::from_str(previous_text).unwrap();
         assert_eq!(
-            payload["previous_mainlines"][0]["id"],
+            previous_payload["previous_mainlines"][0]["id"],
             cache.mainlines.as_ref().unwrap().items[0].id
         );
         assert_eq!(
@@ -1240,6 +1253,78 @@ mod tests {
     }
 
     #[test]
+    fn updating_one_mainline_preserves_other_entries_without_resending_their_bodies() {
+        let mut original = day();
+        let mut other = original.batches[0].activities[0].clone();
+        other.id = "other-activity".into();
+        other.task_id = "other-task".into();
+        other.task_title = "Unrelated project".into();
+        other.text = "Unrelated project history".repeat(30);
+        other.sources[0].id = 40;
+        original.batches[0].activities.push(other.clone());
+        let mut previous = accepted_cache(&original).mainlines.unwrap();
+        previous.items.push(RecapMainline {
+            id: "other-mainline".into(),
+            title: "Unrelated project".into(),
+            text: "Reviewed another project.".into(),
+            task_ids: vec![other.task_id.clone()],
+            activity_ids: vec![other.id.clone()],
+            evidence_ids: vec![40],
+            sources: other.sources.clone(),
+            warnings: vec![],
+        });
+        let snapshot = Snapshot::capture(
+            &original,
+            &previous,
+            "en",
+            &fingerprint(&original, "en"),
+            10,
+        );
+        let mut added = append_period(&original);
+        added.batches[1].activities[0].task_id = "workflow".into();
+        let delta = snapshot.delta(&added);
+        let provider = ResolvedProvider {
+            context_tokens: 128_000,
+            ..Default::default()
+        };
+        let (request, included) = update_request(
+            &added,
+            &RecapSettings::default(),
+            &provider,
+            &previous,
+            Some(&delta),
+        )
+        .unwrap();
+        assert_eq!(included.len(), 3);
+        assert!(included.iter().any(|activity| activity.task_id == "bot"));
+        assert!(!included.iter().any(|activity| activity.id == other.id));
+        let catalog = added
+            .batches
+            .iter()
+            .flat_map(|batch| batch.activities.iter().cloned())
+            .collect::<Vec<_>>();
+        let carried = validate_update(
+            &json!({"items":[previous.items[1]]}),
+            &included,
+            &catalog,
+            &[],
+            &added.date,
+            &previous,
+        );
+        assert!(carried.issues.is_empty());
+        assert_eq!(carried.value.items[0].sources[0].id, 40);
+        let (earlier, _) = update_request(
+            &original,
+            &RecapSettings::default(),
+            &provider,
+            &previous,
+            Some(&snapshot.delta(&original)),
+        )
+        .unwrap();
+        assert_eq!(earlier.messages[1], request.messages[1]);
+    }
+
+    #[test]
     fn mainline_input_is_complete_or_rejected_without_budget_sampling() {
         let mut day = day();
         let template = day.batches[0].activities[0].clone();
@@ -1262,11 +1347,15 @@ mod tests {
         assert_eq!(included.len(), 100);
         let estimate = context::estimated_input_tokens(provider.kind, &full);
         assert!(estimate > 14_400);
-        let Message::User(payload) = &full.messages[1] else {
+        let Message::User(payload) = full.messages.last().unwrap() else {
             panic!("missing activities")
         };
         let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(payload["tasks"].as_array().unwrap().len(), 100);
+        let Message::Context(stable) = &full.messages[1] else {
+            panic!("missing task directory")
+        };
+        let stable: serde_json::Value = serde_json::from_str(stable).unwrap();
+        assert_eq!(stable["tasks"].as_array().unwrap().len(), 100);
         assert_eq!(payload["omitted_activities"], 0);
         let reduced = RecapSettings {
             batch_input_tokens: 24_000,
