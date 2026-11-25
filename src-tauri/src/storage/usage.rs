@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) mod categories;
 mod legacy;
 
 pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
@@ -35,6 +36,7 @@ pub(super) fn initialize(conn: &Connection) -> Result<(), String> {
         CHECK(end_ms>start_ms), CHECK(state<>0 OR context_id IS NOT NULL)) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_usage_day_time ON usage_intervals(day_id,start_ms);")
         .map_err(|e| e.to_string())?;
+    categories::initialize(&tx)?;
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -198,9 +200,12 @@ impl UsageWriter {
             let app_id = match app.id.or_else(|| app_ids.get(&app.token).copied()) {
                 Some(id) => id,
                 None => {
+                    // Refresh a re-observed icon once per cached app identity.
+                    // A failed extraction must not erase the stored icon.
                     tx.execute(
-                        "INSERT OR IGNORE INTO usage_apps(token,info_enc) VALUES(?1,?2)",
-                        params![app.token, app.encrypted],
+                        "INSERT INTO usage_apps(token,info_enc) VALUES(?1,?2)
+                        ON CONFLICT(token) DO UPDATE SET info_enc=excluded.info_enc WHERE ?3",
+                        params![app.token, app.encrypted, app.identity.icon.is_some()],
                     )
                     .map_err(|e| e.to_string())?;
                     tx.query_row(
@@ -522,13 +527,14 @@ impl StorageState {
         if self.db_generation() != generation {
             return Err("USAGE_SOURCE_CHANGED".into());
         }
-        Ok(aggregate::summarize(
-            calendars.pop().unwrap(),
-            observations,
-            now_ms,
-            since,
-            week,
-        ))
+        let manual = self.apply_usage_categories(generation, &mut observations)?;
+        let mut day =
+            aggregate::summarize(calendars.pop().unwrap(), observations, now_ms, since, week);
+        day.generation = generation;
+        for app in &mut day.apps {
+            app.category_is_manual = manual.contains_key(&app.id);
+        }
+        Ok(day)
     }
 
     pub(crate) fn usage_app_details(
@@ -680,6 +686,124 @@ fn sorted_details(details: HashMap<String, UsageDetail>) -> Vec<UsageDetail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshed_icons_replace_cached_payloads_without_changing_usage_or_erasing_icons_on_failure()
+    {
+        let storage = super::super::test_storage_with_schema(std::path::PathBuf::from(
+            "usage-icon-refresh-fixture",
+        ));
+        let generation = storage.db_generation();
+        let calendar = CalendarDay::in_zone("2026-11-24", chrono_tz::UTC).unwrap();
+        let identity = |icon: Option<&str>| {
+            Arc::new(UsageIdentity {
+                app: Arc::new(UsageAppIdentity {
+                    process_name: "msedge.exe".into(),
+                    name: "Microsoft Edge".into(),
+                    process_path: "D:/Apps/msedge.exe".into(),
+                    icon: icon.map(str::to_owned),
+                }),
+                title: "Existing title".into(),
+                url: None,
+                category: "网页浏览".into(),
+            })
+        };
+        let span = |run_id, start_ms, end_ms, icon| UsageSpan {
+            run_id,
+            sequence: 0,
+            start_ms,
+            end_ms,
+            state: UsageState::Active,
+            identity: Some(identity(icon)),
+        };
+        let live = LiveUsage {
+            generation,
+            time_zone: Some("UTC".into()),
+            ..Default::default()
+        };
+        let original = span(
+            1,
+            calendar.start_ms,
+            calendar.start_ms + 60_000,
+            Some("old-icon"),
+        );
+        UsageWriter::new(generation, chrono_tz::UTC)
+            .write(&storage, &[original])
+            .unwrap();
+        let mut refreshed = span(
+            2,
+            calendar.start_ms + 60_000,
+            calendar.start_ms + 120_000,
+            Some("corrected-icon"),
+        );
+        let mut writer = UsageWriter::new(generation, chrono_tz::UTC);
+        writer.write(&storage, &[refreshed.clone()]).unwrap();
+        let payload = || {
+            storage
+                .with_read_connection_named("usage.icon-test", |conn| {
+                    conn.query_row("SELECT info_enc FROM usage_apps", [], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(|error| error.to_string())
+                })
+                .unwrap()
+        };
+        let corrected_payload = payload();
+        assert!(carbonpaper_app_bound::payload::is_sealed(
+            &corrected_payload
+        ));
+        refreshed.end_ms += 60_000;
+        writer.write(&storage, &[refreshed]).unwrap();
+        assert_eq!(
+            payload(),
+            corrected_payload,
+            "checkpoints reuse the cached app payload"
+        );
+
+        let failed = span(
+            3,
+            calendar.start_ms + 180_000,
+            calendar.start_ms + 240_000,
+            None,
+        );
+        UsageWriter::new(generation, chrono_tz::UTC)
+            .write(&storage, &[failed])
+            .unwrap();
+        assert_eq!(
+            payload(),
+            corrected_payload,
+            "failed extraction preserves the existing icon"
+        );
+        let day = storage
+            .usage_day("2026-11-24", live.clone(), calendar.end_ms)
+            .unwrap();
+        assert_eq!(day.total_ms, 240_000);
+        assert_eq!(day.apps.len(), 1);
+        assert_eq!(day.apps[0].icon.as_deref(), Some("corrected-icon"));
+        assert_eq!(day.apps[0].category, "网页浏览");
+        let details = storage
+            .usage_app_details("2026-11-24", "msedge.exe", live, calendar.end_ms)
+            .unwrap();
+        assert_eq!(details.titles[0].label, "Existing title");
+        assert_eq!(details.titles[0].total_ms, 240_000);
+        storage
+            .with_read_connection_named("usage.icon-catalog-test", |conn| {
+                for table in ["usage_apps", "usage_contexts"] {
+                    let count = conn
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    assert_eq!(
+                        count, 1,
+                        "catalog IDs and references survive the icon refresh"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn midnight_checkpoints_are_idempotent_and_catalogs_are_protected() {
         let storage =

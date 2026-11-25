@@ -1,7 +1,9 @@
 //! Usage tracking is independent of screenshot/OCR admission. One native MTA
 //! thread owns all sampling and batches compact interval checkpoints.
 pub(crate) mod aggregate;
+pub(crate) mod categories;
 mod input;
+mod metadata;
 mod picture;
 mod recorder;
 mod sampler;
@@ -51,6 +53,7 @@ pub struct UsageRuntime {
     shutdown: AtomicBool,
     wake: (Mutex<()>, Condvar),
     thread: Mutex<Option<thread::JoinHandle<()>>>,
+    category_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 impl UsageRuntime {
     pub(crate) fn snapshot(&self) -> LiveUsage {
@@ -159,6 +162,14 @@ impl UsageRuntime {
     }
     pub(crate) fn stop(&self) {
         self.shutdown.store(true, Ordering::Release);
+        if let Some(task) = self
+            .category_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         self.wake.1.notify_all();
         if let Some(thread) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = thread.join();
@@ -176,6 +187,13 @@ pub(crate) fn start(app: AppHandle) {
     if state.started.swap(true, Ordering::AcqRel) {
         return;
     }
+    *state
+        .category_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(tauri::async_runtime::spawn(categories::run(
+        app.clone(),
+        state.clone(),
+    )));
     let runtime = state.clone();
     match thread::Builder::new()
         .name("usage-recorder".into())
@@ -478,21 +496,16 @@ fn run(app: &AppHandle, runtime: &UsageRuntime) {
                             });
                         }
                         if state == UsageState::Active {
-                            let category = crate::classification::scoring::process_category(
-                                &process.process_name,
-                            )
-                            .unwrap_or_else(|| {
-                                if capture::is_browser_process(&process.process_name) {
-                                    "网页浏览"
-                                } else {
-                                    "未分类"
-                                }
-                            });
+                            let category = storage.usage_categories.category(
+                                generation,
+                                process.clone(),
+                                Some(info.pid),
+                            );
                             identity = Some(Arc::new(UsageIdentity {
                                 app: process,
                                 title: info.title,
                                 url,
-                                category: category.into(),
+                                category,
                             }));
                         }
                     }

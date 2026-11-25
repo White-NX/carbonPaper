@@ -4,6 +4,9 @@ import { withAuth } from './auth_api';
 const read = (command, args) => withAuth(() => invoke(command, args), { autoPrompt: false });
 export const getUsageDay = (date) => read('usage_get_day', { date });
 export const getUsageAppDetails = (date, appId) => read('usage_get_app_details', { date, appId });
+export const setUsageAppCategory = (appId, category, generation) => withAuth(
+  () => invoke('usage_set_app_category', { appId, category, generation }), { autoPrompt: false },
+);
 
 export function moveUsageDate(date, days) {
   const value = new Date(`${date}T12:00:00Z`);
@@ -29,6 +32,6 @@ export function usageHourlySelection(day, appId) {
 }
 
 export function usageErrorKey(error) {
-  const code = String(error?.message ?? error ?? '').match(/\b(AUTH_REQUIRED|MAINTENANCE_IN_PROGRESS|USAGE_SOURCE_CHANGED|USAGE_QUERY_FAILED)\b/)?.[1];
+  const code = String(error?.message ?? error ?? '').match(/\b(AUTH_REQUIRED|MAINTENANCE_IN_PROGRESS|USAGE_SOURCE_CHANGED|USAGE_QUERY_FAILED|USAGE_INVALID_APP|USAGE_INVALID_CATEGORY)\b/)?.[1];
   return `usage.errors.${code || 'unknown'}`;
 }

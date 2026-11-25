@@ -81,6 +81,7 @@ pub(crate) use screenshot_reader::ScreenshotReader;
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use timeline::TimelineRecord;
 pub use types::*;
+pub(crate) use usage::categories::StoredCategory;
 pub(crate) use usage::UsageWriter;
 pub(crate) use vector_query_metrics::VectorQueryMetrics;
 
@@ -116,6 +117,7 @@ impl From<String> for BackgroundReadError {
 pub struct StorageState {
     pub(crate) backup: backup::Control,
     pub(crate) processing_stage: Arc<crate::processing_stage::ProcessingStaging>,
+    pub(crate) usage_categories: crate::usage::categories::CategoryCache,
     protected: Arc<protected::ProtectedStorage>,
     /// Database connection
     db: Mutex<Option<Connection>>,
@@ -267,6 +269,7 @@ impl StorageState {
         Self {
             backup: backup::Control::default(),
             processing_stage,
+            usage_categories: crate::usage::categories::CategoryCache::default(),
             protected,
             db: Mutex::new(None),
             data_dir: Mutex::new(data_dir),

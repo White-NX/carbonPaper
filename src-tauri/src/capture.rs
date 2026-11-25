@@ -7,9 +7,8 @@ use crate::monitor::MonitorState;
 use crate::office_protocol::OfficeApplication;
 use crate::office_runtime::{OfficeCaptureContext, OfficeRuntimeState};
 use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
-use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::{ImageEncoder, RgbImage};
+use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1358,159 +1357,8 @@ fn capture_foreground_window(
 
 // ==================== Process Icon Extraction ====================
 
-pub(crate) fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
-    use windows::Win32::Graphics::Gdi::*;
-    use windows::Win32::UI::Shell::ExtractIconExW;
-    use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
-
-    // SAFETY: the executable path is NUL-terminated and live for extraction; icon, DC,
-    // bitmap, and GDI handles returned by Windows are checked and released exactly once,
-    // while pixel buffers are sized from the queried bitmap dimensions.
-    unsafe {
-        // Convert path to wide string
-        let wide_path: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let mut icon_large = [windows::Win32::UI::WindowsAndMessaging::HICON::default(); 1];
-        let mut icon_small = [windows::Win32::UI::WindowsAndMessaging::HICON::default(); 1];
-
-        let count = ExtractIconExW(
-            windows::core::PCWSTR(wide_path.as_ptr()),
-            0,
-            Some(icon_large.as_mut_ptr()),
-            Some(icon_small.as_mut_ptr()),
-            1,
-        );
-
-        if count == 0 {
-            return None;
-        }
-
-        let hicon = if !icon_large[0].is_invalid() {
-            icon_large[0]
-        } else if !icon_small[0].is_invalid() {
-            icon_small[0]
-        } else {
-            return None;
-        };
-
-        // Convert HICON to PNG base64
-        let size: i32 = 32;
-        let hdc_screen = GetDC(None);
-        if hdc_screen.is_invalid() {
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
-        if hdc_mem.is_invalid() {
-            ReleaseDC(None, hdc_screen);
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        let hbm = CreateCompatibleBitmap(hdc_screen, size, size);
-        if hbm.is_invalid() {
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(None, hdc_screen);
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        let old_bm = SelectObject(hdc_mem, hbm);
-
-        // Clear background to transparent
-        let _ = PatBlt(hdc_mem, 0, 0, size, size, BLACKNESS);
-
-        // Draw icon
-        let draw_ok = windows::Win32::UI::WindowsAndMessaging::DrawIconEx(
-            hdc_mem,
-            0,
-            0,
-            hicon,
-            size,
-            size,
-            0,
-            None,
-            windows::Win32::UI::WindowsAndMessaging::DI_NORMAL,
-        );
-
-        if draw_ok.is_err() {
-            SelectObject(hdc_mem, old_bm);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(None, hdc_screen);
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        // Extract pixel data using GetDIBits
-        let mut bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut pixels = vec![0u8; (size * size * 4) as usize];
-        let got_bits = GetDIBits(
-            hdc_mem,
-            hbm,
-            0,
-            size as u32,
-            Some(pixels.as_mut_ptr() as *mut _),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-
-        SelectObject(hdc_mem, old_bm);
-        let _ = DeleteObject(hbm);
-        let _ = DeleteDC(hdc_mem);
-        ReleaseDC(None, hdc_screen);
-        let _ = DestroyIcon(hicon);
-
-        // Destroy the other icon if both were extracted
-        if !icon_large[0].is_invalid() && !icon_small[0].is_invalid() {
-            let _ = DestroyIcon(icon_small[0]);
-        }
-
-        if got_bits == 0 {
-            return None;
-        }
-
-        // Convert BGRA to RGBA
-        let mut rgba_pixels = vec![0u8; pixels.len()];
-        for i in (0..pixels.len()).step_by(4) {
-            rgba_pixels[i] = pixels[i + 2]; // R
-            rgba_pixels[i + 1] = pixels[i + 1]; // G
-            rgba_pixels[i + 2] = pixels[i]; // B
-            rgba_pixels[i + 3] = pixels[i + 3]; // A
-        }
-
-        // Create PNG from RGBA pixels
-        let img = image::RgbaImage::from_raw(size as u32, size as u32, rgba_pixels)?;
-        let mut png_buf = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
-        if ImageEncoder::write_image(
-            encoder,
-            img.as_raw(),
-            size as u32,
-            size as u32,
-            image::ExtendedColorType::Rgba8,
-        )
-        .is_err()
-        {
-            return None;
-        }
-
-        Some(base64::engine::general_purpose::STANDARD.encode(&png_buf))
-    }
-}
+mod process_icon;
+pub(crate) use process_icon::extract_process_icon_base64;
 
 // ==================== Main Capture Loop ====================
 

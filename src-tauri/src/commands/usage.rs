@@ -9,6 +9,7 @@ use crate::{
     },
 };
 use std::sync::Arc;
+use tauri::Emitter;
 
 /// Authentication: required. Aggregates one recorded civil day and seven-day
 /// totals; only distinct application identities are decrypted for this view.
@@ -72,4 +73,32 @@ pub async fn usage_get_app_details(
     })
     .await
     .map_err(|_| "USAGE_QUERY_FAILED")?
+}
+
+/// Authentication: required. A manual category applies to this executable's
+/// historical and future statistics; None restores automatic classification.
+#[tauri::command]
+pub async fn usage_set_app_category(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    app_id: String,
+    category: Option<String>,
+    generation: u64,
+) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+    let credentials = credential_state.inner().clone();
+    let storage = storage_state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        check_auth_required(&credentials)?;
+        storage.save_usage_category_override(generation, &app_id, category.as_deref(), || {
+            check_auth_required(&credentials)
+        })?;
+        check_auth_required(&credentials)?;
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|_| "USAGE_QUERY_FAILED")??;
+    let _ = app.emit("usage-categories-changed", ());
+    Ok(())
 }

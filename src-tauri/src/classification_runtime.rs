@@ -283,7 +283,11 @@ pub async fn embed_bge_texts(
     let scheduler = app
         .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
         .map(|state| state.inner().clone());
-    let external_background = state.external_background_lease();
+    // A scoped automatic request already owns its execution lease. Counting it
+    // as external would make RequestWatch revoke that same request immediately.
+    let external_background = crate::background_policy::current_execution()
+        .is_none()
+        .then(|| state.external_background_lease());
     if let Some(scheduler) = &scheduler {
         scheduler.wake();
     }

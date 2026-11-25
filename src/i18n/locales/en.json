@@ -63,6 +63,12 @@
     "websites": "Websites",
     "moreDetails": "Show {{count}} more",
     "categoryTitle": "Categories",
+    "appCategory": "Application category",
+    "changeAppCategory": "Change category for {{app}}",
+    "categoryScope": "This choice applies to this application's past and future usage statistics.",
+    "automaticCategory": "Automatic",
+    "automaticCategoryHint": "Unknown applications are identified when the computer is idle and no application is fullscreen.",
+    "categorySaveFailed": "Could not save the category. Please try again.",
     "categories": {
       "编程开发": "Development",
       "学习教育": "Learning",
@@ -95,6 +101,8 @@
       "MAINTENANCE_IN_PROGRESS": "History is being organized. Please try again shortly.",
       "USAGE_SOURCE_CHANGED": "History has changed. Please refresh.",
       "USAGE_QUERY_FAILED": "Could not load usage statistics. Please try again.",
+      "USAGE_INVALID_APP": "Application information changed. Refresh and try again.",
+      "USAGE_INVALID_CATEGORY": "Choose a valid category.",
       "unknown": "Could not load usage statistics. Please try again."
     }
   },

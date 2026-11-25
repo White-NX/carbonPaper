@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getUsageAppDetails, getUsageDay } from '../lib/usage_api';
+import { getUsageAppDetails, getUsageDay, setUsageAppCategory } from '../lib/usage_api';
+import { listen } from '@tauri-apps/api/event';
 import { localDate } from '../lib/recap_api';
 
 function useUsageRead(key, active, authenticated, read) {
@@ -83,8 +84,24 @@ export default function useUsageStatistics(active, authenticated) {
   }, []);
   const selectApp = useCallback((id) => setSelectedId((current) => current === id ? null : id), []);
   const refresh = useCallback(() => { overview.refresh(); if (appId) details.refresh(); }, [overview.refresh, details.refresh, appId]);
+  const saveCategory = useCallback(async (id, category, generation) => {
+    if (!active || !authenticated) throw new Error('AUTH_REQUIRED');
+    if (!day || day.generation !== generation) throw new Error('USAGE_SOURCE_CHANGED');
+    if (!day.apps.some((app) => app.id === id)) throw new Error('USAGE_INVALID_APP');
+    await setUsageAppCategory(id, category, generation);
+    await overview.refresh();
+  }, [active, authenticated, day, overview.refresh]);
+  useEffect(() => {
+    if (!active || !authenticated) return undefined;
+    let live = true;
+    let unlisten;
+    listen('usage-categories-changed', () => { if (live) overview.refresh(); })
+      .then((stop) => { if (live) unlisten = stop; else stop(); })
+      .catch(() => {});
+    return () => { live = false; unlisten?.(); };
+  }, [active, authenticated, overview.refresh]);
   return { date, today, day, loading: overview.loading, error: overview.error, refresh, selectDate,
-    selectedApp, selectApp, clearApp: () => setSelectedId(null),
+    selectedApp, selectApp, clearApp: () => setSelectedId(null), saveCategory,
     details: details.value?.date === date && details.value?.app_id === appId ? details.value : null,
     detailsError: details.error, detailsLoading: details.loading };
 }

@@ -63,6 +63,12 @@
     "websites": "网站",
     "moreDetails": "显示另外 {{count}} 项",
     "categoryTitle": "类别",
+    "appCategory": "应用分类",
+    "changeAppCategory": "修改 {{app}} 的分类",
+    "categoryScope": "此设置适用于该应用的历史和后续使用统计。",
+    "automaticCategory": "自动识别",
+    "automaticCategoryHint": "未知应用会在电脑空闲且退出全屏后识别。",
+    "categorySaveFailed": "无法保存分类，请重试。",
     "categories": {
       "编程开发": "编程开发",
       "学习教育": "学习教育",
@@ -95,6 +101,8 @@
       "MAINTENANCE_IN_PROGRESS": "正在整理历史记录，请稍后重试。",
       "USAGE_SOURCE_CHANGED": "历史记录已更新，请刷新。",
       "USAGE_QUERY_FAILED": "无法读取使用统计，请重试。",
+      "USAGE_INVALID_APP": "应用信息已更新，请刷新后重试。",
+      "USAGE_INVALID_CATEGORY": "请选择有效的分类。",
       "unknown": "无法读取使用统计，请重试。"
     }
   },

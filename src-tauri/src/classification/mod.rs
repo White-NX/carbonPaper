@@ -75,12 +75,22 @@ struct NativeEncoder {
     generation: u64,
     deadline: tokio::time::Instant,
     capture_work: bool,
+    application_work: bool,
 }
 impl TextEncoder for NativeEncoder {
     async fn encode(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         crate::maintenance::guard()?;
         if self.app.state::<Arc<StorageState>>().db_generation() != self.generation {
             return Err("classification database changed".into());
+        }
+        if self.application_work {
+            let storage = self.app.state::<Arc<StorageState>>();
+            if let Some(reason) =
+                crate::usage::categories::gate_reason(&self.app, &storage, self.generation)
+            {
+                return Err(reason.into());
+            }
+            crate::background_policy::check_current().map_err(|e| e.to_string())?;
         }
         if self.capture_work {
             // The BGE runtime waits for foreground queries between batches.
@@ -156,6 +166,7 @@ async fn classify(
         generation,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
         capture_work: !debug,
+        application_work: false,
     };
     let result = current
         .classifier
@@ -171,6 +182,38 @@ pub(crate) async fn debug(app: &AppHandle, input: Input) -> Result<Value, String
     let generation = app.state::<Arc<StorageState>>().db_generation();
     let mut result = classify(app, &input, true, generation).await?.debug;
     result["status"] = json!("success");
+    Ok(result)
+}
+
+/// Application identities contain no OCR/window content. Automatic callers own
+/// an idle execution lease, which revokes native work on fullscreen or activity.
+pub(crate) async fn classify_application(
+    app: &AppHandle,
+    input: Input,
+    generation: u64,
+) -> Result<Classification, String> {
+    let state = app.state::<Arc<ClassificationState>>();
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let mut cache = state.cache.try_lock().map_err(|_| "classification_busy")?;
+    refresh_cache(storage.clone(), &mut cache).await?;
+    let current = cache.as_mut().unwrap();
+    if current.generation != generation {
+        return Err("USAGE_SOURCE_CHANGED".into());
+    }
+    let mut encoder = NativeEncoder {
+        app: app.clone(),
+        generation,
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        capture_work: false,
+        application_work: true,
+    };
+    let result = current
+        .classifier
+        .classify(&mut encoder, &input, false)
+        .await?;
+    if storage.db_generation() != generation {
+        return Err("USAGE_SOURCE_CHANGED".into());
+    }
     Ok(result)
 }
 
@@ -453,6 +496,7 @@ async fn learn_feedback(
         generation,
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
         capture_work: true,
+        application_work: false,
     };
     current
         .classifier

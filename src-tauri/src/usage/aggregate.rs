@@ -54,6 +54,7 @@ pub(crate) fn summarize(
     let end = now_ms.min(calendar.end_ms).max(calendar.start_ms);
     let spans = normalized(spans, calendar.start_ms, end);
     let mut result = UsageDay {
+        generation: 0,
         date: calendar.date.clone(),
         calendar: calendar.clone(),
         recorded_since_ms,
@@ -127,6 +128,7 @@ pub(crate) fn summarize(
                     name: identity.app.name.clone(),
                     icon: identity.app.icon.clone(),
                     category: identity.category.clone(),
+                    category_is_manual: false,
                     total_ms: 0,
                     visits: 0,
                     longest_ms: 0,

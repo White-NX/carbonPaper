@@ -79,6 +79,22 @@ pub(crate) fn process_category(process: &str) -> Option<&'static str> {
         .map(String::as_str)
 }
 
+/// Exact application names are useful even when screenshot inference is paused.
+/// Content-like partial matches are deliberately left to the semantic scorer.
+pub(crate) fn application_name_category(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut matches = DEFAULTS.anchors.iter().filter(|(_, anchors)| {
+        anchors
+            .iter()
+            .any(|anchor| anchor.eq_ignore_ascii_case(name))
+    });
+    let (category, _) = matches.next()?;
+    matches.next().is_none().then_some(category.as_str())
+}
+
 pub(crate) fn validate_anchors(anchors: &Anchors) -> Result<(), String> {
     for (category, rows) in anchors {
         if category.trim().is_empty() || category.len() > 256 {

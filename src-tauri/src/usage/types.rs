@@ -81,6 +81,7 @@ pub struct UsageApp {
     pub name: String,
     pub icon: Option<String>,
     pub category: String,
+    pub category_is_manual: bool,
     pub total_ms: i64,
     pub visits: usize,
     pub longest_ms: i64,
@@ -109,6 +110,7 @@ pub struct UsageWeekDay {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UsageDay {
+    pub generation: u64,
     pub date: String,
     pub calendar: CalendarDay,
     pub recorded_since_ms: Option<i64>,

@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-import { getUsageAppDetails, getUsageDay, moveUsageDate, usageHourlySelection } from './usage_api';
+import { getUsageAppDetails, getUsageDay, setUsageAppCategory, moveUsageDate, usageHourlySelection } from './usage_api';
 
 vi.mock('./auth_api', () => ({ withAuth: vi.fn((operation) => operation()) }));
-beforeEach(() => invoke.mockResolvedValue({}));
+beforeEach(() => { invoke.mockReset(); invoke.mockResolvedValue({}); });
 
 describe('usage API', () => {
   it('keeps reads authenticated and preserves the selected civil date and application', async () => {
@@ -27,5 +27,13 @@ describe('usage API', () => {
     expect(usageHourlySelection(day, null)).toHaveLength(25);
     expect(moveUsageDate('2026-03-08', -1)).toBe('2026-03-07');
     expect(moveUsageDate('2026-12-31', 1)).toBe('2027-01-01');
+  });
+
+  it('authenticates category changes and preserves the archive generation when restoring automatic classification', async () => {
+    await setUsageAppCategory('example.exe', '游戏', 7);
+    await setUsageAppCategory('example.exe', null, 7);
+    expect(withAuth).toHaveBeenCalledWith(expect.any(Function), { autoPrompt: false });
+    expect(invoke).toHaveBeenNthCalledWith(1, 'usage_set_app_category', { appId: 'example.exe', category: '游戏', generation: 7 });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'usage_set_app_category', { appId: 'example.exe', category: null, generation: 7 });
   });
 });

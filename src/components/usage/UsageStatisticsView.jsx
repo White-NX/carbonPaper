@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { ArrowLeft, BarChart3, CalendarDays, ChevronLeft, ChevronRight, Clock3, ExternalLink, RefreshCw } from 'lucide-react';
+import { ArrowLeft, BarChart3, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, Clock3, ExternalLink, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS, CATEGORY_LIST } from '../../lib/categories';
 import { calendarTimeFormatter } from '../../lib/calendar_time';
@@ -8,6 +8,7 @@ import { PageHeader } from '../PageHeader';
 import { Button } from '../ui/Button';
 import { Banner } from '../ui/Banner';
 import { DateTimePicker } from '../search/DateTimePicker';
+import UsageCategoryDialog from './UsageCategoryDialog';
 import './usage-statistics.css';
 
 const color = (category) => CATEGORY_COLORS[category] || '#84909f';
@@ -86,18 +87,35 @@ function Ribbon({ day, selectedApp, selectApp, time }) {
   </div>;
 }
 
-function Apps({ apps, selectedApp, selectApp }) {
+function AppTile({ name, icon }) {
+  const [failedSource, setFailedSource] = useState(null);
+  const source = icon ? (icon.startsWith('data:') ? icon : `data:image/png;base64,${icon}`) : null;
+  return <span className="usage-app-tile" aria-hidden="true">
+    {source && failedSource !== source
+      ? <img key={source} src={source} alt="" onError={() => setFailedSource(source)} />
+      : name.slice(0, 1).toUpperCase()}
+  </span>;
+}
+
+function Apps({ apps, selectedApp, selectApp, editCategory }) {
   const { t } = useTranslation();
   const max = Math.max(1, ...apps.map((app) => app.total_ms));
   return <section>
     <div className="usage-label"><h2>{t('usage.apps')}</h2><span>{t('usage.selectApp')}</span></div>
-    {apps.length ? <div className="usage-app-list">{apps.map((app) => <button key={app.id} type="button" className="usage-app" aria-pressed={selectedApp?.id === app.id}
+    {apps.length ? <div className="usage-app-list">{apps.map((app) => <div key={app.id} className="usage-app" data-selected={selectedApp?.id === app.id}
       style={{ '--usage-color': color(app.category) }} onClick={() => selectApp(app.id)}>
-      <span className="usage-app-tile" aria-hidden="true">{app.name.slice(0, 1).toUpperCase()}{app.icon && <img src={app.icon.startsWith('data:') ? app.icon : `data:image/png;base64,${app.icon}`} alt="" onError={(event) => { event.currentTarget.hidden = true; }} />}</span>
-      <span className="usage-app-name"><strong>{app.name}</strong><span>{categoryLabel(app.category, t)}</span></span>
+      <AppTile name={app.name} icon={app.icon} />
+      <div className="usage-app-name">
+        <button type="button" className="usage-app-select" aria-pressed={selectedApp?.id === app.id}
+          aria-label={`${app.name} ${categoryLabel(app.category, t)}`} onClick={(event) => { event.stopPropagation(); selectApp(app.id); }}><strong>{app.name}</strong></button>
+        <button type="button" className="usage-app-category" title={t('usage.changeAppCategory', { app: app.name })}
+          aria-label={t('usage.changeAppCategory', { app: app.name })} onClick={(event) => { event.stopPropagation(); editCategory(app); }}>
+          {categoryLabel(app.category, t)}<ChevronDown className="h-3 w-3" aria-hidden="true" />
+        </button>
+      </div>
       <span className="usage-app-duration">{usageDuration(app.total_ms, t)}</span>
       <span className="usage-track"><i style={{ width: `${app.total_ms / max * 100}%` }} /></span>
-    </button>)}</div> : <p className="usage-empty">{t('usage.noApps')}</p>}
+    </div>)}</div> : <p className="usage-empty">{t('usage.noApps')}</p>}
   </section>;
 }
 
@@ -141,8 +159,9 @@ function Details({ app, details, loading, error, onViewSnapshots, clearApp }) {
   </section>;
 }
 
-export default function UsageStatisticsView({ date, today, day, loading, error, refresh, selectDate, selectedApp, selectApp, clearApp, details, detailsError, detailsLoading, onViewSnapshots, onOpenRecap }) {
+export default function UsageStatisticsView({ date, today, day, loading, error, refresh, selectDate, selectedApp, selectApp, clearApp, saveCategory, details, detailsError, detailsLoading, onViewSnapshots, onOpenRecap }) {
   const { t, i18n } = useTranslation();
+  const [categoryApp, setCategoryApp] = useState(null);
   const time = useMemo(() => {
     const calendar = day?.calendar;
     if (calendar?.time_zone && calendar.start_utc_offset_seconds !== calendar.end_utc_offset_seconds) {
@@ -188,7 +207,7 @@ export default function UsageStatisticsView({ date, today, day, loading, error, 
           <Hours day={day} selectedApp={selectedApp} time={time} onViewSnapshots={onViewSnapshots} />
           <Ribbon day={day} selectedApp={selectedApp} selectApp={selectApp} time={time} />
           {!day.observed_ms && <Banner>{t('usage.noRecords')}{day.recorded_since_ms && <span> {t('usage.recordedSince', { date: new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeZone: day.calendar.time_zone || undefined }).format(new Date(day.recorded_since_ms)) })}</span>}</Banner>}
-          <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} /><aside className="usage-side">
+          <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} editCategory={(app) => setCategoryApp({ ...app, generation: day.generation })} /><aside className="usage-side">
             <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />
             <Categories categories={day.categories} total={day.total_ms} />
           </aside></div>
@@ -196,5 +215,6 @@ export default function UsageStatisticsView({ date, today, day, loading, error, 
         </>}
       </div>
     </div>
+    {categoryApp && categoryApp.generation === day?.generation && <UsageCategoryDialog key={categoryApp.id} app={categoryApp} onClose={() => setCategoryApp(null)} onSave={saveCategory} />}
   </div>;
 }
