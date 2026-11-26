@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -24,9 +25,9 @@ use crate::credential_manager::CredentialManagerState;
 use crate::mcp_contract;
 use crate::mcp_token;
 use crate::pii;
-use crate::sensitive_filter::{FilterMode, SensitiveFilterState};
+use crate::sensitive_filter::{FilterMode, Findings, SensitiveFilterState};
 use crate::storage::smart_cluster::{SmartClusterSummaryRecord, SmartClusterSummaryUpsert};
-use crate::storage::{OcrResult, StorageState};
+use crate::storage::{OcrResult, SearchResult, StorageState};
 use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
@@ -466,14 +467,22 @@ fn filter_segment(
     text: &str,
     context: pii::Context,
 ) -> Result<Option<String>, Rejected> {
-    let findings = filter.inspect(text, context);
+    filter_segment_with_findings(filter, mode, text, &filter.inspect(text, context))
+}
+
+fn filter_segment_with_findings(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+    findings: &Findings,
+) -> Result<Option<String>, Rejected> {
     if !findings.is_flagged() {
-        return Ok(Some(filter.kept_text(text, &findings)));
+        return Ok(Some(filter.kept_text(text, findings)));
     }
     match mode {
         FilterMode::Reject => Err(Rejected),
         FilterMode::RemoveParagraph => Ok(None),
-        FilterMode::Mask => Ok(Some(filter.masked_text(text, &findings))),
+        FilterMode::Mask => Ok(Some(filter.masked_text(text, findings))),
     }
 }
 
@@ -504,34 +513,90 @@ pub(crate) fn filter_url(
     }
 }
 
-/// The OCR blocks of one screenshot. Each block is checked with the labels of
-/// its neighbours, because forms put "身份证号" and the number in separate
-/// blocks.
+fn ocr_layout(blocks: &[OcrResult]) -> Vec<(&str, Option<pii::Bounds>)> {
+    blocks
+        .iter()
+        .map(|block| {
+            (
+                block.text.as_str(),
+                pii::Bounds::from_points(&block.box_coords),
+            )
+        })
+        .collect()
+}
+
+/// The OCR blocks of one screenshot, with context from nearby labels and
+/// card numbers spanning multiple boxes.
 pub(crate) fn filter_ocr_blocks(
     filter: &SensitiveFilterState,
     mode: FilterMode,
     blocks: Vec<OcrResult>,
 ) -> Result<Vec<OcrResult>, Rejected> {
-    let contexts = {
-        let layout: Vec<(&str, Option<pii::Bounds>)> = blocks
-            .iter()
-            .map(|block| {
-                (
-                    block.text.as_str(),
-                    pii::Bounds::from_points(&block.box_coords),
-                )
-            })
-            .collect();
-        pii::block_contexts(&layout)
-    };
+    let findings = filter.inspect_ocr_blocks(&ocr_layout(&blocks));
     let mut kept = Vec::with_capacity(blocks.len());
-    for (mut block, context) in blocks.into_iter().zip(contexts) {
-        if let Some(text) = filter_segment(filter, mode, &block.text, context)? {
+    for (mut block, finding) in blocks.into_iter().zip(findings) {
+        if let Some(text) = filter_segment_with_findings(filter, mode, &block.text, &finding)? {
             block.text = text;
             kept.push(block);
         }
     }
     Ok(kept)
+}
+
+fn split_card_ocr_ids(
+    storage: &StorageState,
+    filter: &SensitiveFilterState,
+    hits: &[SearchResult],
+) -> Result<HashSet<i64>, String> {
+    if !filter.filters_bank_cards() {
+        return Ok(HashSet::new());
+    }
+    // Search returns one OCR box per hit. Load neighbours in one batch only
+    // for boxes that are short numeric fragments.
+    let mut screenshots: Vec<_> = hits
+        .iter()
+        .filter(|hit| pii::is_bank_card_fragment(&hit.text))
+        .map(|hit| hit.screenshot_id)
+        .collect();
+    screenshots.sort_unstable();
+    screenshots.dedup();
+    let blocks = storage.get_ocr_blocks_by_screenshot_ids(&screenshots)?;
+    Ok(blocks
+        .into_values()
+        .flat_map(|blocks| {
+            let marked = pii::split_bank_card_blocks(&ocr_layout(&blocks));
+            blocks
+                .into_iter()
+                .zip(marked)
+                .filter_map(|(block, marked)| marked.then_some(block.id))
+        })
+        .collect())
+}
+
+fn filter_ocr_hit(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    mut hit: SearchResult,
+    split_card: bool,
+) -> Option<Value> {
+    if let Some(title) = hit.window_title.take() {
+        hit.window_title = Some(filter_identity(filter, mode, &title).ok()?);
+    }
+    let findings = if split_card {
+        filter.inspect_bank_card_fragment(&hit.text)
+    } else {
+        filter.inspect(&hit.text, pii::Context::default())
+    };
+    hit.text = filter_segment_with_findings(filter, mode, &hit.text, &findings).ok()??;
+    if findings
+        .pii
+        .iter()
+        .any(|span| span.kind == pii::PiiKind::BankCard)
+    {
+        // The unfiltered match terms can repeat digits hidden from the text.
+        hit.match_evidence = None;
+    }
+    Some(wire::ocr_hit(&hit))
 }
 
 fn text_flagged(filter: &SensitiveFilterState, text: &str) -> bool {
@@ -870,6 +935,116 @@ mod privacy_filter_tests {
     }
 
     #[test]
+    fn bank_card_split_across_ocr_blocks_uses_the_selected_filter_mode() {
+        let blocks = || {
+            vec![
+                block(1, "2233", 10.0, 10.0),
+                block(2, "0012", 216.0, 12.0),
+                block(3, "3456", 422.0, 11.0),
+                block(4, "0020", 628.0, 10.0),
+                block(5, "2026", 10.0, 45.0),
+            ]
+        };
+
+        for mode in [
+            FilterMode::RemoveParagraph,
+            FilterMode::Mask,
+            FilterMode::Reject,
+        ] {
+            let filter = filter(mode);
+            let mut config = filter.get_config();
+            config.pii_entities = vec![pii::PiiKind::BankCard.name().into()];
+            filter.update_config(config);
+            let kept = filter_ocr_blocks(&filter, mode, blocks());
+            match mode {
+                FilterMode::RemoveParagraph => assert_eq!(texts(&kept.unwrap()), ["2026"]),
+                FilterMode::Mask => assert_eq!(
+                    texts(&kept.unwrap()),
+                    [
+                        "[CN_BANK_CARD]",
+                        "[CN_BANK_CARD]",
+                        "[CN_BANK_CARD]",
+                        "[CN_BANK_CARD]",
+                        "2026"
+                    ]
+                ),
+                FilterMode::Reject => assert!(kept.is_err()),
+            }
+        }
+
+        let mode = FilterMode::RemoveParagraph;
+        let filter = filter(mode);
+        let mut separated = blocks();
+        separated[3] = block(4, "0020", 800.0, 10.0);
+        let kept = filter_ocr_blocks(&filter, mode, separated).unwrap();
+        assert_eq!(texts(&kept), ["2233", "0012", "3456", "0020", "2026"]);
+
+        let mut config = filter.get_config();
+        config
+            .pii_entities
+            .retain(|kind| kind != pii::PiiKind::BankCard.name());
+        filter.update_config(config);
+        let kept = filter_ocr_blocks(&filter, mode, blocks()).unwrap();
+        assert_eq!(texts(&kept), ["2233", "0012", "3456", "0020", "2026"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bank_card_fragment_in_ocr_search_is_masked_before_the_agent_receives_it() {
+        use crate::storage::{OcrResultInput, SaveScreenshotRequest};
+
+        let directory = tempfile::tempdir().unwrap();
+        let credentials =
+            crate::credential_manager::cng_tests::storage_credentials(directory.path());
+        let storage = StorageState::new(directory.path().into(), credentials);
+        storage.initialize().unwrap();
+        let blocks = ["2233", "0012", "3456", "0020"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let block = block(index as i64, text, 10.0 + 206.0 * index as f64, 10.0);
+                OcrResultInput {
+                    text: block.text,
+                    confidence: block.confidence,
+                    box_coords: block.box_coords,
+                    text_layout: None,
+                }
+            })
+            .collect();
+        let saved = storage
+            .save_screenshot(&SaveScreenshotRequest {
+                image_data: "AA==".into(),
+                image_hash: "split-card-fixture".into(),
+                width: 900,
+                height: 100,
+                window_title: None,
+                process_name: None,
+                metadata: None,
+                ocr_results: Some(blocks),
+                source: None,
+                page_url: None,
+                page_icon: None,
+                visible_links: None,
+            })
+            .unwrap();
+        assert_eq!(saved.added, 4);
+        assert_eq!(storage.process_lazy_indexing_batch().unwrap(), 4);
+        let mut hits = storage
+            .search_text("0012", 20, 0, false, None, None, None, None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let mode = FilterMode::Mask;
+        let filter = filter(mode);
+        let split_cards = split_card_ocr_ids(&storage, &filter, &hits).unwrap();
+        let hit = hits.pop().unwrap();
+        assert!(hit.match_evidence.is_some());
+        let split_card = split_cards.contains(&hit.id);
+        let result = filter_ocr_hit(&filter, mode, hit, split_card).unwrap();
+        assert_eq!(result["text"], "[CN_BANK_CARD]");
+        assert!(result.get("match_evidence").is_none());
+    }
+
+    #[test]
     fn titles_urls_and_joined_snippets() {
         let mode = FilterMode::RemoveParagraph;
         let filter = filter(mode);
@@ -898,6 +1073,10 @@ mod privacy_filter_tests {
         assert_eq!(
             filter_joined_text(&filter, mode, "项目进展 下周发布").unwrap(),
             "项目进展 下周发布"
+        );
+        assert_eq!(
+            filter_joined_text(&filter, mode, "2233 0012 3456 0120").unwrap(),
+            CENSORED_LABEL
         );
     }
 
@@ -1074,14 +1253,10 @@ async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<V
             end_time,
             categories,
         )?;
-        // Each hit is one OCR segment. Its neighbours are not loaded, so only
-        // labels inside the segment count as context.
-        Ok::<_, String>(page.filtered(results, |mut r| {
-            if let Some(title) = r.window_title.take() {
-                r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
-            }
-            r.text = filter_segment(&filter, mode, &r.text, pii::Context::default()).ok()??;
-            Some(wire::ocr_hit(&r))
+        let split_cards = split_card_ocr_ids(&storage, &filter, &results)?;
+        Ok::<_, String>(page.filtered(results, |hit| {
+            let split_card = split_cards.contains(&hit.id);
+            filter_ocr_hit(&filter, mode, hit, split_card)
         }))
     })
     .await

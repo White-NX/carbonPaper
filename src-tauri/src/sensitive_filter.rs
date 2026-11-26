@@ -35,9 +35,10 @@ const DICT_FILES: &[(&str, &str)] = &[
 ];
 
 /// Policy version of [`SensitiveFilterConfig`]. Version 2 replaced Presidio
-/// with [`crate::pii`]. Version 3 uses curated dictionaries and narrower domains;
-/// advancing the version invalidates recap caches filtered under the old policy.
-pub const CONFIG_VERSION: u32 = 3;
+/// with [`crate::pii`]. Version 3 uses curated dictionaries and narrower domains.
+/// Version 4 recognizes more grouped cards, including split OCR boxes.
+/// Advancing the version invalidates recap caches filtered under the old policy.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// What happens to content with a sensitive word or personal information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +340,47 @@ impl SensitiveFilterState {
             sensitive_word: self.contains_sensitive(text),
             pii: pii::detect(text, settings, context),
         }
+    }
+
+    pub(crate) fn filters_bank_cards(&self) -> bool {
+        self.pii.read().unwrap().wants(PiiKind::BankCard)
+    }
+
+    /// A block already matched as part of a card number spanning several boxes.
+    pub(crate) fn inspect_bank_card_fragment(&self, text: &str) -> Findings {
+        Findings {
+            sensitive_word: self.contains_sensitive(text),
+            pii: vec![PiiSpan {
+                kind: PiiKind::BankCard,
+                start: 0,
+                end: text.len(),
+            }],
+        }
+    }
+
+    pub(crate) fn inspect_ocr_blocks(
+        &self,
+        blocks: &[(&str, Option<pii::Bounds>)],
+    ) -> Vec<Findings> {
+        let settings = *self.pii.read().unwrap();
+        let split_cards = settings
+            .wants(PiiKind::BankCard)
+            .then(|| pii::split_bank_card_blocks(blocks));
+        blocks
+            .iter()
+            .zip(pii::block_contexts(blocks))
+            .enumerate()
+            .map(|(index, ((text, _), context))| {
+                if split_cards.as_ref().is_some_and(|marked| marked[index]) {
+                    self.inspect_bank_card_fragment(text)
+                } else {
+                    Findings {
+                        sensitive_word: self.contains_sensitive(text),
+                        pii: pii::detect(text, settings, context),
+                    }
+                }
+            })
+            .collect()
     }
 
     /// The field as returned when it is kept: only long numbers are hidden.
@@ -858,7 +900,7 @@ mod tests {
             "pii_entities": [],
             "version": 2,
         }));
-        assert_eq!(config.version, 3);
+        assert_eq!(config.version, CONFIG_VERSION);
         assert!(!config.enabled);
         assert!(!config.pii_enabled);
         assert!(config.pii_entities.is_empty());

@@ -492,12 +492,12 @@ fn redact(
         .iter()
         .map(|b| (b.text.as_str(), Bounds::from_points(&b.box_coords)))
         .collect();
-    let contexts = pii::block_contexts(&layout);
+    let findings = filter.inspect_ocr_blocks(&layout);
+    let mode = filter.mode();
     let (width, height) = image.dimensions();
     let mut regions = Vec::new();
-    for (((block, bounds), original), context) in layout.iter().zip(blocks).zip(contexts) {
-        let findings = filter.inspect(block, context);
-        if findings.is_flagged() && filter.mode() == FilterMode::Reject {
+    for (((_, bounds), original), findings) in layout.iter().zip(blocks).zip(findings) {
+        if findings.is_flagged() && mode == FilterMode::Reject {
             return Err("PRIVACY_REJECTED: Rejected by user's privacy settings.".into());
         }
         if !findings.is_flagged() && findings.pii.is_empty() {
@@ -611,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn privacy_masks_contextual_pii_and_rejects_missing_coordinates() {
+    fn privacy_masks_ocr_and_split_card_boxes_and_rejects_missing_coordinates() {
         let filter = SensitiveFilterState::default();
         let block = |text: &str, coords: Vec<Vec<f64>>| OcrResult {
             text_layout: None,
@@ -627,12 +627,20 @@ mod tests {
             100,
             Rgba([255, 255, 255, 255]),
         ));
-        let blocks = vec![
+        let mut blocks = vec![
             block("手机", vec![vec![0.0, 20.0], vec![30.0, 40.0]]),
             block("13812345678", vec![vec![35.0, 20.0], vec![180.0, 40.0]]),
         ];
+        let groups = ["2233", "0012", "3456", "0020"];
+        blocks.extend(groups.into_iter().enumerate().map(|(index, group)| {
+            let x = 46.0 * index as f64;
+            block(group, vec![vec![x, 52.0], vec![x + 40.0, 72.0]])
+        }));
         redact(&mut image, &filter, &blocks).unwrap();
         assert_eq!(image.get_pixel(100, 30), Rgba([32, 32, 32, 255]));
+        for x in [20, 66, 112, 158] {
+            assert_eq!(image.get_pixel(x, 62), Rgba([32, 32, 32, 255]));
+        }
         assert_eq!(image.get_pixel(100, 80), Rgba([255, 255, 255, 255]));
         assert!(redact(&mut image, &filter, &[block("13812345678", vec![])]).is_err());
     }
