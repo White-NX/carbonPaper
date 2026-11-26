@@ -1,9 +1,9 @@
-import React, { useMemo, useState } from 'react';
-import { ArrowLeft, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Clock3, ExternalLink, RefreshCw } from 'lucide-react';
+import React, { memo, useEffect, useMemo, useState } from 'react';
+import { ArrowLeft, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Clock3, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS, CATEGORY_LIST } from '../../lib/categories';
 import { calendarTimeFormatter } from '../../lib/calendar_time';
-import { moveUsageDate, usageDuration, usageErrorKey, usageHourlySelection } from '../../lib/usage_api';
+import { usageDuration, usageErrorKey, usageHourlySelection } from '../../lib/usage_api';
 import { PageHeader } from '../PageHeader';
 import { Button } from '../ui/Button';
 import { Banner } from '../ui/Banner';
@@ -177,66 +177,98 @@ function Details({ app, details, loading, error, onViewSnapshots, clearApp }) {
   </section>;
 }
 
-export default function UsageStatisticsView({ date, today, day, loading, error, refresh, selectDate, selectedApp, selectApp, clearApp, saveCategory, details, detailsError, detailsLoading, onViewSnapshots }) {
+const UsageDayContent = memo(function UsageDayContent({ day, today, selectDate, selectedApp, selectApp, clearApp, details, detailsError, detailsLoading, onViewSnapshots, setCategoryApp }) {
   const { t, i18n } = useTranslation();
-  const [categoryApp, setCategoryApp] = useState(null);
+  const { date, calendar } = day;
   const time = useMemo(() => {
-    const calendar = day?.calendar;
-    if (calendar?.time_zone && calendar.start_utc_offset_seconds !== calendar.end_utc_offset_seconds) {
+    if (calendar.time_zone && calendar.start_utc_offset_seconds !== calendar.end_utc_offset_seconds) {
       const formatter = new Intl.DateTimeFormat(i18n.language, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: calendar.time_zone, timeZoneName: 'shortOffset' });
       return (ms) => Number.isFinite(ms) ? formatter.format(new Date(ms)) : '';
     }
     return calendarTimeFormatter(i18n.language, calendar);
-  }, [i18n.language, day?.calendar]);
-  const fullDate = new Intl.DateTimeFormat(i18n.language, { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short', timeZone: 'UTC' }).format(dateValue(date));
+  }, [i18n.language, calendar]);
   const scope = selectedApp ? t('usage.appDuration', { app: selectedApp.name }) : t(date === today ? 'usage.todayDuration' : 'usage.dayDuration');
-  return <div className="usage-surface flex min-h-0 flex-1 flex-col overflow-hidden bg-ide-bg">
+  return <div className="usage-body">
+    <div className="usage-summary">
+      <section className="usage-summary-main">
+        <div className="usage-label"><h2 title={selectedApp ? scope : undefined}>{scope}</h2>{selectedApp && <Button size="xs" variant="ghost" icon={ArrowLeft} onClick={clearApp}>{t('usage.allApps')}</Button>}</div>
+        <Total ms={selectedApp?.total_ms ?? day.total_ms} />
+        <div className="usage-facts">
+          <div className="usage-fact-row" aria-hidden={Boolean(selectedApp)}>
+            <span>{t('usage.firstUse')} <b>{time(day.first_ms) || '—'}</b></span><span>{t('usage.lastUse')} <b>{time(day.last_ms) || '—'}</b></span><span>{t('usage.appSwitches')} <b>{day.switches}</b></span><span>{t('usage.longestContinuousUse')} <b>{usageDuration(day.longest_ms, t)}</b></span>
+          </div>
+          {selectedApp && <div className="usage-fact-row">
+            <span>{t('usage.dayShare')} <b>{Math.round(selectedApp.total_ms / Math.max(1, day.total_ms) * 100)}%</b></span><span>{t('usage.visits')} <b>{selectedApp.visits}</b></span><span>{t('usage.longestContinuousUse')} <b>{usageDuration(selectedApp.longest_ms, t)}</b></span>
+          </div>}
+        </div>
+      </section>
+      <Week days={day.week} date={date} today={today} selectDate={selectDate} />
+    </div>
+    <Hours day={day} selectedApp={selectedApp} time={time} onViewSnapshots={onViewSnapshots} />
+    <div className="usage-day-details">
+      <Ribbon day={day} selectedApp={selectedApp} selectApp={selectApp} time={time} />
+      {calendar.rule === 'system_time_zone_changed' && <Banner>{t('usage.timeZoneChanged')}</Banner>}
+      {!day.observed_ms && <Banner>{t('usage.noRecords')}{day.recorded_since_ms && <span> {t('usage.recordedSince', { date: new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeZone: calendar.time_zone || undefined }).format(new Date(day.recorded_since_ms)) })}</span>}</Banner>}
+      <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} editCategory={(app) => setCategoryApp({ ...app, date, generation: day.generation })} /><aside className="usage-side">
+        <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />
+        <Categories categories={day.categories} total={day.total_ms} />
+      </aside></div>
+    </div>
+  </div>;
+});
+
+const LOADING_DELAY_MS = 200;
+
+export default function UsageStatisticsView({ date, requestedDate = date, navigationDate = date, today, day, loading, error, refresh, selectDate, stepDate,
+  selectedApp, selectApp, clearApp, saveCategory, details, detailsError, detailsLoading, onViewSnapshots, surfaceRef }) {
+  const { t, i18n } = useTranslation();
+  const [categoryApp, setCategoryApp] = useState(null);
+  const [slowLoad, setSlowLoad] = useState(false);
+  const waitingForDate = loading && (!day || requestedDate !== date);
+  useEffect(() => {
+    if (!waitingForDate) {
+      setSlowLoad(false);
+      return undefined;
+    }
+    const timeout = setTimeout(() => setSlowLoad(true), LOADING_DELAY_MS);
+    return () => clearTimeout(timeout);
+  }, [waitingForDate]);
+  useEffect(() => { setCategoryApp(null); }, [day?.date, day?.generation]);
+
+  const dateFormat = useMemo(() => new Intl.DateTimeFormat(i18n.language, { dateStyle: 'full', timeZone: 'UTC' }), [i18n.language]);
+  const fullDate = dateFormat.format(dateValue(date));
+  const otherDate = requestedDate !== date ? dateFormat.format(dateValue(requestedDate)) : null;
+  return <div ref={surfaceRef} className="usage-surface flex min-h-0 flex-1 flex-col overflow-hidden bg-ide-bg">
     <PageHeader as="header" className="usage-header">
       <div className="usage-header-layout grid min-w-0 flex-1 items-start gap-x-5 gap-y-2">
         <div className="flex h-10 min-w-0 items-center">
           <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold text-ide-text"><BarChart3 className="h-4 w-4 shrink-0 text-ide-accent" aria-hidden="true" /><span className="truncate">{t('usage.title')}</span></h1>
         </div>
         <div className="usage-header-actions flex min-h-10 items-center justify-end gap-1.5">
-          {date !== today && <Button variant="ghost" onClick={() => selectDate(today)}>{t('usage.today')}</Button>}
-          <Button variant="ghost" icon={RefreshCw} loading={loading} onClick={refresh} aria-label={t('usage.refresh')} title={t('usage.refresh')} />
+          {(date !== today || navigationDate !== today) && <Button variant="ghost" disabled={navigationDate === today} onClick={() => selectDate(today)}>{t('usage.today')}</Button>}
+          <Button variant="ghost" icon={RefreshCw} loading={loading && !waitingForDate} disabled={waitingForDate} onClick={refresh} aria-label={t('usage.refresh')} title={t('usage.refresh')} />
         </div>
         <div role="group" aria-label={fullDate} className="usage-date-nav flex h-10 shrink-0 items-center gap-1.5">
-          <Button variant="ghost" icon={ChevronLeft} onClick={() => selectDate(moveUsageDate(date, -1))} aria-label={t('usage.previousDay')} />
-          <DateTimePicker label={fullDate} value={date} onChange={selectDate} max={today} dateOnly applyOnSelect clearable={false} className="w-36 flex-none" />
-          <Button variant="ghost" icon={ChevronRight} onClick={() => selectDate(moveUsageDate(date, 1))} disabled={date >= today} aria-label={t('usage.nextDay')} />
+          <Button variant="ghost" icon={ChevronLeft} onClick={() => stepDate(-1)} aria-label={t('usage.previousDay')} />
+          <DateTimePicker label={fullDate} value={date} onChange={selectDate} max={today} dateOnly applyOnSelect clearable={false} className="usage-date-picker w-36 flex-none" />
+          <Button variant="ghost" icon={ChevronRight} onClick={() => stepDate(1)} disabled={navigationDate >= today} aria-label={t('usage.nextDay')} />
         </div>
       </div>
     </PageHeader>
-    <div className="usage-scroll custom-scrollbar">
-      <div className="usage-body">
-        {error && <Banner tone="error" action={<Button size="xs" onClick={refresh}>{t('common.retry')}</Button>}>{t(usageErrorKey(error))}</Banner>}
-        {!day ? !error && <div className="usage-loading" role="status"><BarChart3 className="h-7 w-7" aria-hidden="true" /><p>{t('usage.loading')}</p></div> : <>
-          <div className="usage-summary">
-            <section className="usage-summary-main">
-              <div className="usage-label"><h2 title={selectedApp ? scope : undefined}>{scope}</h2>{selectedApp && <Button size="xs" variant="ghost" icon={ArrowLeft} onClick={clearApp}>{t('usage.allApps')}</Button>}</div>
-              <Total ms={selectedApp?.total_ms ?? day.total_ms} />
-              <div className="usage-facts">
-                <div className="usage-fact-row" aria-hidden={Boolean(selectedApp)}>
-                  <span>{t('usage.firstUse')} <b>{time(day.first_ms) || '—'}</b></span><span>{t('usage.lastUse')} <b>{time(day.last_ms) || '—'}</b></span><span>{t('usage.appSwitches')} <b>{day.switches}</b></span><span>{t('usage.longestContinuousUse')} <b>{usageDuration(day.longest_ms, t)}</b></span>
-                </div>
-                {selectedApp && <div className="usage-fact-row">
-                  <span>{t('usage.dayShare')} <b>{Math.round(selectedApp.total_ms / Math.max(1, day.total_ms) * 100)}%</b></span><span>{t('usage.visits')} <b>{selectedApp.visits}</b></span><span>{t('usage.longestContinuousUse')} <b>{usageDuration(selectedApp.longest_ms, t)}</b></span>
-                </div>}
-              </div>
-            </section>
-            <Week days={day.week} date={date} today={today} selectDate={selectDate} />
-          </div>
-          <Hours day={day} selectedApp={selectedApp} time={time} onViewSnapshots={onViewSnapshots} />
-          <Ribbon day={day} selectedApp={selectedApp} selectApp={selectApp} time={time} />
-          {day.calendar.rule === 'system_time_zone_changed' && <Banner>{t('usage.timeZoneChanged')}</Banner>}
-          {!day.observed_ms && <Banner>{t('usage.noRecords')}{day.recorded_since_ms && <span> {t('usage.recordedSince', { date: new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeZone: day.calendar.time_zone || undefined }).format(new Date(day.recorded_since_ms)) })}</span>}</Banner>}
-          <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} editCategory={(app) => setCategoryApp({ ...app, generation: day.generation })} /><aside className="usage-side">
-            <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />
-            <Categories categories={day.categories} total={day.total_ms} />
-          </aside></div>
-        </>}
+    {error && <div className="usage-error">
+      <Banner tone="error" title={otherDate} action={<Button size="xs" onClick={refresh}>{t('common.retry')}</Button>}>{t(usageErrorKey(error))}</Banner>
+    </div>}
+    <div className="usage-panel" data-waiting={waitingForDate && slowLoad}>
+      <div className="usage-scroll custom-scrollbar" aria-busy={waitingForDate}>
+        {day && <UsageDayContent day={day} today={today} selectDate={selectDate} selectedApp={selectedApp} selectApp={selectApp} clearApp={clearApp}
+          details={details} detailsError={detailsError} detailsLoading={detailsLoading} onViewSnapshots={onViewSnapshots} setCategoryApp={setCategoryApp} />}
       </div>
+      {waitingForDate && slowLoad && <div className="usage-wait" role="status">
+        <Loader2 className="h-6 w-6 text-ide-accent motion-safe:animate-spin" aria-hidden="true" />
+        <span className="sr-only">{otherDate ? t('usage.loadingDate', { date: otherDate }) : t('usage.loading')}</span>
+      </div>}
     </div>
-    {categoryApp && categoryApp.generation === day?.generation && <UsageCategoryDialog key={categoryApp.id} app={categoryApp} onClose={() => setCategoryApp(null)} onSave={saveCategory} />}
+    {categoryApp && categoryApp.date === day?.date && categoryApp.generation === day.generation &&
+      <UsageCategoryDialog key={categoryApp.id} app={categoryApp} onClose={() => setCategoryApp(null)} onSave={saveCategory} />}
   </div>;
 }

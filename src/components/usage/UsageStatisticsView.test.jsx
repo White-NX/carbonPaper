@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { createInstance } from 'i18next';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import en from '../../i18n/locales/en.json';
@@ -71,8 +71,8 @@ describe('usage statistics weekly totals', () => {
       const date = moveUsageDate(first, index);
       return { date, total_ms: date <= today ? (index + 1) * 60000 : 0, observed_ms: date <= today ? 3600000 : 0 };
     });
-    const selectDate = vi.fn();
-    const props = { today, loading: false, selectDate, selectApp: vi.fn(), clearApp: vi.fn(), refresh: vi.fn() };
+    const selectDate = vi.fn(); const stepDate = vi.fn();
+    const props = { today, loading: false, selectDate, stepDate, selectApp: vi.fn(), clearApp: vi.fn(), refresh: vi.fn() };
     const { container, rerender } = render(<UsageStatisticsView {...props} date={monday} day={{ ...day, date: monday, week: makeWeek(monday) }} />);
     const chart = within(container.querySelector('.usage-week'));
     const buttons = chart.getAllByRole('button');
@@ -84,7 +84,7 @@ describe('usage statistics weekly totals', () => {
     fireEvent.click(buttons[3]);
     expect(selectDate).toHaveBeenLastCalledWith(today);
     fireEvent.click(screen.getByRole('button', { name: 'Previous day' }));
-    expect(selectDate).toHaveBeenLastCalledWith(previousSunday);
+    expect(stepDate).toHaveBeenLastCalledWith(-1);
 
     rerender(<UsageStatisticsView {...props} date={previousSunday} day={{ ...day, date: previousSunday, week: makeWeek(previousMonday) }} />);
     expect(chart.getByRole('heading', { name: /Nov 16\s*–\s*22/ })).toBeInTheDocument();
@@ -94,6 +94,40 @@ describe('usage statistics weekly totals', () => {
 });
 
 describe('usage statistics navigation', () => {
+  it('delays the centered loading state, keeps the current layout and offers retry for the failed date', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const requestedDate = '2026-11-23';
+      const refresh = vi.fn(); const stepDate = vi.fn();
+      const props = { date, today: date, day, requestedDate, navigationDate: requestedDate, selectDate: vi.fn(), stepDate, refresh };
+      const { container, rerender } = render(<UsageStatisticsView {...props} loading />);
+      const plot = container.querySelector('.usage-hours');
+      const panel = container.querySelector('.usage-panel');
+      expect(screen.getByRole('button', { name: 'Tuesday, November 24, 2026' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Next day' })).toBeEnabled();
+      act(() => vi.advanceTimersByTime(199));
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(panel).toHaveAttribute('data-waiting', 'false');
+      act(() => vi.advanceTimersByTime(1));
+      expect(screen.getByRole('status')).toHaveTextContent('Loading usage statistics for Monday, November 23, 2026…');
+      expect(panel).toHaveAttribute('data-waiting', 'true');
+      expect(container.querySelector('.usage-hours')).toBe(plot);
+      fireEvent.click(screen.getByRole('button', { name: 'Previous day' }));
+      expect(stepDate).toHaveBeenCalledWith(-1);
+
+      rerender(<UsageStatisticsView {...props} navigationDate={date} loading={false} error="USAGE_QUERY_FAILED" />);
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(container.querySelector('.usage-hours')).toBe(plot);
+      const alert = screen.getByRole('alert');
+      expect(alert).toHaveTextContent('Monday, November 23, 2026');
+      expect(alert).toHaveTextContent(en.usage.errors.USAGE_QUERY_FAILED);
+      fireEvent.click(within(alert).getByRole('button', { name: en.common.retry }));
+      expect(refresh).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps initials behind transparent icons out of the tile and recovers after an icon source changes', () => {
     const icon = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="32" height="32"/%3E';
     const props = { date, today: date, loading: false, selectDate: vi.fn(), selectApp: vi.fn(), clearApp: vi.fn(), refresh: vi.fn() };

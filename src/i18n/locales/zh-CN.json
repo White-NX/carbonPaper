@@ -97,6 +97,7 @@
     "noCategories": "暂无类别统计。",
     "noDetails": "暂无窗口标题或网站明细。",
     "loading": "正在读取使用统计…",
+    "loadingDate": "正在读取 {{date}} 的使用统计…",
     "loadingDetails": "正在读取明细…",
     "previousDay": "前一天",
     "nextDay": "后一天",

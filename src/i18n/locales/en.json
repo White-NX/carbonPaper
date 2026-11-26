@@ -97,6 +97,7 @@
     "noCategories": "No category statistics yet.",
     "noDetails": "No window title or website details yet.",
     "loading": "Loading usage statistics…",
+    "loadingDate": "Loading usage statistics for {{date}}…",
     "loadingDetails": "Loading details…",
     "previousDay": "Previous day",
     "nextDay": "Next day",
