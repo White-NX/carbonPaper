@@ -2,8 +2,8 @@ import React from 'react';
 import useUsageStatistics from '../../hooks/useUsageStatistics';
 import UsageStatisticsView from './UsageStatisticsView';
 
-export default function UsageStatistics({ active, isAuthenticated, onViewSnapshots, onOpenRecap }) {
+export default function UsageStatistics({ active, isAuthenticated, onViewSnapshots }) {
   const statistics = useUsageStatistics(active, isAuthenticated);
   if (!active || !isAuthenticated) return null;
-  return <UsageStatisticsView {...statistics} onViewSnapshots={onViewSnapshots} onOpenRecap={onOpenRecap} />;
+  return <UsageStatisticsView {...statistics} onViewSnapshots={onViewSnapshots} />;
 }

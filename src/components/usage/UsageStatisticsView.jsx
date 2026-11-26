@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { ArrowLeft, BarChart3, CalendarDays, ChevronDown, ChevronLeft, ChevronRight, Clock3, ExternalLink, RefreshCw } from 'lucide-react';
+import { ArrowLeft, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Clock3, ExternalLink, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS, CATEGORY_LIST } from '../../lib/categories';
 import { calendarTimeFormatter } from '../../lib/calendar_time';
@@ -13,7 +13,9 @@ import './usage-statistics.css';
 
 const color = (category) => CATEGORY_COLORS[category] || '#84909f';
 const categoryLabel = (category, t) => CATEGORY_LIST.includes(category) ? t(`usage.categories.${category}`) : category;
-const dateValue = (date) => new Date(`${date}T12:00:00`);
+const dateValue = (date) => new Date(`${date}T00:00:00Z`);
+const endTime = (end, calendar, time, t) => end === calendar.end_ms && calendar.rule !== 'system_time_zone_changed'
+  ? t('usage.endOfDay') : time(end);
 
 function Total({ ms }) {
   const { t } = useTranslation();
@@ -25,18 +27,30 @@ function Total({ ms }) {
 
 function Week({ days, date, today, selectDate }) {
   const { t, i18n } = useTranslation();
+  if (!days.length) return null;
   const max = Math.max(1, ...days.map((day) => day.total_ms));
   const recorded = days.filter((day) => day.observed_ms > 0);
   const average = recorded.reduce((sum, day) => sum + day.total_ms, 0) / (recorded.length || 1);
-  const weekday = new Intl.DateTimeFormat(i18n.language, { weekday: 'short' });
+  const weekday = new Intl.DateTimeFormat(i18n.language, { weekday: 'short', timeZone: 'UTC' });
+  const fullDate = new Intl.DateTimeFormat(i18n.language, { dateStyle: 'full', timeZone: 'UTC' });
+  const title = days.some((day) => day.date === today) ? t('usage.currentWeek')
+    : new Intl.DateTimeFormat(i18n.language, { month: 'short', day: 'numeric', timeZone: 'UTC' })
+      .formatRange(dateValue(days[0].date), dateValue(days.at(-1).date));
   return <div className="usage-week">
-    <div className="usage-label"><h2>{t('usage.sevenDays')}</h2><span title={t('usage.averageHint')}>{recorded.length ? t('usage.dailyAverage', { duration: usageDuration(average, t) }) : t('usage.noAverage')}</span></div>
+    <div className="usage-label"><h2>{title}</h2><span title={t('usage.averageHint')}>{recorded.length ? t('usage.dailyAverage', { duration: usageDuration(average, t) }) : t('usage.noAverage')}</span></div>
     <div className="usage-week-bars">
-      {days.map((day) => <button key={day.date} type="button" className={`usage-week-day ${day.observed_ms ? '' : 'unrecorded'}`} disabled={day.date > today} aria-pressed={day.date === date}
-        aria-label={`${day.date} · ${day.observed_ms ? usageDuration(day.total_ms, t) : t('usage.states.unknown')}`} title={`${day.date} · ${day.observed_ms ? usageDuration(day.total_ms, t) : t('usage.states.unknown')}`} onClick={() => selectDate(day.date)}>
-        <span className="usage-week-column"><i style={{ height: `${day.total_ms / max * 100}%` }} /></span>
-        <span className="usage-week-tick">{weekday.format(dateValue(day.date))}</span>
-      </button>)}
+      {days.map((day) => {
+        const value = dateValue(day.date);
+        const formattedDate = fullDate.format(value);
+        const future = day.date > today;
+        const label = day.observed_ms ? t('usage.weekDayUsage', { date: formattedDate, duration: usageDuration(day.total_ms, t) })
+          : future ? formattedDate : t('usage.weekDayNoUsage', { date: formattedDate });
+        return <button key={day.date} type="button" className={`usage-week-day ${day.observed_ms ? '' : 'unrecorded'}`} disabled={future} aria-pressed={day.date === date}
+          aria-label={label} title={label} onClick={() => selectDate(day.date)}>
+          <span className="usage-week-column"><i style={{ height: `${day.total_ms / max * 100}%` }} /></span>
+          <span className="usage-week-tick">{weekday.format(value)}</span>
+        </button>;
+      })}
     </div>
   </div>;
 }
@@ -46,14 +60,14 @@ function Hours({ day, selectedApp, time, onViewSnapshots }) {
   const selected = useMemo(() => usageHourlySelection(day, selectedApp?.id), [day, selectedApp?.id]);
   const hourTick = useMemo(() => calendarTimeFormatter(i18n.language, day.calendar, 'hour'), [i18n.language, day.calendar]);
   return <figure className="usage-hours-figure">
-    <div className="usage-label"><figcaption>{t('usage.hourlyMinutes')}</figcaption><span>{selectedApp ? selectedApp.name : t('usage.allApps')}</span></div>
+    <div className="usage-label"><figcaption>{t('usage.hourlyMinutes')}</figcaption><span title={selectedApp?.name}>{selectedApp ? selectedApp.name : t('usage.allApps')}</span></div>
     <div className="usage-hours-axis"><span>60</span><span>30</span><span>0</span></div>
     <div className="usage-hours" style={{ '--usage-hours': day.hours.length }}>
       {day.hours.map((hour, index) => {
         const total = hour.total_ms;
-        const end = hour.end_ms === day.calendar.end_ms && day.calendar.rule !== 'system_time_zone_changed'
-          ? t('usage.endOfDay') : time(hour.end_ms);
-        const label = `${time(hour.start_ms)}–${end} · ${usageDuration(total, t)}${selectedApp ? ` · ${selectedApp.name} ${usageDuration(selected[index], t)}` : ''}`;
+        const usage = { start: time(hour.start_ms), end: endTime(hour.end_ms, day.calendar, time, t), duration: usageDuration(total, t) };
+        const label = selectedApp ? t('usage.hourAppUsage', { ...usage, app: selectedApp.name, appDuration: usageDuration(selected[index], t) })
+          : t('usage.hourUsage', usage);
         const segments = selectedApp ? [{ category: null, total_ms: Math.max(0, total - selected[index]) }, { category: selectedApp.category, total_ms: selected[index] }] : hour.categories;
         return <button key={hour.start_ms} type="button" className="usage-hour" aria-label={label} title={label} onClick={() => onViewSnapshots?.(hour.start_ms)}>
           <span className="usage-hour-stack">{segments.filter((segment) => segment.total_ms > 0).map((segment, part) => <i key={`${segment.category}:${part}`}
@@ -74,7 +88,9 @@ function Ribbon({ day, selectedApp, selectApp, time }) {
     <div className="usage-ribbon" aria-label={t('usage.activityTimeline')}>
       {day.intervals.map((interval) => {
         const app = apps.get(interval.app_id);
-        const label = `${app?.name || t(`usage.states.${interval.state}`)} · ${time(interval.start_ms)}–${interval.end_ms === day.calendar.end_ms ? t('usage.endOfDay') : time(interval.end_ms)} · ${usageDuration(interval.end_ms - interval.start_ms, t)}`;
+        const usage = { start: time(interval.start_ms), end: endTime(interval.end_ms, day.calendar, time, t), duration: usageDuration(interval.end_ms - interval.start_ms, t) };
+        const label = app ? t('usage.appInterval', { ...usage, app: app.name })
+          : t('usage.stateInterval', { ...usage, state: t(`usage.states.${interval.state}`) });
         const style = { left: `${(interval.start_ms - day.calendar.start_ms) / duration * 100}%`, width: `${(interval.end_ms - interval.start_ms) / duration * 100}%`,
           ...(interval.state === 'active' ? { background: color(interval.category || app?.category), opacity: !selectedApp || selectedApp.id === interval.app_id ? 1 : 0.2 } : {}) };
         return interval.state === 'active' && app ? <button key={`${interval.start_ms}:${interval.end_ms}`} type="button" className="usage-segment active" style={style}
@@ -82,7 +98,7 @@ function Ribbon({ day, selectedApp, selectApp, time }) {
       })}
     </div>
     <div className="usage-legend">
-      <span><i style={activeStyle} />{selectedApp ? selectedApp.name : t('usage.states.active')}</span>
+      <span className="usage-legend-app"><i style={activeStyle} /><span title={selectedApp?.name}>{selectedApp ? selectedApp.name : t('usage.states.active')}</span></span>
       {selectedApp && <span><i className="other" />{t('usage.otherApps')}</span>}
       <span><i className="idle" />{t('usage.states.idle')}</span><span><i className="paused" />{t('usage.states.paused')}</span><span><i className="unknown" />{t('usage.states.unknown')}</span>
     </div>
@@ -151,7 +167,7 @@ function Details({ app, details, loading, error, onViewSnapshots, clearApp }) {
     {error ? <Banner tone="error">{t(usageErrorKey(error))}</Banner> : loading && !details ? <p role="status" className="usage-empty">{t('usage.loadingDetails')}</p> : <>
       {!websites.length && <h3 className="usage-detail-subtitle">{t('usage.windowTitles')}</h3>}
       {list.length ? <div className="usage-detail-list">{list.slice(0, limit).map((item) => <button key={item.label} type="button" className="usage-detail-row" onClick={() => onViewSnapshots?.(item.first_ms)}
-        title={`${item.label} · ${t('usage.viewNearbySnapshots')}`}>
+        title={t('usage.viewNearbySnapshots', { label: item.label })}>
         <span className="usage-detail-name">{item.label}</span><span className="usage-detail-duration">{usageDuration(item.total_ms, t)}</span><ExternalLink className="h-3 w-3" aria-hidden="true" />
         <span className="usage-track"><i style={{ background: color(app.category), width: `${item.total_ms / Math.max(1, app.total_ms) * 100}%` }} /></span>
       </button>)}</div> : <p className="usage-empty">{t('usage.noDetails')}</p>}
@@ -161,7 +177,7 @@ function Details({ app, details, loading, error, onViewSnapshots, clearApp }) {
   </section>;
 }
 
-export default function UsageStatisticsView({ date, today, day, loading, error, refresh, selectDate, selectedApp, selectApp, clearApp, saveCategory, details, detailsError, detailsLoading, onViewSnapshots, onOpenRecap }) {
+export default function UsageStatisticsView({ date, today, day, loading, error, refresh, selectDate, selectedApp, selectApp, clearApp, saveCategory, details, detailsError, detailsLoading, onViewSnapshots }) {
   const { t, i18n } = useTranslation();
   const [categoryApp, setCategoryApp] = useState(null);
   const time = useMemo(() => {
@@ -172,7 +188,7 @@ export default function UsageStatisticsView({ date, today, day, loading, error, 
     }
     return calendarTimeFormatter(i18n.language, calendar);
   }, [i18n.language, day?.calendar]);
-  const fullDate = new Intl.DateTimeFormat(i18n.language, { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' }).format(dateValue(date));
+  const fullDate = new Intl.DateTimeFormat(i18n.language, { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short', timeZone: 'UTC' }).format(dateValue(date));
   const scope = selectedApp ? t('usage.appDuration', { app: selectedApp.name }) : t(date === today ? 'usage.todayDuration' : 'usage.dayDuration');
   return <div className="usage-surface flex min-h-0 flex-1 flex-col overflow-hidden bg-ide-bg">
     <PageHeader as="header" className="usage-header">
@@ -197,11 +213,15 @@ export default function UsageStatisticsView({ date, today, day, loading, error, 
         {!day ? !error && <div className="usage-loading" role="status"><BarChart3 className="h-7 w-7" aria-hidden="true" /><p>{t('usage.loading')}</p></div> : <>
           <div className="usage-summary">
             <section className="usage-summary-main">
-              <div className="usage-label"><h2>{scope}</h2>{selectedApp && <Button size="xs" variant="ghost" icon={ArrowLeft} onClick={clearApp}>{t('usage.allApps')}</Button>}</div>
+              <div className="usage-label"><h2 title={selectedApp ? scope : undefined}>{scope}</h2>{selectedApp && <Button size="xs" variant="ghost" icon={ArrowLeft} onClick={clearApp}>{t('usage.allApps')}</Button>}</div>
               <Total ms={selectedApp?.total_ms ?? day.total_ms} />
               <div className="usage-facts">
-                {selectedApp ? <><span>{t('usage.dayShare')} <b>{Math.round(selectedApp.total_ms / Math.max(1, day.total_ms) * 100)}%</b></span><span>{t('usage.visits')} <b>{selectedApp.visits}</b></span><span>{t('usage.longestVisit')} <b>{usageDuration(selectedApp.longest_ms, t)}</b></span></>
-                  : <><span>{t('usage.firstUse')} <b>{time(day.first_ms) || '—'}</b></span><span>{t('usage.lastUse')} <b>{time(day.last_ms) || '—'}</b></span><span>{t('usage.appSwitches')} <b>{day.switches}</b></span><span>{t('usage.longestVisit')} <b>{usageDuration(day.longest_ms, t)}</b></span></>}
+                <div className="usage-fact-row" aria-hidden={Boolean(selectedApp)}>
+                  <span>{t('usage.firstUse')} <b>{time(day.first_ms) || '—'}</b></span><span>{t('usage.lastUse')} <b>{time(day.last_ms) || '—'}</b></span><span>{t('usage.appSwitches')} <b>{day.switches}</b></span><span>{t('usage.longestContinuousUse')} <b>{usageDuration(day.longest_ms, t)}</b></span>
+                </div>
+                {selectedApp && <div className="usage-fact-row">
+                  <span>{t('usage.dayShare')} <b>{Math.round(selectedApp.total_ms / Math.max(1, day.total_ms) * 100)}%</b></span><span>{t('usage.visits')} <b>{selectedApp.visits}</b></span><span>{t('usage.longestContinuousUse')} <b>{usageDuration(selectedApp.longest_ms, t)}</b></span>
+                </div>}
               </div>
             </section>
             <Week days={day.week} date={date} today={today} selectDate={selectDate} />
@@ -214,7 +234,6 @@ export default function UsageStatisticsView({ date, today, day, loading, error, 
             <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />
             <Categories categories={day.categories} total={day.total_ms} />
           </aside></div>
-          <footer className="usage-footer"><p>{t('usage.measurementHint')}</p><Button size="xs" variant="ghost" icon={CalendarDays} onClick={() => onOpenRecap?.({ date })}>{t('usage.openRecap')}</Button></footer>
         </>}
       </div>
     </div>

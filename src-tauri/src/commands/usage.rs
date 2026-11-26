@@ -11,8 +11,8 @@ use crate::{
 use std::sync::Arc;
 use tauri::Emitter;
 
-/// Authentication: required. Aggregates one recorded civil day and seven-day
-/// totals; only distinct application identities are decrypted for this view.
+/// Authentication: required. Aggregates a civil day and the daily totals in
+/// its Monday–Sunday week. Only the selected day's app identities are decrypted.
 #[tauri::command]
 pub async fn usage_get_day(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,

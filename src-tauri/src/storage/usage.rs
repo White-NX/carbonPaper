@@ -5,7 +5,7 @@ use crate::{
     calendar::{self, CalendarDay},
     usage::{aggregate, types::*},
 };
-use chrono::{Days, TimeZone};
+use chrono::{Datelike, Days, TimeZone};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -428,10 +428,13 @@ impl StorageState {
     ) -> Result<UsageDay, String> {
         let generation = self.db_generation();
         let selected = calendar::parse_date(date)?;
-        let first = selected
-            .checked_sub_days(Days::new(6))
-            .ok_or("USAGE_INVALID_DATE")?
-            .to_string();
+        let selected_offset = selected.weekday().num_days_from_monday();
+        let monday = selected
+            .checked_sub_days(Days::new(u64::from(selected_offset)))
+            .ok_or("USAGE_INVALID_DATE")?;
+        let sunday = monday
+            .checked_add_days(Days::new(6))
+            .ok_or("USAGE_INVALID_DATE")?;
         let zone = calendar::time_zone(live.time_zone.as_deref())?;
         let live_spans = if live.generation == generation {
             live.spans
@@ -440,11 +443,11 @@ impl StorageState {
         };
         let (rows, legacy_rows, mut calendars, since) =
             self.with_read_connection_named("usage.day", |conn| {
-                let rows = rows_on_conn(conn, &first, date)?;
-                let mut calendars = vec![];
-                for offset in (0..=6).rev() {
-                    let date = selected
-                        .checked_sub_days(Days::new(offset))
+                let rows = rows_on_conn(conn, &monday.to_string(), &sunday.to_string())?;
+                let mut calendars = Vec::with_capacity(7);
+                for offset in 0..=6 {
+                    let date = monday
+                        .checked_add_days(Days::new(offset))
                         .ok_or("USAGE_INVALID_DATE")?
                         .to_string();
                     let mut calendar = calendar_on_conn(conn, &date, zone)?;
@@ -473,7 +476,7 @@ impl StorageState {
             })?;
         let selected_rows: Vec<_> = rows.iter().filter(|r| r.day == date).cloned().collect();
         let apps = self.read_usage_apps(&selected_rows)?;
-        let selected_cal = calendars.last().unwrap();
+        let selected_cal = &calendars[selected_offset as usize];
         let selected_legacy: Vec<_> = legacy_rows
             .iter()
             .filter(|row| {
@@ -483,7 +486,7 @@ impl StorageState {
             })
             .collect();
         let legacy_identities = legacy::identities(self, &selected_legacy, generation)?;
-        let mut week = vec![];
+        let mut week = Vec::with_capacity(calendars.len());
         for cal in &calendars {
             let mut observations: Vec<_> = rows
                 .iter()
@@ -533,8 +536,8 @@ impl StorageState {
             return Err("USAGE_SOURCE_CHANGED".into());
         }
         let manual = self.apply_usage_categories(generation, &mut observations)?;
-        let mut day =
-            aggregate::summarize(calendars.pop().unwrap(), observations, now_ms, since, week);
+        let selected_cal = calendars.swap_remove(selected_offset as usize);
+        let mut day = aggregate::summarize(selected_cal, observations, now_ms, since, week);
         day.generation = generation;
         for app in &mut day.apps {
             app.category_is_manual = manual.contains_key(&app.id);
@@ -882,6 +885,76 @@ mod tests {
             writer.write(&storage, &[observed]).unwrap_err(),
             "USAGE_SOURCE_CHANGED"
         );
+    }
+
+    #[test]
+    fn weekly_totals_follow_the_selected_monday_through_sunday() {
+        let storage = super::super::test_storage_with_schema("usage-week".into());
+        let generation = storage.db_generation();
+        let zone = chrono_tz::UTC;
+        let identity = Arc::new(UsageIdentity {
+            app: Arc::new(UsageAppIdentity {
+                process_name: "code.exe".into(),
+                name: "Visual Studio Code".into(),
+                process_path: "D:/code.exe".into(),
+                icon: None,
+            }),
+            title: String::new(),
+            url: None,
+            category: "编程开发".into(),
+        });
+        let spans: Vec<_> = [
+            ("2026-12-27", 5_000),
+            ("2026-12-30", 10_000),
+            ("2027-01-02", 20_000),
+            ("2027-01-04", 40_000),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, (date, duration))| {
+            let start = CalendarDay::in_zone(date, zone).unwrap().start_ms;
+            UsageSpan {
+                run_id: 1,
+                sequence: sequence as i64,
+                start_ms: start,
+                end_ms: start + duration,
+                state: UsageState::Active,
+                identity: Some(identity.clone()),
+            }
+        })
+        .collect();
+        UsageWriter::new(generation, zone)
+            .write(&storage, &spans)
+            .unwrap();
+        let live = LiveUsage {
+            generation,
+            time_zone: Some("UTC".into()),
+            spans: vec![],
+        };
+        let now = spans.last().unwrap().end_ms;
+        let wednesday = storage.usage_day("2026-12-30", live.clone(), now).unwrap();
+        assert_eq!(wednesday.calendar.date, "2026-12-30");
+        assert_eq!(wednesday.total_ms, 10_000);
+        assert_eq!(
+            wednesday
+                .week
+                .iter()
+                .map(|day| (day.date.as_str(), day.total_ms))
+                .collect::<Vec<_>>(),
+            [
+                ("2026-12-28", 0),
+                ("2026-12-29", 0),
+                ("2026-12-30", 10_000),
+                ("2026-12-31", 0),
+                ("2027-01-01", 0),
+                ("2027-01-02", 20_000),
+                ("2027-01-03", 0),
+            ]
+        );
+        let monday = storage.usage_day("2027-01-04", live, now).unwrap();
+        assert_eq!(monday.week.first().unwrap().date, "2027-01-04");
+        assert_eq!(monday.week.first().unwrap().total_ms, 40_000);
+        assert_eq!(monday.week.last().unwrap().date, "2027-01-10");
     }
 
     #[test]

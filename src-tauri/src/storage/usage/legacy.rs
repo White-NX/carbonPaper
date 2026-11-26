@@ -435,7 +435,15 @@ mod tests {
         assert_eq!(second.recorded_since_ms, Some(day.start_ms));
         assert_eq!(second.apps[0].name, "Endfield");
         assert_eq!(second.apps[0].visits, 1);
-        assert_eq!(second.week.last().unwrap().total_ms, second.total_ms);
+        assert_eq!(
+            second
+                .week
+                .iter()
+                .find(|day| day.date == second.date)
+                .unwrap()
+                .total_ms,
+            second.total_ms
+        );
         assert_eq!(
             second
                 .week

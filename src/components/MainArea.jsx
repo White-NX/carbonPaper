@@ -434,7 +434,7 @@ export default function MainArea({
           />
         </div>
 
-        <UsageStatistics active={activeTab === 'usage-statistics'} isAuthenticated={isAuthenticated} onViewSnapshots={onViewUsageSnapshots} onOpenRecap={handleOpenRecap} />
+        <UsageStatistics active={activeTab === 'usage-statistics'} isAuthenticated={isAuthenticated} onViewSnapshots={onViewUsageSnapshots} />
 
         <div className={`${activeTab === 'smart-cluster' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
           <SmartClustersView

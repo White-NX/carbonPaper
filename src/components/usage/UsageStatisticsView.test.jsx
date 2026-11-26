@@ -1,11 +1,16 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { createInstance } from 'i18next';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import en from '../../i18n/locales/en.json';
+import zhCN from '../../i18n/locales/zh-CN.json';
+import { moveUsageDate } from '../../lib/usage_api';
 import UsageStatisticsView from './UsageStatisticsView';
 
-const { i18n } = vi.hoisted(() => ({ i18n: { language: 'en' } }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key) => key, i18n }) }));
-beforeEach(() => { i18n.language = 'en'; });
+const i18n = createInstance();
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: i18n.t, i18n }) }));
+beforeAll(() => i18n.init({ lng: 'en', resources: { en: { translation: en }, 'zh-CN': { translation: zhCN } }, interpolation: { escapeValue: false } }));
+beforeEach(() => i18n.changeLanguage('en'));
 const date = '2026-11-24';
 const start = Date.UTC(2026, 10, 24);
 const app = { id: 'endfield.exe', process_name: 'endfield.exe', name: 'Endfield', category: '游戏', total_ms: 3600000, visits: 1, longest_ms: 3600000 };
@@ -25,12 +30,12 @@ describe('usage statistics hourly calendars', () => {
     };
     render(<UsageStatisticsView date={date} today={date} day={partialDay} loading={false}
       selectDate={vi.fn()} selectApp={vi.fn()} clearApp={vi.fn()} refresh={vi.fn()} />);
-    expect(screen.getByText('usage.timeZoneChanged')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^21:00 UTC–22:00 UTC/ })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /usage.endOfDay/ })).not.toBeInTheDocument();
+    expect(screen.getByText(en.usage.timeZoneChanged)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /from 21:00 UTC to 22:00 UTC/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /24:00/ })).not.toBeInTheDocument();
   });
-  it.each(['zh-CN', 'en'])('keeps numeric hour ticks and offset labels across DST changes in %s', (locale) => {
-    i18n.language = locale;
+  it.each(['zh-CN', 'en'])('keeps numeric hour ticks and offset labels across DST changes in %s', async (locale) => {
+    await i18n.changeLanguage(locale);
     const onViewSnapshots = vi.fn();
     const props = { today: date, loading: false, selectDate: vi.fn(), selectApp: vi.fn(), clearApp: vi.fn(), refresh: vi.fn(), onViewSnapshots };
     const transitions = [
@@ -53,6 +58,38 @@ describe('usage statistics hourly calendars', () => {
       fireEvent.click(buttons[2]);
       expect(onViewSnapshots).toHaveBeenLastCalledWith(startMs + 2 * 3600000);
     }
+  });
+});
+
+describe('usage statistics weekly totals', () => {
+  it('keeps the selected week in weekday order and shows the date range when navigating to another week', () => {
+    const today = '2026-11-26';
+    const monday = '2026-11-23';
+    const previousMonday = '2026-11-16';
+    const previousSunday = '2026-11-22';
+    const makeWeek = (first) => Array.from({ length: 7 }, (_, index) => {
+      const date = moveUsageDate(first, index);
+      return { date, total_ms: date <= today ? (index + 1) * 60000 : 0, observed_ms: date <= today ? 3600000 : 0 };
+    });
+    const selectDate = vi.fn();
+    const props = { today, loading: false, selectDate, selectApp: vi.fn(), clearApp: vi.fn(), refresh: vi.fn() };
+    const { container, rerender } = render(<UsageStatisticsView {...props} date={monday} day={{ ...day, date: monday, week: makeWeek(monday) }} />);
+    const chart = within(container.querySelector('.usage-week'));
+    const buttons = chart.getAllByRole('button');
+    expect(chart.getByRole('heading', { name: 'Most recent week' })).toBeInTheDocument();
+    expect(buttons.map((button) => button.textContent)).toEqual(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']);
+    expect(buttons[0]).toHaveAttribute('aria-pressed', 'true');
+    expect(buttons[3]).toHaveAccessibleName('4 min of use on Thursday, November 26, 2026');
+    expect(buttons.slice(4).every((button) => button.disabled)).toBe(true);
+    fireEvent.click(buttons[3]);
+    expect(selectDate).toHaveBeenLastCalledWith(today);
+    fireEvent.click(screen.getByRole('button', { name: 'Previous day' }));
+    expect(selectDate).toHaveBeenLastCalledWith(previousSunday);
+
+    rerender(<UsageStatisticsView {...props} date={previousSunday} day={{ ...day, date: previousSunday, week: makeWeek(previousMonday) }} />);
+    expect(chart.getByRole('heading', { name: /Nov 16\s*–\s*22/ })).toBeInTheDocument();
+    expect(chart.getAllByRole('button')[6]).toHaveAttribute('aria-pressed', 'true');
+    expect(chart.getAllByRole('button')[0]).toHaveAccessibleName('1 min of use on Monday, November 16, 2026');
   });
 });
 
@@ -82,11 +119,11 @@ describe('usage statistics navigation', () => {
     const selectApp = vi.fn(); const saveCategory = vi.fn().mockResolvedValue(undefined);
     render(<UsageStatisticsView date={date} today={date} day={day} selectedApp={app}
       loading={false} selectDate={vi.fn()} selectApp={selectApp} clearApp={vi.fn()} refresh={vi.fn()} saveCategory={saveCategory} />);
-    fireEvent.click(screen.getByRole('button', { name: 'usage.changeAppCategory' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Change category for Endfield' }));
     expect(selectApp).not.toHaveBeenCalled();
     expect(screen.getByRole('combobox')).toHaveValue('auto');
     fireEvent.change(screen.getByRole('combobox'), { target: { value: '游戏' } });
-    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(saveCategory).toHaveBeenCalledWith(app.id, '游戏', 7);
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
@@ -96,27 +133,26 @@ describe('usage statistics navigation', () => {
     const saveCategory = vi.fn().mockRejectedValueOnce(new Error('USAGE_SOURCE_CHANGED')).mockResolvedValue(undefined);
     render(<UsageStatisticsView date={date} today={date} day={{ ...day, apps: [manual] }} selectedApp={manual}
       loading={false} selectDate={vi.fn()} selectApp={vi.fn()} clearApp={vi.fn()} refresh={vi.fn()} saveCategory={saveCategory} />);
-    fireEvent.click(screen.getByRole('button', { name: 'usage.changeAppCategory' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Change category for Endfield' }));
     expect(screen.getByRole('combobox')).toHaveValue('游戏');
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'auto' } });
-    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
-    await waitFor(() => expect(screen.getByText('usage.errors.USAGE_SOURCE_CHANGED')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.getByText(en.usage.errors.USAGE_SOURCE_CHANGED)).toBeInTheDocument());
     expect(screen.getByRole('dialog')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(saveCategory).toHaveBeenLastCalledWith(app.id, null, 7);
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
 
-  it('preserves millisecond timestamps for nearby screenshots and the civil date for recaps', () => {
-    const onViewSnapshots = vi.fn(); const onOpenRecap = vi.fn(); const selectApp = vi.fn();
+  it('preserves millisecond timestamps for nearby screenshots after removing the footer', () => {
+    const onViewSnapshots = vi.fn(); const selectApp = vi.fn();
     render(<UsageStatisticsView date={date} today={date} day={day} selectedApp={app} details={{ titles: [{ label: 'High-load scene', total_ms: 3600000, first_ms: start + 1234 }] }}
-      loading={false} selectDate={vi.fn()} selectApp={selectApp} clearApp={vi.fn()} refresh={vi.fn()} onViewSnapshots={onViewSnapshots} onOpenRecap={onOpenRecap} />);
+      loading={false} selectDate={vi.fn()} selectApp={selectApp} clearApp={vi.fn()} refresh={vi.fn()} onViewSnapshots={onViewSnapshots} />);
     fireEvent.click(screen.getByRole('button', { name: /High-load scene/ }));
     expect(onViewSnapshots).toHaveBeenCalledWith(start + 1234);
-    fireEvent.click(screen.getByRole('button', { name: 'usage.openRecap' }));
-    expect(onOpenRecap).toHaveBeenCalledWith({ date });
-    expect(screen.getByRole('button', { name: 'usage.nextDay' })).toBeDisabled();
-    expect(screen.getByText('usage.states.unknown')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Endfield usage.categories/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Next day' })).toBeDisabled();
+    expect(screen.getByText('Unrecorded')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Endfield Games' })).toHaveAttribute('aria-pressed', 'true');
   });
 });
