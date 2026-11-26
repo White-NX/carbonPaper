@@ -17,31 +17,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HANDLE;
 
-/// Return whether `pid` is `expected_ancestor_pid` or a bounded-depth descendant.
-fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
-    if pid == expected_ancestor_pid {
-        return true;
-    }
-    let Some(processes) = crate::windows_platform::process_tree() else {
-        return false;
-    };
-
-    let mut current = pid;
-    for _ in 0..8 {
-        let Some(parent) = processes.get(&current).map(|(parent, _)| *parent) else {
-            return false;
-        };
-        if parent == expected_ancestor_pid {
-            return true;
-        }
-        if parent == 0 || parent == current {
-            return false;
-        }
-        current = parent;
-    }
-    false
-}
-
 /// Compute deterministic NMH pipe name from current user's Windows SID.
 /// Both CarbonPaper and carbonpaper-nmh.exe use this same formula.
 pub fn compute_nmh_pipe_name() -> Result<String, String> {
@@ -300,7 +275,7 @@ async fn process_nmh_request(
             use tauri::Manager;
             match app_handle
                 .state::<Arc<crate::usage::UsageRuntime>>()
-                .browser_metadata(peer.pid, browser.pid, data)
+                .browser_metadata(peer.pid, browser.pid, &session.browser_exe_path, data)
             {
                 Ok(()) => StorageResponse::success(serde_json::json!({"accepted":true})),
                 Err(error) => StorageResponse::error(&error),
@@ -687,7 +662,13 @@ pub fn find_nmh_session_for_pid(window_pid: u32, process_path: &str) -> Option<N
     }
     prune_dead_sessions();
     let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    select_session(&sessions, window_pid, process_path, is_pid_descendant_of).cloned()
+    select_session(
+        &sessions,
+        window_pid,
+        process_path,
+        windows_platform::is_pid_descendant_of,
+    )
+    .cloned()
 }
 
 /// Whether any registered NMH session belongs to a process with this

@@ -44,6 +44,7 @@
     "averageHint": "Only dates with recorded activity are included",
     "noAverage": "No average yet",
     "hourlyMinutes": "Minutes used per hour",
+    "timeZoneChanged": "The system time zone changed on this date. Times are shown in UTC.",
     "allApps": "All apps",
     "endOfDay": "24:00",
     "activityTimeline": "Daily activity timeline",
@@ -857,7 +858,7 @@
       },
       "retention": {
         "label": "Snapshot retention period",
-        "description": "Snapshots older than this period will be pruned",
+        "description": "Snapshots older than this period are cleaned automatically. Usage statistics are retained separately.",
         "options": {
           "1month": "1 month",
           "6months": "6 months",
@@ -948,8 +949,8 @@
       },
       "save": "Save filter rules",
       "quickDelete": {
-        "title": "Quick Delete Records",
-        "description": "Quickly delete all screenshots and OCR records within the specified range. This action cannot be undone.",
+        "title": "Quick Delete Snapshots",
+        "description": "Delete snapshots and their OCR content within the specified range. Usage statistics are retained separately. This action cannot be undone.",
         "options": {
           "5min": "5 minutes",
           "30min": "30 minutes",
@@ -960,14 +961,14 @@
         "yes": "YES",
         "no": "NO",
         "chooseRange": "Choose a time range",
-        "range": "Time range to clear",
-        "action": "Clear records",
-        "confirmRange": "Permanently delete records from “{{range}}”? This cannot be undone."
+        "range": "Snapshot time range to clear",
+        "action": "Clear snapshots",
+        "confirmRange": "Permanently delete snapshots and their OCR content from “{{range}}”? Usage statistics are retained separately. This cannot be undone."
       }
     },
     "delete": {
       "failure": "",
-      "success": "Deleted {{count}} records"
+      "success": "Deleted {{count}} snapshots"
     },
     "save_filters": {
       "synced": "Filter rules saved and applied.",
@@ -1546,11 +1547,11 @@
     }
   },
   "previewAction": {
-    "deleteNowTitle": "Delete this record immediately",
+    "deleteNowTitle": "Delete this snapshot immediately",
     "delete": "Delete",
     "moreDeleteOptions": "More delete options",
-    "deleteThisRecord": "Delete this record",
-    "deleteNearby5min": "Delete records within 5 minutes",
+    "deleteThisRecord": "Delete this snapshot",
+    "deleteNearby5min": "Delete snapshots from the preceding 5 minutes",
     "more": "More",
     "showOcr": "Show OCR content",
     "openFloatingPreview": "View in separate window",

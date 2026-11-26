@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
 };
 
+mod calendars;
 pub(crate) mod categories;
 mod legacy;
 
@@ -81,6 +82,32 @@ impl UsageWriter {
             contexts: VecDeque::new(),
             written_ends: HashMap::new(),
         }
+    }
+
+    pub fn change_time_zone(
+        &mut self,
+        storage: &StorageState,
+        zone: Tz,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        if self.zone == zone {
+            return Ok(());
+        }
+        let guard = storage
+            .try_get_connection_named("usage.time_zone")?
+            .ok_or("USAGE_WRITE_BUSY")?;
+        if self.generation != storage.db_generation() {
+            return Err("USAGE_SOURCE_CHANGED".into());
+        }
+        if crate::maintenance::is_active() || storage.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        calendars::change_zone(&tx, self.zone, zone, at_ms)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.zone = zone;
+        Ok(())
     }
 
     fn prepare(
@@ -255,25 +282,9 @@ impl UsageWriter {
                     .date_naive()
                     .to_string();
                 if !days.contains_key(&date) {
-                    let cal = CalendarDay::in_zone(&date, self.zone)?;
-                    tx.execute(
-                        "INSERT OR IGNORE INTO usage_days(date,calendar) VALUES(?1,?2)",
-                        params![
-                            date,
-                            serde_json::to_string(&cal).map_err(|e| e.to_string())?
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let (id, saved) = tx
-                        .query_row(
-                            "SELECT id,calendar FROM usage_days WHERE date=?1",
-                            [&date],
-                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                        )
-                        .map_err(|e| e.to_string())?;
                     days.insert(
                         date.clone(),
-                        (id, serde_json::from_str(&saved).map_err(|e| e.to_string())?),
+                        calendars::for_write(&tx, &date, self.zone, start)?,
                     );
                 }
                 let (day_id, cal) = &days[&date];
@@ -328,16 +339,8 @@ struct RowSpan {
 }
 
 fn calendar_on_conn(conn: &Connection, date: &str, zone: Tz) -> Result<CalendarDay, String> {
-    let saved: Option<String> = conn
-        .query_row(
-            "SELECT calendar FROM usage_days WHERE date=?1",
-            [date],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    match saved {
-        Some(saved) => serde_json::from_str(&saved).map_err(|e| e.to_string()),
+    match calendars::read(conn, date)? {
+        Some((_, saved)) => Ok(saved),
         None => CalendarDay::in_zone(date, zone),
     }
 }
@@ -430,6 +433,11 @@ impl StorageState {
             .ok_or("USAGE_INVALID_DATE")?
             .to_string();
         let zone = calendar::time_zone(live.time_zone.as_deref())?;
+        let live_spans = if live.generation == generation {
+            live.spans
+        } else {
+            vec![]
+        };
         let (rows, legacy_rows, mut calendars, since) =
             self.with_read_connection_named("usage.day", |conn| {
                 let rows = rows_on_conn(conn, &first, date)?;
@@ -439,7 +447,9 @@ impl StorageState {
                         .checked_sub_days(Days::new(offset))
                         .ok_or("USAGE_INVALID_DATE")?
                         .to_string();
-                    calendars.push(calendar_on_conn(conn, &date, zone)?);
+                    let mut calendar = calendar_on_conn(conn, &date, zone)?;
+                    calendars::include_live(&mut calendar, &live_spans, zone)?;
+                    calendars.push(calendar);
                 }
                 let since: Option<String> = conn
                     .query_row(
@@ -461,11 +471,6 @@ impl StorageState {
                     .min();
                 Ok((rows, legacy_rows, calendars, since))
             })?;
-        let live_spans = if live.generation == generation {
-            live.spans
-        } else {
-            vec![]
-        };
         let selected_rows: Vec<_> = rows.iter().filter(|r| r.day == date).cloned().collect();
         let apps = self.read_usage_apps(&selected_rows)?;
         let selected_cal = calendars.last().unwrap();
@@ -486,7 +491,7 @@ impl StorageState {
                 .map(|r| span(r, None))
                 .collect();
             observations.extend(legacy_rows.iter().map(|row| row.span(None)));
-            observations.extend(live_spans.iter().cloned());
+            observations.extend(calendars::live_on_day(&live_spans, &cal.date, zone)?);
             let observations = aggregate::normalized(
                 observations,
                 cal.start_ms,
@@ -522,7 +527,7 @@ impl StorageState {
             .filter(|s| s.end_ms > s.start_ms)
             .map(|s| s.start_ms)
             .min();
-        observations.extend(live_spans);
+        observations.extend(calendars::live_on_day(&live_spans, date, zone)?);
         let since = since.into_iter().chain(live_since).min();
         if self.db_generation() != generation {
             return Err("USAGE_SOURCE_CHANGED".into());
@@ -552,7 +557,10 @@ impl StorageState {
         let zone = calendar::time_zone(live.time_zone.as_deref())?;
         let (cal, rows, legacy_rows) =
             self.with_read_connection_named("usage.details", |conn| {
-                let cal = calendar_on_conn(conn, date, zone)?;
+                let mut cal = calendar_on_conn(conn, date, zone)?;
+                if live.generation == generation {
+                    calendars::include_live(&mut cal, &live.spans, zone)?;
+                }
                 let rows = rows_on_conn(conn, date, date)?;
                 let legacy_rows = legacy::rows(conn, cal.start_ms, cal.end_ms)?;
                 Ok((cal, rows, legacy_rows))
@@ -621,7 +629,7 @@ impl StorageState {
                 .map(|row| row.span(legacy_identities.get(&row.id).cloned())),
         );
         if live.generation == generation {
-            observations.extend(live.spans);
+            observations.extend(calendars::live_on_day(&live.spans, date, zone)?);
         }
         let observations = aggregate::normalized(
             observations,

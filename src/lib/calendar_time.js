@@ -4,14 +4,14 @@ export function calendarTimeFormatter(locale, calendar, part) {
   let shiftMs = 0;
   if (calendar?.time_zone) {
     options.timeZone = calendar.time_zone;
-  } else if (calendar?.rule === 'recorded_bounds') {
+  } else if (calendar?.rule === 'recorded_bounds' || calendar?.rule === 'system_time_zone_changed') {
     options.timeZone = 'UTC';
     const offset = calendar.start_utc_offset_seconds;
-    if (Number.isFinite(offset) && offset === calendar.end_utc_offset_seconds) {
+    if (calendar.rule === 'recorded_bounds' && Number.isFinite(offset) && offset === calendar.end_utc_offset_seconds) {
       shiftMs = offset * 1000;
     } else {
-      // A legacy day can record the two endpoint offsets without recording
-      // when its clock changed. Show explicit UTC instead of inventing a rule.
+      // A day with multiple system zones has no single named clock rule.
+      // The same applies to legacy days with unknown transitions.
       options.timeZoneName = 'short';
     }
   }

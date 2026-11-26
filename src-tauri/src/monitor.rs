@@ -673,6 +673,9 @@ async fn apply_control(
 ) -> Result<String, String> {
     let state = app.state::<MonitorState>();
     let _control = state.control.lock().await;
+    if action == MonitorAction::TogglePause && !state.is_running() {
+        return Ok("Monitor stopped".into());
+    }
     if let MonitorAction::PauseFor(minutes) = action {
         if minutes == 0 || minutes > 24 * 60 || !state.is_running() {
             return Err("Invalid timed pause or monitor is not running".into());
@@ -695,7 +698,7 @@ async fn apply_control(
                 .state::<Arc<CaptureState>>()
                 .paused
                 .load(Ordering::SeqCst);
-            policy.user_action(action, paused);
+            policy.user_action(action, paused, state.is_running());
         }
         if action == MonitorAction::ExpireTimedPause {
             policy.expire_timed_pause();
@@ -752,11 +755,7 @@ async fn apply_control(
         }
         MonitorAction::TogglePause => {
             if state.is_running() {
-                let paused = app
-                    .state::<Arc<CaptureState>>()
-                    .paused
-                    .load(Ordering::SeqCst);
-                set_capture_paused(app, !paused)
+                set_capture_paused(app, initially_paused)
             } else {
                 Ok("Monitor stopped".into())
             }

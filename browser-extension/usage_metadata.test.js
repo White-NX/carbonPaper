@@ -47,4 +47,17 @@ describe('lightweight browser usage metadata', () => {
     await context.reportUsageMetadata();
     expect(postMessage).toHaveBeenLastCalledWith({ type: 'usage_metadata', focused: false });
   });
+  it.each([
+    ['x'.repeat(512), 'x'.repeat(512)],
+    ['x'.repeat(600), 'x'.repeat(512)],
+    ['x'.repeat(511) + '😀tail', 'x'.repeat(511)],
+    ['x'.repeat(510) + '😀tail', 'x'.repeat(510) + '😀'],
+    ['😀'.repeat(300), '😀'.repeat(256)],
+  ])('truncates long titles at complete UTF-16 characters', async (title, expected) => {
+    const { context, state, postMessage } = worker();
+    state.tab.title = title;
+    await context.reportUsageMetadata();
+    expect(postMessage.mock.lastCall[0].title).toBe(expected);
+    expect(postMessage.mock.lastCall[0].title.length).toBeLessThanOrEqual(512);
+  });
 });

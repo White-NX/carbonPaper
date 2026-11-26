@@ -43,4 +43,11 @@ describe('saved recap calendars', () => {
     });
     expect(time(Date.parse('2026-03-08T07:00:00Z'))).toBe('07:00 UTC');
   });
+  it('shows explicit UTC for a day recorded in multiple system time zones', () => {
+    const time = calendarTimeFormatter('en-US', {
+      rule: 'system_time_zone_changed', time_zone: null,
+      start_utc_offset_seconds: 28800, end_utc_offset_seconds: 28800,
+    });
+    expect(time(Date.parse('2026-11-25T07:00:00Z'))).toBe('07:00 UTC');
+  });
 });

@@ -17,6 +17,18 @@ const day = { date, generation: 7, calendar: { start_ms: start, end_ms: start + 
 };
 
 describe('usage statistics hourly calendars', () => {
+  it('shows UTC and the actual closing time when a time-zone change ends a date early', () => {
+    const partialDay = { ...day,
+      calendar: { ...day.calendar, end_ms: start + 22 * 3600000, time_zone: null,
+        rule: 'system_time_zone_changed', start_utc_offset_seconds: 0, end_utc_offset_seconds: 0 },
+      hours: day.hours.slice(0, 22),
+    };
+    render(<UsageStatisticsView date={date} today={date} day={partialDay} loading={false}
+      selectDate={vi.fn()} selectApp={vi.fn()} clearApp={vi.fn()} refresh={vi.fn()} />);
+    expect(screen.getByText('usage.timeZoneChanged')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^21:00 UTC–22:00 UTC/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /usage.endOfDay/ })).not.toBeInTheDocument();
+  });
   it.each(['zh-CN', 'en'])('keeps numeric hour ticks and offset labels across DST changes in %s', (locale) => {
     i18n.language = locale;
     const onViewSnapshots = vi.fn();

@@ -107,6 +107,14 @@ impl Recorder {
     pub fn committed(&mut self) {
         self.pending.clear();
     }
+    /// Called after a successful checkpoint at a system time-zone transition.
+    /// The continuation needs a new interval key and must not keep old-zone
+    /// observations in the live overlay.
+    pub fn split_at(&mut self, now_ms: i64) {
+        if let Some(current) = self.current.take() {
+            self.begin(now_ms, now_ms, current.state, current.identity);
+        }
+    }
 }
 
 #[cfg(test)]

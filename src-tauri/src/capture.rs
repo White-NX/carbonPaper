@@ -494,10 +494,39 @@ impl CaptureState {
 
 // ==================== Active Window Detection ====================
 
+// Keep the browser metadata limit in background.js aligned with this UTF-16
+// payload limit. GetWindowTextW also needs a separate terminator slot.
+pub(crate) const MAX_WINDOW_TITLE_UNITS: usize = 512;
+
+pub(crate) fn window_title_from_utf16(units: &[u16]) -> String {
+    // Both native and extension truncation must leave complete surrogate pairs.
+    let units = if units
+        .last()
+        .is_some_and(|last| (0xd800..=0xdbff).contains(last))
+    {
+        &units[..units.len() - 1]
+    } else {
+        units
+    };
+    String::from_utf16_lossy(units)
+}
+
+pub(crate) fn window_title_prefix(title: &str) -> &str {
+    let mut units = 0;
+    for (index, character) in title.char_indices() {
+        units += character.len_utf16();
+        if units > MAX_WINDOW_TITLE_UNITS {
+            return &title[..index];
+        }
+    }
+    title
+}
+
 /// Information about the currently focused window (handle, title, rect, PID).
 pub struct ActiveWindowInfo {
     pub(crate) hwnd_raw: isize,
     pub(crate) title: String,
+    pub(crate) title_at_limit: bool,
     rect: RECT,
     pub(crate) pid: u32,
 }
@@ -611,10 +640,10 @@ pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
         }
 
         // Get window title
-        let mut title_buf = [0u16; 512];
+        let mut title_buf = [0u16; MAX_WINDOW_TITLE_UNITS + 1];
         let len = GetWindowTextW(hwnd, &mut title_buf);
         let title = if len > 0 {
-            String::from_utf16_lossy(&title_buf[..len as usize])
+            window_title_from_utf16(&title_buf[..len as usize])
         } else {
             String::new()
         };
@@ -632,6 +661,7 @@ pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
         Some(ActiveWindowInfo {
             hwnd_raw: hwnd.0 as isize,
             title,
+            title_at_limit: len as usize == MAX_WINDOW_TITLE_UNITS,
             rect,
             pid,
         })
@@ -2466,6 +2496,7 @@ mod tests {
         let window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Roadmap - PowerPoint".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
@@ -2481,6 +2512,7 @@ mod tests {
         let window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Roadmap - PowerPoint".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
@@ -2508,12 +2540,14 @@ mod tests {
         let first_window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Terminal - bash".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
         let second_window = ActiveWindowInfo {
             hwnd_raw: first_window.hwnd_raw,
             title: "Terminal - cargo test".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: first_window.pid,
         };
@@ -2532,6 +2566,7 @@ mod tests {
         let window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Document1 - Word".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };

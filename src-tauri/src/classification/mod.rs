@@ -245,8 +245,9 @@ pub(crate) async fn remove_local(
     Ok(count)
 }
 
-fn scheduling_deferred(error: &str) -> bool {
+pub(crate) fn scheduling_deferred(error: &str) -> bool {
     [
+        "classification_busy",
         "foreground_busy",
         "background_busy",
         "foreground_request",

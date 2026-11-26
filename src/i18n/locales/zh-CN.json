@@ -44,6 +44,7 @@
     "averageHint": "仅计入有记录的日期",
     "noAverage": "暂无日均",
     "hourlyMinutes": "每小时使用分钟数",
+    "timeZoneChanged": "当天更改了系统时区，时间统一显示为 UTC。",
     "allApps": "全部应用",
     "endOfDay": "24:00",
     "activityTimeline": "当日活动时间条",
@@ -857,7 +858,7 @@
       },
       "retention": {
         "label": "快照保留时间",
-        "description": "超过保留时间的快照将被自动清理",
+        "description": "超过保留时间的快照将被自动清理，使用统计独立保留。",
         "options": {
           "1month": "1 个月",
           "6months": "6 个月",
@@ -948,8 +949,8 @@
       },
       "save": "保存过滤规则",
       "quickDelete": {
-        "title": "快速删除记录",
-        "description": "快速删除指定时间范围内的所有截图和OCR记录。此操作不可撤销。",
+        "title": "快速删除快照",
+        "description": "删除指定时间范围内的快照及其 OCR 内容，使用统计独立保留。此操作不可撤销。",
         "options": {
           "5min": "5 分钟",
           "30min": "30 分钟",
@@ -960,14 +961,14 @@
         "yes": "是",
         "no": "否",
         "chooseRange": "选择时间范围",
-        "range": "清除记录的时间范围",
-        "action": "清除记录",
-        "confirmRange": "这会永久删除“{{range}}”范围内的记录，且无法撤销。确定继续吗？"
+        "range": "清除快照的时间范围",
+        "action": "清除快照",
+        "confirmRange": "这会永久删除“{{range}}”范围内的快照及其 OCR 内容，使用统计独立保留。此操作无法撤销。确定继续吗？"
       }
     },
     "delete": {
       "failure": "",
-      "success": "已删除 {{count}} 条记录"
+      "success": "已删除 {{count}} 张快照"
     },
     "save_filters": {
       "synced": "过滤规则已保存并生效。",
@@ -1546,11 +1547,11 @@
     }
   },
   "previewAction": {
-    "deleteNowTitle": "立即删除此记录",
+    "deleteNowTitle": "立即删除此快照",
     "delete": "删除",
     "moreDeleteOptions": "更多删除选项",
-    "deleteThisRecord": "删除此记录",
-    "deleteNearby5min": "删除附近5分钟内的记录",
+    "deleteThisRecord": "删除此快照",
+    "deleteNearby5min": "删除此前5分钟内的快照",
     "more": "更多",
     "showOcr": "显示OCR内容",
     "openFloatingPreview": "在独立窗口中查看",

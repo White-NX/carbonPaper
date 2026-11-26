@@ -38,9 +38,16 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 struct BrowserPage {
     nmh_pid: u32,
     browser_pid: u32,
+    browser_path: String,
     title: String,
     url: Option<String>,
     private: bool,
+    at: Instant,
+}
+struct BrowserAncestry {
+    pid: u32,
+    path: String,
+    parents: Vec<u32>,
     at: Instant,
 }
 
@@ -49,6 +56,7 @@ pub struct UsageRuntime {
     live: Mutex<LiveUsage>,
     pictures: Mutex<PictureSignals>,
     pages: Mutex<VecDeque<BrowserPage>>,
+    browser_ancestry: Mutex<VecDeque<BrowserAncestry>>,
     started: AtomicBool,
     shutdown: AtomicBool,
     wake: (Mutex<()>, Condvar),
@@ -83,6 +91,7 @@ impl UsageRuntime {
         &self,
         nmh_pid: u32,
         browser_pid: u32,
+        browser_path: &str,
         data: &serde_json::Value,
     ) -> Result<(), String> {
         let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
@@ -116,10 +125,11 @@ impl UsageRuntime {
         pages.push_back(BrowserPage {
             nmh_pid,
             browser_pid,
+            browser_path: browser_path.to_owned(),
             title: if private {
                 String::new()
             } else {
-                title.chars().take(512).collect()
+                capture::window_title_prefix(title).to_owned()
             },
             url: if private { None } else { url },
             private,
@@ -136,18 +146,63 @@ impl UsageRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|p| p.nmh_pid != nmh_pid);
     }
-    fn page_for_window(&self, info: &ActiveWindowInfo) -> (Option<String>, bool) {
-        self.page_for_foreground(info.pid, &info.title)
+    fn page_for_window(
+        &self,
+        info: &ActiveWindowInfo,
+        process_path: &str,
+    ) -> (Option<String>, bool) {
+        self.page_for_foreground(info.pid, &info.title, process_path, info.title_at_limit)
     }
-    fn page_for_foreground(&self, pid: u32, title: &str) -> (Option<String>, bool) {
+    fn page_for_foreground(
+        &self,
+        pid: u32,
+        title: &str,
+        process_path: &str,
+        title_at_limit: bool,
+    ) -> (Option<String>, bool) {
         let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         pages.retain(|p| p.at.elapsed() < Duration::from_secs(45));
-        pages
+        let mut parents = None;
+        select_browser_page(
+            &pages,
+            pid,
+            title,
+            process_path,
+            title_at_limit,
+            |pid, ancestor| {
+                parents
+                    .get_or_insert_with(|| self.browser_parents(pid, process_path))
+                    .contains(&ancestor)
+            },
+        )
+        .map(|p| (p.url.clone(), p.private))
+        .unwrap_or((None, false))
+    }
+    fn browser_parents(&self, pid: u32, process_path: &str) -> Vec<u32> {
+        let mut cache = self
+            .browser_ancestry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|entry| entry.at.elapsed() < Duration::from_secs(5));
+        if let Some(entry) = cache
             .iter()
-            .rev()
-            .find(|p| p.browser_pid == pid && (p.private || title_matches_page(title, &p.title)))
-            .map(|p| (p.url.clone(), p.private))
-            .unwrap_or((None, false))
+            .find(|entry| entry.pid == pid && entry.path.eq_ignore_ascii_case(process_path))
+        {
+            return entry.parents.clone();
+        }
+        // At most one native process snapshot per foreground identity per 5s,
+        // including failed lookups. Exact PID matches never enumerate processes.
+        let parents = crate::windows_platform::process_ancestors(pid).unwrap_or_default();
+        cache.push_back(BrowserAncestry {
+            pid,
+            path: process_path.to_owned(),
+            parents: parents.clone(),
+            at: Instant::now(),
+        });
+        while cache.len() > 64 {
+            cache.pop_front();
+        }
+        parents
     }
     fn wait(&self, duration: Duration) {
         let guard = self.wake.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -179,6 +234,10 @@ impl UsageRuntime {
             let _ = thread.join();
         }
         self.pages.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.browser_ancestry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pictures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -292,7 +351,7 @@ fn application_name(process: &str) -> String {
 fn run(app: &AppHandle, runtime: &UsageRuntime) {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let capture = app.state::<Arc<CaptureState>>().inner().clone();
-    let Ok(zone) = calendar::time_zone(None) else {
+    let Ok(mut zone) = calendar::time_zone(None) else {
         tracing::warn!("[USAGE] System time zone is unavailable");
         return;
     };
@@ -319,6 +378,9 @@ fn run(app: &AppHandle, runtime: &UsageRuntime) {
         let now = chrono::Utc::now().timestamp_millis();
         if generation != storage.db_generation() {
             generation = storage.db_generation();
+            if let Ok(current) = calendar::time_zone(None) {
+                zone = current;
+            }
             recorder = Recorder::new();
             writer = UsageWriter::new(generation, zone);
             processes.clear();
@@ -371,7 +433,7 @@ fn run(app: &AppHandle, runtime: &UsageRuntime) {
                 if let Some((process, private)) = process_for_window(&info, &mut processes) {
                     let (url, private_page) = if capture::is_browser_process(&process.process_name)
                     {
-                        runtime.page_for_window(&info)
+                        runtime.page_for_window(&info, &process.process_path)
                     } else {
                         (None, false)
                     };
@@ -544,6 +606,24 @@ fn run(app: &AppHandle, runtime: &UsageRuntime) {
                 Ok(()) => {
                     recorder.committed();
                     checkpoint_at = Instant::now();
+                    // One OS lookup per checkpoint, never on the sampling path.
+                    // Commit the old calendar first, then split the continuation.
+                    if let Ok(current) = calendar::time_zone(None) {
+                        if current != zone {
+                            match writer.change_time_zone(&storage, current, now) {
+                                Ok(()) => {
+                                    zone = current;
+                                    recorder.split_at(now);
+                                }
+                                Err(error) => {
+                                    tracing::debug!("[USAGE] Time-zone update deferred: {error}");
+                                    checkpoint_at = Instant::now()
+                                        .checked_sub(Duration::from_secs(25))
+                                        .unwrap_or_else(Instant::now);
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     if last_error_at.elapsed() >= Duration::from_secs(60) {
@@ -584,25 +664,173 @@ fn activity_age(input: Option<u64>, other: Option<u64>, picture: Option<u64>) ->
     input.into_iter().chain(other).chain(picture).min()
 }
 
-fn title_matches_page(window: &str, page: &str) -> bool {
+fn title_matches_page(window: &str, page: &str, title_at_limit: bool) -> bool {
     let clean = |value: &str| {
         value.chars().filter(|c| !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')).collect::<String>()
     };
     let window = clean(window);
     let page = clean(page);
-    let window = window.trim();
+    let window = window.trim_start();
     let page = page.trim();
     !page.is_empty()
-        && (window == page
+        && (window.trim_end() == page
+            || (title_at_limit && !window.is_empty() && page.starts_with(window))
             || window.strip_prefix(page).is_some_and(|suffix| {
-                [" - ", " — ", " – ", " | "]
-                    .iter()
-                    .any(|separator| suffix.starts_with(separator))
+                [" - ", " — ", " – ", " | "].iter().any(|separator| {
+                    suffix.starts_with(separator)
+                        || (title_at_limit && !suffix.is_empty() && separator.starts_with(suffix))
+                })
             }))
+}
+fn select_browser_page<'a>(
+    pages: &'a VecDeque<BrowserPage>,
+    pid: u32,
+    title: &str,
+    process_path: &str,
+    title_at_limit: bool,
+    mut is_descendant: impl FnMut(u32, u32) -> bool,
+) -> Option<&'a BrowserPage> {
+    let matches_title = |page: &&BrowserPage| {
+        page.private || title_matches_page(title, &page.title, title_at_limit)
+    };
+    pages
+        .iter()
+        .rev()
+        .filter(|page| page.browser_pid == pid)
+        .find(matches_title)
+        .or_else(|| {
+            pages.iter().rev().filter(matches_title).find(|page| {
+                !process_path.is_empty()
+                    && page.browser_pid != pid
+                    && page.browser_path.eq_ignore_ascii_case(process_path)
+                    && is_descendant(pid, page.browser_pid)
+            })
+        })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_browser_titles_match_native_utf16_truncation_and_partial_browser_suffixes() {
+        let runtime = UsageRuntime::default();
+        let path = "D:/Apps/msedge.exe";
+        let mut titles: Vec<String> = (508..=514).map(|length| "x".repeat(length)).collect();
+        titles.extend([
+            "x".repeat(600),
+            format!("{}😀tail", "x".repeat(511)),
+            format!("{}😀tail", "x".repeat(510)),
+            "😀".repeat(300),
+        ]);
+        for title in titles {
+            runtime
+                .browser_metadata(
+                    10,
+                    20,
+                    path,
+                    &serde_json::json!({
+                        "focused": true, "title": title, "url": "https://example.com/"
+                    }),
+                )
+                .unwrap();
+            for prefix in ["", "\u{200f}"] {
+                let native: Vec<u16> = format!("{prefix}{title} - Microsoft Edge")
+                    .encode_utf16()
+                    .take(capture::MAX_WINDOW_TITLE_UNITS)
+                    .collect();
+                let window = capture::window_title_from_utf16(&native);
+                assert_eq!(
+                    runtime
+                        .page_for_foreground(
+                            20,
+                            &window,
+                            path,
+                            native.len() == capture::MAX_WINDOW_TITLE_UNITS
+                        )
+                        .0
+                        .as_deref(),
+                    Some("https://example.com/"),
+                    "UTF-16 length {}",
+                    title.encode_utf16().count(),
+                );
+            }
+        }
+        assert!(!title_matches_page(
+            "Example 2 - Microsoft Edge",
+            "Example",
+            false
+        ));
+        assert!(
+            !title_matches_page("Example -", "Example", false),
+            "short titles need the complete separator"
+        );
+        assert!(
+            !title_matches_page(
+                &format!("{} ", "x".repeat(511)),
+                &format!("{}y", "x".repeat(511)),
+                true,
+            ),
+            "a browser suffix must not be mistaken for another page's last character"
+        );
+    }
+    #[test]
+    fn browser_descendants_require_the_registered_executable_and_matching_title() {
+        let runtime = UsageRuntime::default();
+        let path = "D:/Apps/msedge.exe";
+        runtime
+            .browser_metadata(
+                10,
+                20,
+                path,
+                &serde_json::json!({
+                    "focused": true, "title": "Example", "url": "https://first.example/"
+                }),
+            )
+            .unwrap();
+        runtime
+            .browser_metadata(
+                11,
+                30,
+                path,
+                &serde_json::json!({
+                    "focused": true, "title": "Example", "url": "https://second.example/"
+                }),
+            )
+            .unwrap();
+        let pages = runtime.pages.lock().unwrap();
+        let descendant = |pid, ancestor| pid == 21 && ancestor == 20;
+        let select = |pid, title, path| {
+            select_browser_page(&pages, pid, title, path, false, descendant)
+                .map(|page| (page.url.as_deref(), page.private))
+        };
+        assert_eq!(
+            select(21, "Example - Microsoft Edge", path),
+            Some((Some("https://first.example/"), false))
+        );
+        assert!(select(22, "Example - Microsoft Edge", path).is_none());
+        assert!(select(21, "Another - Microsoft Edge", path).is_none());
+        assert!(select(21, "Example - Microsoft Edge", "D:/Other/msedge.exe").is_none());
+        assert!(select(21, "Example - Microsoft Edge", "").is_none());
+        assert_eq!(
+            select_browser_page(&pages, 20, "Example", path, false, |_, _| true)
+                .unwrap()
+                .nmh_pid,
+            10,
+            "exact foreground PID wins over a newer ancestor candidate",
+        );
+        drop(pages);
+        runtime.browser_metadata(10, 20, path, &serde_json::json!({
+            "focused": true, "private": true, "title": "Secret", "url": "https://secret.example/"
+        })).unwrap();
+        let pages = runtime.pages.lock().unwrap();
+        let page =
+            select_browser_page(&pages, 21, "Private window", path, false, descendant).unwrap();
+        assert!(page.private);
+        assert!(page.url.is_none());
+        assert!(page.title.is_empty());
+        assert!(
+            select_browser_page(&pages, 22, "Private window", path, false, descendant).is_none()
+        );
+    }
     #[test]
     fn stop_cannot_notify_between_shutdown_check_and_condvar_wait() {
         use std::sync::mpsc;
@@ -662,31 +890,38 @@ mod tests {
     #[test]
     fn browser_pages_require_matching_foreground_identity_and_expire_without_heartbeats() {
         let runtime = UsageRuntime::default();
-        runtime.browser_metadata(10, 20, &serde_json::json!({"focused": true, "title": "Example", "url": "https://user:password@example.com/page#fragment"})).unwrap();
+        let path = "D:/Apps/msedge.exe";
+        runtime.browser_metadata(10, 20, path, &serde_json::json!({"focused": true, "title": "Example", "url": "https://user:password@example.com/page#fragment"})).unwrap();
         assert_eq!(
             runtime
-                .page_for_foreground(20, "Example\u{200f} - Microsoft Edge")
+                .page_for_foreground(20, "Example\u{200f} - Microsoft Edge", path, false)
                 .0
                 .as_deref(),
             Some("https://example.com/page")
         );
         assert_eq!(
-            runtime.page_for_foreground(21, "Example - Microsoft Edge"),
+            runtime.page_for_foreground(21, "Example - Microsoft Edge", path, false),
             (None, false)
         );
         assert_eq!(
-            runtime.page_for_foreground(20, "Example 2 - Microsoft Edge"),
+            runtime.page_for_foreground(20, "Example 2 - Microsoft Edge", path, false),
             (None, false)
         );
         runtime.pages.lock().unwrap().front_mut().unwrap().at =
             Instant::now() - Duration::from_secs(46);
-        assert_eq!(runtime.page_for_foreground(20, "Example"), (None, false));
-        runtime.browser_metadata(10,20,&serde_json::json!({"focused":true,"private":true,"title":"Secret","url":"https://secret.example"})).unwrap();
+        assert_eq!(
+            runtime.page_for_foreground(20, "Example", path, false),
+            (None, false)
+        );
+        runtime.browser_metadata(10,20,path,&serde_json::json!({"focused":true,"private":true,"title":"Secret","url":"https://secret.example"})).unwrap();
         let pages = runtime.pages.lock().unwrap();
         assert!(pages[0].title.is_empty());
         assert!(pages[0].url.is_none());
         drop(pages);
         runtime.clear_browser(10);
-        assert_eq!(runtime.page_for_foreground(20, "Example"), (None, false));
+        assert_eq!(
+            runtime.page_for_foreground(20, "Example", path, false),
+            (None, false)
+        );
     }
 }

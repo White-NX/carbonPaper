@@ -14,6 +14,14 @@ const MAX_RETRY = 30;
 const MAX_FAVICON_BYTES = 256 * 1024;
 const FAVICON_FETCH_TIMEOUT_MS = 5000;
 const MAX_FAVICON_DATA_URL_CHARS = 128 + 4 * Math.ceil(MAX_FAVICON_BYTES / 3);
+// Matches capture.rs's payload limit; the native buffer has one extra NUL slot.
+const MAX_WINDOW_TITLE_UNITS = 512;
+
+function usageTitlePrefix(title) {
+  const prefix = title.slice(0, MAX_WINDOW_TITLE_UNITS);
+  const last = prefix.charCodeAt(prefix.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? prefix.slice(0, -1) : prefix;
+}
 
 let nmPort = null;
 // Conservative default: do not connect until persisted state is loaded.
@@ -40,7 +48,7 @@ async function reportUsageMetadata() {
       if (window.incognito || tab?.incognito) {
         payload = { type: 'usage_metadata', focused: true, private: true };
       } else if (tab?.url && /^https?:\/\//i.test(tab.url) && tab.title) {
-        payload = { type: 'usage_metadata', focused: true, private: false, url: tab.url.slice(0, 8192), title: tab.title.slice(0, 512) };
+        payload = { type: 'usage_metadata', focused: true, private: false, url: tab.url.slice(0, 8192), title: usageTitlePrefix(tab.title) };
       }
     }
     if (revision === metadataRevision && port === nmPort && isEnabled) port.postMessage(payload);

@@ -51,7 +51,8 @@ function Hours({ day, selectedApp, time, onViewSnapshots }) {
     <div className="usage-hours" style={{ '--usage-hours': day.hours.length }}>
       {day.hours.map((hour, index) => {
         const total = hour.total_ms;
-        const end = hour.end_ms === day.calendar.end_ms ? t('usage.endOfDay') : time(hour.end_ms);
+        const end = hour.end_ms === day.calendar.end_ms && day.calendar.rule !== 'system_time_zone_changed'
+          ? t('usage.endOfDay') : time(hour.end_ms);
         const label = `${time(hour.start_ms)}–${end} · ${usageDuration(total, t)}${selectedApp ? ` · ${selectedApp.name} ${usageDuration(selected[index], t)}` : ''}`;
         const segments = selectedApp ? [{ category: null, total_ms: Math.max(0, total - selected[index]) }, { category: selectedApp.category, total_ms: selected[index] }] : hour.categories;
         return <button key={hour.start_ms} type="button" className="usage-hour" aria-label={label} title={label} onClick={() => onViewSnapshots?.(hour.start_ms)}>
@@ -207,6 +208,7 @@ export default function UsageStatisticsView({ date, today, day, loading, error, 
           </div>
           <Hours day={day} selectedApp={selectedApp} time={time} onViewSnapshots={onViewSnapshots} />
           <Ribbon day={day} selectedApp={selectedApp} selectApp={selectApp} time={time} />
+          {day.calendar.rule === 'system_time_zone_changed' && <Banner>{t('usage.timeZoneChanged')}</Banner>}
           {!day.observed_ms && <Banner>{t('usage.noRecords')}{day.recorded_since_ms && <span> {t('usage.recordedSince', { date: new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeZone: day.calendar.time_zone || undefined }).format(new Date(day.recorded_since_ms)) })}</span>}</Banner>}
           <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} editCategory={(app) => setCategoryApp({ ...app, generation: day.generation })} /><aside className="usage-side">
             <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />

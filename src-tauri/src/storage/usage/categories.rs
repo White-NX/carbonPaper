@@ -34,7 +34,7 @@ impl StorageState {
         &self,
         generation: u64,
         app: &UsageAppIdentity,
-    ) -> Result<(bool, Option<StoredCategory>), String> {
+    ) -> Result<(Option<String>, Option<StoredCategory>), String> {
         let manual_key = categories::override_key(&app.process_name);
         let app_key = categories::app_key(app);
         self.with_read_connection_named("usage.category", |conn| {
@@ -43,13 +43,12 @@ impl StorageState {
             }
             let manual = conn
                 .query_row(
-                    "SELECT 1 FROM usage_category_overrides WHERE app_key=?1",
+                    "SELECT category FROM usage_category_overrides WHERE app_key=?1",
                     [manual_key.as_slice()],
-                    |_| Ok(true),
+                    |r| r.get::<_, String>(0),
                 )
                 .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or(false);
+                .map_err(|e| e.to_string())?;
             let cached = read_cached(conn, &app_key)?;
             Ok((manual, cached))
         })
@@ -92,7 +91,7 @@ impl StorageState {
         // The cache lock never participates in SQLite/decryption lock ordering.
         drop(guard);
         self.usage_categories
-            .manual_changed(generation, app_id, category.is_some());
+            .manual_changed(generation, app_id, category);
         Ok(())
     }
 
@@ -136,6 +135,7 @@ impl StorageState {
             apps.entry(categories::app_key(&identity.app))
                 .or_insert_with(|| identity.app.clone());
         }
+        let manual_revision = self.usage_categories.manual_revision(generation);
         let (manual, cached) = self.with_read_connection_named("usage.category.rules", |conn| {
             let mut overrides = conn
                 .prepare("SELECT category FROM usage_category_overrides WHERE app_key=?1")
@@ -155,7 +155,7 @@ impl StorageState {
                 {
                     manual.insert(id, category);
                 }
-                if let Some((Some(category), checked_ms)) = cache
+                if let Some((category, checked_ms)) = cache
                     .query_row([key.as_slice()], |r| {
                         Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
                     })
@@ -171,26 +171,39 @@ impl StorageState {
             return Err("USAGE_SOURCE_CHANGED".into());
         }
         let mut resolved = HashMap::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         for (key, app) in apps {
             let id = aggregate::app_id(&app);
-            self.usage_categories
-                .manual_changed(generation, &id, manual.contains_key(&id));
-            if let Some((category, checked_ms)) = cached.get(&key) {
-                self.usage_categories
-                    .publish(generation, &app, category.clone(), *checked_ms);
-            }
-            let automatic = self.usage_categories.category(generation, app, None);
+            let automatic = self.usage_categories.history_category(
+                generation,
+                app,
+                manual.get(&id).map(String::as_str),
+                cached.get(&key),
+                manual_revision,
+                now_ms,
+            );
             resolved.insert(key, automatic);
         }
-        for identity in spans.iter_mut().filter_map(|span| span.identity.as_mut()) {
+        for span in spans.iter_mut() {
+            let Some(identity) = span.identity.as_mut() else {
+                continue;
+            };
+            let mut automatic = resolved
+                .get(&categories::app_key(&identity.app))
+                .map(String::as_str);
+            // Legacy rows predate the per-app cache. Keep their original fallback
+            // when automatic classification has no result. New contexts may
+            // contain a manual snapshot, which must follow an override reset.
+            if span.run_id == i64::MIN {
+                automatic =
+                    automatic.filter(|category| !category.is_empty() && *category != "未分类");
+            }
             let category = categories::effective_category(
                 &identity.category,
                 manual
                     .get(&aggregate::app_id(&identity.app))
                     .map(String::as_str),
-                resolved
-                    .get(&categories::app_key(&identity.app))
-                    .map(String::as_str),
+                automatic,
             );
             if category != identity.category {
                 Arc::make_mut(identity).category = category;
@@ -378,5 +391,244 @@ mod tests {
                 .unwrap_err(),
             "USAGE_SOURCE_CHANGED"
         );
+    }
+    #[test]
+    fn fresh_null_cache_rows_do_not_requeue_cold_history_or_evict_the_active_app() {
+        let storage = crate::storage::test_storage_with_schema("usage-negative-cache".into());
+        let generation = storage.db_generation();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hot = Arc::new(UsageAppIdentity {
+            process_name: "active-unknown.exe".into(),
+            name: "Unknown application".into(),
+            process_path: "D:/Apps/active-unknown.exe".into(),
+            icon: None,
+        });
+        storage
+            .usage_categories
+            .category(generation, hot.clone(), Some(7));
+        storage
+            .usage_categories
+            .publish(generation, &hot, Some("游戏".into()), now);
+        let mut spans = Vec::new();
+        for index in 0..160 {
+            let app = Arc::new(UsageAppIdentity {
+                process_name: format!("cold-unknown-{index}.exe"),
+                process_path: format!("D:/Apps/cold-unknown-{index}.exe"),
+                ..hot.as_ref().clone()
+            });
+            storage
+                .save_usage_inferred_category(
+                    generation,
+                    &app,
+                    &StoredCategory {
+                        category: None,
+                        fingerprint: vec![1],
+                        checked_ms: now,
+                    },
+                )
+                .unwrap();
+            spans.push(UsageSpan {
+                run_id: 1,
+                sequence: index,
+                start_ms: index,
+                end_ms: index + 1,
+                state: UsageState::Active,
+                identity: Some(Arc::new(UsageIdentity {
+                    app,
+                    title: String::new(),
+                    url: None,
+                    category: "未分类".into(),
+                })),
+            });
+        }
+        // Hydrate a negative result into an existing query-created memory entry.
+        let warm = spans[0].identity.as_ref().unwrap().app.clone();
+        storage
+            .usage_categories
+            .category(generation, warm.clone(), None);
+        for _ in 0..2 {
+            storage
+                .apply_usage_categories(generation, &mut spans)
+                .unwrap();
+            assert!(spans
+                .iter()
+                .all(|span| span.identity.as_ref().unwrap().category == "未分类"));
+            storage
+                .usage_categories
+                .category(generation, warm.clone(), None);
+            assert_eq!(storage.usage_categories.pending_count(), 1);
+            assert_eq!(
+                storage
+                    .usage_categories
+                    .category(generation, hot.clone(), Some(7)),
+                "游戏"
+            );
+        }
+        let expired = Arc::new(UsageAppIdentity {
+            process_name: "expired-unknown.exe".into(),
+            process_path: "D:/Apps/expired-unknown.exe".into(),
+            ..warm.as_ref().clone()
+        });
+        storage
+            .save_usage_inferred_category(
+                generation,
+                &expired,
+                &StoredCategory {
+                    category: None,
+                    fingerprint: vec![1],
+                    checked_ms: now - 86_400_000,
+                },
+            )
+            .unwrap();
+        Arc::make_mut(spans[0].identity.as_mut().unwrap()).app = expired;
+        storage
+            .apply_usage_categories(generation, &mut spans)
+            .unwrap();
+        assert_eq!(
+            storage.usage_categories.pending_count(),
+            2,
+            "expired negatives may retry"
+        );
+    }
+    #[test]
+    fn manual_categories_are_written_into_new_contexts_and_reset_to_the_automatic_rule() {
+        let storage = crate::storage::test_storage_with_schema("usage-manual-snapshot".into());
+        let generation = storage.db_generation();
+        let calendar = CalendarDay::in_zone("2026-11-25", chrono_tz::UTC).unwrap();
+        let app = Arc::new(UsageAppIdentity {
+            process_name: "code.exe".into(),
+            name: "Visual Studio Code".into(),
+            process_path: "D:/Apps/code.exe".into(),
+            icon: None,
+        });
+        let mut writer = UsageWriter::new(generation, chrono_tz::UTC);
+        for (index, manual) in [Some("办公文档"), Some("设计创作"), None]
+            .into_iter()
+            .enumerate()
+        {
+            storage
+                .save_usage_category_override(generation, "code.exe", manual, || Ok(()))
+                .unwrap();
+            let category = storage
+                .usage_categories
+                .category(generation, app.clone(), Some(7));
+            assert_eq!(category, manual.unwrap_or("编程开发"));
+            let span = UsageSpan {
+                run_id: 1,
+                sequence: index as i64,
+                start_ms: calendar.start_ms + index as i64 * 60_000,
+                end_ms: calendar.start_ms + (index as i64 + 1) * 60_000,
+                state: UsageState::Active,
+                identity: Some(Arc::new(UsageIdentity {
+                    app: app.clone(),
+                    title: "Example".into(),
+                    url: None,
+                    category,
+                })),
+            };
+            writer.write(&storage, &[span]).unwrap();
+        }
+        let categories = storage
+            .with_read_connection_named("usage.manual-snapshot-test", |conn| {
+                conn.prepare("SELECT category FROM usage_contexts ORDER BY id")
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(categories, ["办公文档", "设计创作", "编程开发"]);
+        let day = storage
+            .usage_day(
+                "2026-11-25",
+                LiveUsage {
+                    generation,
+                    time_zone: Some("UTC".into()),
+                    ..Default::default()
+                },
+                calendar.end_ms,
+            )
+            .unwrap();
+        assert_eq!(day.apps[0].category, "编程开发");
+        assert_eq!(day.apps[0].total_ms, 180_000);
+    }
+    #[test]
+    fn clearing_a_manual_snapshot_uses_a_negative_result_and_preserves_legacy_fallbacks() {
+        let storage =
+            crate::storage::test_storage_with_schema("usage-manual-negative-reset".into());
+        let generation = storage.db_generation();
+        let day = CalendarDay::in_zone("2026-11-25", chrono_tz::UTC).unwrap();
+        let app = Arc::new(UsageAppIdentity {
+            process_name: "manual-unknown.exe".into(),
+            name: "Unknown application".into(),
+            process_path: "D:/Apps/manual-unknown.exe".into(),
+            icon: None,
+        });
+        storage
+            .save_usage_inferred_category(
+                generation,
+                &app,
+                &StoredCategory {
+                    category: None,
+                    fingerprint: vec![1],
+                    checked_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .unwrap();
+        storage
+            .usage_categories
+            .category(generation, app.clone(), Some(7));
+        storage
+            .save_usage_category_override(
+                generation,
+                &app.process_name,
+                Some("办公文档"),
+                || Ok(()),
+            )
+            .unwrap();
+        let recorded = UsageSpan {
+            run_id: 1,
+            sequence: 0,
+            start_ms: day.start_ms,
+            end_ms: day.start_ms + 60_000,
+            state: UsageState::Active,
+            identity: Some(Arc::new(UsageIdentity {
+                app: app.clone(),
+                title: "Example".into(),
+                url: None,
+                category: storage
+                    .usage_categories
+                    .category(generation, app.clone(), Some(7)),
+            })),
+        };
+        assert_eq!(recorded.identity.as_ref().unwrap().category, "办公文档");
+        UsageWriter::new(generation, chrono_tz::UTC)
+            .write(&storage, &[recorded.clone()])
+            .unwrap();
+        storage
+            .save_usage_category_override(generation, &app.process_name, None, || Ok(()))
+            .unwrap();
+        let result = storage
+            .usage_day(
+                "2026-11-25",
+                LiveUsage {
+                    generation,
+                    time_zone: Some("UTC".into()),
+                    ..Default::default()
+                },
+                day.end_ms,
+            )
+            .unwrap();
+        assert_eq!(result.apps[0].category, "未分类");
+        assert!(!result.apps[0].category_is_manual);
+        assert_eq!(result.total_ms, 60_000);
+        let mut legacy = recorded;
+        legacy.run_id = i64::MIN;
+        Arc::make_mut(legacy.identity.as_mut().unwrap()).category = "游戏".into();
+        storage
+            .apply_usage_categories(generation, std::slice::from_mut(&mut legacy))
+            .unwrap();
+        assert_eq!(legacy.identity.as_ref().unwrap().category, "游戏");
     }
 }
