@@ -191,6 +191,10 @@ pub struct Evidence {
     pub page_url: String,
     pub text: String,
     pub segment: String,
+    /// Original filtered OCR character positions supplied in this run only.
+    /// Do not enlarge encrypted evidence payloads or carry visibility across runs.
+    #[serde(skip)]
+    pub supplied_ranges: Vec<(usize, usize)>,
     pub context: String,
     pub novelty: f64,
     pub span_ms: i64,

@@ -299,6 +299,7 @@ pub async fn run(
             ),
             temperature: Some(0.2),
             disable_tools: false,
+            prompt_only_final: false,
         };
         context::fit_request(
             &mut request,

@@ -29,6 +29,10 @@ pub enum Message {
     // Replayed frontend history cannot supply system instructions.
     #[serde(skip_deserializing)]
     System(String),
+    /// Backend-supplied quoted context whose boundary can be cached separately
+    /// from the current user input. It carries no system-instruction authority.
+    #[serde(skip_deserializing)]
+    Context(String),
     User(String),
     Assistant {
         text: String,
@@ -105,6 +109,10 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     /// Retain tool schemas in the cached prefix when the last step must answer.
     pub disable_tools: bool,
+    /// Keep the API tool-choice mode unchanged for a controller-enforced final
+    /// answer. The caller must reject/decline any further tool calls itself.
+    /// Ordinary chat callers retain the explicit tool_choice=none behavior.
+    pub prompt_only_final: bool,
 }
 
 /// Use the actual protocol shape when budgeting, including tool schemas and

@@ -6,42 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Preserve beginnings, changes and endings, rather than only an OCR prefix.
 pub fn excerpt(text: &str, previous: Option<&str>, limit: usize) -> String {
-    let mut seen = HashSet::new();
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && seen.insert(*s))
-        .collect();
-    let joined = lines.join("\n");
-    if joined.chars().count() <= limit {
-        return joined;
-    }
-    if limit < 16 {
-        return limited(&joined, limit);
-    }
-    // Select disjoint source positions, including the separator cost. A new
-    // context has no "changed" range: sample its actual middle, not its head twice.
-    let chars: Vec<char> = joined.chars().collect();
-    let budget = limit - 10; // two "\n[…]\n" separators
-    let edge = budget / 4;
-    let middle_len = budget - edge * 2;
-    let prior: HashSet<&str> = previous.unwrap_or("").lines().map(str::trim).collect();
-    let mut offset = 0;
-    let changed_start = lines.iter().find_map(|line| {
-        let start = offset;
-        offset += line.chars().count() + 1;
-        (previous.is_some() && !prior.contains(line) && offset > edge).then_some(start)
-    });
-    let middle = changed_start
-        .unwrap_or((chars.len() - middle_len) / 2)
-        .clamp(edge, chars.len() - edge - middle_len);
-    let slice = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
-    format!(
-        "{}\n[…]\n{}\n[…]\n{}",
-        slice(0, edge),
-        slice(middle, middle + middle_len),
-        slice(chars.len() - edge, chars.len())
-    )
+    super::delivery::excerpt(text, previous, limit).0
 }
 
 pub fn prepare(records: &mut [Evidence]) {
@@ -487,6 +452,7 @@ mod tests {
             novelty: 0.0,
             span_ms: 0,
             screening: Default::default(),
+            supplied_ranges: vec![],
         }
     }
     #[test]

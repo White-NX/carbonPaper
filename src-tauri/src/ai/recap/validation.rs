@@ -402,6 +402,7 @@ async fn drive<T: Send>(
         request.messages.push(Message::User(feedback.to_string()));
         request.max_tokens = Some(output);
         request.disable_tools = !request.tools.is_empty();
+        request.prompt_only_final = request.disable_tools;
         if let Err(error) = budget::check_input(host.provider(), &request, allowance.input) {
             report.repair_error = Some(error);
             break;
@@ -533,6 +534,7 @@ mod tests {
             novelty: 0.,
             span_ms: 0,
             screening: Default::default(),
+            supplied_ranges: vec![],
         }
     }
 
