@@ -12,6 +12,28 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.scope.outputs.windows }}
+
+    steps:
+      - name: Checkout PR merge and its parents
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+
+      - name: Determine whether to run Windows checks
+        id: scope
+        run: node scripts/ci-check-scope.mjs
+
   frontend-tests:
     runs-on: ubuntu-latest
 
@@ -43,7 +65,12 @@ jobs:
       - name: Run frontend unit tests
         run: npm run test:frontend
 
+      - name: Run CI scope tests
+        run: node --test scripts/ci-check-scope.test.mjs
+
   app-bound-native:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.windows != 'false') }}
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -78,6 +105,8 @@ jobs:
           if-no-files-found: ignore
 
   backend-fast:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.windows != 'false') }}
     runs-on: windows-latest
 
     steps:
@@ -88,6 +117,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.100.0"
+
+      - name: Cache desktop and semantic worker dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./src-tauri -> target
+            ./src-tauri/semantic-worker -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run Rust unit tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
