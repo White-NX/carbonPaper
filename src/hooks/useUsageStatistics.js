@@ -101,7 +101,7 @@ export default function useUsageStatistics(active, authenticated, transitionDate
             return true;
           };
           if (transitionDate && previousDay && previousDay.date !== day.date) {
-            await transitionDate(previousDay.date, day.date, commit);
+            await transitionDate(previousDay, day, commit);
           } else {
             commit();
           }

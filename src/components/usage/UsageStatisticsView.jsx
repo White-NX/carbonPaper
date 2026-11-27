@@ -3,7 +3,7 @@ import { ArrowLeft, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Clock3, E
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS, CATEGORY_LIST } from '../../lib/categories';
 import { calendarTimeFormatter } from '../../lib/calendar_time';
-import { usageDuration, usageErrorKey, usageHourlySelection } from '../../lib/usage_api';
+import { getUsageRecordedDates, usageDuration, usageErrorKey, usageHourlySelection } from '../../lib/usage_api';
 import { PageHeader } from '../PageHeader';
 import { Button } from '../ui/Button';
 import { Banner } from '../ui/Banner';
@@ -38,19 +38,26 @@ function Week({ days, date, today, selectDate }) {
       .formatRange(dateValue(days[0].date), dateValue(days.at(-1).date));
   return <div className="usage-week">
     <div className="usage-label"><h2>{title}</h2><span title={t('usage.averageHint')}>{recorded.length ? t('usage.dailyAverage', { duration: usageDuration(average, t) }) : t('usage.noAverage')}</span></div>
-    <div className="usage-week-bars">
-      {days.map((day) => {
-        const value = dateValue(day.date);
-        const formattedDate = fullDate.format(value);
-        const future = day.date > today;
-        const label = day.observed_ms ? t('usage.weekDayUsage', { date: formattedDate, duration: usageDuration(day.total_ms, t) })
-          : future ? formattedDate : t('usage.weekDayNoUsage', { date: formattedDate });
-        return <button key={day.date} type="button" className={`usage-week-day ${day.observed_ms ? '' : 'unrecorded'}`} disabled={future} aria-pressed={day.date === date}
-          aria-label={label} title={label} onClick={() => selectDate(day.date)}>
-          <span className="usage-week-column"><i style={{ height: `${day.total_ms / max * 100}%` }} /></span>
-          <span className="usage-week-tick">{weekday.format(value)}</span>
-        </button>;
-      })}
+    <div className="usage-week-chart">
+      <div className="usage-week-bars" aria-hidden="true">
+        {days.map((day) => <span key={day.date} className="usage-week-column"
+          data-selected={day.date === date} data-unrecorded={!day.observed_ms} data-future={day.date > today}>
+          <i style={{ height: `${day.total_ms / max * 100}%` }} />
+        </span>)}
+      </div>
+      <div className="usage-week-controls">
+        {days.map((day) => {
+          const value = dateValue(day.date);
+          const formattedDate = fullDate.format(value);
+          const future = day.date > today;
+          const label = day.observed_ms ? t('usage.weekDayUsage', { date: formattedDate, duration: usageDuration(day.total_ms, t) })
+            : future ? formattedDate : t('usage.weekDayNoUsage', { date: formattedDate });
+          return <button key={day.date} type="button" className="usage-week-day" disabled={future} aria-pressed={day.date === date}
+            aria-label={label} title={label} onClick={() => selectDate(day.date)}>
+            <span className="usage-week-tick">{weekday.format(value)}</span>
+          </button>;
+        })}
+      </div>
     </div>
   </div>;
 }
@@ -63,18 +70,25 @@ function Hours({ day, selectedApp, time, onViewSnapshots }) {
     <div className="usage-label"><figcaption>{t('usage.hourlyMinutes')}</figcaption><span title={selectedApp?.name}>{selectedApp ? selectedApp.name : t('usage.allApps')}</span></div>
     <div className="usage-hours-axis"><span>60</span><span>30</span><span>0</span></div>
     <div className="usage-hours" style={{ '--usage-hours': day.hours.length }}>
-      {day.hours.map((hour, index) => {
-        const total = hour.total_ms;
-        const usage = { start: time(hour.start_ms), end: endTime(hour.end_ms, day.calendar, time, t), duration: usageDuration(total, t) };
-        const label = selectedApp ? t('usage.hourAppUsage', { ...usage, app: selectedApp.name, appDuration: usageDuration(selected[index], t) })
-          : t('usage.hourUsage', usage);
-        const segments = selectedApp ? [{ category: null, total_ms: Math.max(0, total - selected[index]) }, { category: selectedApp.category, total_ms: selected[index] }] : hour.categories;
-        return <button key={hour.start_ms} type="button" className="usage-hour" aria-label={label} title={label} onClick={() => onViewSnapshots?.(hour.start_ms)}>
-          <span className="usage-hour-stack">{segments.filter((segment) => segment.total_ms > 0).map((segment, part) => <i key={`${segment.category}:${part}`}
-            style={{ height: `${segment.total_ms / 3600000 * 100}%`, background: segment.category ? color(segment.category) : 'var(--ide-active)' }} />)}</span>
-          <span className="usage-hour-tick">{index % 6 === 0 || index === day.hours.length - 1 ? hourTick(hour.start_ms) : ''}</span>
-        </button>;
-      })}
+      <div className="usage-hour-bars" aria-hidden="true">
+        {day.hours.map((hour, index) => {
+          const segments = selectedApp ? [{ category: null, total_ms: Math.max(0, hour.total_ms - selected[index]) }, { category: selectedApp.category, total_ms: selected[index] }] : hour.categories;
+          return <span key={hour.start_ms} className="usage-hour-stack">
+            {segments.filter((segment) => segment.total_ms > 0).map((segment, part) => <i key={`${segment.category}:${part}`}
+              style={{ height: `${segment.total_ms / 3600000 * 100}%`, background: segment.category ? color(segment.category) : 'var(--ide-active)' }} />)}
+          </span>;
+        })}
+      </div>
+      <div className="usage-hour-controls">
+        {day.hours.map((hour, index) => {
+          const usage = { start: time(hour.start_ms), end: endTime(hour.end_ms, day.calendar, time, t), duration: usageDuration(hour.total_ms, t) };
+          const label = selectedApp ? t('usage.hourAppUsage', { ...usage, app: selectedApp.name, appDuration: usageDuration(selected[index], t) })
+            : t('usage.hourUsage', usage);
+          return <button key={hour.start_ms} type="button" className="usage-hour" aria-label={label} title={label} onClick={() => onViewSnapshots?.(hour.start_ms)}>
+            <span className="usage-hour-tick">{index % 6 === 0 || index === day.hours.length - 1 ? hourTick(hour.start_ms) : ''}</span>
+          </button>;
+        })}
+      </div>
     </div>
   </figure>;
 }
@@ -141,11 +155,13 @@ function Categories({ categories, total }) {
   const { t } = useTranslation();
   return <section className="usage-categories">
     <div className="usage-label"><h2>{t('usage.categoryTitle')}</h2></div>
-    <div className="usage-category-strip" aria-hidden="true">{categories.map((item) => <i key={item.category} style={{ width: `${item.total_ms / Math.max(1, total) * 100}%`, background: color(item.category) }} />)}</div>
-    {categories.map((item) => <div key={item.category} className="usage-category-row">
-      <span><i style={{ background: color(item.category) }} />{categoryLabel(item.category, t)}</span>
-      <span>{usageDuration(item.total_ms, t)}</span><span>{Math.round(item.total_ms / Math.max(1, total) * 100)}%</span>
-    </div>)}
+    <div className="usage-category-totals">
+      <div className="usage-category-strip" aria-hidden="true">{categories.map((item) => <i key={item.category} style={{ width: `${item.total_ms / Math.max(1, total) * 100}%`, background: color(item.category) }} />)}</div>
+      {categories.map((item) => <div key={item.category} className="usage-category-row">
+        <span><i style={{ background: color(item.category) }} />{categoryLabel(item.category, t)}</span>
+        <span>{usageDuration(item.total_ms, t)}</span><span>{Math.round(item.total_ms / Math.max(1, total) * 100)}%</span>
+      </div>)}
+    </div>
     {!categories.length && <p className="usage-empty">{t('usage.noCategories')}</p>}
   </section>;
 }
@@ -205,19 +221,17 @@ const UsageDayContent = memo(function UsageDayContent({ day, today, selectDate, 
       <Week days={day.week} date={date} today={today} selectDate={selectDate} />
     </div>
     <Hours day={day} selectedApp={selectedApp} time={time} onViewSnapshots={onViewSnapshots} />
-    <div className="usage-day-details">
-      <Ribbon day={day} selectedApp={selectedApp} selectApp={selectApp} time={time} />
-      {calendar.rule === 'system_time_zone_changed' && <Banner>{t('usage.timeZoneChanged')}</Banner>}
-      {!day.observed_ms && <Banner>{t('usage.noRecords')}{day.recorded_since_ms && <span> {t('usage.recordedSince', { date: new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeZone: calendar.time_zone || undefined }).format(new Date(day.recorded_since_ms)) })}</span>}</Banner>}
-      <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} editCategory={(app) => setCategoryApp({ ...app, date, generation: day.generation })} /><aside className="usage-side">
-        <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />
-        <Categories categories={day.categories} total={day.total_ms} />
-      </aside></div>
-    </div>
+    <Ribbon day={day} selectedApp={selectedApp} selectApp={selectApp} time={time} />
+    {calendar.rule === 'system_time_zone_changed' && <Banner>{t('usage.timeZoneChanged')}</Banner>}
+    {!day.observed_ms && <Banner>{t('usage.noRecords')}{day.recorded_since_ms && <span> {t('usage.recordedSince', { date: new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeZone: calendar.time_zone || undefined }).format(new Date(day.recorded_since_ms)) })}</span>}</Banner>}
+    <div className="usage-columns"><Apps apps={day.apps} selectedApp={selectedApp} selectApp={selectApp} editCategory={(app) => setCategoryApp({ ...app, date, generation: day.generation })} /><aside className="usage-side">
+      <Details key={`${date}:${selectedApp?.id || ''}`} app={selectedApp} details={details} loading={detailsLoading} error={detailsError} onViewSnapshots={onViewSnapshots} clearApp={clearApp} />
+      <Categories categories={day.categories} total={day.total_ms} />
+    </aside></div>
   </div>;
 });
 
-const LOADING_DELAY_MS = 200;
+const LOADING_DELAY_MS = 500;
 
 export default function UsageStatisticsView({ date, requestedDate = date, navigationDate = date, today, day, loading, error, refresh, selectDate, stepDate,
   selectedApp, selectApp, clearApp, saveCategory, details, detailsError, detailsLoading, onViewSnapshots, surfaceRef }) {
@@ -250,7 +264,8 @@ export default function UsageStatisticsView({ date, requestedDate = date, naviga
         </div>
         <div role="group" aria-label={fullDate} className="usage-date-nav flex h-10 shrink-0 items-center gap-1.5">
           <Button variant="ghost" icon={ChevronLeft} onClick={() => stepDate(-1)} aria-label={t('usage.previousDay')} />
-          <DateTimePicker label={fullDate} value={date} onChange={selectDate} max={today} dateOnly applyOnSelect clearable={false} className="usage-date-picker w-36 flex-none" />
+          <DateTimePicker label={fullDate} value={date} onChange={selectDate} max={today} dateOnly applyOnSelect clearable={false}
+            loadSelectableDates={getUsageRecordedDates} className="usage-date-picker w-36 flex-none" />
           <Button variant="ghost" icon={ChevronRight} onClick={() => stepDate(1)} disabled={navigationDate >= today} aria-label={t('usage.nextDay')} />
         </div>
       </div>

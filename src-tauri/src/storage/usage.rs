@@ -420,6 +420,85 @@ impl StorageState {
             .collect()
     }
 
+    pub(crate) fn usage_recorded_dates(
+        &self,
+        first_date: &str,
+        last_date: &str,
+        live: LiveUsage,
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        let first = calendar::parse_date(first_date)?;
+        let last = calendar::parse_date(last_date)?;
+        let offset = (last - first).num_days();
+        if !(0..42).contains(&offset) {
+            return Err("USAGE_INVALID_DATE".into());
+        }
+        let zone = calendar::time_zone(live.time_zone.as_deref())?;
+        let live_spans = if live.generation == self.db_generation() {
+            live.spans.as_slice()
+        } else {
+            &[]
+        };
+
+        self.with_read_connection_named("usage.recorded_dates", |conn| {
+            // Use the day/time index and stop at the first observation. No app
+            // catalog, context payloads, or per-day aggregates are needed.
+            let mut saved = conn
+                .prepare(
+                    "SELECT EXISTS(SELECT 1 FROM usage_intervals
+                 WHERE day_id=?1 AND start_ms<?2 AND end_ms>?3 AND state<>?4)",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut legacy = legacy::observation_query(conn)?;
+            let mut dates = Vec::new();
+            for date in first.iter_days().take(offset as usize + 1) {
+                let date = date.to_string();
+                let (id, mut day) = match calendars::read(conn, &date)? {
+                    Some((id, day)) => (Some(id), day),
+                    None if live_spans.is_empty() && legacy.is_none() => continue,
+                    None => (None, CalendarDay::in_zone(&date, zone)?),
+                };
+                calendars::include_live(&mut day, live_spans, zone)?;
+                let end = now_ms.min(day.end_ms);
+                if end <= day.start_ms {
+                    continue;
+                }
+                if let Some(id) = id {
+                    let observed: bool = saved
+                        .query_row(
+                            params![id, end, day.start_ms, UsageState::Unknown.code()],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if observed {
+                        dates.push(date);
+                        continue;
+                    }
+                }
+                if !live_spans.is_empty()
+                    && calendars::live_on_day(live_spans, &date, zone)?
+                        .iter()
+                        .any(|span| {
+                            span.state != UsageState::Unknown
+                                && span.start_ms.max(day.start_ms) < span.end_ms.min(end)
+                        })
+                {
+                    dates.push(date);
+                    continue;
+                }
+                if let Some(query) = &mut legacy {
+                    let observed: bool = query
+                        .query_row([day.start_ms, end], |row| row.get(0))
+                        .map_err(|e| e.to_string())?;
+                    if observed {
+                        dates.push(date);
+                    }
+                }
+            }
+            Ok(dates)
+        })
+    }
+
     pub(crate) fn usage_day(
         &self,
         date: &str,

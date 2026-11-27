@@ -2,7 +2,7 @@
 //! Authenticated day reads hydrate only the selected day's application rows.
 use super::{StorageState, UsageAppIdentity, UsageIdentity, UsageSpan, UsageState};
 use crate::credential_manager::{decrypt_with_master_key, unwrap_storage_domain_key};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Statement};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -122,6 +122,18 @@ pub(super) fn rows(conn: &Connection, start_ms: i64, end_ms: i64) -> Result<Vec<
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string());
     result
+}
+
+pub(super) fn observation_query(conn: &Connection) -> Result<Option<Statement<'_>>, String> {
+    if !StorageState::table_exists(conn, TABLE)? {
+        return Ok(None);
+    }
+    conn.prepare(
+        "SELECT EXISTS(SELECT 1 FROM usage_intervals_legacy
+         WHERE is_deleted=0 AND end_ms>?1 AND start_ms<?2 AND end_ms>start_ms)",
+    )
+    .map(Some)
+    .map_err(|e| e.to_string())
 }
 
 pub(super) fn recorded_since(conn: &Connection) -> Result<Option<i64>, String> {
@@ -356,6 +368,93 @@ mod tests {
              VALUES(?1,'old-run',?1,?2,?3,?4,?5,?6,?7,0,'boundary',?8)",
             params![row.id,row.start_ms,row.end_ms,row.process_name,encrypted,wrapped,row.state==UsageState::Active,deleted],
         ).unwrap();
+    }
+
+    #[test]
+    fn recorded_dates_combine_saved_live_and_legacy_observations() {
+        let storage = storage();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        storage.init_tables(&conn).unwrap();
+        let utc_start = |date| CalendarDay::in_zone(date, chrono_tz::UTC).unwrap().start_ms;
+        let midnight = utc_start("2026-11-20");
+        for (id, start, end, deleted) in [
+            (1, midnight - 1_000, midnight + 1_000, false),
+            (
+                2,
+                utc_start("2026-11-21"),
+                utc_start("2026-11-21") + 1_000,
+                true,
+            ),
+            (3, utc_start("2026-11-22"), utc_start("2026-11-22"), false),
+        ] {
+            insert(
+                &conn,
+                &Row {
+                    id,
+                    start_ms: start,
+                    end_ms: end,
+                    state: UsageState::Active,
+                    process_name: "old.exe".into(),
+                },
+                &[1],
+                &[2],
+                deleted,
+            );
+        }
+        let zone = chrono_tz::Asia::Shanghai;
+        let saved_start = CalendarDay::in_zone("2026-11-24", zone).unwrap().start_ms;
+        *storage.db.lock().unwrap() = Some(conn);
+        let generation = storage.db_generation();
+        let span = |sequence, start, state| UsageSpan {
+            run_id: 1,
+            sequence,
+            start_ms: start,
+            end_ms: start + 1_000,
+            state,
+            identity: None,
+        };
+        let mut writer = UsageWriter::new(generation, zone);
+        writer
+            .write(
+                &storage,
+                &[
+                    span(1, saved_start, UsageState::Idle),
+                    span(2, utc_start("2026-11-25"), UsageState::Unknown),
+                ],
+            )
+            .unwrap();
+        let live = LiveUsage {
+            generation,
+            time_zone: Some("UTC".into()),
+            spans: vec![
+                span(3, utc_start("2026-11-26"), UsageState::Paused),
+                span(4, utc_start("2026-11-27"), UsageState::Idle),
+            ],
+        };
+        let now = utc_start("2026-11-26") + 1_000;
+        assert_eq!(
+            storage
+                .usage_recorded_dates("2026-10-17", "2026-11-27", live.clone(), now)
+                .unwrap(),
+            ["2026-11-19", "2026-11-20", "2026-11-24", "2026-11-26"]
+        );
+        let stale = LiveUsage {
+            generation: generation + 1,
+            ..live.clone()
+        };
+        assert_eq!(
+            storage
+                .usage_recorded_dates("2026-11-19", "2026-11-27", stale, now)
+                .unwrap(),
+            ["2026-11-19", "2026-11-20", "2026-11-24"]
+        );
+        assert_eq!(
+            storage
+                .usage_recorded_dates("2026-10-16", "2026-11-27", live, now)
+                .unwrap_err(),
+            "USAGE_INVALID_DATE"
+        );
     }
 
     #[test]

@@ -1000,6 +1000,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::usage::usage_get_day,
+            commands::usage::usage_get_recorded_dates,
             commands::usage::usage_get_app_details,
             commands::usage::usage_set_app_category,
             commands::utility::set_app_language,

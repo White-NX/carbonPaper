@@ -1496,6 +1496,8 @@
     "select": "Choose date and time",
     "selectDate": "Choose a date",
     "calendar": "Calendar",
+    "loadingDates": "Checking available dates…",
+    "loadDatesFailed": "Couldn’t check available dates.",
     "previousMonth": "Previous month",
     "nextMonth": "Next month",
     "year": "Year",

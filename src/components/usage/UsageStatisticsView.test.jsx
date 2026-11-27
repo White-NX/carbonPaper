@@ -1,5 +1,7 @@
 import React from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { invoke } from '@tauri-apps/api/core';
 import { createInstance } from 'i18next';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import en from '../../i18n/locales/en.json';
@@ -86,6 +88,15 @@ describe('usage statistics weekly totals', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Previous day' }));
     expect(stepDate).toHaveBeenLastCalledWith(-1);
 
+    const columns = [...container.querySelectorAll('.usage-week-column')];
+    rerender(<UsageStatisticsView {...props} date={today} day={{ ...day, date: today, week: makeWeek(monday) }} />);
+    expect(buttons[0]).toHaveAttribute('aria-pressed', 'false');
+    expect(buttons[3]).toHaveAttribute('aria-pressed', 'true');
+    container.querySelectorAll('.usage-week-column').forEach((column, index) => {
+      expect(column).toBe(columns[index]);
+      expect(column).toHaveAttribute('data-selected', String(index === 3));
+    });
+
     rerender(<UsageStatisticsView {...props} date={previousSunday} day={{ ...day, date: previousSunday, week: makeWeek(previousMonday) }} />);
     expect(chart.getByRole('heading', { name: /Nov 16\s*–\s*22/ })).toBeInTheDocument();
     expect(chart.getAllByRole('button')[6]).toHaveAttribute('aria-pressed', 'true');
@@ -94,6 +105,35 @@ describe('usage statistics weekly totals', () => {
 });
 
 describe('usage statistics navigation', () => {
+  it('only lets the date panel select recorded dates, including those in the adjacent month', async () => {
+    const user = userEvent.setup();
+    const selectDate = vi.fn();
+    invoke.mockResolvedValueOnce(['2026-10-30', date, '2026-11-26']);
+    render(<UsageStatisticsView date={date} day={day} today="2026-11-27" selectDate={selectDate} />);
+    expect(invoke).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Tuesday, November 24, 2026' }));
+    const picker = within(screen.getByRole('dialog'));
+    const cell = (name) => picker.getByRole('gridcell', { name });
+    const selected = cell('Tuesday, November 24, 2026');
+    await waitFor(() => expect(selected).toHaveFocus());
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('usage_get_recorded_dates', { firstDate: '2026-10-26', lastDate: '2026-11-27' });
+    const missing = cell('Wednesday, November 25, 2026');
+    expect(missing).toBeDisabled();
+    expect(cell('Saturday, November 28, 2026')).toBeDisabled();
+    await user.keyboard('{ArrowRight}{Enter}');
+    expect(selectDate).toHaveBeenCalledExactlyOnceWith('2026-11-26');
+    await user.click(missing);
+    expect(selectDate).toHaveBeenCalledTimes(1);
+
+    invoke.mockResolvedValueOnce(['2026-10-30']);
+    const adjacent = cell('Friday, October 30, 2026');
+    expect(adjacent).toBeEnabled();
+    await user.click(adjacent);
+    expect(selectDate).toHaveBeenLastCalledWith('2026-10-30');
+    expect(invoke).toHaveBeenLastCalledWith('usage_get_recorded_dates', { firstDate: '2026-09-28', lastDate: '2026-11-08' });
+  });
+
   it('delays the centered loading state, keeps the current layout and offers retry for the failed date', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
@@ -105,7 +145,7 @@ describe('usage statistics navigation', () => {
       const panel = container.querySelector('.usage-panel');
       expect(screen.getByRole('button', { name: 'Tuesday, November 24, 2026' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Next day' })).toBeEnabled();
-      act(() => vi.advanceTimersByTime(199));
+      act(() => vi.advanceTimersByTime(499));
       expect(screen.queryByRole('status')).not.toBeInTheDocument();
       expect(panel).toHaveAttribute('data-waiting', 'false');
       act(() => vi.advanceTimersByTime(1));

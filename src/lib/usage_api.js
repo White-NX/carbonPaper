@@ -3,6 +3,7 @@ import { withAuth } from './auth_api';
 
 const read = (command, args) => withAuth(() => invoke(command, args), { autoPrompt: false });
 export const getUsageDay = (date) => read('usage_get_day', { date });
+export const getUsageRecordedDates = (firstDate, lastDate) => read('usage_get_recorded_dates', { firstDate, lastDate });
 export const getUsageAppDetails = (date, appId) => read('usage_get_app_details', { date, appId });
 export const setUsageAppCategory = (appId, category, generation) => withAuth(
   () => invoke('usage_set_app_category', { appId, category, generation }), { autoPrompt: false },

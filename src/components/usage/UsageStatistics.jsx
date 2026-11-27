@@ -6,19 +6,22 @@ import UsageStatisticsView from './UsageStatisticsView';
 export default function UsageStatistics({ active, isAuthenticated, onViewSnapshots }) {
   const surface = useRef(null);
   const animation = useRef(null);
-  const transitionDate = useCallback(async (from, to, commit) => {
+  const transitionDate = useCallback(async (fromDay, toDay, commit) => {
     const element = surface.current;
     if (!element?.startViewTransition || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
       commit();
       return;
     }
 
+    const types = [toDay.date < fromDay.date ? 'usage-earlier' : 'usage-later'];
+    if (fromDay.week[0]?.date !== toDay.week[0]?.date) types.push('usage-week-change');
+
     animation.current?.skipTransition();
     let transition;
     try {
       // Capture only this view. The date arrows stay live during playback.
       transition = element.startViewTransition({
-        types: [to < from ? 'usage-earlier' : 'usage-later'],
+        types,
         update: () => { if (!flushSync(commit)) transition.skipTransition(); },
       });
     } catch {

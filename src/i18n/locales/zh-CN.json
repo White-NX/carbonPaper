@@ -1496,6 +1496,8 @@
     "select": "选择日期和时间",
     "selectDate": "选择日期",
     "calendar": "日历",
+    "loadingDates": "正在读取可选日期…",
+    "loadDatesFailed": "无法读取可选日期。",
     "previousMonth": "上个月",
     "nextMonth": "下个月",
     "year": "年",

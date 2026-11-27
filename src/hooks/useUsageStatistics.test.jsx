@@ -56,7 +56,7 @@ describe('usage statistics requests', () => {
 
     await waitFor(() => expect(result.current.day?.date).toBe('2026-11-21'));
     expect(getUsageDay.mock.calls).toEqual([['2026-11-24'], ['2026-11-21']]);
-    expect(transition).toHaveBeenCalledExactlyOnceWith('2026-11-24', '2026-11-21', expect.any(Function));
+    expect(transition).toHaveBeenCalledExactlyOnceWith(day('2026-11-24'), day('2026-11-21'), expect.any(Function));
   });
 
   it('keeps the displayed day and skips a pending result after a newer selection', async () => {
@@ -80,7 +80,7 @@ describe('usage statistics requests', () => {
     expect(transition).not.toHaveBeenCalled();
 
     await act(async () => latest.resolve(day('2026-11-21')));
-    expect(transition).toHaveBeenCalledExactlyOnceWith('2026-11-24', '2026-11-21', expect.any(Function));
+    expect(transition).toHaveBeenCalledExactlyOnceWith(day('2026-11-24'), day('2026-11-21'), expect.any(Function));
     expect(result.current).toMatchObject({ date: '2026-11-21', loading: false });
   });
 
