@@ -123,18 +123,26 @@ not link the desktop archive repository, CNG private key context, screenshot
 loader or an arbitrary file-read API.
 
 The SQLCipher-encrypted `agent-memory.db` uses an independently random content
-key. It keeps small text projections for capture metadata, links, clusters,
-summaries, recap activities, calendars and privacy settings. OCR rows contain
-identifiers, revisions, ciphertext digests and wrapped OCR keys. Vector access
-wraps each existing vectors-domain key once; recap search access wraps the key
-for its existing saved payload. The reader reuses OCR bodies, vector arrays and
-HMAC posting lists in the main database. The Agent database keeps no full-text
-tables or second OCR/vector copy.
+key. Format 3 stores snapshot fields in typed columns. Captures with the same
+title, process, URL and source share one context. Identical visible-link lists
+also share one row. Link lists, recap text and cluster summaries use zstd when
+compression reduces their size. Updating or deleting the last reference
+reclaims its links and context in the same transaction.
+
+Packed OCR uses one scoped key envelope per immutable archive block. An
+integer records a contiguous prefix of authorized slots. A bitmap records
+membership when some slots are hidden. Each read checks the dataset,
+generation, screenshot, block scope, authorized slot and authenticated OCR row
+ID. OCR stored inline in the archive keeps its per-row ciphertext digest and
+key envelope.
+Vector and recap search grants reuse the existing archive ciphertext and HMAC
+posting lists.
 
 The source connector receives separately wrapped public-bootstrap SQLCipher
 and HMAC search keys. It receives neither the archive master key nor screenshot
 keys. Key envelopes authenticate the dataset, generation, domain, record
-identity and ciphertext digest. The transactional outbox uses a second
+identity and the corresponding ciphertext digest or OCR block scope tag.
+The transactional outbox uses a second
 independently random key and authenticates its dataset and generation. These
 keys are independent of bearer credentials.
 
@@ -167,7 +175,11 @@ Capture and processing stage freshly generated row/domain keys before clearing
 them, so new OCR and vectors can become available while the UI is locked.
 Other projection text is staged as bounded, short-lived Agent-key-encrypted
 material. Source triggers return encrypted key/projection events, or
-identifier-only gaps when the required material is unavailable. Ciphertext
+identifier-only gaps when the required material is unavailable. Packed OCR mutations
+coalesce by block, and vector mutations coalesce by domain key. The writer
+reads committed source membership, applies one replacement grant and acknowledges
+only the revision it read. A concurrent capture leaves a newer revision queued.
+Ciphertext
 digests avoid carrying full OCR or recap-search payloads through those events.
 Plaintext SQL decryption functions retain their `DIRECTONLY` restriction.
 
@@ -175,8 +187,10 @@ OCR search reuses the main database's HMAC bitmap index and shared fuzzy
 matching and ranking rules. The desktop writer fills missing postings from
 authorized OCR even while locked, decrypting and hashing outside the main
 database mutex and committing at most 32 OCR rows per transaction. The reader
-checks OCR and recap-search digests before decrypting their source payloads;
-semantic reads validate the existing vector model, revision and dimensions.
+checks inline OCR and recap-search ciphertext digests before decryption.
+For packed OCR, it checks slot membership and the authenticated row identity
+and reuses decoded blocks within a bounded request cache. Semantic reads
+validate the existing vector model, revision and dimensions.
 CLIP scans read vectors in bounded pages.
 
 Events commit alongside source changes. Explicit source transactions reserve
@@ -195,6 +209,28 @@ remaining updates before publishing readiness. It logs cumulative phase,
 row-key, read and write timings at bounded intervals. It pauses on lock, cancellation or
 maintenance. The main database must remain available; missing files, mismatched
 datasets or changed ciphertext fail the read rather than return a stale copy.
+
+### Recovery and long-running storage
+
+To replace a view from an earlier development build, disable and re-enable
+unattended access. Re-enabling builds a fresh view from the archive under a
+new credential generation. Interrupted preparation resumes at its last
+committed page using the cursor stored in the view. If the view file is lost,
+the next authenticated session rebuilds it from the archive under the
+existing credential generation.
+
+Once preparation, gap repair and outbox acknowledgement have finished, the
+writer records the revision published by the protected service while excluding
+concurrent source writers. Older events can then be discarded on replay.
+Bounded cleanup batches reclaim covered OCR and projection tombstones and
+free pages. Retired snapshot IDs merge into intervals so a delayed child
+cannot revive a deleted parent. A newer explicit snapshot restore takes
+precedence over its retired interval.
+
+OCR and visual search scan in bounded pages and retain ranked identities for
+the requested pagination window. OCR uses a compressed set of screenshot IDs
+to report the exact distinct total. Full result text, links and match evidence
+are loaded for the selected page.
 
 ## Protected reader and authority
 

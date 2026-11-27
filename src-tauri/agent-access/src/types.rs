@@ -182,6 +182,37 @@ pub struct OcrAccess {
     pub key_envelope: Vec<u8>,
 }
 
+/// Permission for the visible slots of one immutable, authenticated archive block.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrBlockAccess {
+    pub block_id: i64,
+    pub screenshot_id: i64,
+    pub scope_tag: Vec<u8>,
+    pub slots: Vec<u8>,
+    pub key_envelope: Vec<u8>,
+}
+
+impl OcrBlockAccess {
+    pub fn slot_mask(slots: &[usize]) -> Result<Vec<u8>, String> {
+        let mut mask = Vec::new();
+        for &slot in slots {
+            if slot >= crate::ocr_block_codec::MAX_ROWS {
+                return Err("AGENT_INVALID_OCR_SLOT".into());
+            }
+            if mask.len() <= slot / 8 {
+                mask.resize(slot / 8 + 1, 0u8);
+            }
+            let bit = 1 << (slot % 8);
+            if mask[slot / 8] & bit != 0 {
+                return Err("AGENT_DUPLICATE_OCR_SLOT".into());
+            }
+            mask[slot / 8] |= bit;
+        }
+        Ok(mask)
+    }
+}
+
 /// Only the vectors domain is shared; metadata, ANN and image keys stay separate.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,13 +242,14 @@ macro_rules! opaque_debug {
         }
     )+};
 }
-opaque_debug!(OcrAccess, VectorAccess, RecapSearchAccess);
+opaque_debug!(OcrAccess, OcrBlockAccess, VectorAccess, RecapSearchAccess);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum TextRecord {
     Snapshot(SnapshotText),
     OcrAccess(OcrAccess),
+    OcrBlock(OcrBlockAccess),
     Cluster(ClusterText),
     Summary(SummaryText),
     Assignment(AssignmentText),
@@ -241,6 +273,7 @@ impl TextRecord {
             Self::Recap(v) => ("recap", format!("{}:{}", v.part, v.key)),
             Self::RecapSearchAccess(v) => ("recap", format!("search:{}", v.key)),
             Self::Calendar(v) => ("calendar", v.date.clone()),
+            Self::OcrBlock(v) => ("ocr_block", v.block_id.to_string()),
             Self::VectorAccess(v) => ("vector_key", v.key_id.clone()),
             Self::Privacy(_) => ("privacy", "settings".into()),
         }

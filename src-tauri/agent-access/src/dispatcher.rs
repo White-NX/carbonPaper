@@ -31,11 +31,6 @@ pub fn tools_list() -> Value {
     }
     json!({"tools":tools})
 }
-fn decode<T: DeserializeOwned>(rows: Vec<String>) -> Result<Vec<T>, String> {
-    rows.into_iter()
-        .map(|s| serde_json::from_str(&s).map_err(|_| "AGENT_INVALID_RECORD".into()))
-        .collect()
-}
 fn id(args: &Value) -> i64 {
     args.get("cluster_id")
         .or_else(|| args.get("smart_cluster_id"))
@@ -128,17 +123,7 @@ pub(crate) fn query_page<T: DeserializeOwned>(
     sql: &str,
     parameters: impl rusqlite::Params,
 ) -> Result<Vec<T>, String> {
-    let mut statement = repo
-        .conn
-        .prepare(sql)
-        .map_err(|e| format!("AGENT_STORAGE_FAILED: {e}"))?;
-    let rows = statement
-        .query_map(parameters, |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?;
-    let rows = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
-    decode(rows)
+    repo.json_rows(sql, parameters)
 }
 
 pub fn call(
@@ -163,9 +148,7 @@ pub fn call(
         "get_snapshots_by_time_range" => {
             let page = Page::parse(&args, 500, 500)?;
             let range = TimeRange::from_args(&args, true)?;
-            let rows:Vec<SnapshotText>=query_page(repo,"SELECT body FROM records WHERE kind='snapshot' AND body IS NOT NULL
-                AND captured_at_ms>=?1 AND captured_at_ms<?2 ORDER BY captured_at_ms DESC,CAST(key AS INTEGER) DESC LIMIT ?3 OFFSET ?4",
-                params![range.start_ms,range.end_ms,page.limit as i64,page.offset as i64])?;
+            let rows=repo.snapshots_where("AND s.captured_at_ms>=?1 AND s.captured_at_ms<?2 ORDER BY s.captured_at_ms DESC,s.id DESC LIMIT ?3 OFFSET ?4",params![range.start_ms,range.end_ms,page.limit as i64,page.offset as i64])?;
             Ok(page.filtered(rows, |v| {
                 clean_snapshot(v, filter).ok().map(|v| metadata(&v))
             }))
@@ -199,7 +182,7 @@ pub fn call(
             };
             let processes: Vec<String> =
                 serde_json::from_value(args["process_names"].clone()).unwrap_or_default();
-            let mut scores = Vec::new();
+            let mut scores = crate::ranking::PageRanking::new(page.offset + page.limit);
             let mut indexed = 0;
             let mut cursor = 0;
             let total = repo.snapshot_count()?;
@@ -209,6 +192,8 @@ pub fn call(
                     break;
                 };
                 cursor = last.screenshot_id;
+                let ids: Vec<_> = vectors.iter().map(|v| v.screenshot_id).collect();
+                let headers = repo.search_headers(&ids)?;
                 for v in vectors {
                     if v.model_id != model
                         || v.model_revision != revision
@@ -217,12 +202,12 @@ pub fn call(
                         continue;
                     }
                     indexed += 1;
-                    let Some(snapshot) = repo.snapshot(v.screenshot_id)? else {
+                    let Some(header) = headers.get(&v.screenshot_id) else {
                         continue;
                     };
-                    if !range.contains(snapshot.captured_at_ms)
+                    if !range.contains(header.captured_at_ms)
                         || !processes.is_empty()
-                            && !snapshot
+                            && !header
                                 .process_name
                                 .as_ref()
                                 .is_some_and(|p| processes.contains(p))
@@ -230,7 +215,12 @@ pub fn call(
                         continue;
                     }
                     if let Some(score) = cosine(query, &v.vector) {
-                        scores.push((score, snapshot));
+                        scores.insert(crate::ranking::Hit {
+                            score: f64::from(score),
+                            secondary: Some(v.screenshot_id),
+                            row: v.screenshot_id,
+                            screenshot: v.screenshot_id,
+                        });
                     }
                 }
             }
@@ -240,18 +230,14 @@ pub fn call(
                         .into(),
                 );
             }
-            scores.sort_by(|a, b| {
-                b.0.total_cmp(&a.0)
-                    .then_with(|| b.1.screenshot_id.cmp(&a.1.screenshot_id))
-            });
-            let rows = scores
-                .into_iter()
-                .skip(page.offset)
-                .take(page.limit)
+            let rows: Vec<_> = scores
+                .page(page.offset)
+                .map(|h| (h.score as f32, h.screenshot))
                 .collect();
             let mut error = None;
-            let mut result=page.filtered(rows,|(score,v)| {
-                let v=clean_snapshot(v,filter).ok()?;
+            let mut result=page.filtered(rows,|(score,id)| {
+                let raw=match repo.snapshot(id) {Ok(Some(v))=>v,Ok(None)=>return None,Err(e)=>{error=Some(e);return None}};
+                let v=clean_snapshot(raw,filter).ok()?;
                 let blocks=match repo.ocr(v.screenshot_id) {Ok(b)=>b,Err(e)=>{error=Some(e);return None}};
                 let blocks=clean_blocks(blocks,filter).ok()?;
                 Some(json!({"screenshot_id":v.screenshot_id,"captured_at_ms":v.captured_at_ms,"window_title":v.window_title,"process_name":v.process_name,
@@ -271,11 +257,16 @@ pub fn call(
             let rows: Vec<ClusterText> = repo.all("cluster")?;
             let mut values = Vec::new();
             for mut v in rows {
-                let assignments: Vec<AssignmentText> = query_page(repo,
-                    "SELECT a.body FROM records a JOIN records s ON s.kind='snapshot' AND s.key=CAST(a.screenshot_id AS TEXT)
-                    WHERE a.kind='assignment' AND a.cluster_id=?1 AND a.body IS NOT NULL AND s.body IS NOT NULL",[v.cluster_id])?;
-                v.snapshot_count = assignments.len() as i64;
-                v.last_assigned_at_ms = assignments.iter().filter_map(|a| a.assigned_at_ms).max();
+                (v.snapshot_count, v.last_assigned_at_ms) = repo
+                    .conn
+                    .query_row(
+                        "SELECT count(*),max(json_extract(a.body,'$.assigned_at_ms'))
+                    FROM records a JOIN snapshots s ON s.id=a.screenshot_id AND s.deleted=0
+                    WHERE a.kind='assignment' AND a.cluster_id=?1 AND a.body IS NOT NULL",
+                        [v.cluster_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
                 let Some(anchor) = filter_joined_text(filter, mode, &v.anchor_text).ok() else {
                     continue;
                 };
@@ -300,8 +291,8 @@ pub fn call(
         "get_smart_cluster_ocr_corpus" => {
             let page = Page::parse(&args, 50, 200)?;
             let cluster_id = id(&args);
-            let rows:Vec<AssignmentText>=query_page(repo,"SELECT a.body FROM records a JOIN records s ON s.kind='snapshot' AND s.key=CAST(a.screenshot_id AS TEXT)
-                WHERE a.kind='assignment' AND a.cluster_id=?1 AND a.body IS NOT NULL AND s.body IS NOT NULL
+            let rows:Vec<AssignmentText>=query_page(repo,"SELECT a.body FROM records a JOIN snapshots s ON s.id=a.screenshot_id
+                WHERE a.kind='assignment' AND a.cluster_id=?1 AND a.body IS NOT NULL AND s.deleted=0
                 ORDER BY COALESCE(json_extract(a.body,'$.rerank_score'),-1) DESC,a.screenshot_id DESC LIMIT ?2 OFFSET ?3",
                 params![cluster_id,page.limit as i64,page.offset as i64])?;
             let mut error = None;

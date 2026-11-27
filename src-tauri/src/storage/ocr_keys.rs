@@ -17,8 +17,8 @@ const MAX_CACHED_KEYS: usize = 64;
 
 pub(super) mod backup;
 mod wire;
-pub(super) use wire::block_aad;
-use wire::{aad, open, scope, scope_tag, seal, verify_scope};
+use wire::{aad, open, scope, scope_tag, seal};
+pub(super) use wire::{block_aad, verify_scope};
 
 fn invalid() -> CredentialError {
     CredentialError::CryptoError("Invalid OCR key or payload binding".into())

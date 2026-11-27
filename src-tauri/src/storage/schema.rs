@@ -106,7 +106,6 @@ impl StorageState {
         progress(InitializationProgress::phase(InitializationPhase::Schema));
         self.agent_writer.register(&mut conn)?;
         self.init_tables(&conn)?;
-        self.init_agent_access_tables(&conn)?;
         let tables_dur = t3.elapsed();
         let protected_started = std::time::Instant::now();
         #[cfg(test)]
@@ -114,6 +113,7 @@ impl StorageState {
             .allow_plaintext_fixtures(self.credential_state.storage_fixture_for_tests());
         self.protected.initialize(&conn)?;
         self.protected.register_functions(&conn)?;
+        self.init_agent_access_tables(&conn)?;
         if let Err(error) = self.restore_agent_access(&conn) {
             tracing::warn!("Agent access restoration deferred: {error}");
         }

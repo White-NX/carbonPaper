@@ -23,6 +23,7 @@ mod ocr_layout;
 mod page;
 #[path = "../../src/pii/mod.rs"]
 pub mod pii;
+mod ranking;
 #[cfg(test)]
 mod reader_tests;
 mod recap;

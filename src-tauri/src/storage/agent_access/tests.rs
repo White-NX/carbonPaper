@@ -48,7 +48,7 @@ fn fixture() -> (tempfile::TempDir, StorageState, Arc<Mutex<Authority>>) {
             } => {
                 let binding = AgentViewBinding {
                     dataset_id,
-                    generation: "b".repeat(64),
+                    generation: carbonpaper_app_bound::protocol::random_id(),
                     view_path,
                 };
                 state.binding = Some(binding.clone());
@@ -487,14 +487,6 @@ fn failed_history_page_does_not_publish_a_prefix_or_advance_past_unprepared_ocr(
         let guard = storage
             .get_connection_named("agent_test_repair_history_key")
             .unwrap();
-        guard
-            .as_ref()
-            .unwrap()
-            .execute(
-                "UPDATE agent_access_state SET checkpoint='superseded legacy cursor'",
-                [],
-            )
-            .unwrap();
         guard.as_ref().unwrap().execute(
             "UPDATE ocr_results SET text_key_encrypted=(SELECT text_key_encrypted FROM ocr_results WHERE id=43) WHERE id=44",
             [],
@@ -512,39 +504,262 @@ fn failed_history_page_does_not_publish_a_prefix_or_advance_past_unprepared_ocr(
 }
 
 #[test]
-fn older_preparations_migrate_the_resume_cursor_without_rewriting_source_state() {
-    let (_directory, storage, _authority) = fixture();
-    seed_history(&storage);
+fn unsupported_view_is_replaced_by_disabling_and_reenabling_access() {
+    let (_directory, storage, authority) = fixture();
+    let screenshot_id = seed_history(&storage);
     let binding = storage.begin_agent_access().unwrap();
+    {
+        let guard = storage
+            .get_connection_named("agent_test_obsolete_state")
+            .unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE obsolete_state(id INTEGER PRIMARY KEY CHECK(id=1),binding TEXT NOT NULL,checkpoint TEXT NOT NULL);
+             INSERT INTO obsolete_state SELECT id,binding,'old cursor' FROM agent_access_state;
+             DROP TABLE agent_access_state;
+             ALTER TABLE obsolete_state RENAME TO agent_access_state;",
+        )
+        .unwrap();
+        storage.init_agent_access_tables(conn).unwrap();
+    }
     {
         let conn = Connection::open(&binding.view_path).unwrap();
         conn.execute_batch(&format!("PRAGMA key=\"x'{}'\"", hex::encode([7; 32])))
             .unwrap();
-        conn.execute(
-            "DELETE FROM agent_metadata WHERE key='preparation_checkpoint'",
-            [],
-        )
+        conn.execute("UPDATE agent_metadata SET value='2' WHERE key='format'", [])
+            .unwrap();
+    }
+    assert!(storage
+        .sync_agent_access()
+        .unwrap_err()
+        .starts_with("AGENT_STORAGE_FORMAT_UNSUPPORTED"));
+    assert_eq!(authority.lock().unwrap().phase, "preparing");
+    assert_eq!(storage.agent_binding().unwrap(), binding);
+
+    storage.disable_agent_access().unwrap();
+    assert!(!Path::new(&binding.view_path).exists());
+    let fresh = storage.begin_agent_access().unwrap();
+    assert_eq!(fresh.dataset_id, binding.dataset_id);
+    assert_ne!(fresh.generation, binding.generation);
+    storage.sync_agent_access().unwrap();
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    assert_eq!(
+        view(&storage).ocr(screenshot_id).unwrap()[0].text,
+        "historical OCR"
+    );
+}
+
+#[test]
+fn lost_view_rebuilds_after_unlock_with_the_existing_credential_generation() {
+    let (_dir, storage, authority) = fixture();
+    seed_history(&storage);
+    let binding = storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    std::fs::remove_file(&binding.view_path).unwrap();
+    storage.credential_state.invalidate_session();
+    assert_eq!(storage.sync_agent_access().unwrap_err(), "AUTH_REQUIRED");
+    assert!(!Path::new(&binding.view_path).exists());
+    assert_ne!(authority.lock().unwrap().phase, "ready");
+    storage.credential_state.update_auth_time();
+    storage.sync_agent_access().unwrap();
+    assert_eq!(storage.agent_binding().unwrap(), binding);
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    assert_eq!(view(&storage).ocr(42).unwrap()[0].text, "historical OCR");
+}
+
+#[test]
+fn vector_packing_coalesces_a_locked_domain_grant_and_fences_deletion() {
+    use carbonpaper_app_bound::payload::CipherKey;
+    let (_dir, storage, authority) = fixture();
+    seed_history(&storage);
+    let binding = storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    storage.credential_state.invalidate_session();
+    let key = CipherKey::new(
+        "01".repeat(16),
+        binding.dataset_id,
+        "vectors".into(),
+        &[5; 32],
+    )
+    .unwrap();
+    storage.agent_writer.stage_vector_key(&key);
+    let bytes = key
+        .seal("clip_image:history", &1.0f32.to_le_bytes())
         .unwrap();
+    {
+        let guard = storage
+            .get_connection_named("agent_test_packed_vector")
+            .unwrap();
+        let tx = guard.as_ref().unwrap().unchecked_transaction().unwrap();
+        tx.execute("INSERT INTO protected_storage_keys(key_id,purpose,dataset_id,public_key_fingerprint,wrapped_key)
+            VALUES(?1,'vectors',?2,'fixture',zeroblob(256))",params![key.id,key.dataset]).unwrap();
+        tx.execute("INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,model_id,model_revision,embedding_version,source_fingerprint)
+            VALUES('clip_image','history',1,?1,'fixture','fixture',1,'fixture')",[&bytes]).unwrap();
+        tx.execute("INSERT INTO vector_blocks(data) VALUES(?1)", [&bytes])
+            .unwrap();
+        tx.execute("UPDATE derived_embeddings SET vector_block_id=?1,vector_offset=0,vector_length=?2,vector_f32=X'' WHERE subject_key='history'",params![tx.last_insert_rowid(),bytes.len() as i64]).unwrap();
+        let (n,matching):(i64,i64)=tx.query_row("SELECT count(*),sum(key=?1 AND length(grant_envelope)=60) FROM agent_projection_gaps WHERE kind='vector_key'",[&key.id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((n, matching), (1, 1));
+        tx.commit().unwrap();
     }
     storage.sync_agent_access().unwrap();
-    let checkpoint: Checkpoint =
-        serde_json::from_str(&view(&storage).preparation_checkpoint().unwrap().unwrap()).unwrap();
-    assert!(checkpoint.complete);
-    let guard = storage
-        .get_connection_named("agent_test_legacy_state")
-        .unwrap();
-    let saved: String = guard
-        .as_ref()
+    assert_eq!(
+        view(&storage).vector_page("clip_image", 0, 10).unwrap()[0].vector,
+        [1.0]
+    );
+    {
+        let guard = storage
+            .get_connection_named("agent_test_remove_packed_vector")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "DELETE FROM protected_storage_keys WHERE key_id=?1",
+                [&key.id],
+            )
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "DELETE FROM derived_embeddings WHERE subject_key='history'",
+                [],
+            )
+            .unwrap();
+    }
+    assert_eq!(authority.lock().unwrap().phase, "syncing");
+    storage.sync_agent_access().unwrap();
+    assert!(view(&storage).vector_envelope(&key.id).unwrap().is_none());
+    assert!(view(&storage)
+        .vector_page("clip_image", 0, 10)
         .unwrap()
-        .query_row(
-            "SELECT checkpoint FROM agent_access_state WHERE id=1",
-            [],
-            |r| r.get(0),
-        )
+        .is_empty());
+}
+
+#[test]
+fn locked_block_sync_coalesces_slots_and_restores_only_current_members() {
+    let (_dir, storage, authority) = fixture();
+    seed_history(&storage);
+    storage.begin_agent_access().unwrap();
+    storage.sync_agent_access().unwrap();
+    storage.credential_state.invalidate_session();
+    let rows = (0..32)
+        .map(|n| super::super::OcrResultInput {
+            text: format!("fixture row {n}"),
+            text_layout: None,
+            confidence: 1.0,
+            box_coords: vec![vec![0., 0.], vec![1., 0.], vec![1., 1.], vec![0., 1.]],
+        })
+        .collect();
+    storage
+        .commit_screenshot(42, Some(&rows), None, None)
         .unwrap();
-    let legacy: Checkpoint = serde_json::from_str(&saved).unwrap();
-    assert!(!legacy.complete);
-    assert_eq!(view(&storage).ocr(42).unwrap()[0].text, "historical OCR");
+    let slot_id = {
+        let guard = storage.get_connection_named("test_block_queue").unwrap();
+        let conn = guard.as_ref().unwrap();
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM agent_projection_gaps WHERE kind='ocr_block' AND length(grant_envelope)=60",[],|r|r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        conn.query_row(
+            "SELECT id FROM ocr_results WHERE screenshot_id=42 AND ocr_block_slot=7",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    storage.sync_agent_access().unwrap();
+    assert_eq!(view(&storage).ocr(42).unwrap().len(), 33);
+    {
+        let guard = storage
+            .get_connection_named("test_block_visibility")
+            .unwrap();
+        let conn = guard.as_ref().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("UPDATE ocr_results SET is_deleted=1 WHERE id=?1", [slot_id])
+            .unwrap();
+        tx.rollback().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM agent_projection_gaps", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        conn.execute("UPDATE ocr_results SET is_deleted=1 WHERE id=?1", [slot_id])
+            .unwrap();
+    }
+    storage.sync_agent_access().unwrap();
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    assert_eq!(view(&storage).ocr(42).unwrap().len(), 32);
+    {
+        let guard = storage
+            .get_connection_named("test_block_unhide_slot")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE ocr_results SET is_deleted=0 WHERE id=?1", [slot_id])
+            .unwrap();
+    }
+    // Source visibility changed before publication. The old mask must still deny this slot.
+    assert!(view(&storage).ocr_ids(&[slot_id]).is_err());
+    storage.sync_agent_access().unwrap();
+    assert_eq!(view(&storage).ocr_ids(&[slot_id]).unwrap().len(), 1);
+    {
+        let guard = storage
+            .get_connection_named("test_block_hide_slot")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE ocr_results SET is_deleted=1 WHERE id=?1", [slot_id])
+            .unwrap();
+    }
+    storage.sync_agent_access().unwrap();
+    {
+        let guard = storage
+            .get_connection_named("test_block_delete_parent")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET is_deleted=1 WHERE id=42", [])
+            .unwrap();
+    }
+    storage.sync_agent_access().unwrap();
+    assert!(view(&storage).ocr(42).unwrap().is_empty());
+    {
+        let guard = storage
+            .get_connection_named("test_block_restore_parent")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET is_deleted=0 WHERE id=42", [])
+            .unwrap();
+    }
+    storage.credential_state.update_auth_time();
+    storage.sync_agent_access().unwrap();
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    let restored = view(&storage).ocr(42).unwrap();
+    assert_eq!(restored.len(), 32);
+    assert!(restored.iter().all(|r| r.ocr_id != slot_id));
+    // Both parent transitions can land before either batch is consumed.
+    {
+        let guard = storage
+            .get_connection_named("test_coalesced_parent_restore")
+            .unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "BEGIN;UPDATE screenshots SET is_deleted=1 WHERE id=42;
+            UPDATE screenshots SET is_deleted=0 WHERE id=42;COMMIT;",
+            )
+            .unwrap();
+    }
+    storage.sync_agent_access().unwrap();
+    assert_eq!(authority.lock().unwrap().phase, "ready");
+    assert_eq!(view(&storage).ocr(42).unwrap().len(), 32);
 }
 
 #[test]
@@ -903,6 +1118,14 @@ fn source_pages_seek_native_ids_and_project_only_the_selected_history() {
         assert_eq!(&keys[..3], ["9", "10", "11"]);
     }
     assert_eq!(projected.load(Ordering::Relaxed), 128 + 1 + 128);
+    conn.execute(
+        "UPDATE screenshots SET window_title_enc=zeroblob(2200000) WHERE id=2",
+        [],
+    )
+    .unwrap();
+    assert_eq!(source_query_keys(conn, "snapshot", "", None).0, ["1"]);
+    assert_eq!(source_query_keys(conn, "snapshot", "1", None).0, ["2"]);
+    assert_eq!(source_query_keys(conn, "snapshot", "2", None).0[0], "3");
 
     conn.execute_batch(
         "INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,

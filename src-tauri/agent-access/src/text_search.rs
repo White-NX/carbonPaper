@@ -38,7 +38,10 @@ pub(crate) fn ocr(
     let categories: Vec<String> =
         serde_json::from_value(args["categories"].clone()).unwrap_or_default();
     let fuzzy = args["fuzzy"].as_bool().unwrap_or(true);
-    let mut ranked = Vec::new();
+    // Retain only the winning identity and score per screenshot. OCR bodies,
+    // evidence and links are hydrated again only for the requested page.
+    let mut winners = crate::ranking::PageRanking::new(page.offset + page.limit);
+    let mut matched = roaring::RoaringTreemap::new();
     let source = repo.source()?;
     let candidates = if short {
         None
@@ -57,52 +60,59 @@ pub(crate) fn ocr(
             break;
         };
         cursor = *last;
-        let mut scoped = Vec::new();
-        let mut snapshots = std::collections::HashMap::new();
-        for id in ids {
-            let Some(snapshot) = repo.ocr_snapshot(id)? else {
-                continue;
-            };
-            if !range.contains(snapshot.captured_at_ms)
-                || !processes.is_empty()
-                    && !snapshot
-                        .process_name
-                        .as_ref()
-                        .is_some_and(|v| processes.contains(v))
-                || !categories.is_empty()
-                    && !snapshot
-                        .category
-                        .as_ref()
-                        .is_some_and(|v| categories.contains(v))
-            {
-                continue;
-            }
-            snapshots.insert(snapshot.screenshot_id, snapshot);
-            scoped.push(id);
-        }
+        let owners = source.ocr_owners(&ids)?;
+        let shots: HashSet<_> = owners.iter().map(|v| v.1).collect();
+        let headers = repo.search_headers(&shots.into_iter().collect::<Vec<_>>())?;
+        let scoped: Vec<_> = owners
+            .into_iter()
+            .filter_map(|(id, shot)| {
+                let header = headers.get(&shot)?;
+                (range.contains(header.captured_at_ms)
+                    && (processes.is_empty()
+                        || header
+                            .process_name
+                            .as_ref()
+                            .is_some_and(|p| processes.contains(p)))
+                    && (categories.is_empty()
+                        || header
+                            .category
+                            .as_ref()
+                            .is_some_and(|v| categories.contains(v))))
+                .then_some(id)
+            })
+            .collect();
         for row in repo.ocr_ids(&scoped)? {
             let rank = search_rank::score_text(&plan, &row.text);
             if rank.matched && (fuzzy || rank.literal) {
-                let snapshot = snapshots[&row.screenshot_id].clone();
-                ranked.push((row, snapshot, rank));
+                matched.insert(row.screenshot_id as u64);
+                winners.insert(crate::ranking::Hit {
+                    score: rank.score,
+                    secondary: headers
+                        .get(&row.screenshot_id)
+                        .ok_or("AGENT_SOURCE_CHANGED")?
+                        .captured_at_ms,
+                    row: row.ocr_id,
+                    screenshot: row.screenshot_id,
+                });
             }
         }
     }
-    ranked.sort_by(|a, b| {
-        b.2.score
-            .total_cmp(&a.2.score)
-            .then_with(|| b.1.captured_at_ms.cmp(&a.1.captured_at_ms))
-            .then_with(|| a.0.ocr_id.cmp(&b.0.ocr_id))
-    });
-    // One representative OCR row per screenshot, as in the interactive tool.
-    let mut seen = HashSet::new();
-    ranked.retain(|r| seen.insert(r.0.screenshot_id));
-    let total = ranked.len();
-    let rows: Vec<_> = ranked
+    let total = matched.len() as usize;
+    let ids: Vec<_> = winners.page(page.offset).map(|hit| hit.row).collect();
+    let mut hydrated: HashMap<_, _> = repo
+        .ocr_ids(&ids)?
         .into_iter()
-        .skip(page.offset)
-        .take(page.limit)
+        .map(|r| (r.ocr_id, r))
         .collect();
+    let mut rows = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row = hydrated.remove(&id).ok_or("AGENT_SOURCE_CHANGED")?;
+        let snapshot = repo
+            .snapshot(row.screenshot_id)?
+            .ok_or("AGENT_SOURCE_CHANGED")?;
+        let rank = search_rank::score_text(&plan, &row.text);
+        rows.push((row, snapshot, rank));
+    }
     let mut split_cards = HashSet::new();
     if filter.filters_bank_cards() {
         let screenshots: Vec<_> = rows
@@ -110,14 +120,8 @@ pub(crate) fn ocr(
             .filter(|(row, _, _)| pii::is_bank_card_fragment(&row.text))
             .map(|(row, _, _)| row.screenshot_id)
             .collect();
-        let mut blocks_by_screenshot = HashMap::<_, Vec<_>>::new();
-        for block in repo.ocr_for_screenshots(&screenshots)? {
-            blocks_by_screenshot
-                .entry(block.screenshot_id)
-                .or_default()
-                .push(block);
-        }
-        for blocks in blocks_by_screenshot.into_values() {
+        for shot in screenshots {
+            let blocks = repo.ocr_for_screenshots(&[shot])?;
             let marked = pii::split_bank_card_blocks(&ocr_layout(&blocks));
             split_cards.extend(
                 blocks

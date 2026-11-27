@@ -26,7 +26,7 @@ fn key_aad(
 ) -> Result<Vec<u8>, String> {
     if !matches!(
         domain,
-        "bootstrap" | "hmac" | "ocr" | "vectors" | "recap_search"
+        "bootstrap" | "hmac" | "ocr" | "ocr_block" | "vectors" | "recap_search"
     ) || !matches!(digest.len(), 0 | 32)
     {
         return Err("AGENT_INVALID_KEY_SCOPE".into());
@@ -250,6 +250,17 @@ impl ArchiveReader {
 
     pub fn ocr_for_screenshots(&self, ids: &[i64]) -> Result<Vec<RawOcr>, String> {
         self.ocr_query("o.screenshot_id IN (SELECT value FROM json_each(?1))", ids)
+    }
+
+    pub fn ocr_owners(&self, ids: &[i64]) -> Result<Vec<(i64, i64)>, String> {
+        let mut stmt = storage(self.conn.prepare_cached("SELECT o.id,o.screenshot_id FROM json_each(?1) j
+            CROSS JOIN ocr_results o ON o.id=j.value CROSS JOIN screenshots s ON s.id=o.screenshot_id
+            WHERE o.is_deleted=0 AND s.is_deleted=0"))?;
+        let rows = storage(stmt.query_map(
+            [serde_json::to_string(ids).map_err(|_| "AGENT_INVALID_IDS")?],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ))?;
+        storage(rows.collect())
     }
 
     pub fn ocr_ids(&self, ids: &[i64]) -> Result<Vec<RawOcr>, String> {

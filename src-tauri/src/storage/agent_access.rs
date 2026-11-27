@@ -140,13 +140,14 @@ pub(crate) struct AgentWriter {
     configured_binding: Mutex<Option<AgentViewBinding>>,
     pending: Mutex<HashMap<[u8; 32], (Instant, Vec<u8>)>>,
     pending_keys: Mutex<HashMap<[u8; 32], (Instant, Vec<u8>)>>,
-    vector_keys: Mutex<HashMap<String, VectorAccess>>,
+    vector_keys: Mutex<HashMap<String, (Instant, Vec<u8>)>>,
     progress: Mutex<AgentPreparationProgress>,
     pub(super) sync_lock: Mutex<()>,
     started: AtomicBool,
     stopped: AtomicBool,
     cancelled: AtomicBool,
     configured: AtomicBool,
+    reclaim_pending: AtomicBool,
     fence_batch_unsupported: AtomicBool,
     #[cfg(test)]
     authority: Mutex<Option<Arc<dyn Fn(Request) -> Result<Response, String> + Send + Sync>>>,
@@ -374,27 +375,29 @@ impl AgentWriter {
         if key.purpose != "vectors" || key.dataset != binding.dataset_id {
             return;
         }
-        if self
-            .vector_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&key.id)
         {
-            return;
+            let mut staged = self.vector_keys.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((last_used, _)) = staged.get_mut(&key.id) {
+                *last_used = Instant::now();
+                return;
+            }
         }
         let Ok(sealed) = self.wrap_access_key("vectors", &key.id, &[], key.bytes()) else {
             return;
         };
-        self.vector_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                key.id.clone(),
-                VectorAccess {
-                    key_id: key.id.clone(),
-                    key_envelope: sealed,
-                },
-            );
+        let mut staged = self.vector_keys.lock().unwrap_or_else(|e| e.into_inner());
+        // Once delivered, grants are also available from the encrypted sidecar.
+        // Bound transient staging even as long-running workers rotate domain keys.
+        if staged.len() >= 128 {
+            if let Some(oldest) = staged
+                .iter()
+                .min_by_key(|(_, v)| v.0)
+                .map(|(id, _)| id.clone())
+            {
+                staged.remove(&oldest);
+            }
+        }
+        staged.insert(key.id.clone(), (Instant::now(), sealed));
     }
     fn prepare_live_projection(&self, kind: &str, value: &mut Value) -> Result<(), String> {
         match kind {
@@ -433,7 +436,7 @@ impl AgentWriter {
                     .ok_or("AGENT_INVALID_VECTOR_ACCESS")?
                     .to_ascii_lowercase();
                 let keys = self.vector_keys.lock().unwrap_or_else(|e| e.into_inner());
-                value["key_envelope"] = json!(keys.get(&id).map(|v| hex::encode(&v.key_envelope)));
+                value["key_envelope"] = json!(keys.get(&id).map(|(_, sealed)| hex::encode(sealed)));
                 value["key_id"] = json!(id);
             }
             "ocr" | "recap" => {
@@ -622,6 +625,54 @@ impl AgentWriter {
         db(conn
             .create_scalar_function("cp_agent_enabled", 0, flags, move |_| Ok(writer.enabled())))?;
         let writer = self.clone();
+        let vector_writer = self.clone();
+        db(
+            conn.create_scalar_function("cp_agent_vector_key", 1, flags, move |args| {
+                let id: String = args.get(0)?;
+                let staged = vector_writer
+                    .vector_keys
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                Ok(staged.get(&id).map(|(_, sealed)| sealed.clone()))
+            }),
+        )?;
+        let ranges = revisions.clone();
+        db(
+            conn.create_scalar_function("cp_agent_revision", 0, flags, move |args| {
+                let binding = writer
+                    .binding()
+                    .ok_or_else(|| sql_error("AGENT_ACCESS_DISABLED".into()))?;
+                // SAFETY: same callback thread, inspect transaction state only.
+                let conn = unsafe { args.get_connection() }?;
+                let writing = !conn.is_autocommit()
+                    && conn.transaction_state(Some("main"))? == rusqlite::TransactionState::Write;
+                writer
+                    .next_revision(&binding, writing.then_some(ranges.as_ref()))
+                    .map_err(sql_error)
+            }),
+        )?;
+        let writer = self.clone();
+        db(
+            conn.create_scalar_function("cp_agent_block_key", 4, flags, move |args| {
+                let id: i64 = args.get(0)?;
+                let shot: i64 = args.get(1)?;
+                let tag: Vec<u8> = args.get(2)?;
+                let wrapped: Vec<u8> = args.get(3)?;
+                let Some(key) = writer.staged_row_key(&Sha256::digest(&wrapped).into()) else {
+                    return Ok(None::<Vec<u8>>);
+                };
+                let binding = writer
+                    .binding()
+                    .ok_or_else(|| sql_error("AGENT_ACCESS_DISABLED".into()))?;
+                super::ocr_keys::verify_scope(&key, &binding.dataset_id, shot, id, &tag)
+                    .map_err(|_| sql_error("AGENT_INVALID_OCR_SCOPE".into()))?;
+                writer
+                    .wrap_access_key("ocr_block", &id.to_string(), &tag, &key)
+                    .map(Some)
+                    .map_err(sql_error)
+            }),
+        )?;
+        let writer = self.clone();
         db(
             conn.create_scalar_function("cp_agent_emit", 4, flags, move |args| {
                 if !writer.enabled() {
@@ -778,6 +829,28 @@ fn live_projection(
     let record = decode_projection(kind, value)?;
     Ok(TextChange::Put { record })
 }
+fn block_projection(value: Value) -> Result<(OcrBlockAccess, Vec<u8>), String> {
+    #[derive(Deserialize)]
+    struct Projection {
+        block_id: i64,
+        screenshot_id: i64,
+        scope_tag: String,
+        key_enc: String,
+        slots: Vec<usize>,
+    }
+    let p: Projection = serde_json::from_value(value).map_err(|_| "AGENT_INVALID_OCR_SOURCE")?;
+    Ok((
+        OcrBlockAccess {
+            block_id: p.block_id,
+            screenshot_id: p.screenshot_id,
+            slots: OcrBlockAccess::slot_mask(&p.slots)?,
+            scope_tag: hex::decode(p.scope_tag).map_err(|_| "AGENT_INVALID_OCR_SOURCE")?,
+            key_envelope: Vec::new(),
+        },
+        hex::decode(p.key_enc).map_err(|_| "AGENT_INVALID_OCR_SOURCE")?,
+    ))
+}
+
 fn decode_projection(kind: &str, mut value: Value) -> Result<TextRecord, String> {
     let decode =
         |value| serde_json::from_value(value).map_err(|e| format!("AGENT_INVALID_RECORD: {e}"));
@@ -893,9 +966,9 @@ fn decode_projection(kind: &str, mut value: Value) -> Result<TextRecord, String>
 
 impl StorageState {
     pub(super) fn init_agent_access_tables(&self, conn: &Connection) -> Result<(), String> {
-        db(conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_access_state(id INTEGER PRIMARY KEY CHECK(id=1),binding TEXT NOT NULL,checkpoint TEXT NOT NULL);
+        db(conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_access_state(id INTEGER PRIMARY KEY CHECK(id=1),binding TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS agent_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,envelope BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS agent_projection_gaps(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL,PRIMARY KEY(kind,key));
+            CREATE TABLE IF NOT EXISTS agent_projection_gaps(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL,grant_envelope BLOB,PRIMARY KEY(kind,key));
             CREATE VIEW IF NOT EXISTS agent_ocr_source AS
                 SELECT o.id, o.screenshot_id, o.is_deleted, o.text_hash,
                     CASE WHEN o.ocr_block_slot IS NULL THEN cp_agent_digest(o.text_enc)
@@ -912,6 +985,21 @@ impl StorageState {
                     WHERE json_type(NEW.envelope,'$.gap_kind')='text'
                     ON CONFLICT(kind,key) DO UPDATE SET revision=excluded.revision,operation=excluded.operation WHERE agent_projection_gaps.revision<excluded.revision;
             END;"))?;
+        // Drop the retired source-side cursor so existing development archives
+        // can store a fresh binding when unattended access is enabled again.
+        if db(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_access_state') WHERE name='checkpoint')",
+            [],
+            |r| r.get::<_, bool>(0),
+        ))? {
+            db(conn.execute_batch("ALTER TABLE agent_access_state DROP COLUMN checkpoint"))?;
+        }
+        StorageState::add_column_if_missing(
+            conn,
+            "agent_projection_gaps",
+            "grant_envelope",
+            "BLOB",
+        )?;
         install_triggers(conn)
     }
     pub(super) fn restore_agent_access(&self, conn: &Connection) -> Result<(), String> {
@@ -981,6 +1069,9 @@ impl StorageState {
             return Err("AGENT_WRITE_KEY_UNAVAILABLE".into());
         };
         self.agent_writer.install_keys(keys)?;
+        self.agent_writer
+            .reclaim_pending
+            .store(true, Ordering::Release);
         self.agent_writer.progress_phase("syncing", None);
         Ok(())
     }
@@ -1034,10 +1125,6 @@ impl StorageState {
                 }
             }
             let mut repo = AgentRepository::open(&path, &keys.content_key.0, &binding, false)?;
-            repo.configure_source(
-                &self.database_key()?,
-                &self.credential_state.get_hmac_key()?,
-            )?;
             let Response::AgentStatus(status) =
                 self.agent_writer.request(Request::AgentStatus {})?
             else {
@@ -1050,20 +1137,19 @@ impl StorageState {
                 baseline: status.source_revision,
                 complete: false,
             };
-            repo.apply_preparation_batch(
-                &[],
-                &serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?,
+            let cursor = serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?;
+            repo.configure_source_at(
+                &self.database_key()?,
+                &self.credential_state.get_hmac_key()?,
+                Some((&cursor, checkpoint.baseline)),
             )?;
             let guard = self.get_connection_named("agent_prepare_state")?;
             let conn = guard.as_ref().unwrap();
             db(conn.execute(
-                "INSERT INTO agent_access_state VALUES(1,?1,?2)",
-                params![
-                    serde_json::to_string(&binding).map_err(|e| e.to_string())?,
-                    serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?
-                ],
+                "INSERT INTO agent_access_state(id,binding) VALUES(1,?1)",
+                [serde_json::to_string(&binding).map_err(|e| e.to_string())?],
             ))?;
-            let total=db(conn.query_row("SELECT (SELECT COUNT(*) FROM screenshots WHERE is_deleted=0)+(SELECT COUNT(*) FROM ocr_results WHERE is_deleted=0)+(SELECT COUNT(*) FROM smart_clusters)+(SELECT COUNT(*) FROM smart_cluster_summaries)+(SELECT COUNT(*) FROM smart_cluster_assignments)+(SELECT COUNT(*) FROM recap_days)+(SELECT COUNT(*) FROM recap_payloads WHERE kind IN ('batch','summary','corrections','threads','search'))+(SELECT COUNT(*) FROM derived_embeddings)",[],|r|r.get::<_,i64>(0)))?.max(0) as u64;
+            let total=db(conn.query_row("SELECT (SELECT COUNT(*) FROM screenshots WHERE is_deleted=0)+((SELECT COUNT(*) FROM ocr_results)-(SELECT COALESCE(SUM(k.live_rows),0) FROM ocr_blocks b JOIN ocr_keys k ON k.id=b.id))+(SELECT COUNT(*) FROM ocr_blocks)+(SELECT COUNT(*) FROM smart_clusters)+(SELECT COUNT(*) FROM smart_cluster_summaries)+(SELECT COUNT(*) FROM smart_cluster_assignments)+(SELECT COUNT(*) FROM recap_days)+(SELECT COUNT(*) FROM recap_payloads WHERE kind IN ('batch','summary','corrections','threads','search'))+(SELECT COUNT(*) FROM protected_storage_keys WHERE purpose='vectors')",[],|r|r.get::<_,i64>(0)))?.max(0) as u64;
             *self
                 .agent_writer
                 .progress
@@ -1160,6 +1246,65 @@ impl StorageState {
             }
         });
     }
+    fn open_agent_writer(&self, binding: &AgentViewBinding) -> Result<AgentRepository, String> {
+        let key = self
+            .agent_writer
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .ok_or("AGENT_WRITE_KEY_UNAVAILABLE")?
+            .content
+            .clone();
+        let path = Path::new(&binding.view_path);
+        let missing = !path.try_exists().map_err(|e| e.to_string())?;
+        let replacement = if missing {
+            Some(self.agent_rebuild_checkpoint(binding)?)
+        } else {
+            None
+        };
+        let mut repo = AgentRepository::open(path, &key, binding, false)?;
+        if !repo.source_configured()? {
+            let (cursor, baseline) = match replacement {
+                Some(checkpoint) => checkpoint,
+                None => self.agent_rebuild_checkpoint(binding)?,
+            };
+            repo.configure_source_at(
+                &self.database_key()?,
+                &self.credential_state.get_hmac_key()?,
+                Some((&cursor, baseline)),
+            )?;
+        }
+        Ok(repo)
+    }
+
+    fn agent_rebuild_checkpoint(
+        &self,
+        binding: &AgentViewBinding,
+    ) -> Result<(String, i64), String> {
+        if !self.is_session_valid() {
+            return Err("AUTH_REQUIRED".into());
+        }
+        let guard = self.get_connection_named("agent_rebuild_fence")?;
+        let tx = db(rusqlite::Transaction::new_unchecked(
+            guard.as_ref().unwrap(),
+            rusqlite::TransactionBehavior::Immediate,
+        ))?;
+        let baseline = self.agent_writer.next_revision(binding, None)?;
+        db(tx.commit())?;
+        let checkpoint = Checkpoint {
+            generation: binding.generation.clone(),
+            phase: 0,
+            cursor: String::new(),
+            baseline,
+            complete: false,
+        };
+        Ok((
+            serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?,
+            baseline,
+        ))
+    }
+
     pub(crate) fn sync_agent_access(&self) -> Result<(), String> {
         let _activity = self.foreground_db_activity.background_read("agent_export");
         if self.agent_maintenance_pending() {
@@ -1184,6 +1329,14 @@ impl StorageState {
         let Some(binding) = self.agent_binding() else {
             return Ok(());
         };
+        if self.agent_preparation().phase == "ready"
+            && !Path::new(&binding.view_path)
+                .try_exists()
+                .map_err(|e| e.to_string())?
+        {
+            self.agent_writer.next_revision(&binding, None)?;
+            self.agent_writer.progress_phase("syncing", None);
+        }
         if self.agent_preparation().phase == "ready" {
             let pending = {
                 let guard = self.get_connection_named("agent_sync_pending")?;
@@ -1198,40 +1351,23 @@ impl StorageState {
                         && status.phase == "ready"
                         && status.source_revision == status.applied_revision
                     {
+                        if self.agent_writer.reclaim_pending.load(Ordering::Acquire) {
+                            let mut repo = self.open_agent_writer(&binding)?;
+                            self.agent_writer
+                                .reclaim_pending
+                                .store(repo.reclaim_batch()?, Ordering::Release);
+                        }
                         return Ok(());
                     }
                 }
             }
         }
-        let mut repo = {
-            let keys = self
-                .agent_writer
-                .keys
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let keys = keys.as_ref().ok_or("AGENT_WRITE_KEY_UNAVAILABLE")?;
-            AgentRepository::open(
-                Path::new(&binding.view_path),
-                &keys.content,
-                &binding,
-                false,
-            )?
-        };
-        let mut checkpoint: Checkpoint = {
-            let value = match repo.preparation_checkpoint()? {
-                Some(value) => value,
-                // Resume an older preparation from its last durable source
-                // cursor. Its next page migrates the cursor into the Agent DB.
-                None => self.with_read_connection_named("agent_checkpoint", |conn| {
-                    db(conn.query_row(
-                        "SELECT checkpoint FROM agent_access_state WHERE id=1",
-                        [],
-                        |r| r.get::<_, String>(0),
-                    ))
-                })?,
-            };
-            serde_json::from_str(&value).map_err(|_| "AGENT_INVALID_CHECKPOINT")?
-        };
+        let mut repo = self.open_agent_writer(&binding)?;
+        let cursor = repo
+            .preparation_checkpoint()?
+            .ok_or("AGENT_INVALID_CHECKPOINT")?;
+        let mut checkpoint: Checkpoint =
+            serde_json::from_str(&cursor).map_err(|_| "AGENT_INVALID_CHECKPOINT")?;
         if checkpoint.generation != binding.generation {
             return Err("AGENT_DATASET_MISMATCH".into());
         }
@@ -1258,16 +1394,37 @@ impl StorageState {
                     timings = PreparationTimings::new(kind);
                 }
                 let read_started = Instant::now();
-                let rows = self.agent_source_page(source, &checkpoint.cursor, None)?;
+                // Most archives contain almost exclusively packed OCR. Advance over a
+                // bounded raw ID window even when it has no inline OCR.
+                let upper = if kind == "ocr" {
+                    let cursor = if checkpoint.cursor.is_empty() {
+                        0
+                    } else {
+                        checkpoint
+                            .cursor
+                            .parse()
+                            .map_err(|_| "AGENT_INVALID_SOURCE_KEY")?
+                    };
+                    self.with_read_connection_named("agent_inline_ocr_window",|conn|db(conn.query_row(
+                        "SELECT max(id) FROM (SELECT id FROM ocr_results WHERE id>?1 ORDER BY id LIMIT 8192)",[cursor],|r|r.get::<_,Option<i64>>(0))))?
+                } else {
+                    None
+                };
+                let rows =
+                    self.agent_source_page_bounded(source, &checkpoint.cursor, None, upper)?;
                 timings.read += read_started.elapsed();
-                let complete = rows.is_empty();
+                let complete = rows.is_empty() && upper.is_none();
                 let processed = rows.len() as u64;
                 let mut events = Vec::with_capacity(rows.len());
                 if complete {
                     checkpoint.phase += 1;
                     checkpoint.cursor.clear();
                 } else {
-                    let cursor = rows.last().unwrap().0.clone();
+                    let cursor = rows
+                        .last()
+                        .map(|row| row.0.clone())
+                        .or_else(|| upper.map(|id| id.to_string()))
+                        .ok_or("AGENT_INVALID_SOURCE_KEY")?;
                     let hydrate_started = Instant::now();
                     let prepared =
                         self.prepare_agent_history_keys(kind, &rows, &mut timings.row_keys)?;
@@ -1335,7 +1492,7 @@ impl StorageState {
         if self.is_session_valid() {
             let mut row_key_timings = RowKeyDecryptTimings::default();
             let prepared = PreparedHistoryKeys::new();
-            for (kind, key, revision) in repo.gaps()? {
+            for (kind, key, revision) in repo.repairable_gap_batch()? {
                 if self.agent_maintenance_pending() {
                     return Ok(());
                 }
@@ -1346,7 +1503,10 @@ impl StorageState {
                     return Err("AGENT_INVALID_GAP".into());
                 };
                 let rows = self.agent_source_page(source, "", Some(&key))?;
-                if rows.is_empty() {
+                if rows.is_empty()
+                    || (kind == "ocr_block"
+                        && rows[0].1["slots"].as_array().is_some_and(Vec::is_empty))
+                {
                     repo.apply(&ExportEvent {
                         dataset_id: binding.dataset_id.clone(),
                         generation: binding.generation.clone(),
@@ -1373,10 +1533,9 @@ impl StorageState {
                         }
                     }
                 }
-                repo.clear_gap(&kind, &key, revision)?;
             }
         }
-        if !repo.has_gaps()? {
+        if !repo.has_content_gaps()? {
             self.sync_agent_ocr_index(&repo)?;
         }
         if self.agent_maintenance_pending() {
@@ -1389,8 +1548,11 @@ impl StorageState {
             .unwrap_or_else(|| json!(crate::sensitive_filter::SensitiveFilterConfig::default()));
         let privacy = decode_projection("privacy", config)?;
         let guard = self.get_connection_named("agent_publish")?;
-        let conn = guard.as_ref().unwrap();
-        let pending: bool = db(conn.query_row(
+        let source_tx = db(rusqlite::Transaction::new_unchecked(
+            guard.as_ref().unwrap(),
+            rusqlite::TransactionBehavior::Immediate,
+        ))?;
+        let pending: bool = db(source_tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_outbox UNION ALL SELECT 1 FROM agent_projection_gaps)",
             [],
             |r| r.get(0),
@@ -1412,14 +1574,27 @@ impl StorageState {
             change: TextChange::Put { record: privacy },
         })?;
         let complete = !repo.has_gaps()?;
-        self.agent_writer.request(Request::AgentPublish {
+        let Response::Ok = self.agent_writer.request(Request::AgentPublish {
             generation: binding.generation,
             revision: status.source_revision,
             complete,
-        })?;
+        })?
+        else {
+            return Err("AGENT_INVALID_STATUS".into());
+        };
+        if complete {
+            repo.seal_revision(status.source_revision)?;
+        }
+        db(source_tx.commit())?;
+        drop(guard);
+        self.agent_writer
+            .reclaim_pending
+            .store(repo.reclaim_batch()?, Ordering::Release);
         self.agent_writer.progress_phase(
             if complete {
                 "ready"
+            } else if self.is_session_valid() {
+                "syncing"
             } else {
                 "waiting_for_unlock"
             },
@@ -1442,14 +1617,14 @@ impl StorageState {
             if self.agent_writer.cancelled.load(Ordering::Acquire) {
                 return Err("AGENT_CANCELLED".into());
             }
-            let rows = repo.unindexed_ocr(0, 32)?;
+            let rows = repo.unindexed_ocr_with_digests(0, 32)?;
             if rows.is_empty() {
                 return Ok(());
             }
             let hmac = repo.source_hmac_key()?;
             let mut row_digests = Vec::with_capacity(rows.len());
             let mut tokens = BTreeMap::<String, roaring::RoaringBitmap>::new();
-            for mut row in rows {
+            for (mut row, digest) in rows {
                 let id = u32::try_from(row.ocr_id).map_err(|_| "AGENT_INDEX_ID_UNSUPPORTED")?;
                 let plaintext = Zeroizing::new(std::mem::take(&mut row.text));
                 for term in Self::bigram_tokenize(&plaintext) {
@@ -1458,10 +1633,7 @@ impl StorageState {
                         .or_default()
                         .insert(id);
                 }
-                row_digests.push((
-                    row.ocr_id,
-                    hex::encode(repo.ocr_payload_digest(row.ocr_id)?),
-                ));
+                row_digests.push((row.ocr_id, hex::encode(digest)));
             }
             let guard = self.get_connection_named("agent_index_write")?;
             let conn = guard.as_ref().unwrap();
@@ -1493,6 +1665,52 @@ impl StorageState {
             db(tx.commit())?;
         }
     }
+    fn refresh_agent_block(
+        &self,
+        repo: &AgentRepository,
+        id: &str,
+        sealed: Option<Vec<u8>>,
+    ) -> Result<TextChange, String> {
+        let (sql, args) = schema::BLOCK_SOURCE.query("", Some(id))?;
+        // Read committed references only. Locked capture can finalize membership
+        // without acquiring an archive private key or opening the OCR payload.
+        let payload: Option<String> =
+            self.with_read_connection_named("agent_block_refresh", |conn| {
+                db(conn
+                    .query_row(&sql, rusqlite::params_from_iter(args), |r| r.get(1))
+                    .optional())
+            })?;
+        let delete = || TextChange::Delete {
+            kind: "ocr_block".into(),
+            key: id.into(),
+        };
+        let Some(payload) = payload else {
+            return Ok(delete());
+        };
+        let (mut grant, _) = block_projection(
+            serde_json::from_str(&payload).map_err(|_| "AGENT_INVALID_OCR_SOURCE")?,
+        )?;
+        if grant.slots.is_empty() {
+            return Ok(delete());
+        }
+        let envelope = match sealed {
+            Some(key) => Some(key),
+            None => repo.block_envelope(grant.block_id, grant.screenshot_id, &grant.scope_tag)?,
+        };
+        match envelope {
+            Some(key) => {
+                grant.key_envelope = key;
+                Ok(TextChange::Put {
+                    record: TextRecord::OcrBlock(grant),
+                })
+            }
+            None => Ok(TextChange::Gap {
+                kind: "ocr_block".into(),
+                key: id.into(),
+            }),
+        }
+    }
+
     fn apply_agent_outbox(
         &self,
         binding: &AgentViewBinding,
@@ -1518,19 +1736,32 @@ impl StorageState {
                 };
                 let conn = guard.as_ref().unwrap();
                 let mut statement = db(conn.prepare(
-                    "SELECT kind,key,revision,operation FROM agent_projection_gaps ORDER BY revision LIMIT 256",
+                    "SELECT kind,key,revision,operation,grant_envelope FROM agent_projection_gaps ORDER BY rowid LIMIT 128",
                 ))?;
-                let gaps: Vec<(String, String, i64, String)> =
-                    db(db(statement
-                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))))?
-                    .collect())?;
+                let gaps: Vec<(String, String, i64, String, Option<Vec<u8>>)> = db(db(statement
+                    .query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    }))?
+                .collect())?;
                 let mut statement = db(conn.prepare(
                     "SELECT id,envelope FROM agent_outbox WHERE id>?1 ORDER BY id LIMIT 256",
                 ))?;
-                let rows: Vec<(i64, Vec<u8>)> = db(db(
-                    statement.query_map([applied], |r| Ok((r.get(0)?, r.get(1)?)))
-                )?
-                .collect())?;
+                let mut rows = Vec::new();
+                let mut total_bytes = 0;
+                let mut cursor = db(statement.query([applied]))?;
+                while let Some(r) = db(cursor.next())? {
+                    let bytes = db(r.get_ref(1))?
+                        .as_blob()
+                        .map_err(|_| "AGENT_INVALID_EVENT")?;
+                    if bytes.len() > 32 * 1024 * 1024 {
+                        return Err("AGENT_INVALID_EVENT".into());
+                    }
+                    if !rows.is_empty() && total_bytes + bytes.len() > 4 * 1024 * 1024 {
+                        break;
+                    }
+                    total_bytes += bytes.len();
+                    rows.push((db(r.get::<_, i64>(0))?, bytes.to_vec()));
+                }
                 let pending_ack: bool = db(conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM agent_outbox WHERE id<=?1)",
                     [applied],
@@ -1554,7 +1785,10 @@ impl StorageState {
                     .clone()
             };
             let mut events = Vec::with_capacity(gaps.len() + rows.len());
-            for (kind, key, revision, operation) in &gaps {
+            for (kind, key, revision, operation, _) in &gaps {
+                if matches!(operation.as_str(), "block" | "vector_grant") {
+                    continue;
+                }
                 let change = match operation.as_str() {
                     "delete" => TextChange::Delete {
                         kind: kind.clone(),
@@ -1579,6 +1813,40 @@ impl StorageState {
                     return Err("AGENT_CANCELLED".into());
                 }
                 events.push(open_event(&outbox_key, binding, &bytes)?);
+            }
+            for (kind, id, revision, op, sealed) in &gaps {
+                if op == "vector_grant" && kind == "vector_key" {
+                    let envelope = match sealed {
+                        Some(v) => Some(v.clone()),
+                        None => repo.vector_envelope(id)?,
+                    };
+                    let change = match envelope {
+                        Some(key_envelope) => TextChange::Put {
+                            record: TextRecord::VectorAccess(VectorAccess {
+                                key_id: id.clone(),
+                                key_envelope,
+                            }),
+                        },
+                        None => TextChange::Gap {
+                            kind: kind.clone(),
+                            key: id.clone(),
+                        },
+                    };
+                    events.push(ExportEvent {
+                        dataset_id: binding.dataset_id.clone(),
+                        generation: binding.generation.clone(),
+                        revision: *revision,
+                        change,
+                    });
+                }
+                if op == "block" && kind == "ocr_block" {
+                    events.push(ExportEvent {
+                        dataset_id: binding.dataset_id.clone(),
+                        generation: binding.generation.clone(),
+                        revision: *revision,
+                        change: self.refresh_agent_block(repo, id, sealed.clone())?,
+                    });
+                }
             }
             if self.agent_maintenance_pending() {
                 return Ok(());
@@ -1605,7 +1873,7 @@ impl StorageState {
                 let mut ack = db(tx.prepare(
                     "DELETE FROM agent_projection_gaps WHERE kind=?1 AND key=?2 AND revision<=?3",
                 ))?;
-                for (kind, key, revision, _) in gaps {
+                for (kind, key, revision, _, _) in gaps {
                     db(ack.execute(params![kind, key, revision]))?;
                 }
             }
@@ -1622,10 +1890,20 @@ impl StorageState {
         cursor: &str,
         key: Option<&str>,
     ) -> Result<Vec<(String, Value)>, String> {
+        self.agent_source_page_bounded(source, cursor, key, None)
+    }
+
+    fn agent_source_page_bounded(
+        &self,
+        source: &schema::Source,
+        cursor: &str,
+        key: Option<&str>,
+        upper: Option<i64>,
+    ) -> Result<Vec<(String, Value)>, String> {
         if !self.is_session_valid() {
             return Err("AUTH_REQUIRED".into());
         }
-        let (sql, parameters) = source.query(cursor, key)?;
+        let (sql, parameters) = source.bounded_query(cursor, key, upper)?;
         let rows: Vec<(String, String)> =
             self.with_read_connection_named("agent_export_source", |conn| {
                 AgentWriter::register_digest(conn)?;
@@ -1633,12 +1911,20 @@ impl StorageState {
                     return Err("AUTH_REQUIRED".into());
                 }
                 let mut statement = db(conn.prepare(&sql))?;
-                let rows = db(
-                    statement.query_map(rusqlite::params_from_iter(parameters), |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    }),
-                )?;
-                db(rows.collect())
+                let mut cursor = db(statement.query(rusqlite::params_from_iter(parameters)))?;
+                let mut rows = Vec::new();
+                let mut bytes = 0;
+                while let Some(row) = db(cursor.next())? {
+                    let payload = db(row.get_ref(1))?
+                        .as_str()
+                        .map_err(|_| "AGENT_INVALID_SOURCE")?;
+                    if !rows.is_empty() && bytes + payload.len() > 4 * 1024 * 1024 {
+                        break;
+                    }
+                    bytes += payload.len();
+                    rows.push((db(row.get(0))?, payload.to_owned()));
+                }
+                Ok(rows)
             })?;
         if !self.is_session_valid() {
             return Err("AUTH_REQUIRED".into());
@@ -1674,7 +1960,8 @@ impl StorageState {
         };
         for (_, value) in rows {
             match kind {
-                "ocr" => add(&value["key_enc"])?,
+                "ocr_block" if value["slots"].as_array().is_some_and(Vec::is_empty) => {}
+                "ocr" | "ocr_block" => add(&value["key_enc"])?,
                 "snapshot" => {
                     if ["window_title_enc", "process_name_enc", "page_url_enc"]
                         .iter()
@@ -1724,6 +2011,26 @@ impl StorageState {
         timings: &mut RowKeyDecryptTimings,
         prepared: &PreparedHistoryKeys,
     ) -> Result<Vec<TextRecord>, String> {
+        if kind == "ocr_block" {
+            if !self.is_session_valid() {
+                return Err("AUTH_REQUIRED".into());
+            }
+            let (mut grant, wrapped) = block_projection(value)?;
+            if grant.slots.is_empty() {
+                return Ok(Vec::new());
+            }
+            let raw = Zeroizing::new(self.unwrap_agent_history_key(&wrapped, timings, prepared)?);
+            grant.key_envelope = self.agent_writer.wrap_access_key(
+                "ocr_block",
+                &grant.block_id.to_string(),
+                &grant.scope_tag,
+                &raw,
+            )?;
+            if !self.is_session_valid() {
+                return Err("AUTH_REQUIRED".into());
+            }
+            return Ok(vec![TextRecord::OcrBlock(grant)]);
+        }
         if kind == "ocr" || kind == "vector_key" || (kind == "recap" && value["part"] == "search") {
             if !self.is_session_valid() {
                 return Err("AUTH_REQUIRED".into());

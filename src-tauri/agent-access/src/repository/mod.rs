@@ -19,10 +19,14 @@ use serde_json::json;
 use std::{collections::HashMap, path::Path};
 use zeroize::Zeroizing;
 
+mod blocks;
+mod maintenance;
+mod payload;
+mod snapshots;
 #[cfg(test)]
 mod tests;
 
-const FORMAT: &str = "2";
+const FORMAT: &str = "3";
 pub struct AgentRepository {
     pub(crate) conn: Connection,
     binding: AgentViewBinding,
@@ -101,6 +105,29 @@ pub fn open_event(
     Ok(event)
 }
 
+fn create_schema(conn: &Connection) -> Result<(), String> {
+    db(conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,
+                    screenshot_id INTEGER,cluster_id INTEGER,date TEXT,captured_at_ms INTEGER,body TEXT,PRIMARY KEY(kind,key));
+
+                CREATE INDEX IF NOT EXISTS agent_records_snapshot ON records(screenshot_id,kind) WHERE screenshot_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS agent_records_cluster ON records(cluster_id,kind) WHERE cluster_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS agent_records_day ON records(date,kind) WHERE date IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS ocr_access(ocr_id INTEGER PRIMARY KEY,screenshot_id INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,payload_digest BLOB,key_envelope BLOB);
+                CREATE INDEX IF NOT EXISTS agent_ocr_snapshot ON ocr_access(screenshot_id);
+                CREATE TABLE IF NOT EXISTS vector_access(key_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,key_envelope BLOB);
+                CREATE TABLE IF NOT EXISTS recap_search_access(key TEXT PRIMARY KEY,date TEXT NOT NULL,
+                    revision INTEGER NOT NULL,payload_revision INTEGER NOT NULL,payload_digest BLOB,key_envelope BLOB);
+                CREATE INDEX IF NOT EXISTS agent_recap_search_day ON recap_search_access(date,key);
+                CREATE TABLE IF NOT EXISTS gaps(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(kind,key));
+                CREATE INDEX IF NOT EXISTS gap_repair_order ON gaps(CASE kind WHEN 'snapshot' THEN 0 WHEN 'cluster' THEN 0 WHEN 'calendar' THEN 0 ELSE 1 END,revision) WHERE kind!='privacy';
+                CREATE TABLE IF NOT EXISTS retired_days(date TEXT PRIMARY KEY,revision INTEGER NOT NULL);"))?;
+    db(conn.execute_batch(snapshots::SCHEMA))?;
+    db(conn.execute_batch(blocks::SCHEMA))?;
+    db(conn.execute_batch(maintenance::INDEXES))
+}
+
 impl AgentRepository {
     pub fn open(
         path: &Path,
@@ -130,6 +157,9 @@ impl AgentRepository {
             return Err("AGENT_ENCRYPTION_UNAVAILABLE".into());
         }
         let existing: bool = db(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_metadata')", [], |r| r.get(0)))?;
+        if read_only && !existing {
+            return Err("AGENT_STORAGE_UNINITIALIZED".into());
+        }
         if existing {
             let format: Option<String> = db(conn
                 .query_row(
@@ -140,48 +170,41 @@ impl AgentRepository {
                 .optional())?;
             if format.as_deref() != Some(FORMAT) {
                 return Err(
-                    "AGENT_STORAGE_FORMAT_UNSUPPORTED: Prepare unattended access again".into(),
+                    "AGENT_STORAGE_FORMAT_UNSUPPORTED: Disable and re-enable unattended access"
+                        .into(),
                 );
             }
+            let saved: String = db(conn.query_row(
+                "SELECT value FROM agent_metadata WHERE key='binding'",
+                [],
+                |r| r.get(0),
+            ))?;
+            if serde_json::from_str::<AgentViewBinding>(&saved)
+                .map_err(|_| "AGENT_INVALID_BINDING")?
+                != *binding
+            {
+                return Err("AGENT_DATASET_MISMATCH".into());
+            }
         }
-        if !read_only {
-            db(conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-                CREATE TABLE IF NOT EXISTS agent_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,
-                    screenshot_id INTEGER,cluster_id INTEGER,date TEXT,captured_at_ms INTEGER,body TEXT,PRIMARY KEY(kind,key));
-                CREATE INDEX IF NOT EXISTS agent_records_time ON records(kind,captured_at_ms,key);
-                CREATE INDEX IF NOT EXISTS agent_records_snapshot ON records(screenshot_id,kind);
-                CREATE INDEX IF NOT EXISTS agent_records_cluster ON records(cluster_id,kind);
-                CREATE INDEX IF NOT EXISTS agent_records_day ON records(date,kind);
-                CREATE TABLE IF NOT EXISTS ocr_access(ocr_id INTEGER PRIMARY KEY,screenshot_id INTEGER NOT NULL,
-                    revision INTEGER NOT NULL,payload_digest BLOB,key_envelope BLOB);
-                CREATE INDEX IF NOT EXISTS agent_ocr_snapshot ON ocr_access(screenshot_id,ocr_id);
-                CREATE TABLE IF NOT EXISTS vector_access(key_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,key_envelope BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS recap_search_access(key TEXT PRIMARY KEY,date TEXT NOT NULL,
-                    revision INTEGER NOT NULL,payload_revision INTEGER NOT NULL,payload_digest BLOB,key_envelope BLOB);
-                CREATE INDEX IF NOT EXISTS agent_recap_search_day ON recap_search_access(date,key);
-                CREATE TABLE IF NOT EXISTS gaps(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(kind,key));
-                CREATE TABLE IF NOT EXISTS retired_days(date TEXT PRIMARY KEY,revision INTEGER NOT NULL);"))?;
-            db(conn.execute(
-                "INSERT OR IGNORE INTO agent_metadata VALUES('format',?1)",
-                [FORMAT],
-            ))?;
-            db(conn.execute(
-                "INSERT OR IGNORE INTO agent_metadata VALUES('binding',?1)",
-                [serde_json::to_string(binding).map_err(|_| "AGENT_INVALID_BINDING")?],
-            ))?;
-        } else {
+        if read_only {
             db(conn.execute_batch("PRAGMA query_only=ON"))?;
-        }
-        let saved: String = db(conn.query_row(
-            "SELECT value FROM agent_metadata WHERE key='binding'",
-            [],
-            |r| r.get(0),
-        ))?;
-        if serde_json::from_str::<AgentViewBinding>(&saved).map_err(|_| "AGENT_INVALID_BINDING")?
-            != *binding
-        {
-            return Err("AGENT_DATASET_MISMATCH".into());
+        } else {
+            if !existing {
+                db(conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL"))?;
+            }
+            db(conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"))?;
+            if !existing {
+                let tx = db(conn.unchecked_transaction())?;
+                create_schema(&tx)?;
+                db(tx.execute(
+                    "INSERT INTO agent_metadata VALUES('format',?1),('binding',?2)",
+                    params![
+                        FORMAT,
+                        serde_json::to_string(binding).map_err(|_| "AGENT_INVALID_BINDING")?
+                    ],
+                ))?;
+                db(tx.commit())?;
+            }
         }
         Ok(Self {
             conn,
@@ -198,11 +221,47 @@ impl AgentRepository {
         bootstrap_key: &[u8],
         hmac_key: &[u8],
     ) -> Result<(), String> {
+        self.configure_source_at(bootstrap_key, hmac_key, None)
+    }
+
+    pub fn source_configured(&self) -> Result<bool, String> {
+        let keys: i64 = db(self.conn.query_row(
+            "SELECT count(*) FROM agent_metadata WHERE key IN ('bootstrap','hmac')",
+            [],
+            |r| r.get(0),
+        ))?;
+        if keys == 2 {
+            return Ok(true);
+        }
+        let empty:bool=db(self.conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM agent_metadata WHERE key NOT IN ('format','binding'))
+            AND NOT EXISTS(SELECT 1 FROM snapshots UNION ALL SELECT 1 FROM records UNION ALL SELECT 1 FROM ocr_access
+            UNION ALL SELECT 1 FROM block_access UNION ALL SELECT 1 FROM vector_access UNION ALL SELECT 1 FROM recap_search_access)",[],|r|r.get(0)))?;
+        if !empty {
+            return Err("AGENT_SOURCE_CONFIG_INCOMPLETE".into());
+        }
+        Ok(false)
+    }
+
+    pub fn configure_source_at(
+        &mut self,
+        bootstrap_key: &[u8],
+        hmac_key: &[u8],
+        checkpoint: Option<(&str, i64)>,
+    ) -> Result<(), String> {
         let tx = db(self.conn.transaction())?;
         for (domain, key) in [("bootstrap", bootstrap_key), ("hmac", hmac_key)] {
             let sealed = source::seal_key(&self.key, &self.binding, domain, "", &[], key)?;
             db(tx.execute("INSERT INTO agent_metadata VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![domain,hex::encode(sealed)]))?;
+        }
+        if let Some((cursor, baseline)) = checkpoint {
+            if baseline <= 0 {
+                return Err("AGENT_INVALID_REVISION".into());
+            }
+            db(tx.execute(
+                "INSERT INTO agent_metadata VALUES('floor',?1),('preparation_checkpoint',?2)",
+                params![(baseline - 1).to_string(), cursor],
+            ))?;
         }
         db(tx.commit())?;
         self.source.take();
@@ -262,49 +321,61 @@ impl AgentRepository {
             .conn
             .query_row("SELECT EXISTS(SELECT 1 FROM gaps)", [], |r| r.get(0)))
     }
-    pub fn gaps(&self) -> Result<Vec<(String, String, i64)>, String> {
-        let mut stmt = db(self
-            .conn
-            .prepare("SELECT kind,key,revision FROM gaps ORDER BY revision"))?;
+    pub fn has_content_gaps(&self) -> Result<bool, String> {
+        db(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gaps WHERE kind!='privacy')",
+            [],
+            |r| r.get(0),
+        ))
+    }
+    pub fn repairable_gap_batch(&self) -> Result<Vec<(String, String, i64)>, String> {
+        let mut stmt = db(self.conn.prepare(
+            "SELECT kind,key,revision FROM gaps WHERE kind!='privacy' ORDER BY CASE kind WHEN 'snapshot' THEN 0 WHEN 'cluster' THEN 0 WHEN 'calendar' THEN 0 ELSE 1 END,revision LIMIT 64",
+        ))?;
         let rows = db(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?;
         db(rows.collect())
     }
-    pub fn clear_gap(&self, kind: &str, key: &str, revision: i64) -> Result<(), String> {
-        db(self.conn.execute(
-            "DELETE FROM gaps WHERE kind=?1 AND key=?2 AND revision<=?3",
-            params![kind, key, revision],
-        ))?;
-        Ok(())
-    }
     pub fn get<T: DeserializeOwned>(&self, kind: &str, key: &str) -> Result<Option<T>, String> {
-        let row: Option<String> = db(self
-            .conn
-            .query_row(
+        if kind == "snapshot" {
+            let id = key.parse().map_err(|_| "AGENT_INVALID_RECORD")?;
+            return self
+                .snapshot(id)?
+                .map(|v| {
+                    serde_json::from_value(json!(v)).map_err(|_| "AGENT_INVALID_RECORD".into())
+                })
+                .transpose();
+        }
+        Ok(self
+            .json_rows(
                 "SELECT body FROM records WHERE kind=?1 AND key=?2 AND body IS NOT NULL",
                 params![kind, key],
-                |r| r.get(0),
-            )
-            .optional())?;
-        row.map(|v| serde_json::from_str(&v).map_err(|_| "AGENT_INVALID_RECORD".into()))
-            .transpose()
+            )?
+            .pop())
     }
     pub fn all<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>, String> {
-        let mut stmt = db(self
-            .conn
-            .prepare("SELECT body FROM records WHERE kind=?1 AND body IS NOT NULL ORDER BY key"))?;
-        let rows = db(stmt.query_map([kind], |r| r.get::<_, String>(0)))?;
-        rows.map(|v| serde_json::from_str(&db(v)?).map_err(|_| "AGENT_INVALID_RECORD".into()))
-            .collect()
+        if kind == "snapshot" {
+            return self
+                .snapshots_where("ORDER BY CAST(s.id AS TEXT)", [])?
+                .into_iter()
+                .map(|v| {
+                    serde_json::from_value(json!(v)).map_err(|_| "AGENT_INVALID_RECORD".into())
+                })
+                .collect();
+        }
+        self.json_rows(
+            "SELECT body FROM records WHERE kind=?1 AND body IS NOT NULL ORDER BY key",
+            [kind],
+        )
     }
     pub fn snapshot(&self, id: i64) -> Result<Option<SnapshotText>, String> {
-        self.get("snapshot", &id.to_string())
+        Ok(self.snapshots_where("AND s.id=?1", [id])?.pop())
     }
     pub fn snapshot_count(&self) -> Result<usize, String> {
-        db(self.conn.query_row(
-            "SELECT COUNT(*) FROM records WHERE kind='snapshot' AND body IS NOT NULL",
-            [],
-            |r| r.get::<_, i64>(0),
-        ))
+        db(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM snapshots WHERE deleted=0", [], |r| {
+                r.get::<_, i64>(0)
+            }))
         .map(|v| v.max(0) as usize)
     }
     pub fn revision(&self) -> Result<String, String> {
@@ -335,109 +406,86 @@ impl AgentRepository {
         self.ocr_for_screenshots(&[id])
     }
     pub(crate) fn ocr_for_screenshots(&self, ids: &[i64]) -> Result<Vec<OcrText>, String> {
-        self.hydrate_ocr(self.source()?.ocr_for_screenshots(ids)?)
+        Ok(self
+            .hydrate_ocr(self.source()?.ocr_for_screenshots(ids)?)?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect())
     }
     pub fn ocr_ids(&self, ids: &[i64]) -> Result<Vec<OcrText>, String> {
-        self.hydrate_ocr(self.source()?.ocr_ids(ids)?)
+        Ok(self
+            .hydrate_ocr(self.source()?.ocr_ids(ids)?)?
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect())
     }
-    pub(crate) fn ocr_snapshot(&self, id: i64) -> Result<Option<SnapshotText>, String> {
-        let screenshot: Option<i64> = db(self
-            .conn
-            .query_row(
-                "SELECT screenshot_id FROM ocr_access WHERE ocr_id=?1 AND key_envelope IS NOT NULL",
-                [id],
-                |r| r.get(0),
-            )
-            .optional())?;
-        match screenshot {
-            Some(id) => self.snapshot(id),
-            None => Ok(None),
-        }
-    }
-
-    fn hydrate_ocr(&self, rows: Vec<RawOcr>) -> Result<Vec<OcrText>, String> {
-        let mut access = db(self.conn.prepare_cached("SELECT screenshot_id,payload_digest,key_envelope FROM ocr_access WHERE ocr_id=?1 AND key_envelope IS NOT NULL"))?;
+    fn hydrate_ocr(&self, rows: Vec<RawOcr>) -> Result<Vec<(OcrText, Vec<u8>)>, String> {
+        let mut blocks = blocks::BlockCache::default();
+        let mut access=db(self.conn.prepare_cached("SELECT screenshot_id,payload_digest,key_envelope FROM ocr_access WHERE ocr_id=?1 AND key_envelope IS NOT NULL"))?;
         let mut output = Vec::with_capacity(rows.len());
-        let mut blocks = HashMap::<i64, (ocr_block_codec::Decoded, Option<i64>)>::new();
-        let mut block_bytes = 0;
         for mut row in rows {
-            let grant: Option<(i64, Vec<u8>, Vec<u8>)> = db(access
-                .query_row([row.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional())?;
-            let Some((screenshot, digest, sealed)) = grant else {
-                return Err("AGENT_SYNC_INCOMPLETE: OCR authorization is unavailable".into());
-            };
-            let source_digest = match (row.slot, &row.key, row.ciphertext.as_deref()) {
-                (Some(slot), Some(key), None) => {
-                    source::ocr_block_digest(key.id, slot, &key.scope_tag).to_vec()
+            let (text, digest) = match (row.slot, &row.key, row.ciphertext.as_deref()) {
+                (Some(slot), Some(group), None) => {
+                    let (text, meta, processed) =
+                        blocks.read(self, group, row.screenshot_id, slot, row.id)?;
+                    row.confidence = meta.confidence;
+                    row.coordinates = meta.box_coords.into_iter().map(Vec::from).collect();
+                    row.processed_at_ms = row.processed_at_ms.or(processed);
+                    (
+                        text,
+                        source::ocr_block_digest(group.id, slot, &group.scope_tag).to_vec(),
+                    )
                 }
-                (None, _, Some(bytes)) => source::digest(bytes),
+                (None, group, Some(ciphertext)) => {
+                    let grant: Option<(i64, Vec<u8>, Vec<u8>)> = db(access
+                        .query_row([row.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                        .optional())?;
+                    let (shot, digest, sealed) =
+                        grant.ok_or("AGENT_SYNC_INCOMPLETE: OCR authorization is unavailable")?;
+                    if shot != row.screenshot_id || digest != source::digest(ciphertext) {
+                        return Err("AGENT_SOURCE_CHANGED".into());
+                    }
+                    let key = source::open_key(
+                        &self.key,
+                        &self.binding,
+                        "ocr",
+                        &row.id.to_string(),
+                        &digest,
+                        &sealed,
+                    )?;
+                    let plain = Zeroizing::new(if let Some(group) = group {
+                        let integrity = |_| "AGENT_SOURCE_INTEGRITY_FAILED";
+                        ocr_key_wire::verify_scope(
+                            &key,
+                            &self.binding.dataset_id,
+                            shot,
+                            group.id,
+                            &group.scope_tag,
+                        )
+                        .map_err(integrity)?;
+                        let aad =
+                            ocr_key_wire::aad(&self.binding.dataset_id, shot, group.id, row.id)
+                                .map_err(integrity)?;
+                        ocr_key_wire::open(&key, &aad, ciphertext).map_err(integrity)?
+                    } else {
+                        carbonpaper_app_bound::crypto::decrypt_storage_bytes(&key, ciphertext)
+                            .map_err(|_| "AGENT_SOURCE_INTEGRITY_FAILED")?
+                    });
+                    (ocr_layout::decode_text(&plain)?.to_owned(), digest)
+                }
                 _ => return Err("AGENT_INVALID_OCR_SOURCE".into()),
             };
-            if screenshot != row.screenshot_id || digest != source_digest {
-                return Err("AGENT_SOURCE_CHANGED".into());
-            }
-            let key = source::open_key(
-                &self.key,
-                &self.binding,
-                "ocr",
-                &row.id.to_string(),
-                &digest,
-                &sealed,
-            )?;
-            let dataset = &self.binding.dataset_id;
-            let integrity = |_| "AGENT_SOURCE_INTEGRITY_FAILED";
-            if let Some(group) = &row.key {
-                ocr_key_wire::verify_scope(&key, dataset, screenshot, group.id, &group.scope_tag)
-                    .map_err(integrity)?;
-            }
-            let text = if let (Some(slot), Some(group)) = (row.slot, &row.key) {
-                if !blocks.contains_key(&group.id) {
-                    let (ciphertext, processed_at) =
-                        self.source()?.ocr_block(group.id, screenshot)?;
-                    let aad = ocr_key_wire::block_aad(dataset, screenshot, group.id)
-                        .map_err(integrity)?;
-                    let plain = Zeroizing::new(
-                        ocr_key_wire::open(&key, &aad, &ciphertext).map_err(integrity)?,
-                    );
-                    let block = ocr_block_codec::Decoded::open(&plain)?;
-                    if block_bytes + block.size() > 4 * 1024 * 1024 {
-                        blocks.clear();
-                        block_bytes = 0;
-                    }
-                    block_bytes += block.size();
-                    blocks.insert(group.id, (block, processed_at));
-                }
-                let (block, processed_at) = &blocks[&group.id];
-                let slot = usize::try_from(slot).map_err(|_| "AGENT_INVALID_OCR_SOURCE")?;
-                let metadata = block.metadata_for(slot, row.id)?;
-                row.confidence = metadata.confidence;
-                row.coordinates = metadata.box_coords.into_iter().map(Vec::from).collect();
-                row.processed_at_ms = row.processed_at_ms.or(*processed_at);
-                block.text(slot, row.id)?.to_owned()
-            } else {
-                let ciphertext = row
-                    .ciphertext
-                    .as_deref()
-                    .ok_or("AGENT_INVALID_OCR_SOURCE")?;
-                let plain = Zeroizing::new(if let Some(group) = &row.key {
-                    let aad = ocr_key_wire::aad(dataset, screenshot, group.id, row.id)
-                        .map_err(integrity)?;
-                    ocr_key_wire::open(&key, &aad, ciphertext).map_err(integrity)?
-                } else {
-                    carbonpaper_app_bound::crypto::decrypt_storage_bytes(&key, ciphertext)
-                        .map_err(|_| "AGENT_SOURCE_INTEGRITY_FAILED")?
-                });
-                ocr_layout::decode_text(&plain)?.to_owned()
-            };
-            output.push(OcrText {
-                ocr_id: row.id,
-                screenshot_id: row.screenshot_id,
-                text,
-                confidence: row.confidence,
-                box_coords: row.coordinates,
-                ocr_processed_at_ms: row.processed_at_ms,
-            });
+            output.push((
+                OcrText {
+                    ocr_id: row.id,
+                    screenshot_id: row.screenshot_id,
+                    text,
+                    confidence: row.confidence,
+                    box_coords: row.coordinates,
+                    ocr_processed_at_ms: row.processed_at_ms,
+                },
+                digest,
+            ));
         }
         Ok(output)
     }
@@ -447,15 +495,41 @@ impl AgentRepository {
     pub fn unindexed_ocr(&self, cursor: i64, limit: usize) -> Result<Vec<OcrText>, String> {
         self.ocr_ids(&self.source()?.unindexed_ids(cursor, limit)?)
     }
+
+    pub fn unindexed_ocr_with_digests(
+        &self,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<Vec<(OcrText, Vec<u8>)>, String> {
+        self.hydrate_ocr(
+            self.source()?
+                .ocr_ids(&self.source()?.unindexed_ids(cursor, limit)?)?,
+        )
+    }
     pub fn source_hmac_key(&self) -> Result<&[u8], String> {
         Ok(&self.source()?.hmac_key)
     }
     pub fn ocr_payload_digest(&self, id: i64) -> Result<Vec<u8>, String> {
-        db(self.conn.query_row(
-            "SELECT payload_digest FROM ocr_access WHERE ocr_id=?1 AND key_envelope IS NOT NULL",
-            [id],
-            |r| r.get(0),
-        ))
+        self.hydrate_ocr(self.source()?.ocr_ids(&[id])?)?
+            .pop()
+            .map(|(_, digest)| digest)
+            .ok_or_else(|| "AGENT_SYNC_INCOMPLETE: OCR authorization is unavailable".into())
+    }
+
+    pub fn vector_envelope(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+        db(self
+            .conn
+            .query_row(
+                "SELECT key_envelope FROM vector_access WHERE key_id=?1 AND key_envelope IS NOT NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional())
+    }
+
+    #[cfg(test)]
+    pub fn snapshot_retired(&self, id: i64) -> Result<bool, String> {
+        snapshots::retired(&self.conn, id)
     }
 
     pub fn vector_page(
@@ -465,12 +539,16 @@ impl AgentRepository {
         limit: usize,
     ) -> Result<Vec<VectorText>, String> {
         let mut keys = HashMap::<String, CipherKey>::new();
-        let mut lookup = db(self
-            .conn
-            .prepare_cached("SELECT key_envelope FROM vector_access WHERE key_id=?1"))?;
+        let mut lookup = db(self.conn.prepare_cached(
+            "SELECT key_envelope FROM vector_access WHERE key_id=?1 AND key_envelope IS NOT NULL",
+        ))?;
         let mut output = Vec::new();
         for raw in self.source()?.vectors(kind, cursor, limit)? {
-            if self.snapshot(raw.screenshot_id)?.is_none() {
+            if !db(self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM snapshots WHERE id=?1 AND deleted=0)",
+                [raw.screenshot_id],
+                |r| r.get::<_, bool>(0),
+            ))? {
                 continue;
             }
             let id = payload_key_id(&raw.ciphertext)?;
@@ -592,8 +670,9 @@ impl AgentRepository {
             return Ok(());
         }
         let tx = db(self.conn.transaction())?;
+        let floor:i64=db(tx.query_row("SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM agent_metadata WHERE key='floor'),0)",[],|r|r.get(0)))?;
         for event in events {
-            Self::apply_event(&tx, &self.key, &self.binding, event)?;
+            Self::apply_event(&tx, &self.key, &self.binding, event, floor)?;
         }
         if let Some(revision) = events.iter().map(|event| event.revision).max() {
             db(tx.execute("INSERT INTO agent_metadata VALUES('revision',?1) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(agent_metadata.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)",[revision.to_string()]))?;
@@ -612,6 +691,7 @@ impl AgentRepository {
         key: &[u8],
         binding: &AgentViewBinding,
         event: &ExportEvent,
+        floor: i64,
     ) -> Result<(), String> {
         if event.dataset_id != binding.dataset_id
             || event.generation != binding.generation
@@ -620,10 +700,28 @@ impl AgentRepository {
             return Err("AGENT_DATASET_MISMATCH".into());
         }
         let revision = event.revision;
+        if revision <= floor {
+            return Ok(());
+        }
         match &event.change {
             TextChange::Put { record } => {
                 let (kind, id) = record.identity();
+                let parent = match record {
+                    TextRecord::OcrAccess(v) => Some(v.screenshot_id),
+                    TextRecord::OcrBlock(v) => Some(v.screenshot_id),
+                    TextRecord::Assignment(v) => Some(v.screenshot_id),
+                    _ => None,
+                };
+                if let Some(parent) = parent {
+                    if snapshots::retired(tx, parent)? {
+                        // A parent restore and its children can arrive in different
+                        // batches. Reconcile against the archive after the parent.
+                        return Self::defer_gap(tx, kind, &id, revision);
+                    }
+                }
                 match record {
+                    TextRecord::Snapshot(v) => snapshots::put(tx, v, revision)?,
+                    TextRecord::OcrBlock(v) => blocks::put(tx, key, binding, v, revision)?,
                     TextRecord::OcrAccess(v) => {
                         if v.ocr_id <= 0 || v.screenshot_id <= 0 || v.payload_digest.len() != 32 {
                             return Err("AGENT_INVALID_OCR_ACCESS".into());
@@ -636,8 +734,7 @@ impl AgentRepository {
                             &v.payload_digest,
                             &v.key_envelope,
                         )?;
-                        db(tx.execute("INSERT INTO ocr_access SELECT ?1,?2,?3,?4,?5
-                            WHERE NOT EXISTS(SELECT 1 FROM records WHERE kind='snapshot' AND key=CAST(?2 AS TEXT) AND body IS NULL)
+                        db(tx.execute("INSERT INTO ocr_access VALUES(?1,?2,?3,?4,?5)
                             ON CONFLICT(ocr_id) DO UPDATE SET screenshot_id=excluded.screenshot_id,revision=excluded.revision,
                                 payload_digest=excluded.payload_digest,key_envelope=excluded.key_envelope WHERE ocr_access.revision<excluded.revision",
                             params![v.ocr_id,v.screenshot_id,revision,v.payload_digest,v.key_envelope]))?;
@@ -667,14 +764,13 @@ impl AgentRepository {
                             params![v.key,v.date,revision,v.revision,v.payload_digest,v.key_envelope]))?;
                     }
                     _ => {
-                        let (snapshot, cluster, date, captured, body) = match record {
-                            TextRecord::Snapshot(v) => (
-                                Some(v.screenshot_id),
-                                None,
-                                None,
-                                v.captured_at_ms,
-                                json!(v),
-                            ),
+                        let (snapshot, cluster, date, captured, body): (
+                            Option<i64>,
+                            Option<i64>,
+                            Option<&str>,
+                            Option<i64>,
+                            serde_json::Value,
+                        ) = match record {
                             TextRecord::Cluster(v) => {
                                 (None, Some(v.cluster_id), None, None, json!(v))
                             }
@@ -701,13 +797,18 @@ impl AgentRepository {
                             _ => unreachable!(),
                         };
                         let retired: bool = db(tx.query_row("SELECT EXISTS(SELECT 1 FROM retired_days WHERE date=?1 AND (?3<>'calendar' OR revision>=?2))
-                            OR EXISTS(SELECT 1 FROM records WHERE kind='snapshot' AND key=CAST(?4 AS TEXT) AND body IS NULL AND ?3<>'snapshot')
-                            OR EXISTS(SELECT 1 FROM records WHERE kind='cluster' AND key=CAST(?5 AS TEXT) AND body IS NULL AND ?3<>'cluster')",
-                            params![date,revision,kind,snapshot,cluster],|r|r.get(0)))?;
+                            OR EXISTS(SELECT 1 FROM records WHERE kind='cluster' AND key=CAST(?4 AS TEXT) AND body IS NULL AND ?3<>'cluster')",
+                            params![date,revision,kind,cluster],|r|r.get(0)))?;
                         if !retired {
+                            let body = body.to_string();
+                            let stored = if matches!(kind, "recap" | "summary") {
+                                payload::encode(body)?
+                            } else {
+                                rusqlite::types::Value::Text(body)
+                            };
                             let changed = db(tx.execute("INSERT INTO records VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(kind,key) DO UPDATE SET revision=excluded.revision,screenshot_id=excluded.screenshot_id,
                                 cluster_id=excluded.cluster_id,date=excluded.date,captured_at_ms=excluded.captured_at_ms,body=excluded.body WHERE records.revision<excluded.revision",
-                                params![kind,id,revision,snapshot,cluster,date,captured,body.to_string()]))?;
+                                params![kind,id,revision,snapshot,cluster,date,captured,stored]))?;
                             if changed > 0 && kind == "calendar" {
                                 db(tx.execute(
                                     "DELETE FROM retired_days WHERE date=?1 AND revision<?2",
@@ -744,14 +845,10 @@ impl AgentRepository {
                         Self::delete_children(tx, &id, revision)?;
                     }
                 } else {
-                    db(tx.execute("UPDATE records SET body=json_set(body,'$.category',?2,'$.status',?3),revision=?4 WHERE kind='snapshot' AND key=?1 AND body IS NOT NULL AND revision<?4",params![id,category,status,revision]))?;
+                    db(tx.execute("UPDATE snapshots SET category=?2,status=?3,revision=?4 WHERE id=?1 AND deleted=0 AND revision<?4",params![id,category,status,revision]))?;
                 }
             }
-            TextChange::Gap { kind, key } => {
-                if Self::record_revision(tx, kind, key)?.is_none_or(|v| v < revision) {
-                    db(tx.execute("INSERT INTO gaps VALUES(?1,?2,?3) ON CONFLICT(kind,key) DO UPDATE SET revision=MAX(gaps.revision,excluded.revision)",params![kind,key,revision]))?;
-                }
-            }
+            TextChange::Gap { kind, key } => Self::defer_gap(tx, kind, key, revision)?,
             TextChange::DeleteDay { date } => {
                 let changed = db(tx.execute("INSERT INTO retired_days SELECT ?1,?2 WHERE NOT EXISTS(SELECT 1 FROM records WHERE kind='calendar' AND key=?1 AND revision>?2)
                     ON CONFLICT(date) DO UPDATE SET revision=excluded.revision WHERE retired_days.revision<excluded.revision",params![date,revision]))?;
@@ -769,7 +866,22 @@ impl AgentRepository {
         Ok(())
     }
 
+    fn defer_gap(conn: &Connection, kind: &str, key: &str, revision: i64) -> Result<(), String> {
+        if Self::record_revision(conn, kind, key)?.is_none_or(|v| v < revision) {
+            db(conn.execute("INSERT INTO gaps VALUES(?1,?2,?3) ON CONFLICT(kind,key) DO UPDATE SET revision=MAX(gaps.revision,excluded.revision)",params![kind,key,revision]))?;
+        }
+        Ok(())
+    }
+
     fn record_revision(conn: &Connection, kind: &str, key: &str) -> Result<Option<i64>, String> {
+        if kind == "snapshot" || kind == "ocr_block" {
+            let sql = if kind == "snapshot" {
+                "SELECT revision FROM snapshots WHERE id=?1"
+            } else {
+                "SELECT revision FROM block_access WHERE id=?1"
+            };
+            return db(conn.query_row(sql, [key], |r| r.get(0)).optional());
+        }
         if kind == "ocr" {
             return db(conn
                 .query_row(
@@ -808,9 +920,16 @@ impl AgentRepository {
             .optional())
     }
     fn delete(conn: &Connection, kind: &str, key: &str, revision: i64) -> Result<bool, String> {
-        let changed = if kind == "ocr" {
+        let changed = if kind == "snapshot" {
+            snapshots::delete(conn, key, revision)?
+        } else if kind == "ocr_block" {
+            blocks::delete(conn, key, revision)?
+        } else if kind == "ocr" {
             let id = key.parse::<i64>().map_err(|_| "AGENT_INVALID_RECORD")?;
             db(conn.execute("INSERT INTO ocr_access VALUES(?1,0,?2,NULL,NULL) ON CONFLICT(ocr_id) DO UPDATE SET revision=excluded.revision,key_envelope=NULL,payload_digest=NULL WHERE ocr_access.revision<excluded.revision",params![id,revision]))?
+        } else if kind == "vector_key" {
+            db(conn.execute("INSERT INTO vector_access VALUES(?1,?2,NULL) ON CONFLICT(key_id) DO UPDATE SET revision=excluded.revision,
+                key_envelope=NULL WHERE vector_access.revision<excluded.revision",params![key,revision]))?
         } else if kind == "recap" && key.starts_with("search:") {
             db(conn.execute("INSERT INTO recap_search_access VALUES(?1,'',?2,0,NULL,NULL) ON CONFLICT(key) DO UPDATE SET revision=excluded.revision,key_envelope=NULL,payload_digest=NULL WHERE recap_search_access.revision<excluded.revision",params![&key[7..],revision]))?
         } else {
@@ -823,6 +942,7 @@ impl AgentRepository {
         Ok(changed > 0)
     }
     fn delete_children(conn: &Connection, id: &str, revision: i64) -> Result<(), String> {
+        db(conn.execute("UPDATE block_access SET envelope=NULL,slots=NULL,revision=MAX(revision,?2) WHERE screenshot_id=?1",params![id,revision]))?;
         db(conn.execute("UPDATE records SET body=NULL,revision=MAX(revision,?2) WHERE screenshot_id=CAST(?1 AS INTEGER)",params![id,revision]))?;
         db(conn.execute("UPDATE ocr_access SET key_envelope=NULL,payload_digest=NULL,revision=MAX(revision,?2) WHERE screenshot_id=CAST(?1 AS INTEGER)",params![id,revision]))?;
         db(conn.execute("DELETE FROM gaps WHERE (kind,key) IN (SELECT kind,key FROM records WHERE screenshot_id=CAST(?1 AS INTEGER)) OR (kind='ocr' AND CAST(key AS INTEGER) IN (SELECT ocr_id FROM ocr_access WHERE screenshot_id=CAST(?1 AS INTEGER)))",[id]))?;
