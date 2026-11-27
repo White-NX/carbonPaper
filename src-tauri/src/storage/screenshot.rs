@@ -11,6 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use super::encryption::RowKeyUnwrapper;
 use super::{
     wire_time, BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
     DerivedIndexKind, IncrementalVacuumResult, IndexStorageStats, OcrDeleteBatchResult,
@@ -19,9 +20,30 @@ use super::{
 };
 
 const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
+
+type EncryptedMetadataRow = (i64, Option<Vec<u8>>, Option<Vec<u8>>);
 const MAX_OCR_DELETE_CLEANUP_FAILURES: i64 = 3;
 const STARTUP_PENDING_SCREENSHOTS_SQL: &str =
     "SELECT id FROM screenshots WHERE status = 'pending' AND is_deleted = 0 ORDER BY id ASC";
+
+fn image_hash_mapping_sql(count: usize) -> String {
+    let placeholders = vec!["?"; count].join(",");
+    // The live/time index otherwise attracts repeated archive scans before
+    // ANALYZE, even though this is a bounded set of exact hash lookups.
+    format!(
+        "SELECT image_hash, id FROM screenshots INDEXED BY idx_image_hash
+             WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+             ORDER BY created_at DESC, id DESC"
+    )
+}
+
+fn clip_candidate_metadata_sql(count: usize) -> String {
+    let placeholders = vec!["?"; count].join(",");
+    format!("SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), cp_process(process_name), category
+             FROM screenshots INDEXED BY idx_image_hash
+             WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+             ORDER BY created_at DESC, id DESC")
+}
 
 struct OcrDeleteQueueRow {
     id: i64,
@@ -70,12 +92,24 @@ impl EncryptedOcrResultRow {
             screenshot_id: row.get(1)?,
             text_enc: row.get(2)?,
             text_key_encrypted: row.get(3)?,
-            confidence: row.get(4)?,
+            confidence: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
             box_coords: vec![
-                vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
-                vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
-                vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
-                vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
+                vec![
+                    row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
+                ],
+                vec![
+                    row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(8)?.unwrap_or_default(),
+                ],
+                vec![
+                    row.get::<_, Option<f64>>(9)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(10)?.unwrap_or_default(),
+                ],
+                vec![
+                    row.get::<_, Option<f64>>(11)?.unwrap_or_default(),
+                    row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
+                ],
             ],
             created_at: row.get(13)?,
         })
@@ -227,8 +261,8 @@ where
 fn ocr_text_prefix_query(placeholder_count: usize) -> String {
     let placeholders = vec!["?"; placeholder_count].join(",");
     format!(
-        "SELECT screenshot_id, text_enc, text_key_encrypted
-         FROM ocr_results
+        "SELECT screenshot_id, text_enc, text_key_ref
+         FROM ocr_results_read
          WHERE is_deleted = 0 AND screenshot_id IN ({})
          ORDER BY screenshot_id, id",
         placeholders
@@ -242,7 +276,7 @@ fn ocr_text_prefix_query(placeholder_count: usize) -> String {
 /// prefix of the full join, so its first `min_chars` characters match the
 /// full text exactly (the MiniLM source contract only consumes that prefix).
 fn assemble_ocr_text_prefixes(
-    rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>,
+    rows: Vec<EncryptedMetadataRow>,
     min_chars: usize,
     deadline: Option<Instant>,
     mut decrypt: impl FnMut(&[u8], &[u8]) -> Result<String, BackgroundReadError>,
@@ -292,7 +326,7 @@ pub(super) fn ocr_postprocess_retry_decision(
     }
 }
 
-fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
+pub(super) fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
     if result.box_coords.len() != 4 || result.box_coords.iter().any(|point| point.len() != 2) {
         return Err("OCR box must contain exactly four 2D points".to_string());
     }
@@ -308,10 +342,17 @@ fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
     if result.text.chars().count() > 16_384 {
         return Err("OCR result text exceeds the storage limit".to_string());
     }
+    if let Some(layout) = &result.text_layout {
+        crate::ocr_layout::validate(&result.text, layout)?;
+    }
     Ok(())
 }
 
 impl StorageState {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the existing OCR status, provenance and elapsed-time update interface."
+    )]
     pub fn set_ocr_status(
         &self,
         screenshot_id: i64,
@@ -617,14 +658,20 @@ impl StorageState {
             tracing::warn!("Failed to generate thumbnail during save: {}", e);
         }
 
-        // Save to database (SQLCipher whole-database encryption)
+        let ocr_key = request
+            .ocr_results
+            .as_ref()
+            .filter(|rows| !rows.is_empty())
+            .map(|_| self.new_ocr_write_key())
+            .transpose()?;
+        // Publish the screenshot, OCR group and child rows in one transaction.
         let mut guard = self.get_connection_named("save_screenshot")?;
         let conn = guard.as_mut().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let conn: &Connection = &tx;
 
-        let metadata_json = request
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_string(m).ok());
+        let (metadata_json, process_icon_id) =
+            self.serialize_metadata_with_shared_icon(conn, request.metadata.as_ref())?;
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
                 encrypt_with_master_key(&row_key, value.as_bytes())
@@ -673,8 +720,8 @@ impl StorageState {
                 window_title, process_name, metadata,
                 window_title_enc, process_name_enc, metadata_enc,
                 content_key_encrypted,
-                source, page_url_enc, page_icon_id, link_set_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                source, page_url_enc, page_icon_id, link_set_id, process_icon_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &image_path_str,
                 &request.image_hash,
@@ -695,6 +742,7 @@ impl StorageState {
                 page_url_enc_save,
                 page_icon_id,
                 link_set_id,
+                process_icon_id,
             ],
         )
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
@@ -706,15 +754,14 @@ impl StorageState {
         let mut skipped = 0;
 
         if let Some(ocr_results) = &request.ocr_results {
+            let mut next_id = super::ocr_keys::next_row_id(conn)?;
+            let mut records: Vec<super::ocr_blocks::Record> = Vec::new();
             for result in ocr_results {
                 if let Err(error) = validate_ocr_result(result) {
                     tracing::warn!("Skipping invalid OCR result during save: {}", error);
                     skipped += 1;
                     continue;
                 }
-                let (text_enc, text_key_encrypted) =
-                    self.encrypt_payload_with_row_key(result.text.as_bytes())?;
-
                 // Check for duplicates
                 let box_coords = &result.box_coords;
                 if box_coords.len() >= 4 {
@@ -729,38 +776,34 @@ impl StorageState {
                         )
                         .unwrap_or(0);
 
-                    if existing > 0 {
+                    if existing > 0
+                        || records.iter().any(|r| {
+                            (r.box_coords[0][0] - box_coords[0][0]).abs() < 10.0
+                                && (r.box_coords[0][1] - box_coords[0][1]).abs() < 10.0
+                        })
+                    {
                         skipped += 1;
                         continue;
                     }
-
-                    // Insert new OCR result with encrypted text (lazy indexing will process this later)
-                    conn.execute(
-                        "INSERT INTO ocr_results (
-                            screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
-                            box_x1, box_y1, box_x2, box_y2,
-                            box_x3, box_y3, box_x4, box_y4
-                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        params![
-                            screenshot_id,
-                            Option::<String>::None,
-                            "", // empty text_hash signifies unindexed/backlogged
-                            text_enc,
-                            text_key_encrypted,
-                            result.confidence,
-                            box_coords[0][0], box_coords[0][1],
-                            box_coords[1][0], box_coords[1][1],
-                            box_coords[2][0], box_coords[2][1],
-                            box_coords[3][0], box_coords[3][1],
-                        ],
-                    )
-                    .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
+                    records.push(super::ocr_blocks::input_record(next_id, result)?);
 
                     added += 1;
-                    self.ocr_row_count.fetch_add(1, Ordering::Relaxed);
+                    next_id = next_id
+                        .checked_add(1)
+                        .ok_or("OCR row ID capacity exhausted")?;
                 }
             }
+            super::ocr_blocks::insert_records(
+                conn,
+                screenshot_id,
+                &records,
+                ocr_key.as_ref(),
+                || self.new_ocr_write_key(),
+            )?;
         }
+        tx.commit().map_err(|e| e.to_string())?;
+        self.ocr_row_count
+            .fetch_add(added as u64, Ordering::Relaxed);
 
         Ok(SaveScreenshotResponse {
             status: "success".to_string(),
@@ -843,10 +886,8 @@ impl StorageState {
         let mutex_wait_dur = fn_start.elapsed() - exists_dur - img_encrypt_dur - file_write_dur;
 
         let t3 = std::time::Instant::now();
-        let metadata_json = request
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_string(m).ok());
+        let (metadata_json, process_icon_id) =
+            self.serialize_metadata_with_shared_icon(conn, request.metadata.as_ref())?;
 
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
@@ -896,8 +937,8 @@ impl StorageState {
                 window_title, process_name, metadata,
                 window_title_enc, process_name_enc, metadata_enc,
                 content_key_encrypted, status,
-                source, page_url_enc, page_icon_id, link_set_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                source, page_url_enc, page_icon_id, link_set_id, process_icon_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &image_path_str,
                 &request.image_hash,
@@ -919,6 +960,7 @@ impl StorageState {
                 page_url_enc,
                 page_icon_id,
                 link_set_id,
+                process_icon_id,
             ],
         )
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
@@ -957,7 +999,7 @@ impl StorageState {
         let ocr_count = ocr_results.map(|v| v.len()).unwrap_or(0);
 
         let db_wait_started = std::time::Instant::now();
-        let image_path_str = {
+        let (image_path_str, source_generation) = {
             let guard = self.get_connection_named("commit_screenshot.lookup")?;
             let conn = guard.as_ref().unwrap();
             let image_path: Option<String> = conn
@@ -968,25 +1010,41 @@ impl StorageState {
                 )
                 .optional()
                 .map_err(|e| format!("Failed to query screenshot: {}", e))?;
-            drop(guard);
-            image_path.ok_or_else(|| "Screenshot not found".to_string())?
+            (
+                image_path.ok_or_else(|| "Screenshot not found".to_string())?,
+                self.db_generation(),
+            )
         };
         let mutex_wait_dur = db_wait_started.elapsed();
 
         let image_path = self.resolve_image_path(&image_path_str);
 
-        // If filename ends with .pending, rename to final name before taking the DB lock again.
+        // Publishing the file can precede a failed database transaction. A
+        // retry must adopt the final file rather than write a stale pending path.
         let mut final_image_path_str = image_path_str.clone();
         if let Some(fname) = image_path.file_name().and_then(|s| s.to_str()) {
-            if fname.ends_with(".pending") {
-                let new_name = fname.trim_end_matches(".pending");
+            if let Some(new_name) = fname.strip_suffix(".pending") {
                 let new_path = image_path.with_file_name(new_name);
-                if let Err(e) = std::fs::rename(&image_path, &new_path) {
-                    // Log but continue trying to insert OCR results
-                    tracing::error!("Failed to rename pending image file: {}", e);
-                } else {
-                    final_image_path_str = self.to_relative_image_path(&new_path);
+                match std::fs::rename(&image_path, &new_path) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && super::image_io::regular_image_file_exists(&new_path)? =>
+                    {
+                        tracing::debug!(
+                            screenshot_id,
+                            "Screenshot commit reused an already published image"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(screenshot_id, image_path = %image_path_str, error = %error,
+                            "Failed to publish pending screenshot");
+                        return Err(format!(
+                            "Failed to publish screenshot {screenshot_id}: {error}"
+                        ));
+                    }
                 }
+                final_image_path_str = self.to_relative_image_path(&new_path);
             }
         }
 
@@ -995,12 +1053,12 @@ impl StorageState {
 
         // Timing accumulators for OCR processing
         let mut total_encrypt_dur = std::time::Duration::ZERO;
-        let total_db_insert_dur;
+
         let total_bitmap_dur = std::time::Duration::ZERO;
 
-        // Encrypt OCR results outside the global DB mutex. This avoids holding the
-        // storage lock while generating row keys and wrapping them with CNG/public-key APIs.
-        let mut encrypted_results = Vec::new();
+        // Wrap one fresh OCR-only key outside the mutex. AES uses the actual
+        // AUTOINCREMENT IDs reserved inside the publication transaction.
+        let mut valid_results = Vec::new();
         if let Some(results) = ocr_results {
             for result in results {
                 if let Err(error) = validate_ocr_result(result) {
@@ -1012,50 +1070,62 @@ impl StorageState {
                     );
                     continue;
                 }
-                let te0 = std::time::Instant::now();
-                let (text_enc, text_key_encrypted) =
-                    self.encrypt_payload_with_row_key(result.text.as_bytes())?;
-                total_encrypt_dur += te0.elapsed();
-                encrypted_results.push((result, text_enc, text_key_encrypted));
+                valid_results.push(result);
             }
         }
+        let te0 = std::time::Instant::now();
+        let ocr_key = if valid_results.is_empty() {
+            None
+        } else {
+            Some(self.new_ocr_write_key()?)
+        };
+        total_encrypt_dur += te0.elapsed();
 
         let td0 = std::time::Instant::now();
         {
             let mut guard = self.get_connection_named("commit_screenshot.write")?;
+            if self.db_generation() != source_generation {
+                return Err("Database changed while preparing OCR results".into());
+            }
             let conn = guard.as_mut().unwrap();
             let tx = conn
                 .transaction()
                 .map_err(|e| format!("Failed to start commit transaction: {}", e))?;
 
-            for (result, text_enc, text_key_encrypted) in encrypted_results {
-                tx.execute(
-                    "INSERT INTO ocr_results (
-                        screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
-                        box_x1, box_y1, box_x2, box_y2,
-                        box_x3, box_y3, box_x4, box_y4
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        screenshot_id,
-                        Option::<String>::None,
-                        "", // empty text_hash signifies unindexed/backlogged
-                        text_enc,
-                        text_key_encrypted,
-                        result.confidence,
-                        result.box_coords[0][0],
-                        result.box_coords[0][1],
-                        result.box_coords[1][0],
-                        result.box_coords[1][1],
-                        result.box_coords[2][0],
-                        result.box_coords[2][1],
-                        result.box_coords[3][0],
-                        result.box_coords[3][1],
-                    ],
+            // A concurrent edit or abort must not be overwritten by work which
+            // prepared OCR against an earlier screenshot path.
+            let current: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT image_path,status FROM screenshots WHERE id=?1 AND is_deleted=0",
+                    [screenshot_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
-
-                added += 1;
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let (current_path, status) = current.ok_or("Screenshot not found")?;
+            if current_path != image_path_str && current_path != final_image_path_str {
+                return Err("Screenshot changed while preparing OCR results".into());
             }
+            if status.as_deref() == Some("aborted") {
+                return Err("Screenshot was aborted while preparing OCR results".into());
+            }
+            let mut next_id = super::ocr_keys::next_row_id(&tx)?;
+            let mut records = Vec::with_capacity(valid_results.len());
+            for result in valid_results {
+                records.push(super::ocr_blocks::input_record(next_id, result)?);
+                next_id = next_id
+                    .checked_add(1)
+                    .ok_or("OCR row ID capacity exhausted")?;
+            }
+            let te0 = std::time::Instant::now();
+            added += super::ocr_blocks::insert_records(
+                &tx,
+                screenshot_id,
+                &records,
+                ocr_key.as_ref(),
+                || self.new_ocr_write_key(),
+            )? as i32;
+            total_encrypt_dur += te0.elapsed();
 
             // Mark committed and set committed_at. If classification has already
             // arrived asynchronously, do not overwrite it with NULL.
@@ -1081,7 +1151,7 @@ impl StorageState {
 
             drop(guard);
         }
-        total_db_insert_dur = td0.elapsed();
+        let total_db_insert_dur = td0.elapsed();
         if added > 0 {
             self.ocr_row_count
                 .fetch_add(added as u64, Ordering::Relaxed);
@@ -1398,13 +1468,8 @@ impl StorageState {
         self.with_vector_scan_connection("map_image_hashes_to_screenshot_ids", |conn| {
             let mut mapped: HashMap<String, Vec<i64>> = HashMap::new();
             for chunk in image_hashes.chunks(500) {
-                let placeholders = vec!["?"; chunk.len()].join(",");
                 let mut statement = conn
-                    .prepare(&format!(
-                        "SELECT image_hash, id FROM screenshots
-                         WHERE is_deleted = 0 AND image_hash IN ({placeholders})
-                         ORDER BY created_at DESC, id DESC"
-                    ))
+                    .prepare(&image_hash_mapping_sql(chunk.len()))
                     .map_err(|e| format!("Failed to prepare the image hash mapping: {}", e))?;
                 let rows = statement
                     .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
@@ -1434,24 +1499,28 @@ impl StorageState {
             return Ok(std::collections::HashMap::new());
         }
         let result = self.with_vector_scan_connection("clip_candidate_metadata", |conn| {
-            let _deadline = super::connection::QueryDeadline::install(conn, Some(deadline))
+            let deadline_guard = super::connection::QueryDeadline::install(conn, Some(deadline))
                 .map_err(|error| error.to_string())?;
+            let conn = &*deadline_guard;
             let mut result = std::collections::HashMap::new();
             for chunk in hashes.chunks(500) {
                 check_read_deadline(Some(deadline)).map_err(|error| error.to_string())?;
-                let placeholders = vec!["?"; chunk.len()].join(",");
-                let sql = format!(
-                    "SELECT image_hash, id, CAST(strftime('%s', created_at) AS INTEGER), cp_process(process_name), category
-                     FROM screenshots WHERE is_deleted = 0 AND image_hash IN ({placeholders})
-                     ORDER BY created_at DESC, id DESC"
-                );
+                let sql = clip_candidate_metadata_sql(chunk.len());
                 let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-                let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                    Ok((row.get::<_, String>(0)?, BackgroundScreenshotSummary {
-                        id: row.get(1)?, timestamp: row.get(2)?, process_name: row.get(3)?,
-                        category: row.get(4)?, window_title: None,
-                    }))
-                }).map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            BackgroundScreenshotSummary {
+                                id: row.get(1)?,
+                                timestamp: row.get(2)?,
+                                process_name: row.get(3)?,
+                                category: row.get(4)?,
+                                window_title: None,
+                            },
+                        ))
+                    })
+                    .map_err(|error| error.to_string())?;
                 for row in rows {
                     let (hash, metadata) = row.map_err(|error| error.to_string())?;
                     result.entry(hash).or_insert(metadata);
@@ -1542,7 +1611,7 @@ impl StorageState {
     /// callers borrow the authenticated [`CngKeySession`] across worker threads.
     fn decrypt_screenshot_summary_with_unwrap(
         row: EncryptedScreenshotSummaryRow,
-        unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+        unwrap_row_key: &RowKeyUnwrapper<'_>,
         is_authorized: &dyn Fn() -> bool,
     ) -> Result<BackgroundScreenshotSummary, BackgroundReadError> {
         let needs_row_key = row.window_title_enc.is_some() || row.process_name_enc.is_some();
@@ -1719,14 +1788,16 @@ impl StorageState {
         &self,
         screenshot_id: i64,
     ) -> Result<Vec<super::OcrResult>, String> {
+        let decoder = self.ocr_decoder();
         let encrypted_rows = {
             let conn = self.open_read_connection_named("get_screenshot_ocr_results")?;
+            let _snapshot = super::ocr_keys::read_snapshot(&conn)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
+                    "SELECT id, screenshot_id, text_enc, text_key_ref, confidence,
                         box_x1, box_y1, box_x2, box_y2,
                         box_x3, box_y3, box_x4, box_y4, created_at
-                 FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0
+                 FROM ocr_results_read WHERE screenshot_id = ? AND is_deleted = 0
                  ORDER BY box_y1, box_x1, id",
                 )
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -1735,30 +1806,38 @@ impl StorageState {
                 .map_err(|e| format!("Failed to execute query: {}", e))?
                 .filter_map(|row| row.ok())
                 .collect::<Vec<_>>();
+            decoder.load_blocks(
+                &conn,
+                rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+            )?;
             rows
         };
 
-        // CNG decryption can be slow or prompt the user. Close the SQLite
-        // cursor and read connection before starting it.
+        // Close the SQLite read before using the retained, silent CNG context.
         Ok(encrypted_rows
             .into_iter()
-            .map(|row| self.decrypt_ocr_row(row))
+            .map(|row| Self::decrypt_ocr_row(row, &decoder))
             .collect())
     }
 
-    fn decrypt_ocr_row(&self, row: EncryptedOcrResultRow) -> super::OcrResult {
-        let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
-            (Some(data), Some(key)) => self
-                .decrypt_payload_with_row_key(data, key)
-                .ok()
-                .and_then(|v| String::from_utf8(v).ok()),
-            _ => None,
+    fn decrypt_ocr_row(
+        mut row: EncryptedOcrResultRow,
+        decoder: &super::ocr_keys::Decoder<'_>,
+    ) -> super::OcrResult {
+        let decoded = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
+            (Some(data), Some(key)) => decoder.decrypt_record(data, key).unwrap_or_default(),
+            _ => super::ocr_keys::DecodedRecord::default(),
         };
+        if let Some(metadata) = decoded.metadata {
+            row.confidence = metadata.confidence;
+            row.box_coords = metadata.box_coords.map(Vec::from).to_vec();
+        }
 
         super::OcrResult {
             id: row.id,
             screenshot_id: row.screenshot_id,
-            text: text.unwrap_or_default(),
+            text: decoded.text,
+            text_layout: decoded.text_layout,
             confidence: row.confidence,
             box_coords: row.box_coords,
             created_at: wire_time::from_sqlite_utc(&row.created_at),
@@ -1777,17 +1856,19 @@ impl StorageState {
         if screenshot_ids.is_empty() {
             return Ok(blocks);
         }
+        let decoder = self.ocr_decoder();
         let encrypted_rows = {
             let conn = self.open_read_connection_named("get_ocr_blocks_by_screenshot_ids")?;
+            let _snapshot = super::ocr_keys::read_snapshot(&conn)?;
             let mut rows = Vec::new();
             // Chunked to stay under SQLite's bound-parameter limit.
             for chunk in screenshot_ids.chunks(500) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
+                    "SELECT id, screenshot_id, text_enc, text_key_ref, confidence,
                         box_x1, box_y1, box_x2, box_y2,
                         box_x3, box_y3, box_x4, box_y4, created_at
-                     FROM ocr_results
+                     FROM ocr_results_read
                      WHERE is_deleted = 0 AND screenshot_id IN ({placeholders})
                      ORDER BY screenshot_id, box_y1, box_x1, id"
                 );
@@ -1801,12 +1882,16 @@ impl StorageState {
                     .map_err(|e| format!("Failed to execute batch OCR block query: {}", e))?;
                 rows.extend(mapped.filter_map(|row| row.ok()));
             }
+            decoder.load_blocks(
+                &conn,
+                rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+            )?;
             rows
         };
 
         // As above, decrypt only after the read connection is closed.
         for row in encrypted_rows {
-            let block = self.decrypt_ocr_row(row);
+            let block = Self::decrypt_ocr_row(row, &decoder);
             blocks.entry(block.screenshot_id).or_default().push(block);
         }
         Ok(blocks)
@@ -1822,17 +1907,20 @@ impl StorageState {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
+        let decoder = self.ocr_decoder();
         let encrypted_rows = {
             let guard = self
                 .get_connection_named("get_screenshot_ocr_results_silent")
                 .map_err(BackgroundReadError::Other)?;
             let conn = guard.as_ref().unwrap();
+            let _snapshot =
+                super::ocr_keys::read_snapshot(conn).map_err(BackgroundReadError::Other)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
+                    "SELECT id, screenshot_id, text_enc, text_key_ref, confidence,
                             box_x1, box_y1, box_x2, box_y2,
                             box_x3, box_y3, box_x4, box_y4, created_at
-                     FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0
+                     FROM ocr_results_read WHERE screenshot_id = ? AND is_deleted = 0
                      ORDER BY box_y1, box_x1",
                 )
                 .map_err(|e| {
@@ -1846,31 +1934,34 @@ impl StorageState {
                 .map_err(|e| {
                     BackgroundReadError::Other(format!("Failed to read OCR row: {}", e))
                 })?;
+            decoder
+                .load_blocks(
+                    conn,
+                    rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+                )
+                .map_err(BackgroundReadError::Other)?;
             rows
         };
 
         encrypted_rows
             .into_iter()
-            .map(|row| {
+            .map(|mut row| {
                 if !self.is_silent_read_authorized() {
                     return Err(BackgroundReadError::AuthRequired);
                 }
-                let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
-                    (Some(data), Some(key)) => {
-                        String::from_utf8(self.decrypt_payload_with_row_key_silent(data, key)?)
-                            .map_err(|e| {
-                                BackgroundReadError::Other(format!(
-                                    "Invalid OCR text encoding: {}",
-                                    e
-                                ))
-                            })?
-                    }
-                    _ => String::new(),
+                let decoded = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
+                    (Some(data), Some(key)) => decoder.decrypt_record(data, key)?,
+                    _ => super::ocr_keys::DecodedRecord::default(),
                 };
+                if let Some(metadata) = decoded.metadata {
+                    row.confidence = metadata.confidence;
+                    row.box_coords = metadata.box_coords.map(Vec::from).to_vec();
+                }
                 Ok(super::OcrResult {
                     id: row.id,
                     screenshot_id: row.screenshot_id,
-                    text,
+                    text: decoded.text,
+                    text_layout: decoded.text_layout,
                     confidence: row.confidence,
                     box_coords: row.box_coords,
                     created_at: wire_time::from_sqlite_utc(&row.created_at),
@@ -1929,12 +2020,15 @@ impl StorageState {
         check_read_deadline(deadline)?;
 
         // Phase 1: fetch the raw encrypted rows with a read-only connection.
+        let decoder = self.ocr_decoder();
         let raw_rows = {
             let conn = self
                 .open_read_connection_named("get_ocr_text_prefixes_by_screenshot_ids_silent")
                 .map_err(BackgroundReadError::Other)?;
 
-            let mut raw_rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
+            let _snapshot =
+                super::ocr_keys::read_snapshot(&conn).map_err(BackgroundReadError::Other)?;
+            let mut raw_rows: Vec<EncryptedMetadataRow> = Vec::new();
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
             for chunk in screenshot_ids.chunks(500) {
@@ -1966,6 +2060,9 @@ impl StorageState {
                     raw_rows.push(row);
                 }
             }
+            decoder
+                .load_blocks(&conn, raw_rows.iter().filter_map(|r| r.2.as_deref()))
+                .map_err(BackgroundReadError::Other)?;
             raw_rows
         };
 
@@ -1979,7 +2076,7 @@ impl StorageState {
         // of one screenshot are contiguous and in insertion order — the exact
         // order the OCR engine emitted the boxes, which is the order their
         // texts were joined into the embedded MiniLM source string.
-        let mut groups: Vec<Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>> = Vec::new();
+        let mut groups: Vec<Vec<EncryptedMetadataRow>> = Vec::new();
         for row in raw_rows {
             match groups.last_mut() {
                 Some(group) if group.last().map(|(id, _, _)| *id) == Some(row.0) => group.push(row),
@@ -1993,7 +2090,7 @@ impl StorageState {
                 if !self.is_silent_read_authorized() {
                     return Err(BackgroundReadError::AuthRequired);
                 }
-                let bytes = Self::decrypt_payload_with_unwrap(data, key, &|ciphertext| {
+                let bytes = decoder.decrypt_with_unwrap(data, key, &|ciphertext| {
                     session.unwrap_row_key(ciphertext)
                 })?;
                 String::from_utf8(bytes).map_err(|error| {
@@ -2025,6 +2122,7 @@ impl StorageState {
         }
 
         // Phase 1: Use an independent read-only connection to retrieve the raw encrypted rows.
+        let decoder = self.ocr_decoder();
         let raw_rows = {
             let conn = self
                 .open_read_connection_named(if silent {
@@ -2034,14 +2132,16 @@ impl StorageState {
                 })
                 .map_err(BackgroundReadError::Other)?;
 
+            let _snapshot =
+                super::ocr_keys::read_snapshot(&conn).map_err(BackgroundReadError::Other)?;
             let mut raw_rows = Vec::new();
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
             for chunk in screenshot_ids.chunks(500) {
                 let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
                 let sql = format!(
-                    "SELECT screenshot_id, text_enc, text_key_encrypted
-                     FROM ocr_results
+                    "SELECT screenshot_id, text_enc, text_key_ref
+                     FROM ocr_results_read
                      WHERE is_deleted = 0 AND screenshot_id IN ({})
                      ORDER BY screenshot_id, box_y1, box_x1",
                     placeholders.join(",")
@@ -2071,6 +2171,9 @@ impl StorageState {
                     raw_rows.push(row);
                 }
             }
+            decoder
+                .load_blocks(&conn, raw_rows.iter().filter_map(|r| r.2.as_deref()))
+                .map_err(BackgroundReadError::Other)?;
             raw_rows
         };
 
@@ -2088,16 +2191,15 @@ impl StorageState {
             }
             let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
                 (Some(data), Some(key)) if silent => Some(
-                    String::from_utf8(self.decrypt_payload_with_row_key_silent(data, key)?)
-                        .map_err(|error| {
-                            BackgroundReadError::Other(format!(
-                                "Invalid OCR text encoding for screenshot id={}: {}",
-                                screenshot_id, error
-                            ))
-                        })?,
+                    String::from_utf8(decoder.decrypt(data, key)?).map_err(|error| {
+                        BackgroundReadError::Other(format!(
+                            "Invalid OCR text encoding for screenshot id={}: {}",
+                            screenshot_id, error
+                        ))
+                    })?,
                 ),
-                (Some(data), Some(key)) => self
-                    .decrypt_payload_with_row_key(data, key)
+                (Some(data), Some(key)) => decoder
+                    .decrypt(data, key)
                     .ok()
                     .and_then(|v| String::from_utf8(v).ok()),
                 _ => None,
@@ -2210,6 +2312,17 @@ impl StorageState {
             .transaction()
             .map_err(|e| format!("Failed to start soft-delete transaction: {}", e))?;
 
+        let affected_ids = {
+            let mut statement = tx
+                .prepare(&format!("SELECT id FROM screenshots WHERE {filter_plain}"))
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map(params_ref.as_slice(), |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+
         let queue_screenshots_sql = format!(
             "INSERT OR IGNORE INTO delete_queue_screenshots (id) SELECT id FROM screenshots WHERE {}",
             filter_plain
@@ -2250,15 +2363,17 @@ impl StorageState {
             .map_err(|e| format!("Failed to mark screenshots deleted: {}", e))?
             as i64;
 
+        self.persist_staged_deletions_on_conn(&tx, &affected_ids)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit soft-delete transaction: {}", e))?;
         drop(guard);
-        self.finish_staged_deletions()?;
+        self.processing_stage
+            .invalidate_screenshot_receipts(&affected_ids);
 
         if ocr_marked > 0 {
             let _ = self
                 .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(ocr_marked as u64))
                 });
         }
@@ -2306,11 +2421,27 @@ impl StorageState {
         let mut queued_ocr = 0i64;
         let mut ocr_marked = 0i64;
         let mut screenshots_marked = 0i64;
+        let mut affected_ids = Vec::new();
 
         for chunk in normalized_ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let params_ref: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+            {
+                let mut statement = tx
+                    .prepare(&format!(
+                        "SELECT id FROM screenshots WHERE is_deleted=0 AND id IN ({placeholders})"
+                    ))
+                    .map_err(|e| e.to_string())?;
+                let rows = statement
+                    .query_map(params_ref.as_slice(), |row| row.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())?;
+                affected_ids.extend(
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())?,
+                );
+            }
 
             let queue_screenshot_sql = format!(
                 "INSERT OR IGNORE INTO delete_queue_screenshots (id)
@@ -2360,15 +2491,17 @@ impl StorageState {
                 as i64;
         }
 
+        self.persist_staged_deletions_on_conn(&tx, &affected_ids)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit selected screenshot soft-delete: {}", e))?;
         drop(guard);
-        self.finish_staged_deletions()?;
+        self.processing_stage
+            .invalidate_screenshot_receipts(&affected_ids);
 
         if ocr_marked > 0 {
             let _ = self
                 .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(ocr_marked as u64))
                 });
         }
@@ -2524,24 +2657,23 @@ impl StorageState {
 
     /// Fetch pending counts in delete queues.
     pub fn get_delete_queue_status(&self) -> Result<DeleteQueueStatus, String> {
-        let guard = self.get_connection_named("get_delete_queue_status")?;
-        let conn = guard.as_ref().unwrap();
+        self.with_read_connection_named("get_delete_queue_status", |conn| {
+            let pending_screenshots: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
+            let pending_ocr: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
 
-        let pending_screenshots: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
-                row.get(0)
+            Ok(DeleteQueueStatus {
+                pending_screenshots,
+                pending_ocr,
+                running: pending_screenshots > 0 || pending_ocr > 0,
             })
-            .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
-        let pending_ocr: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
-
-        Ok(DeleteQueueStatus {
-            pending_screenshots,
-            pending_ocr,
-            running: pending_screenshots > 0 || pending_ocr > 0,
         })
     }
 
@@ -2584,17 +2716,29 @@ impl StorageState {
             });
         }
 
+        let decoder = self.ocr_decoder();
         let rows: Vec<OcrDeleteQueueRow> = {
             let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
             let conn = guard.as_ref().unwrap();
+            let _snapshot = super::ocr_keys::read_snapshot(conn)?;
+            // A LEFT JOIN directly to ocr_results_read can materialize its
+            // nested key join for the entire corpus before applying LIMIT.
+            // Bound both queue membership and view reads before joining them,
+            // including queue entries whose OCR row is already gone.
             let mut read_stmt = conn
                 .prepare(
-                    "SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
-                            o.text_enc, o.text_key_encrypted
-                     FROM delete_queue_ocr q
-                     LEFT JOIN ocr_results o ON o.id = q.id
-                     ORDER BY q.id ASC
-                     LIMIT ?1",
+                    "WITH batch AS MATERIALIZED (
+                         SELECT id, failure_count FROM delete_queue_ocr
+                         ORDER BY id ASC LIMIT ?1
+                     ), evidence AS MATERIALIZED (
+                         SELECT id, text, text_hash, text_enc, text_key_ref
+                         FROM ocr_results_read WHERE id IN (SELECT id FROM batch)
+                     )
+                     SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
+                            o.text_enc, o.text_key_ref
+                     FROM batch q
+                     LEFT JOIN evidence o ON o.id = q.id
+                     ORDER BY q.id ASC",
                 )
                 .map_err(|e| format!("Failed to prepare OCR queue read: {}", e))?;
 
@@ -2602,9 +2746,14 @@ impl StorageState {
                 .query_map([safe_batch_size], OcrDeleteQueueRow::from_row)
                 .map_err(|e| format!("Failed to read OCR queue rows: {}", e))?;
 
-            mapped_rows
+            let rows = mapped_rows
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to decode OCR queue row: {}", e))?
+                .map_err(|e| format!("Failed to decode OCR queue row: {}", e))?;
+            decoder.load_blocks(
+                conn,
+                rows.iter().filter_map(|r| r.text_key_encrypted.as_deref()),
+            )?;
+            rows
         };
 
         if rows.is_empty() {
@@ -2648,7 +2797,7 @@ impl StorageState {
 
             let plaintext = match (row.text_enc.as_ref(), row.text_key_encrypted.as_ref()) {
                 (Some(enc), Some(key_enc)) => {
-                    match self.decrypt_payload_with_row_key_silent(enc, key_enc) {
+                    match decoder.decrypt(enc, key_enc) {
                         Ok(bytes) => match String::from_utf8(bytes) {
                             Ok(text) => Ok(text),
                             Err(_) => row.legacy_text.clone().ok_or_else(|| {
@@ -2721,10 +2870,7 @@ impl StorageState {
                 .expect("OCR posting cleanup requires an HMAC key");
             for token in Self::bigram_tokenize(&plaintext) {
                 let token_hash = Self::compute_hmac_hash(&token, hmac_key);
-                removals
-                    .entry(token_hash)
-                    .or_insert_with(RoaringBitmap::new)
-                    .insert(bitmap_id);
+                removals.entry(token_hash).or_default().insert(bitmap_id);
             }
 
             // The postings are staged for removal in the same transaction that
@@ -2952,6 +3098,13 @@ impl StorageState {
                 return Ok(IncrementalVacuumResult::default());
             }
         }
+
+        // Acquire before the maintenance gate and connection. Waiting for the
+        // shared rewrite budget must leave foreground database reads available.
+        let Some(_rewrite_permit) = self.rewrite_budget.acquire(&self.foreground_db_activity)
+        else {
+            return Ok(IncrementalVacuumResult::default());
+        };
         let Some(_maintenance) = self.try_database_maintenance("run_incremental_vacuum_if_idle")
         else {
             return Ok(IncrementalVacuumResult::default());
@@ -2980,7 +3133,8 @@ impl StorageState {
             return Ok(IncrementalVacuumResult::default());
         }
 
-        let pages = vacuum_pages.max(1);
+        // Smaller commits bound each burst and the exclusive maintenance hold.
+        let pages = vacuum_pages.clamp(1, 64);
         let page_count_before: i64 = conn
             .query_row("PRAGMA page_count;", [], |row| row.get(0))
             .map_err(|e| format!("Failed to read page_count before vacuum: {}", e))?;
@@ -3140,9 +3294,11 @@ impl StorageState {
     }
 
     /// Clean up orphaned page_icons and link_sets entries after screenshot deletion.
-    fn cleanup_orphaned_dedup_entries(conn: &Connection) -> Result<(), String> {
+    pub(super) fn cleanup_orphaned_dedup_entries(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
-              "DELETE FROM page_icons WHERE id NOT IN (SELECT DISTINCT page_icon_id FROM screenshots WHERE is_deleted = 0 AND page_icon_id IS NOT NULL);
+              "DELETE FROM page_icons WHERE id NOT IN (
+                    SELECT page_icon_id FROM screenshots WHERE is_deleted = 0 AND page_icon_id IS NOT NULL
+                    UNION SELECT process_icon_id FROM screenshots WHERE is_deleted = 0 AND process_icon_id IS NOT NULL);
                DELETE FROM link_sets WHERE id NOT IN (SELECT DISTINCT link_set_id FROM screenshots WHERE is_deleted = 0 AND link_set_id IS NOT NULL);"
         )
         .map_err(|e| format!("Failed to cleanup orphaned dedup entries: {}", e))?;

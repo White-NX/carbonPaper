@@ -50,6 +50,14 @@
   background: var(--ide-border);
   content: '';
 }
+.recap-mainline-preview {
+  max-height: 32px;
+  overflow: hidden;
+  opacity: .55;
+  pointer-events: none;
+  user-select: none;
+  mask-image: linear-gradient(to bottom, #000, transparent);
+}
 @container recap-mainlines (max-width: 640px) {
   .recap-mainline-grid { grid-template-columns: 13px minmax(0, 1fr); gap: 14px 15px; }
   .recap-mainline-branches { grid-column: 2; padding-top: 0; }
@@ -449,6 +457,33 @@ body {
 .dark .preview-action-bar {
   background-color: rgba(37, 37, 38, 0.92);
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* Keep the zoom menu's scrollbar inset within its rounded acrylic panel. */
+.preview-zoom-options::-webkit-scrollbar {
+  width: 6px;
+}
+
+.preview-zoom-options::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.preview-zoom-options::-webkit-scrollbar-thumb {
+  min-height: 24px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background-color: color-mix(in srgb, var(--ide-muted) 50%, transparent);
+  background-clip: padding-box;
+}
+
+.preview-zoom-options::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--ide-muted) 75%, transparent);
+}
+
+.preview-zoom-options::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 /* Collapsed search timeline overview. */

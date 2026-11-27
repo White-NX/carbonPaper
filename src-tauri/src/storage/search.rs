@@ -36,7 +36,7 @@ use super::search_plan::QueryPlan;
 use super::search_rank;
 use super::{
     connection::IndependentReadConnection, wire_time, BackgroundReadError, SearchMatchEvidence,
-    SearchResult, StorageState,
+    SearchResult, SearchSortOrder, StorageState,
 };
 
 type SearchSqlParam = Box<dyn ToSql>;
@@ -270,7 +270,10 @@ fn build_empty_search_sql(
     } else {
         "FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id"
     };
-    let mut sql = format!("SELECT {SEARCH_RESULT_COLUMNS} {from_clause}");
+    let mut sql = format!(
+        "SELECT {SEARCH_RESULT_COLUMNS} {from_clause}
+        LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id"
+    );
     let mut where_clauses = vec![
         "s.is_deleted = 0".to_string(),
         "r.is_deleted = 0".to_string(),
@@ -322,16 +325,22 @@ fn build_empty_search_sql(
 /// list down to its order. One constant makes that true by construction
 /// instead of by review.
 const SEARCH_RESULT_COLUMNS: &str =
-    "r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
+    "r.id, r.screenshot_id, CASE WHEN r.ocr_block_slot IS NULL THEN r.text_enc ELSE X'' END,
+         cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
+             k.screenshot_id,k.scope_tag,k.wrapped_key,
+             (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id'),r.ocr_block_slot), r.confidence,
          r.box_x1, r.box_y1, r.box_x2, r.box_y2,
          r.box_x3, r.box_y3, r.box_x4, r.box_y4,
          s.image_path, s.window_title_enc, cp_process(s.process_name),
          s.content_key_encrypted,
-         CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+         CAST(strftime('%s', COALESCE(r.created_at,(SELECT created_at FROM ocr_blocks WHERE id=r.ocr_key_id))) AS INTEGER) AS created_ts,
          CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
          s.category";
 
-const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted,
+const CANDIDATE_COLUMNS: &str = "r.id, r.screenshot_id, CASE WHEN r.ocr_block_slot IS NULL THEN r.text_enc ELSE X'' END,
+     cp_ocr_key_ref(r.id,r.screenshot_id,r.ocr_key_id,r.text_key_encrypted,
+         k.screenshot_id,k.scope_tag,k.wrapped_key,
+         (SELECT value FROM app_metadata WHERE key='protected_content_dataset_id'),r.ocr_block_slot),
      CAST(strftime('%s', s.created_at) AS INTEGER)";
 
 /// Recall already chose a bounded set of OCR ids. Without statistics SQLite
@@ -356,6 +365,7 @@ fn search_rows_by_id_sql(columns: &str, count: usize) -> String {
          SELECT {columns} FROM requested
          CROSS JOIN ocr_results r NOT INDEXED ON r.id = requested.id
          CROSS JOIN screenshots s NOT INDEXED ON r.screenshot_id = s.id
+         LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id
          WHERE r.is_deleted = 0 AND s.is_deleted = 0"
     )
 }
@@ -386,12 +396,24 @@ fn decode_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSearchRow> 
         screenshot_id: row.get(1)?,
         text_enc: row.get(2)?,
         text_key_enc: row.get(3)?,
-        confidence: row.get(4)?,
+        confidence: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
         box_coords: vec![
-            vec![row.get(5)?, row.get(6)?],
-            vec![row.get(7)?, row.get(8)?],
-            vec![row.get(9)?, row.get(10)?],
-            vec![row.get(11)?, row.get(12)?],
+            vec![
+                row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
+            ],
+            vec![
+                row.get::<_, Option<f64>>(7)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(8)?.unwrap_or_default(),
+            ],
+            vec![
+                row.get::<_, Option<f64>>(9)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(10)?.unwrap_or_default(),
+            ],
+            vec![
+                row.get::<_, Option<f64>>(11)?.unwrap_or_default(),
+                row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
+            ],
         ],
         image_path: row.get(13)?,
         window_title_enc: row.get(14)?,
@@ -428,6 +450,32 @@ struct Scored {
     score: f64,
 }
 
+fn sort_scored_newest(rows: &mut [Scored]) {
+    rows.sort_by(|a, b| {
+        b.screenshot_ts
+            .cmp(&a.screenshot_ts)
+            .then_with(|| a.screenshot_id.cmp(&b.screenshot_id))
+            .then_with(|| b.score.total_cmp(&a.score))
+            .then_with(|| a.ocr_id.cmp(&b.ocr_id))
+    });
+}
+
+fn finalize_scored_order(
+    rows: &mut Vec<Scored>,
+    distinct_keywords: bool,
+    sort_order: SearchSortOrder,
+) {
+    // Chronological result caps count captures rather than their OCR blocks.
+    // The incoming relevance order keeps the strongest representative first.
+    if distinct_keywords || sort_order == SearchSortOrder::Newest {
+        let mut seen = HashSet::new();
+        rows.retain(|row| seen.insert(row.screenshot_id));
+    }
+    if sort_order == SearchSortOrder::Newest {
+        sort_scored_newest(rows);
+    }
+}
+
 /// The ordered result of a text search, kept just long enough for the next
 /// page to arrive.
 ///
@@ -462,6 +510,7 @@ fn order_cache_key(
     categories: Option<&[String]>,
     start_time: Option<f64>,
     end_time: Option<f64>,
+    sort_order: SearchSortOrder,
 ) -> String {
     fn joined(values: Option<&[String]>) -> String {
         let mut values: Vec<&str> = values.unwrap_or(&[]).iter().map(String::as_str).collect();
@@ -472,7 +521,7 @@ fn order_cache_key(
     // Unit separators keep a process named like the query from colliding with
     // it once everything is one string.
     format!(
-        "{fuzzy}\u{1f}{query}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}",
+        "{sort_order:?}\u{1f}{fuzzy}\u{1f}{query}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}",
         joined(process_names),
         joined(categories),
         start_time,
@@ -543,15 +592,18 @@ impl StorageState {
         stages: &mut SearchStages,
     ) -> Result<Vec<SearchResult>, String> {
         let sql_started = Instant::now();
+        let decoder = self.ocr_decoder();
         let raw_rows: Vec<RawSearchRow> = {
+            let _snapshot = super::ocr_keys::read_snapshot(conn)?;
             let mut stmt = conn
                 .prepare(sql)
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
-            let rows = stmt
+            let rows: Vec<RawSearchRow> = stmt
                 .query_map(param_refs, decode_search_row)
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
                 .filter_map(Result::ok)
                 .collect();
+            decoder.load_blocks(conn, rows.iter().filter_map(|r| r.text_key_enc.as_deref()))?;
             rows
         };
         stages.page_sql += sql_started.elapsed();
@@ -584,21 +636,33 @@ impl StorageState {
                 .and_then(|row| row.screenshot_key_enc.as_ref())
                 .and_then(|encrypted| unwrap(encrypted).ok());
 
-            let results: Vec<SearchResult> = rows
+            let results: Result<Vec<SearchResult>, BackgroundReadError> = rows
                 .into_iter()
-                .map(|raw| {
-                    let text = match known_text.get(&raw.id) {
+                .map(|mut raw| {
+                    let mut text = match known_text.get(&raw.id) {
                         Some(text) => text.clone(),
                         None => match (raw.text_enc.as_ref(), raw.text_key_enc.as_ref()) {
-                            (Some(data), Some(key)) => {
-                                Self::decrypt_payload_with_unwrap(data, key, &unwrap)
-                                    .ok()
-                                    .and_then(|value| String::from_utf8(value).ok())
-                                    .unwrap_or_default()
-                            }
+                            (Some(data), Some(key)) => decoder
+                                .decrypt_with_unwrap(data, key, &unwrap)
+                                .ok()
+                                .and_then(|value| String::from_utf8(value).ok())
+                                .unwrap_or_default(),
                             _ => String::new(),
                         },
                     };
+                    if let Some(key) = raw.text_key_enc.as_deref() {
+                        match decoder.metadata_with_unwrap(key, &unwrap) {
+                            Ok(Some(metadata)) => {
+                                raw.confidence = metadata.confidence;
+                                raw.box_coords = metadata.box_coords.map(Vec::from).to_vec();
+                            }
+                            Err(BackgroundReadError::AuthRequired) => {
+                                return Err(BackgroundReadError::AuthRequired)
+                            }
+                            Err(_) => text.clear(),
+                            Ok(None) => {}
+                        }
+                    }
                     let window_title =
                         match (raw.window_title_enc.as_ref(), screenshot_key.as_ref()) {
                             (Some(data), Some(key)) => decrypt_with_master_key(key, data)
@@ -607,7 +671,7 @@ impl StorageState {
                             _ => None,
                         };
 
-                    SearchResult {
+                    Ok(SearchResult {
                         id: raw.id,
                         screenshot_id: raw.screenshot_id,
                         text,
@@ -623,14 +687,14 @@ impl StorageState {
                         ),
                         timestamp: raw.screenshot_created_ts,
                         match_evidence: None,
-                    }
+                    })
                 })
                 .collect();
 
             if let Some(key) = screenshot_key.as_mut() {
                 Self::zeroize_bytes(key);
             }
-            Ok(results)
+            results
         })
         .map_err(describe_read_error)?;
 
@@ -719,9 +783,13 @@ impl StorageState {
     /// failing the search: it will score nothing and be dropped, which is the
     /// same outcome as never having proposed it. A locked session is different
     /// and does fail, because every remaining row would fail the same way.
-    fn decrypt_candidates(&self, rows: Vec<CandidateRow>) -> Result<Vec<VerifiedRow>, String> {
+    fn decrypt_candidates(
+        &self,
+        decoder: &super::ocr_keys::Decoder<'_>,
+        rows: Vec<CandidateRow>,
+    ) -> Result<Vec<VerifiedRow>, String> {
         unwrap_batch_parallel(&self.credential_state, rows, |session, row| {
-            let text = Self::decrypt_payload_with_unwrap(&row.text_enc, &row.text_key_enc, &|c| {
+            let text = decoder.decrypt_with_unwrap(&row.text_enc, &row.text_key_enc, &|c| {
                 session.unwrap_row_key(c)
             });
             let text = match text {
@@ -775,6 +843,10 @@ impl StorageState {
         ))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Caches result evidence with both version fences and their independent read connection."
+    )]
     fn store_order(
         &self,
         key: String,
@@ -797,8 +869,7 @@ impl StorageState {
                 .semantic_cache_reset_generation
                 .load(AtomicOrdering::Acquire)
                 != reset_generation
-            || sqlite_data_version(&version_connection)
-                .map_or(true, |current| current != data_version)
+            || (sqlite_data_version(&version_connection) != Ok(data_version))
         {
             return;
         }
@@ -821,6 +892,7 @@ impl StorageState {
             .search_order_cache
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
+        self.clear_clip_chronological_cache();
     }
 
     /// Search text using the blind bigram bitmap index.
@@ -860,6 +932,32 @@ impl StorageState {
         start_time: Option<f64>,
         end_time: Option<f64>,
         categories: Option<Vec<String>>,
+    ) -> Result<(Vec<SearchResult>, bool), String> {
+        self.search_text_ordered_with_coverage(
+            query,
+            limit,
+            offset,
+            fuzzy,
+            process_names,
+            start_time,
+            end_time,
+            categories,
+            SearchSortOrder::Relevance,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_text_ordered_with_coverage(
+        &self,
+        query: &str,
+        limit: i32,
+        offset: i32,
+        fuzzy: bool,
+        process_names: Option<Vec<String>>,
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        categories: Option<Vec<String>>,
+        sort_order: SearchSortOrder,
     ) -> Result<(Vec<SearchResult>, bool), String> {
         let mut telemetry = SearchTelemetry::new();
         let mut watch = Stopwatch::start();
@@ -915,6 +1013,7 @@ impl StorageState {
             categories.as_deref(),
             start_time,
             end_time,
+            sort_order,
         );
         let reset_generation = self
             .semantic_cache_reset_generation
@@ -1016,6 +1115,7 @@ impl StorageState {
             data_version,
             reset_generation,
             complete,
+            sort_order,
             &mut telemetry,
             &mut watch,
         )?;
@@ -1053,6 +1153,7 @@ impl StorageState {
         data_version: i64,
         reset_generation: u64,
         complete: bool,
+        sort_order: SearchSortOrder,
         telemetry: &mut SearchTelemetry,
         watch: &mut Stopwatch,
     ) -> Result<Vec<SearchResult>, String> {
@@ -1070,9 +1171,15 @@ impl StorageState {
             .map(|candidate| candidate.row_id)
             .collect();
         let sql_started = Instant::now();
-        let rows = self.load_candidate_rows(&conn, &ids, &mut telemetry.counts)?;
+        let decoder = self.ocr_decoder();
+        let rows = {
+            let _snapshot = super::ocr_keys::read_snapshot(&conn)?;
+            let rows = self.load_candidate_rows(&conn, &ids, &mut telemetry.counts)?;
+            decoder.load_blocks(&conn, rows.iter().map(|r| r.text_key_enc.as_slice()))?;
+            rows
+        };
         telemetry.stages.candidate_sql += sql_started.elapsed();
-        let verified = self.decrypt_candidates(rows)?;
+        let verified = self.decrypt_candidates(&decoder, rows)?;
         telemetry.counts.verified += verified.len();
 
         for row in verified {
@@ -1145,15 +1252,7 @@ impl StorageState {
         tolerated.sort_by(by_score);
         scored.append(&mut tolerated);
 
-        // A multi-word search reports captures, not text blocks — the words
-        // may well be spread across several. Keeping the first occurrence of
-        // each screenshot after sorting makes the representative the block
-        // that ranked best, where it used to be whichever block happened to
-        // have the largest row id.
-        if plan.has_distinct_keyword_pass() {
-            let mut seen: HashSet<i64> = HashSet::new();
-            scored.retain(|row| seen.insert(row.screenshot_id));
-        }
+        finalize_scored_order(&mut scored, plan.has_distinct_keyword_pass(), sort_order);
         telemetry.counts.kept = scored.len();
 
         let ordered: Vec<i64> = scored.iter().map(|row| row.ocr_id).collect();
@@ -1271,7 +1370,8 @@ mod tests {
     fn search_fixture() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory search database");
         conn.execute_batch(
-            "CREATE TABLE screenshots (
+            "CREATE TABLE app_metadata(key TEXT PRIMARY KEY,value TEXT);
+             CREATE TABLE screenshots (
                  id INTEGER PRIMARY KEY,
                  image_path TEXT NOT NULL,
                  created_at TEXT NOT NULL,
@@ -1284,6 +1384,8 @@ mod tests {
              CREATE TABLE ocr_results (
                  id INTEGER PRIMARY KEY,
                  screenshot_id INTEGER NOT NULL,
+                 text TEXT,
+                 text_hash TEXT NOT NULL DEFAULT '',
                  text_enc BLOB,
                  text_key_encrypted BLOB,
                  confidence REAL NOT NULL DEFAULT 1,
@@ -1308,6 +1410,7 @@ mod tests {
                  ON ocr_results(is_deleted, screenshot_id);",
         )
         .expect("search fixture schema");
+        crate::storage::ocr_keys::initialize(&conn).unwrap();
         conn.create_scalar_function(
             "cp_process",
             1,
@@ -1382,8 +1485,10 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        conn.execute_batch("CREATE TABLE app_metadata(key TEXT PRIMARY KEY, value TEXT)")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_metadata(key TEXT PRIMARY KEY, value TEXT)",
+        )
+        .unwrap();
         ensure_schema(conn).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         let index = BlindIndex::open(&tx).unwrap();
@@ -1580,7 +1685,8 @@ mod tests {
         let sql = format!(
             "SELECT {SEARCH_RESULT_COLUMNS}
              FROM ocr_results r
-             JOIN screenshots s ON r.screenshot_id = s.id"
+             JOIN screenshots s ON r.screenshot_id = s.id
+             LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id"
         );
         let raw = conn
             .prepare(&sql)
@@ -1591,7 +1697,10 @@ mod tests {
         assert_eq!(raw.id, 42);
         assert_eq!(raw.screenshot_id, 7);
         assert_eq!(raw.text_enc.as_deref(), Some(&[0x01u8][..]));
-        assert_eq!(raw.text_key_enc.as_deref(), Some(&[0x02u8][..]));
+        assert_eq!(
+            raw.text_key_enc.as_deref(),
+            Some(b"CPORKEY1\0\x02".as_slice())
+        );
         assert_eq!(raw.confidence, 0.75);
         assert_eq!(
             raw.box_coords,
@@ -2277,8 +2386,24 @@ mod tests {
 
     #[test]
     fn the_cache_key_separates_queries_from_their_filters() {
-        let query = order_cache_key("code.exe", true, None, None, None, None);
-        let filter = order_cache_key("", true, Some(&["code.exe".to_string()]), None, None, None);
+        let query = order_cache_key(
+            "code.exe",
+            true,
+            None,
+            None,
+            None,
+            None,
+            SearchSortOrder::Relevance,
+        );
+        let filter = order_cache_key(
+            "",
+            true,
+            Some(&["code.exe".to_string()]),
+            None,
+            None,
+            None,
+            SearchSortOrder::Relevance,
+        );
         assert_ne!(query, filter);
 
         // Filter order is not part of the query's identity.
@@ -2289,6 +2414,7 @@ mod tests {
             None,
             None,
             None,
+            SearchSortOrder::Relevance,
         );
         let other = order_cache_key(
             "x",
@@ -2297,12 +2423,110 @@ mod tests {
             None,
             None,
             None,
+            SearchSortOrder::Relevance,
         );
         assert_eq!(one, other);
 
         assert_ne!(
-            order_cache_key("x", true, None, None, None, None),
-            order_cache_key("x", false, None, None, None, None)
+            order_cache_key(
+                "x",
+                true,
+                None,
+                None,
+                None,
+                None,
+                SearchSortOrder::Relevance
+            ),
+            order_cache_key(
+                "x",
+                false,
+                None,
+                None,
+                None,
+                None,
+                SearchSortOrder::Relevance
+            )
+        );
+        assert_ne!(
+            order_cache_key(
+                "x",
+                true,
+                None,
+                None,
+                None,
+                None,
+                SearchSortOrder::Relevance
+            ),
+            order_cache_key("x", true, None, None, None, None, SearchSortOrder::Newest)
+        );
+    }
+
+    #[test]
+    fn newest_order_uses_capture_time_and_keeps_the_best_text_block_first() {
+        let mut rows = vec![
+            Scored {
+                ocr_id: 900,
+                screenshot_id: 1,
+                screenshot_ts: Some(100),
+                score: 2000.0,
+            },
+            Scored {
+                ocr_id: 4,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 500.0,
+            },
+            Scored {
+                ocr_id: 5,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 1000.0,
+            },
+            Scored {
+                ocr_id: 1000,
+                screenshot_id: 3,
+                screenshot_ts: None,
+                score: 3000.0,
+            },
+        ];
+        sort_scored_newest(&mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.ocr_id).collect::<Vec<_>>(),
+            vec![5, 4, 900, 1000]
+        );
+    }
+
+    #[test]
+    fn newest_single_keyword_results_count_captures_without_changing_relevance_pages() {
+        let mut rows = vec![
+            Scored {
+                ocr_id: 900,
+                screenshot_id: 1,
+                screenshot_ts: Some(100),
+                score: 2000.0,
+            },
+            Scored {
+                ocr_id: 5,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 1000.0,
+            },
+            Scored {
+                ocr_id: 4,
+                screenshot_id: 2,
+                screenshot_ts: Some(200),
+                score: 500.0,
+            },
+        ];
+        finalize_scored_order(&mut rows, false, SearchSortOrder::Relevance);
+        assert_eq!(
+            rows.iter().map(|row| row.ocr_id).collect::<Vec<_>>(),
+            vec![900, 5, 4]
+        );
+        finalize_scored_order(&mut rows, false, SearchSortOrder::Newest);
+        assert_eq!(
+            rows.iter().map(|row| row.ocr_id).collect::<Vec<_>>(),
+            vec![5, 900]
         );
     }
 }

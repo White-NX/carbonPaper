@@ -41,6 +41,9 @@ pub fn restart_app(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
+    if let Some(usage) = app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+        usage.stop();
+    }
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {
@@ -82,6 +85,9 @@ pub async fn exit_app(
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
     IS_QUITTING.store(true, Ordering::Relaxed);
+    if let Some(usage) = app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+        usage.stop();
+    }
     monitor_state.stopping.store(true, Ordering::SeqCst);
     capture_state.stopped.store(true, Ordering::SeqCst);
     capture_state.paused.store(false, Ordering::SeqCst);
@@ -453,12 +459,7 @@ pub async fn switch_to_standard_mode(
         timer.abort();
     }
 
-    // Refuse to create a duplicate main window.
-    if app.get_webview_window("main").is_some() {
-        return Err("Window already exists".to_string());
-    }
-
-    // Recreate the standard UI.
+    // Recreate the standard UI, or present the window another open created.
     crate::create_main_window(&app).map_err(|e| e.to_string())?;
 
     if let Some(credential_state) =

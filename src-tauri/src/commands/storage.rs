@@ -12,10 +12,65 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tauri::Manager;
 
 mod timeline_requests;
 static TIMELINE_REQUESTS: Lazy<timeline_requests::TimelineRequests> =
     Lazy::new(timeline_requests::TimelineRequests::default);
+
+/// Publishes an edited image, invalidates old evidence and queues recognition.
+/// Authentication: required, main window only. Frontend: `lib/monitor_api.js`.
+#[tauri::command]
+pub async fn storage_save_edited_screenshot(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    screenshot_id: i64,
+    expected_image_hash: String,
+    image_data: String,
+) -> Result<storage::EditedScreenshotResponse, String> {
+    check_auth_required(&credential_state)?;
+    super::check_main_window(&window)?;
+    let saved = crate::screenshot_editor::save(
+        app.clone(),
+        state.inner().clone(),
+        credential_state.inner().clone(),
+        screenshot_id,
+        expected_image_hash,
+        image_data,
+    )
+    .await?;
+    use tauri::Emitter;
+    let _ = app.emit("screenshot-edited", &saved);
+    Ok(saved)
+}
+
+/// Retries recognition of the current saved edit without rewriting the image.
+/// Authentication: required, main window only. Frontend: `lib/monitor_api.js`.
+#[tauri::command]
+pub async fn storage_retry_edited_screenshot_ocr(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    screenshot_id: i64,
+    expected_image_hash: String,
+) -> Result<storage::EditOcrStatus, String> {
+    check_auth_required(&credential_state)?;
+    super::check_main_window(&window)?;
+    let state = state.inner().clone();
+    let status = tokio::task::spawn_blocking(move || {
+        state.retry_edited_ocr_job(screenshot_id, &expected_image_hash)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    app.state::<Arc<crate::screenshot_editor::ScreenshotEditRuntime>>()
+        .wake();
+    use tauri::Emitter;
+    let _ = app.emit("screenshot-ocr-updated", &status);
+    Ok(status)
+}
 
 /// Authentication: required. Fuses screenshot keywords and recap retrieval.
 #[tauri::command]
@@ -228,6 +283,10 @@ mod tests {
 ///
 /// Authentication: required. `max_records` caps the result (sampling evenly across range).
 /// Returns lightweight `TimelineRecord` objects. Frontend: `lib/monitor_api.js`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn storage_get_timeline(
     window: tauri::Window,
@@ -376,6 +435,10 @@ pub async fn storage_list_recent_screenshots(
 ///
 /// Authentication: required. Returns an array of `SearchResult` objects; optional
 /// filters are omitted as JSON `null`. Frontend: `lib/monitor_api.js`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn storage_search(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -722,7 +785,10 @@ pub async fn storage_get_screenshot_details(
 
         match &record {
             Some(r) => {
+                let mut record = serde_json::to_value(r).map_err(|error| error.to_string())?;
+                record["status"] = serde_json::json!(state.screenshot_status(r.id)?);
                 let ocr_results = state.get_screenshot_ocr_results(r.id)?;
+                let edit_ocr = state.edited_ocr_status(r.id)?;
                 let document_ref = match state.get_screenshot_document_ref(r.id) {
                     Ok(reference) => reference.map(|reference| reference.public_view()),
                     Err(error) => {
@@ -738,6 +804,7 @@ pub async fn storage_get_screenshot_details(
                     "status": "success",
                     "record": record,
                     "ocr_results": ocr_results,
+                    "edit_ocr": edit_ocr,
                     "document_ref": document_ref
                 }))
             }

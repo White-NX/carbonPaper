@@ -25,6 +25,7 @@ pub struct SnapshotRecapActivity {
     task_title: String,
     text: String,
     details: Vec<RecapDetail>,
+    warnings: Vec<RecapWarning>,
     start_ms: i64,
     end_ms: i64,
 }
@@ -54,6 +55,7 @@ fn snapshot_items(day: &RecapDay, screenshot_id: i64) -> Vec<SnapshotRecapActivi
             task_title: activity.task_title.clone(),
             text: activity.text.clone(),
             details: activity.details.clone(),
+            warnings: activity.warnings.clone(),
             start_ms: activity.start_ms,
             end_ms: activity.end_ms,
         })
@@ -197,6 +199,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: RecapUsage::default(),
             can_undo: false,

@@ -14,6 +14,23 @@
   Delete "$INSTDIR\python-3.12.10-amd64.exe"
 !macroend
 
+!macro NSIS_HOOK_PREUNINSTALL
+  ; An updater's temporary uninstall keeps the protected component. A full
+  ; uninstall retires this user's grants before deleting its signed entry point.
+  ${If} $UpdateMode <> 1
+    IfFileExists "$INSTDIR\carbonpaper.exe" 0 carbonpaper_protected_uninstall_done
+    ClearErrors
+    ExecWait '"$INSTDIR\carbonpaper.exe" --uninstall-protected-component' $0
+    ${If} ${Errors}
+      Abort
+    ${EndIf}
+    ${If} $0 <> 0
+      Abort
+    ${EndIf}
+  ${EndIf}
+  carbonpaper_protected_uninstall_done:
+!macroend
+
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1

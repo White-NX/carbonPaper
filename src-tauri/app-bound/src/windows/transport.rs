@@ -24,6 +24,9 @@ pub const PIPE_CLIENT_ACCESS: u32 = 0x0012_0183;
 
 pub fn call(request: Request) -> Result<Response> {
     let deadline = Instant::now() + Duration::from_secs(10);
+    // Upgraded services grant only START/QUERY to clients. Older installations
+    // may deny START; an already running legacy broker must remain usable.
+    let _ = service::ensure_started();
     let mut file = open_pipe(PIPE_NAME, deadline)?;
     let handle = HANDLE(file.as_raw_handle());
     // Verify the peer before sending data that permits pipe impersonation.

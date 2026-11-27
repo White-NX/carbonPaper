@@ -24,6 +24,7 @@ fn config(storage: &StorageState) -> RecapConfig {
             api_key: Some("private-api-key".into()),
             tool_calling: ToolCalling::Unknown,
             context_tokens: 32768,
+            ..Default::default()
         },
         remote_consent: false,
         revision: storage.recap_config_revision().unwrap(),
@@ -424,6 +425,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
         novelty: 0.,
         span_ms: 0,
         screening: Default::default(),
+        supplied_ranges: vec![],
     };
     let batch = recap::RecapBatch {
         start_ms: calendar.period_boundaries_ms[0],
@@ -447,7 +449,10 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
             segments: vec![],
             sources: vec![recap::SourceRef::from(&evidence(1, first))],
             member_ids: vec![1],
+            warnings: vec![],
         }],
+        validation_version: 0,
+        budget_hash: String::new(),
     };
     let first_key = format!("{date}:{}", calendar.start_ms);
     mirror(
@@ -540,6 +545,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
         mainlines: None,
         mainlines_error: None,
         mainlines_updated_at_ms: 0,
+        mainlines_pending: false,
         mainlines_attempts: vec![],
         usage: Default::default(),
         can_undo: false,
@@ -559,7 +565,7 @@ fn protected_period_prompt_reuses_corrected_task_after_restart_without_archive_k
         second,
     )
     .unwrap();
-    let crate::ai::provider::Message::User(payload) = &request.messages[1] else {
+    let crate::ai::provider::Message::Context(payload) = &request.messages[1] else {
         panic!()
     };
     let payload: Value = serde_json::from_str(payload).unwrap();

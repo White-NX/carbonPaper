@@ -285,18 +285,18 @@ fn compare_short_timeline_header_queries() {
 
 #[test]
 fn cancellation_interrupts_sql_before_first_row_and_removes_handler() {
-    let (_temp, _storage, conn) = fixture(4000);
+    let (_temp, _storage, mut conn) = fixture(4000);
     let cancelled = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&cancelled);
     let sql = timeline_rows_sql(Some(21600));
-    let mut stmt = conn.prepare(&sql).unwrap();
     // Simulate a UI cancellation delivered while sqlite3_step is evaluating
     // the first result. The old per-result loop cannot observe this signal.
-    let cancellation = SqlCancellation::install(&conn, move || {
+    let cancellation = SqlCancellation::install(&mut conn, move || {
         stop.store(true, Ordering::Release);
         stop.load(Ordering::Acquire)
     })
     .unwrap();
+    let mut stmt = cancellation.prepare(&sql).unwrap();
     let mut rows = stmt
         .query(params!["2026-01-01", "2026-04-01", 500])
         .unwrap();
@@ -308,6 +308,7 @@ fn cancellation_interrupts_sql_before_first_row_and_removes_handler() {
     drop(rows);
     assert!(cancelled.load(Ordering::Acquire));
     assert!(stmt.get_status(StatementStatus::VmStep) < 5000);
+    drop(stmt);
     drop(cancellation);
     let mut timings = Timings::default();
     let rows = read_rows(
@@ -329,7 +330,7 @@ fn cancellation_interrupts_sql_before_first_row_and_removes_handler() {
 #[ignore = "read-only snapshot benchmark; requires CARBONPAPER_TIMELINE_BENCH_DB"]
 fn compare_snapshot_queries() {
     let path = std::env::var("CARBONPAPER_TIMELINE_BENCH_DB").expect("set snapshot path");
-    let conn =
+    let mut conn =
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     conn.execute_batch("PRAGMA query_only = ON").unwrap();
     eprintln!(
@@ -359,9 +360,9 @@ fn compare_snapshot_queries() {
         for (label, sql) in [("regressed", old), ("fixed", new)] {
             let started = Instant::now();
             let deadline = started + Duration::from_secs(2);
-            let _cancel =
-                SqlCancellation::install(&conn, move || Instant::now() >= deadline).unwrap();
-            let mut stmt = conn.prepare(&sql).unwrap();
+            let cancellation =
+                SqlCancellation::install(&mut conn, move || Instant::now() >= deadline).unwrap();
+            let mut stmt = cancellation.prepare(&sql).unwrap();
             let results = stmt
                 .query_map(params![&start, &end, 500], |row| row.get::<_, i64>(0))
                 .unwrap()

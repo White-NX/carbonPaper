@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { open, save } from '@tauri-apps/plugin-dialog';
-import { selectBackupExportPath, selectBackupImportPath, selectStorageDirectory } from './native_dialogs';
+import { selectAppBoundRepairPackage, selectBackupExportPath, selectBackupImportPath, selectStorageDirectory } from './native_dialogs';
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }));
 beforeEach(() => { open.mockReset(); save.mockReset(); });
@@ -26,6 +26,13 @@ describe('native file selection', () => {
     await expect(selectBackupExportPath()).resolves.toBeNull();
     await expect(selectBackupImportPath()).resolves.toBeNull();
     await expect(selectStorageDirectory()).resolves.toBeNull();
+    await expect(selectAppBoundRepairPackage()).resolves.toBeNull();
+  });
+
+  it('selects a single ZIP as a local repair source', async () => {
+    open.mockResolvedValue('D:/Downloads/repair.zip');
+    await expect(selectAppBoundRepairPackage()).resolves.toBe('D:/Downloads/repair.zip');
+    expect(open).toHaveBeenCalledWith({ directory: false, multiple: false, filters: [{ name: 'CarbonPaper Package', extensions: ['zip'] }] });
   });
 
   it.each([['D:/One', 'D:/Two'], {}, 42])('rejects an invalid single selection %j', async (selection) => {

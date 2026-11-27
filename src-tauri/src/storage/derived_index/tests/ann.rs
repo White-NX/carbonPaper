@@ -21,10 +21,9 @@ fn frozen_input_cursor_bounds_keep_the_job_join_on_a_covering_point_lookup() {
         "freezing must not scan job payload pages: {plan:?}"
     );
     assert!(
-        plan.iter()
-            .filter(|step| step.starts_with("SEARCH "))
-            .last()
-            .is_some_and(|step| step.contains("subject_key=?")),
+        plan.iter().any(|step| step.starts_with("SEARCH j ")
+            && step.contains("COVERING INDEX idx_derived_jobs_completed_visibility")
+            && step.contains("subject_key=?")),
         "the inner join must seek one subject, rather than repeat a bounded range: {plan:?}"
     );
     assert!(!plan.iter().any(|step| step.contains("TEMP B-TREE")));
@@ -62,6 +61,16 @@ fn resumed_ann_freezing_keeps_its_bound_and_concurrent_changes_in_the_tail() {
             ann_vector(0),
         )
         .unwrap();
+    }
+    {
+        let before = current_epoch(&storage);
+        let guard = storage.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        while crate::storage::vector_blocks::compact(conn).unwrap() != 0 {}
+        assert_eq!(
+            read_derived_data_epoch(conn, DerivedIndexKind::ClipImage).unwrap() as u64,
+            before
+        );
     }
     let mut state = ann_checkpoint(&storage, 77);
     storage.begin_ann_build(&mut state).unwrap();

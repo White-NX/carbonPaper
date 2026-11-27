@@ -5,6 +5,7 @@ import { calendarTimeFormatter } from '../../lib/calendar_time';
 import { recapErrorKey } from '../../lib/recap_api';
 import useSnapshotRecap from '../../hooks/useSnapshotRecap';
 import { Button } from '../ui/Button';
+import RecapWarnings from './RecapWarnings';
 
 const taskKey = (item) => `${item.date}:${item.task_id}`;
 
@@ -17,6 +18,7 @@ function Activity({ item, screenshotId, expanded, onToggle, onOpenRecap, showHea
   useEffect(() => { if (details.current) details.current.inert = !expanded; }, [expanded]);
 
   return <div>
+    <RecapWarnings warnings={item.warnings} compact />
     <div className="mb-1 flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
       {showHeading && <span className="text-xs font-medium text-ide-muted">{t('sidebar.recap.title')}</span>}
       <p className="ml-auto text-[11px] font-normal tabular-nums text-ide-muted" title={t('sidebar.recap.recordedTimeHint')}>{t('sidebar.recap.recordedTime', { time: range })}</p>

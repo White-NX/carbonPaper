@@ -11,6 +11,7 @@ import { SettingsDisclosure, SettingsDivider, SettingsErrorBanner, SettingsGroup
 const limits = {
   request_output_tokens: [1000, 64000], answer_tokens: [512, 16000], batch_input_tokens: [4000, 1000000],
   batch_output_tokens: [1000, 64000], daily_input_tokens: [1000, 10000000], daily_output_tokens: [1000, 1000000], screening_input_tokens: [1000, 20000000],
+  evidence_rounds: [1, 24], mainline_reserve_percent: [0, 50],
 };
 const inputClass = 'w-full rounded-lg border border-ide-border bg-ide-panel px-3 py-2 text-sm disabled:opacity-50';
 
@@ -151,12 +152,24 @@ export default function RecapSection() {
         <SettingsDivider />
         <SettingsDisclosure title={t('recap.settings.advanced')}>
           <p className="text-xs leading-relaxed text-ide-muted">{t('recap.settings.budgetHint')}</p>
+          <p className="text-xs leading-relaxed text-ide-muted">{t('recap.settings.evidenceHint', { requests: Number(draft.evidence_rounds) + 4 })}</p>
+          <p className="text-xs leading-relaxed text-ide-muted">{t('recap.settings.reserveHint')}</p>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {Object.entries(limits).map(([key, [min, max]]) => <label key={key} className="block space-y-2 text-xs"><span>{t(`recap.settings.${key}`)}</span><input className={inputClass} type="number" min={min} max={max} step={1} required value={draft[key]} {...commitInput}
               onChange={(event) => update(key, event.target.value === '' ? '' : Number(event.target.value), false)} /></label>)}
           </div>
           {invalidBudget(draft) && <SettingsStatus tone="error">{t('recap.errors.RECAP_INVALID_SETTINGS')}</SettingsStatus>}
-          {usage && <SettingsStatus>{t('recap.settings.usage', { input: usage.input_tokens, output: usage.output_tokens, screening: usage.screening_input_tokens })}</SettingsStatus>}
+          {usage && <>
+            <SettingsStatus>{t('recap.settings.usage', { input: usage.input_tokens, output: usage.output_tokens, screening: usage.screening_input_tokens })}</SettingsStatus>
+            <SettingsStatus>{t('recap.settings.remainingUsage', {
+              input: Math.max(0, saved.daily_input_tokens - usage.input_tokens),
+              output: Math.max(0, saved.daily_output_tokens - usage.output_tokens),
+            })}</SettingsStatus>
+            {usage.unconfirmed_requests > 0 && <SettingsStatus tone="warning">{t('recap.settings.unconfirmedUsage', {
+              input: usage.unconfirmed_input_tokens, output: usage.unconfirmed_output_tokens,
+              screening: usage.unconfirmed_screening_input_tokens, count: usage.unconfirmed_requests,
+            })}</SettingsStatus>}
+          </>}
           <SettingsDivider />
           <SettingsRow label={t('recap.settings.screening')} description={t('recap.settings.screeningHint')}
             control={<SettingsSwitch checked={draft.screening.enabled} onChange={(value) => screen('enabled', value)} />} />

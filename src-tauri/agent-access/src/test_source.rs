@@ -45,9 +45,19 @@ pub fn configure(repo: &mut AgentRepository, binding: &AgentViewBinding) {
         CREATE TABLE screenshots(id INTEGER PRIMARY KEY,image_hash TEXT UNIQUE,is_deleted INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE ocr_results(id INTEGER PRIMARY KEY,screenshot_id INTEGER NOT NULL,text_enc BLOB,text_hash TEXT NOT NULL,
             confidence REAL,box_x1 REAL,box_y1 REAL,box_x2 REAL,box_y2 REAL,box_x3 REAL,box_y3 REAL,box_x4 REAL,box_y4 REAL,
-            created_at TEXT,is_deleted INTEGER NOT NULL DEFAULT 0);
+            created_at TEXT,is_deleted INTEGER NOT NULL DEFAULT 0,ocr_key_id INTEGER,ocr_block_slot INTEGER);
+        CREATE TABLE ocr_index_pending(ocr_id INTEGER PRIMARY KEY);
+        CREATE TABLE ocr_keys(id INTEGER PRIMARY KEY,screenshot_id INTEGER NOT NULL,scope_tag BLOB NOT NULL);
+        CREATE TABLE ocr_blocks(id INTEGER PRIMARY KEY,screenshot_id INTEGER NOT NULL,content_enc BLOB NOT NULL,created_at TEXT NOT NULL);
         CREATE TABLE derived_embeddings(index_kind TEXT,subject_key TEXT,model_id TEXT,model_revision TEXT,vector_f32 BLOB,
+            vector_block_id INTEGER,vector_offset INTEGER,vector_length INTEGER,
             PRIMARY KEY(index_kind,subject_key));
+        CREATE TABLE vector_blocks(id INTEGER PRIMARY KEY,data BLOB NOT NULL);
+        CREATE VIEW derived_embeddings_read AS
+            SELECT e.index_kind,e.subject_key,e.model_id,e.model_revision,
+              CASE WHEN e.vector_block_id IS NULL THEN e.vector_f32
+                ELSE (SELECT substr(b.data,e.vector_offset+1,e.vector_length) FROM vector_blocks b WHERE b.id=e.vector_block_id)
+              END AS vector_f32 FROM derived_embeddings e;
         CREATE TABLE recap_days(day TEXT PRIMARY KEY,revision INTEGER);
         CREATE TABLE recap_payloads(kind TEXT,key TEXT,day TEXT,revision INTEGER,data BLOB,PRIMARY KEY(kind,key));
         CREATE TABLE recap_deleted_days(day TEXT PRIMARY KEY);") .unwrap();
@@ -140,7 +150,7 @@ pub fn vector(binding: &AgentViewBinding, row: VectorText) -> TextRecord {
     )
     .unwrap();
     conn.execute(
-        "INSERT OR REPLACE INTO derived_embeddings VALUES(?1,?2,?3,?4,?5)",
+        "INSERT OR REPLACE INTO derived_embeddings(index_kind,subject_key,model_id,model_revision,vector_f32) VALUES(?1,?2,?3,?4,?5)",
         params![
             row.kind,
             subject,

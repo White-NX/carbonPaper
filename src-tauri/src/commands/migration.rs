@@ -6,7 +6,6 @@
 
 use crate::credential_manager::{get_cached_master_key, CredentialManagerState};
 use crate::monitor::{control_in_maintenance, MonitorAction, MonitorState};
-use crate::storage::database_snapshot;
 use crate::storage::StorageState;
 use std::path::Path;
 use std::sync::Arc;
@@ -258,19 +257,24 @@ pub async fn storage_export_backup(
     credential_state: State<'_, Arc<CredentialManagerState>>,
     password: String,
     export_path: String,
-) -> Result<(), String> {
+) -> Result<crate::storage::backup::BackupSummary, String> {
     super::check_auth_required(&credential_state)?;
+    let started = std::time::Instant::now();
     let Some(maintenance) = crate::maintenance::enter("backup_export") else {
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
     let _operation = state.backup.begin();
+    emit_backup_progress(&app_handle, "prepare", 0, 0);
     let was_running = monitor_state.is_running();
     let office_runtime = app_handle
         .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
         .inner()
         .clone();
     let was_active = office_runtime.is_active();
-    control_in_maintenance(&app_handle, MonitorAction::Stop, &maintenance).await?;
+    control_in_maintenance(&app_handle, MonitorAction::Stop, &maintenance).await.map_err(|error| {
+        tracing::error!(operation = "export", phase = "prepare", error = %error, "Backup failed to stop capture");
+        error
+    })?;
     office_runtime
         .quiesce(std::time::Duration::from_secs(5))
         .await;
@@ -281,13 +285,13 @@ pub async fn storage_export_backup(
     }
     let worker_state = state.inner().clone();
     let credentials = credential_state.inner().clone();
-    let events = app_handle.clone();
+    let mut events = BackupProgressEmitter::new(app_handle.clone());
     let password = zeroize::Zeroizing::new(password);
     let outcome = tokio::task::spawn_blocking(move || {
         let _database_maintenance = worker_state.database_maintenance("backup_export");
         let result = (|| {
             worker_state.backup.check()?;
-            let journal_mode = worker_state.prepare_database_snapshot_under_maintenance()?;
+            worker_state.prepare_ocr_blocks_for_backup()?;
             let master_key =
                 zeroize::Zeroizing::new(get_cached_master_key(&credentials).ok_or_else(|| {
                     "AUTH_REQUIRED: Please verify Windows Hello before backing up".to_string()
@@ -298,14 +302,13 @@ pub async fn storage_export_backup(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            worker_state.shutdown_under_maintenance()?;
-            let snapshot = database_snapshot::create_database_snapshot(
-                &data_dir,
-                &journal_mode,
+            let snapshot = worker_state.create_backup_snapshot_under_maintenance(
+                &database_key,
                 data_dir.parent().unwrap_or(&data_dir),
+                |done, total| events.emit("snapshot", done, total),
             )?;
             crate::storage::backup::write_portable(
-                &snapshot,
+                snapshot.path(),
                 &data_dir,
                 &credentials,
                 &database_key,
@@ -313,10 +316,17 @@ pub async fn storage_export_backup(
                 &password,
                 Path::new(&export_path),
                 &worker_state.backup,
-                |phase, done, total| emit_backup_progress(&events, phase, done, total),
+                |phase, done, total| events.emit(phase, done, total),
             )
         })();
-        let initialize = worker_state.initialize_under_maintenance();
+        events.log_failure(&result);
+        // Export retains the resident store, generation, caches and processing
+        // authority. No initialization or recovery sweep is needed afterward.
+        let initialize = if worker_state.is_initialized() {
+            Ok(())
+        } else {
+            Err("Storage is unavailable after backup export".into())
+        };
         (result, initialize)
     })
     .await;
@@ -324,7 +334,11 @@ pub async fn storage_export_backup(
         Ok(value) => value,
         Err(error) => (
             Err(format!("Backup export task failed: {error}")),
-            state.initialize(),
+            if state.is_initialized() {
+                Ok(())
+            } else {
+                Err("Storage is unavailable after backup export".into())
+            },
         ),
     };
     drop(mcp_lifecycle);
@@ -340,8 +354,26 @@ pub async fn storage_export_backup(
         }
     }
     crate::monitor::wake_automation(&app_handle);
-    spawn_auto_hmac_migration(app_handle);
-    result.and(initialize)
+    let result = result.and_then(|summary| initialize.map(|()| summary));
+    match &result {
+        Ok(summary) => tracing::info!(
+            operation = "export",
+            outcome = "success",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            missing_screenshots = summary.missing_screenshots,
+            repaired_paths = summary.repaired_paths,
+            "Backup completed"
+        ),
+        Err(error) if error.contains("BACKUP_CANCELLED") => tracing::info!(
+            operation = "export",
+            outcome = "cancelled",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Backup cancelled"
+        ),
+        Err(error) => tracing::error!(operation = "export", outcome = "failed", error = %error,
+            elapsed_ms = started.elapsed().as_millis() as u64, "Backup failed"),
+    }
+    result
 }
 
 /// Imports a portable backup, or an old ZIP while its original CNG key is available.
@@ -354,7 +386,7 @@ pub async fn storage_import_backup(
     credential_state: State<'_, Arc<CredentialManagerState>>,
     password: String,
     backup_zip_path: String,
-) -> Result<(), String> {
+) -> Result<crate::storage::backup::BackupSummary, String> {
     super::check_auth_required(&credential_state)?;
     let Some(maintenance) = crate::maintenance::enter("backup_import") else {
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
@@ -380,7 +412,7 @@ pub async fn storage_import_backup(
     }
     let worker_state = state.inner().clone();
     let credentials = credential_state.inner().clone();
-    let events = app_handle.clone();
+    let mut events = BackupProgressEmitter::new(app_handle.clone());
     let password = zeroize::Zeroizing::new(password);
     let outcome = tokio::task::spawn_blocking(move || {
         let _derived_publish_guard = worker_state.derived_generation_publish_guard();
@@ -401,10 +433,15 @@ pub async fn storage_import_backup(
                 database_key,
                 &password,
                 &worker_state.backup,
-                |phase, done, total| emit_backup_progress(&events, phase, done, total),
+                |phase, done, total| events.emit(phase, done, total),
             )?;
-            crate::storage::backup::install_prepared(&worker_state, &prepared)
+            crate::storage::backup::install_prepared(&worker_state, &prepared)?;
+            Ok(crate::storage::backup::BackupSummary {
+                missing_screenshots: prepared.extracted.manifest.missing_screenshots.len() as u64,
+                repaired_paths: 0,
+            })
         })();
+        events.log_failure(&result);
         let initialize = if worker_state.is_initialized() {
             Ok(())
         } else {
@@ -445,7 +482,19 @@ pub async fn storage_import_backup(
     }
     crate::monitor::wake_automation(&app_handle);
     spawn_auto_hmac_migration(app_handle);
-    result.and(initialize)
+    let result = result.and_then(|summary| initialize.map(|()| summary));
+    if let Err(error) = &result {
+        if error.contains("BACKUP_CANCELLED") {
+            tracing::info!(
+                operation = "import",
+                outcome = "cancelled",
+                "Backup cancelled"
+            );
+        } else {
+            tracing::error!(operation = "import", outcome = "failed", error = %error, "Backup failed");
+        }
+    }
+    result
 }
 
 /// Cancels backup preparation while preserving the live database and credentials.
@@ -465,4 +514,53 @@ fn emit_backup_progress(app: &tauri::AppHandle, phase: &str, done: u64, total: u
             "phase": phase, "copied_files": done, "total_files": total,
         }),
     );
+}
+
+/// Bound UI traffic on large archives while retaining phase transitions and
+/// final counts. Progress is observational; cancellation is checked separately
+/// for every database step, record and archive block.
+struct BackupProgressEmitter {
+    app: tauri::AppHandle,
+    phase: String,
+    phase_started: std::time::Instant,
+    last_emitted: std::time::Instant,
+}
+
+impl BackupProgressEmitter {
+    fn new(app: tauri::AppHandle) -> Self {
+        Self {
+            app,
+            phase: "prepare".into(),
+            phase_started: std::time::Instant::now(),
+            last_emitted: std::time::Instant::now(),
+        }
+    }
+
+    fn emit(&mut self, phase: &str, done: u64, total: u64) {
+        let changed = self.phase != phase;
+        if changed {
+            self.phase = phase.into();
+            self.phase_started = std::time::Instant::now();
+            tracing::info!(phase, "Backup phase started");
+        }
+        if changed
+            || (total > 0 && done >= total)
+            || self.last_emitted.elapsed() >= std::time::Duration::from_millis(100)
+        {
+            emit_backup_progress(&self.app, phase, done, total);
+            self.last_emitted = std::time::Instant::now();
+        }
+    }
+
+    fn log_failure<T>(&self, result: &Result<T, String>) {
+        if let Err(error) = result {
+            if error.contains("BACKUP_CANCELLED") {
+                tracing::info!(phase = %self.phase, elapsed_ms = self.phase_started.elapsed().as_millis() as u64,
+                    outcome = "cancelled", "Backup phase cancelled");
+            } else {
+                tracing::error!(phase = %self.phase, elapsed_ms = self.phase_started.elapsed().as_millis() as u64,
+                    outcome = "failed", error = %error, "Backup phase failed");
+            }
+        }
+    }
 }

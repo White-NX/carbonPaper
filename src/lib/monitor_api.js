@@ -392,6 +392,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
         startTime = null,
         endTime = null,
         includeOcr = true,
+        sortOrder = 'relevance',
         fuzzy = true
     } = options || {};
     
@@ -399,22 +400,37 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
         // Natural-language image search is served directly by Rust.
         throwIfSearchAborted(options.signal);
         if (mode === 'nl') {
-            const response = await invoke('monitor_search_nl', {
-                query,
-                limit,
-                offset,
-                processNames,
-                ...(categories.length ? { categories } : {}),
-                startTime,
-                endTime,
-                fuzzy,
-                ...(includeOcr === false ? { includeOcr: false } : {}),
-            });
-            throwIfSearchAborted(options.signal);
-            if (response.error) {
-                throw new Error(response.error);
+            const requestId = options.signal ? crypto.randomUUID() : null;
+            const cancel = () => {
+                void invoke('monitor_cancel_search_nl', { requestId }).catch(() => {});
+            };
+            options.signal?.addEventListener('abort', cancel, { once: true });
+            try {
+                throwIfSearchAborted(options.signal);
+                const response = await invoke('monitor_search_nl', {
+                    query,
+                    limit,
+                    offset,
+                    processNames,
+                    ...(categories.length ? { categories } : {}),
+                    startTime,
+                    endTime,
+                    fuzzy,
+                    ...(includeOcr === false ? { includeOcr: false } : {}),
+                    ...(sortOrder !== 'relevance' ? { sortOrder } : {}),
+                    ...(requestId ? { requestId } : {}),
+                });
+                throwIfSearchAborted(options.signal);
+                if (response.error) {
+                    throw new Error(response.error);
+                }
+                return response.results || [];
+            } catch (error) {
+                throwIfSearchAborted(options.signal);
+                throw error;
+            } finally {
+                options.signal?.removeEventListener('abort', cancel);
             }
-            return response.results || [];
         }
         
         // OCR/文本搜索使用 Rust 存储层
@@ -511,20 +527,31 @@ export const softDeleteScreenshots = async (screenshotIds = []) => {
     });
 };
 
-export const getSoftDeleteQueueStatus = async () => {
-    try {
-        return await withAuth(async () => {
-            const status = await invoke('storage_get_delete_queue_status');
-            return status || { pending_screenshots: 0, pending_ocr: 0, running: false };
-        });
-    } catch (e) {
-        console.warn('Failed to get soft delete queue status', e);
-        return { pending_screenshots: 0, pending_ocr: 0, running: false };
-    }
+let deleteQueueStatusRequest = null;
+let lastDeleteQueueStatus = { pending_screenshots: 0, pending_ocr: 0, running: false };
+
+export const getSoftDeleteQueueStatus = () => {
+    if (deleteQueueStatusRequest) return deleteQueueStatusRequest;
+    deleteQueueStatusRequest = Promise.resolve()
+        .then(() => withAuth(() => invoke('storage_get_delete_queue_status')))
+        .then(status => {
+            if (status) lastDeleteQueueStatus = status;
+            return lastDeleteQueueStatus;
+        })
+        .catch(error => {
+            if (!String(error).includes('MAINTENANCE_IN_PROGRESS')) {
+                console.warn('Failed to get soft delete queue status', error);
+            }
+            return lastDeleteQueueStatus;
+        })
+        .finally(() => { deleteQueueStatusRequest = null; });
+    return deleteQueueStatusRequest;
 };
 
-export const getScreenshotDetails = async (id, path = null) => {
-    const key = imageRequestKey('detail', id, path);
+export const getScreenshotDetails = async (id, path = null, { fresh = false } = {}) => {
+    // Mutation events must not reuse a read started before the change. Leave
+    // fresh reads unkeyed so they also cannot replace ordinary dedupe entries.
+    const key = fresh ? null : imageRequestKey('detail', id, path);
     try {
         const response = await detailQueue.enqueue(
             () => withAuth(() => invoke('storage_get_screenshot_details', { id, path })),
@@ -540,6 +567,14 @@ export const getScreenshotDetails = async (id, path = null) => {
         return { error: e.toString() };
     }
 };
+
+export const saveEditedScreenshot = (screenshotId, expectedImageHash, imageData) => withAuth(
+    () => invoke('storage_save_edited_screenshot', { screenshotId, expectedImageHash, imageData })
+);
+
+export const retryEditedScreenshotOcr = (screenshotId, expectedImageHash) => withAuth(
+    () => invoke('storage_retry_edited_screenshot_ocr', { screenshotId, expectedImageHash })
+);
 
 export const resumeOfficeDocument = async (screenshotId) => {
     if (!screenshotId) throw new Error('A screenshot id is required');

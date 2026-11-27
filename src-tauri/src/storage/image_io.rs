@@ -10,6 +10,25 @@ use std::time::{Duration, Instant};
 
 use super::{BackgroundReadError, StorageState};
 
+type ThumbnailReadResult = (String, Result<(String, String), String>);
+
+/// Absence can be recovered from; permissions, I/O errors and non-file paths
+/// must remain explicit errors when publishing or backing up screenshots.
+pub(super) fn regular_image_file_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "Screenshot is not a regular file: {}",
+            path.display()
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect screenshot {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 const IMAGE_BY_ID_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
     WHERE id = ?1 AND is_deleted = 0";
 const IMAGE_BY_PATH_SQL: &str = "SELECT content_key_encrypted, image_path FROM screenshots
@@ -169,7 +188,7 @@ impl StorageState {
         let started = Instant::now();
         // Keep the database and directory stable while using the fetched file location.
         // This shared maintenance permit does not serialize other image readers.
-        let _activity = self.foreground_db_read();
+        let _activity = self.foreground_db_read()?;
         let maintenance_wait = started.elapsed();
         let acquiring = Instant::now();
         let primary = self.try_get_connection_named("read_image")?;
@@ -354,7 +373,7 @@ impl StorageState {
         &self,
         lookup: ImageLookup<'_>,
     ) -> Result<(String, String), String> {
-        let _activity = self.foreground_db_read();
+        let _activity = self.foreground_db_read()?;
         // Phase 1: DB query for the encrypted row key
         let (location, abs_path) = {
             let conn = self.open_read_connection_named("read_thumbnail")?;
@@ -383,7 +402,7 @@ impl StorageState {
             })
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
-        let thumb_path = Self::thumbnail_path_for(&abs_path);
+        let thumb_path = Self::thumbnail_path_for(abs_path);
 
         // Phase 3: Try reading cached thumbnail
         if thumb_path.exists() {
@@ -461,7 +480,15 @@ impl StorageState {
         let started = Instant::now();
         // Keep maintenance from replacing files or row keys during the batch;
         // this shared permit never holds the primary database mutex.
-        let _activity = self.foreground_db_read();
+        let _activity = match self.foreground_db_read() {
+            Ok(activity) => activity,
+            Err(error) => {
+                return ids
+                    .iter()
+                    .map(|id| (id.to_string(), Err(error.clone())))
+                    .collect()
+            }
+        };
         let lookup = (|| -> Result<_, String> {
             let conn = self.open_read_connection_named("batch_thumbnails_by_ids")?;
             let mut locations = image_locations_by_ids(&conn, ids)?;
@@ -519,10 +546,7 @@ impl StorageState {
     /// Batch read thumbnails for multiple image paths in a single operation.
     /// Does one DB query to fetch all encrypted keys, then processes each thumbnail outside the lock.
     /// Returns a Vec of (path, Result<(base64, mime_type), error_string>).
-    pub fn batch_read_thumbnails(
-        &self,
-        paths: &[String],
-    ) -> Vec<(String, Result<(String, String), String>)> {
+    pub fn batch_read_thumbnails(&self, paths: &[String]) -> Vec<ThumbnailReadResult> {
         if paths.is_empty() {
             return Vec::new();
         }

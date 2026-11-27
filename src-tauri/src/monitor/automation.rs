@@ -28,6 +28,7 @@ pub(super) struct AutomationState {
 
 #[derive(Default)]
 pub(super) struct Policy {
+    pub requested_start: bool,
     pub manual_stop: bool,
     pub manual_pause: bool,
     pub timed_pause: Option<TimedPause>,
@@ -85,7 +86,10 @@ impl Policy {
         }
     }
 
-    pub fn user_action(&mut self, action: MonitorAction, paused: bool) {
+    pub fn user_action(&mut self, action: MonitorAction, paused: bool, running: bool) {
+        if action == MonitorAction::TogglePause && !running {
+            return;
+        }
         self.timed_pause = None;
         match action {
             MonitorAction::Start | MonitorAction::Restart => self.request_start(),
@@ -130,11 +134,16 @@ impl Policy {
     }
 
     pub fn request_start(&mut self) {
+        self.requested_start = true;
         self.manual_stop = false;
         self.manual_pause = false;
         self.timed_pause = None;
         self.error = None;
         self.unexpected_stops.clear();
+    }
+
+    pub fn usage_paused(&self) -> bool {
+        self.manual_pause && !self.timed_pause_expired(Instant::now())
     }
 
     pub fn finish_action(&mut self, result: &Result<String, String>, source: ControlSource) {
@@ -242,6 +251,27 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn a_stopped_pause_toggle_preserves_usage_intent_timers_and_recovery_errors() {
+        let mut policy = Policy::default();
+        policy.request_start();
+        policy.user_action(MonitorAction::TogglePause, false, false);
+        assert!(!policy.manual_pause);
+        assert!(!policy.usage_paused());
+        policy.user_action(MonitorAction::PauseFor(15), false, true);
+        let deadline = policy.timed_pause.unwrap().deadline;
+        policy.error = Some(RESTART_LIMIT.into());
+        policy.user_action(MonitorAction::TogglePause, false, false);
+        assert!(policy.manual_pause);
+        assert_eq!(policy.timed_pause.unwrap().deadline, deadline);
+        assert_eq!(policy.error.as_deref(), Some(RESTART_LIMIT));
+        policy.user_action(MonitorAction::TogglePause, true, true);
+        assert!(!policy.manual_pause);
+        assert!(policy.timed_pause.is_none());
+        policy.user_action(MonitorAction::TogglePause, false, true);
+        assert!(policy.manual_pause);
+    }
+
     fn ready() -> Conditions {
         Conditions {
             running: false,
@@ -257,7 +287,7 @@ mod tests {
     #[test]
     fn timed_pause_expires_without_starting_a_stopped_or_power_blocked_monitor() {
         let mut policy = Policy::default();
-        policy.user_action(MonitorAction::PauseFor(15), false);
+        policy.user_action(MonitorAction::PauseFor(15), false, true);
         assert!(policy.manual_pause);
         assert!(policy.timed_pause.unwrap().until_ms > chrono::Utc::now().timestamp_millis());
         policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
@@ -298,9 +328,9 @@ mod tests {
             MonitorAction::Restart,
         ] {
             let mut policy = Policy::default();
-            policy.user_action(MonitorAction::PauseFor(15), false);
+            policy.user_action(MonitorAction::PauseFor(15), false, true);
             policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
-            policy.user_action(action, true);
+            policy.user_action(action, true, true);
             assert!(policy.timed_pause.is_none());
             assert_ne!(
                 policy.automatic_action(Conditions {
@@ -316,7 +346,7 @@ mod tests {
     #[test]
     fn timed_resume_waits_for_maintenance_and_wakes_at_its_deadline() {
         let mut policy = Policy::default();
-        policy.user_action(MonitorAction::PauseFor(15), false);
+        policy.user_action(MonitorAction::PauseFor(15), false, true);
         policy.timed_pause.as_mut().unwrap().deadline = Instant::now() + Duration::from_secs(2);
         assert!(policy.next_check_delay(RECHECK_INTERVAL) <= Duration::from_secs(2));
         policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
@@ -368,9 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn usage_follows_explicit_pause_and_expires_it_while_screenshots_are_power_blocked() {
+        let mut policy = Policy::default();
+        policy.request_start();
+        assert!(policy.requested_start);
+        assert!(!policy.usage_paused());
+        policy.user_action(MonitorAction::PauseFor(15), false, true);
+        assert!(policy.usage_paused());
+        policy.timed_pause.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        assert!(!policy.usage_paused());
+        policy.user_action(MonitorAction::Pause, false, true);
+        policy.finish_action(
+            &Ok("power stopped screenshots".into()),
+            ControlSource::Automatic,
+        );
+        assert!(policy.usage_paused());
+        policy.user_action(MonitorAction::Stop, false, false);
+        assert!(policy.manual_stop);
+        policy.request_start();
+        assert!(!policy.manual_stop);
+        assert!(!policy.usage_paused());
+    }
+
+    #[test]
     fn manual_stop_survives_reopens_and_power_transitions_until_explicit_start() {
         let mut policy = Policy::default();
-        policy.user_action(MonitorAction::Stop, false);
+        policy.user_action(MonitorAction::Stop, false, false);
         for conditions in [
             ready(),
             Conditions {
@@ -385,7 +438,7 @@ mod tests {
         ] {
             assert_eq!(policy.automatic_action(conditions), None);
         }
-        policy.user_action(MonitorAction::Start, false);
+        policy.user_action(MonitorAction::Start, false, false);
         assert_eq!(policy.automatic_action(ready()), Some(MonitorAction::Start));
     }
 
@@ -409,7 +462,7 @@ mod tests {
             .policy
             .lock()
             .unwrap()
-            .user_action(MonitorAction::Stop, false);
+            .user_action(MonitorAction::Stop, false, false);
         drop(control);
         assert_eq!(queued.await.unwrap(), None);
     }
@@ -479,7 +532,7 @@ mod tests {
     #[test]
     fn battery_stop_preserves_pause_and_resumes_only_when_autostart_is_enabled() {
         let mut policy = Policy::default();
-        policy.user_action(MonitorAction::Pause, false);
+        policy.user_action(MonitorAction::Pause, false, true);
         assert_eq!(
             policy.automatic_action(Conditions {
                 running: true,
@@ -503,7 +556,7 @@ mod tests {
     #[test]
     fn maintenance_restore_does_not_clear_manual_intent_or_a_recovery_limit() {
         let mut policy = Policy::default();
-        policy.user_action(MonitorAction::Stop, false);
+        policy.user_action(MonitorAction::Stop, false, false);
         policy.error = Some(RESTART_LIMIT.into());
         policy.finish_action(&Ok("restored".into()), ControlSource::Maintenance);
         assert!(policy.manual_stop);

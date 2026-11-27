@@ -6,6 +6,7 @@ use crate::credential_manager::{
     decrypt_with_master_key, encrypt_with_master_key, CredentialError, RowKeyDecryptTimings,
 };
 use carbonpaper_agent_access::{
+    ocr_block_digest,
     repository::{open_event, seal_access_key, seal_event, AgentRepository},
     types::*,
 };
@@ -442,7 +443,16 @@ impl AgentWriter {
                         .try_into()
                         .map_err(|_| "AGENT_INVALID_RECORD")?;
                     if kind == "ocr" || value["part"] == "search" {
-                        let key = self.staged_row_key(&digest);
+                        let key_digest = value["key_digest"]
+                            .as_str()
+                            .map(|encoded| {
+                                hex::decode(encoded)
+                                    .ok()
+                                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                                    .ok_or("AGENT_INVALID_RECORD")
+                            })
+                            .transpose()?;
+                        let key = self.staged_row_key(key_digest.as_ref().unwrap_or(&digest));
                         let (domain, id) = if kind == "ocr" {
                             (
                                 "ocr",
@@ -583,7 +593,7 @@ impl AgentWriter {
             )
         }
     }
-    pub(super) fn register(self: &Arc<Self>, conn: &Connection) -> Result<(), String> {
+    pub(super) fn register(self: &Arc<Self>, conn: &mut Connection) -> Result<(), String> {
         Self::register_digest(conn)?;
         // A reserved range belongs to one source transaction on this connection.
         // Discard unused revisions on either outcome: reusing them after a
@@ -677,6 +687,14 @@ impl AgentWriter {
                     }
                     _ => Err(sql_error("AGENT_INVALID_SOURCE".into())),
                 }
+            }),
+        )?;
+        db(
+            conn.create_scalar_function("cp_agent_ocr_block_digest", 3, flags, |args| {
+                let block: i64 = args.get(0)?;
+                let slot: i64 = args.get(1)?;
+                let scope_tag: Vec<u8> = args.get(2)?;
+                Ok(hex::encode(ocr_block_digest(block, slot, &scope_tag)))
             }),
         )
     }
@@ -875,10 +893,16 @@ fn decode_projection(kind: &str, mut value: Value) -> Result<TextRecord, String>
 
 impl StorageState {
     pub(super) fn init_agent_access_tables(&self, conn: &Connection) -> Result<(), String> {
-        self.agent_writer.register(conn)?;
         db(conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_access_state(id INTEGER PRIMARY KEY CHECK(id=1),binding TEXT NOT NULL,checkpoint TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS agent_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,envelope BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS agent_projection_gaps(kind TEXT NOT NULL,key TEXT NOT NULL,revision INTEGER NOT NULL,operation TEXT NOT NULL,PRIMARY KEY(kind,key));
+            CREATE VIEW IF NOT EXISTS agent_ocr_source AS
+                SELECT o.id, o.screenshot_id, o.is_deleted, o.text_hash,
+                    CASE WHEN o.ocr_block_slot IS NULL THEN cp_agent_digest(o.text_enc)
+                    ELSE cp_agent_ocr_block_digest(o.ocr_key_id,o.ocr_block_slot,k.scope_tag) END AS payload_digest,
+                    COALESCE(k.wrapped_key,o.text_key_encrypted) AS wrapped_key,
+                    cp_agent_digest(k.wrapped_key) AS key_digest
+                FROM ocr_results o LEFT JOIN ocr_keys k ON k.id=o.ocr_key_id AND k.screenshot_id=o.screenshot_id;
             CREATE VIEW IF NOT EXISTS agent_enqueue AS SELECT NULL AS envelope WHERE 0;
             DROP TRIGGER IF EXISTS agent_enqueue_route;
             CREATE TRIGGER agent_enqueue_route INSTEAD OF INSERT ON agent_enqueue BEGIN
@@ -1137,7 +1161,7 @@ impl StorageState {
         });
     }
     pub(crate) fn sync_agent_access(&self) -> Result<(), String> {
-        let _activity = self.foreground_db_activity.read("agent_export");
+        let _activity = self.foreground_db_activity.background_read("agent_export");
         if self.agent_maintenance_pending() {
             return Ok(());
         }
@@ -1423,34 +1447,37 @@ impl StorageState {
                 return Ok(());
             }
             let hmac = repo.source_hmac_key()?;
-            let mut row_hashes = Vec::new();
+            let mut row_digests = Vec::with_capacity(rows.len());
             let mut tokens = BTreeMap::<String, roaring::RoaringBitmap>::new();
             for mut row in rows {
                 let id = u32::try_from(row.ocr_id).map_err(|_| "AGENT_INDEX_ID_UNSUPPORTED")?;
                 let plaintext = Zeroizing::new(std::mem::take(&mut row.text));
-                let hash = Self::compute_hmac_hash(&plaintext, hmac);
                 for term in Self::bigram_tokenize(&plaintext) {
                     tokens
                         .entry(Self::compute_hmac_hash(&term, hmac))
                         .or_default()
                         .insert(id);
                 }
-                row_hashes.push((row.ocr_id, hash, repo.ocr_payload_digest(row.ocr_id)?));
+                row_digests.push((
+                    row.ocr_id,
+                    hex::encode(repo.ocr_payload_digest(row.ocr_id)?),
+                ));
             }
             let guard = self.get_connection_named("agent_index_write")?;
             let conn = guard.as_ref().unwrap();
             let tx = db(conn.unchecked_transaction())?;
             let mut active = roaring::RoaringBitmap::new();
             {
-                let mut read = db(tx.prepare("SELECT o.text_enc FROM ocr_results o JOIN screenshots s ON s.id=o.screenshot_id
+                let mut read = db(tx.prepare("SELECT o.payload_digest FROM agent_ocr_source o JOIN screenshots s ON s.id=o.screenshot_id
                     WHERE o.id=?1 AND o.text_hash='' AND o.is_deleted=0 AND s.is_deleted=0"))?;
                 let mut update = db(tx.prepare("UPDATE ocr_results SET text_hash=?2 WHERE id=?1 AND text_hash='' AND is_deleted=0"))?;
-                for (id, hash, digest) in row_hashes {
-                    let encrypted: Option<Vec<u8>> =
-                        db(read.query_row([id], |r| r.get(0)).optional())?;
-                    if encrypted.is_some_and(|v| Sha256::digest(&v).as_slice() == digest.as_slice())
-                    {
-                        db(update.execute(params![id, hash]))?;
+                for (id, digest) in row_digests {
+                    let current = db(read
+                        .query_row([id], |r| r.get::<_, Option<String>>(0))
+                        .optional())?
+                    .flatten();
+                    if current.as_deref() == Some(digest.as_str()) {
+                        db(update.execute(params![id, super::compaction::OCR_INDEXED]))?;
                         active.insert(id as u32);
                     }
                 }

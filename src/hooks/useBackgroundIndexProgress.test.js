@@ -105,4 +105,21 @@ describe('useBackgroundIndexProgress', () => {
     expect(hook.result.current.progress.ann.recovery_needed).toBe(false);
     expect(hook.result.current.progress.ann.percent).toBe(100);
   });
+
+  it('keeps database optimization completion ahead of older polls and events', async () => {
+    let reply;
+    getBackgroundIndexProgress.mockReturnValueOnce(new Promise((resolve) => { reply = resolve; }));
+    const hook = renderHook(() => useBackgroundIndexProgress());
+    await act(async () => {});
+    const compaction = { phase: 'running', running: true, percent: 42, revision: 2 };
+    act(() => events['storage-compaction-progress']({ payload: compaction }));
+    expect(hook.result.current.progress.storage_compaction.percent).toBe(42);
+    act(() => events['storage-compaction-progress']({
+      payload: { ...compaction, phase: 'idle', running: false, percent: 100, revision: 4 },
+    }));
+    await act(async () => { reply({ storage_compaction: { ...compaction, revision: 1 } }); });
+    act(() => events['storage-compaction-progress']({ payload: { ...compaction, revision: 3 } }));
+    expect(hook.result.current.progress.storage_compaction.phase).toBe('idle');
+    expect(hook.result.current.progress.storage_compaction.percent).toBe(100);
+  });
 });

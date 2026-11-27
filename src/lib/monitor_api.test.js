@@ -1,7 +1,62 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { RequestQueue } from './monitor_api';
+import { invoke } from '@tauri-apps/api/core';
+import { RequestQueue, searchScreenshots, getSoftDeleteQueueStatus } from './monitor_api';
+
+vi.mock('./auth_api', async (importOriginal) => ({
+  ...await importOriginal(),
+  withAuth: vi.fn((action) => action()),
+}));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+it('shares concurrent delete status reads and preserves the last status during maintenance', async () => {
+  let finish;
+  invoke.mockReset().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const first = getSoftDeleteQueueStatus();
+  const second = getSoftDeleteQueueStatus();
+  expect(first).toBe(second);
+  await Promise.resolve();
+  expect(invoke).toHaveBeenCalledTimes(1);
+  const status = { pending_screenshots: 12, pending_ocr: 34, running: true };
+  finish(status);
+  await expect(first).resolves.toEqual(status);
+  invoke.mockRejectedValueOnce('MAINTENANCE_IN_PROGRESS');
+  await expect(getSoftDeleteQueueStatus()).resolves.toEqual(status);
+});
+
+describe('visual search ordering', () => {
+  it('passes newest ordering through the authenticated Tauri command when loading another page', async () => {
+    invoke.mockResolvedValueOnce({ results: [] });
+    await searchScreenshots('notes', 'nl', { sortOrder: 'newest', offset: 50, limit: 50, includeOcr: false });
+    expect(invoke).toHaveBeenLastCalledWith('monitor_search_nl', expect.objectContaining({
+      query: 'notes', sortOrder: 'newest', offset: 50, limit: 50, includeOcr: false,
+    }));
+  });
+
+  it('cancels the native visual request when its signal is aborted', async () => {
+    let finish;
+    invoke.mockReset().mockImplementation((command) => command === 'monitor_search_nl'
+      ? new Promise(resolve => { finish = resolve; }) : Promise.resolve());
+    const controller = new AbortController();
+    const pending = searchScreenshots('notes', 'nl', { signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(finish).toEqual(expect.any(Function)));
+    const requestId = invoke.mock.calls.find(([command]) => command === 'monitor_search_nl')[1].requestId;
+    expect(requestId).toEqual(expect.any(String));
+    controller.abort();
+    expect(invoke).toHaveBeenCalledWith('monitor_cancel_search_nl', { requestId });
+    finish({ results: [] });
+    await rejected;
+  });
+
+  it('removes cancellation listeners after the native visual request finishes', async () => {
+    invoke.mockReset().mockResolvedValue({ results: [] });
+    const controller = new AbortController();
+    await searchScreenshots('notes', 'nl', { signal: controller.signal });
+    controller.abort();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('RequestQueue', () => {
   afterEach(() => {

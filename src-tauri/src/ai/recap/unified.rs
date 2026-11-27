@@ -3,7 +3,7 @@ use super::search::{
     SearchContext, SearchMode,
 };
 use super::search_pages::SearchSnapshot;
-use crate::storage::{SearchResult, StorageState};
+use crate::storage::{SearchResult, SearchSortOrder, StorageState};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,6 +31,7 @@ pub struct UnifiedSearchQuery {
     pub end_time: Option<f64>,
     pub include_semantic: bool,
     pub target: SearchTarget,
+    pub sort_order: SearchSortOrder,
     pub ranking_revision: Option<String>,
     pub offset: usize,
     pub limit: usize,
@@ -46,6 +47,7 @@ impl Default for UnifiedSearchQuery {
             end_time: None,
             include_semantic: false,
             target: SearchTarget::Mixed,
+            sort_order: SearchSortOrder::Relevance,
             ranking_revision: None,
             offset: 0,
             limit: 40,
@@ -162,6 +164,7 @@ fn query_key(query: &UnifiedSearchQuery) -> String {
         &serde_json::json!([
             query.query.trim(),
             query.target,
+            query.sort_order,
             query.include_semantic,
             query.process_names,
             query.categories,
@@ -283,7 +286,7 @@ async fn collect_search(
     let search_query = query.clone();
     let (screenshots, snapshot_complete) = if query.target != SearchTarget::Recaps {
         tokio::task::spawn_blocking(move || {
-            search_storage.search_text_with_coverage(
+            search_storage.search_text_ordered_with_coverage(
                 search_query.query.trim(),
                 CANDIDATE_LIMIT as i32,
                 0,
@@ -293,6 +296,7 @@ async fn collect_search(
                 search_query.start_time,
                 search_query.end_time,
                 (!search_query.categories.is_empty()).then_some(search_query.categories.clone()),
+                search_query.sort_order,
             )
         })
         .await
@@ -308,6 +312,7 @@ async fn collect_search(
         } else {
             SearchMode::Keyword
         },
+        sort_order: query.sort_order,
         start_date: None,
         end_date: None,
         include_details: true,
@@ -325,14 +330,16 @@ async fn collect_search(
     } else {
         (vec![], "disabled".into(), true)
     };
-    let mut candidates = fuse(
+    let candidates = fuse(
         screenshots,
         recap_items,
         query.include_semantic && query.target != SearchTarget::Snapshots,
+        if query.query.trim().is_empty() {
+            SearchSortOrder::Newest
+        } else {
+            query.sort_order
+        },
     );
-    if query.query.trim().is_empty() {
-        candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
-    }
     context.check(&app)?;
     let revision = context.token();
     let total = candidates.len();
@@ -374,6 +381,7 @@ fn fuse(
     screenshots: Vec<SearchResult>,
     recaps: Vec<RecapSearchHit>,
     include_semantic: bool,
+    sort_order: SearchSortOrder,
 ) -> Vec<Candidate> {
     let mut candidates = HashMap::<String, Candidate>::new();
     for item in screenshots.into_iter().take(CANDIDATE_LIMIT) {
@@ -396,8 +404,12 @@ fn fuse(
             candidates.insert(id, candidate);
         }
     }
-    for item in recaps {
-        if item.keyword_rank.is_none_or(|rank| rank > CANDIDATE_LIMIT)
+    for (position, item) in recaps.into_iter().enumerate() {
+        if sort_order == SearchSortOrder::Newest {
+            if position >= CANDIDATE_LIMIT {
+                break;
+            }
+        } else if item.keyword_rank.is_none_or(|rank| rank > CANDIDATE_LIMIT)
             && (!include_semantic || item.semantic_rank.is_none_or(|rank| rank > CANDIDATE_LIMIT))
         {
             continue;
@@ -444,6 +456,9 @@ fn fuse(
             candidate.score = lexical + semantic;
         }
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| tie(a, b)));
+    }
+    if sort_order == SearchSortOrder::Newest {
+        candidates.sort_by(tie);
     }
     candidates
 }
@@ -509,6 +524,7 @@ mod tests {
             keyword_score: keyword.map(|_| 1000.0),
             semantic_score: semantic.map(|_| 0.8),
             match_evidence: None,
+            warnings: vec![],
         }
     }
 
@@ -522,6 +538,7 @@ mod tests {
                 recap("tail", 1, Some(201), Some(201)),
             ],
             true,
+            SearchSortOrder::Relevance,
         );
         assert_eq!(hits.len(), 4);
         assert_eq!(hits[0].id, "recap:2026-10-10:both");
@@ -532,6 +549,7 @@ mod tests {
             vec![snapshot(1, 3)],
             vec![recap("semantic", 1, None, Some(1))],
             false,
+            SearchSortOrder::Relevance,
         );
         assert_eq!(keywords.len(), 1);
     }
@@ -541,10 +559,15 @@ mod tests {
         let a = recap("a", 2000, Some(1), None);
         let b = recap("b", 2000, Some(1), None);
         let ids = |recaps| {
-            fuse(vec![snapshot(1, 3)], recaps, false)
-                .into_iter()
-                .map(|row| row.id)
-                .collect::<Vec<_>>()
+            fuse(
+                vec![snapshot(1, 3)],
+                recaps,
+                false,
+                SearchSortOrder::Relevance,
+            )
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
         };
         assert_eq!(ids(vec![b.clone(), a.clone()]), ids(vec![a, b]));
         assert_eq!(
@@ -559,7 +582,12 @@ mod tests {
         strong.keyword_score = Some(1500.0);
         let mut weak = recap("weak", 5000, Some(1), None);
         weak.keyword_score = Some(500.0);
-        let rows = fuse(vec![snapshot(1, 3)], vec![weak, strong], false);
+        let rows = fuse(
+            vec![snapshot(1, 3)],
+            vec![weak, strong],
+            false,
+            SearchSortOrder::Relevance,
+        );
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             vec![
@@ -576,6 +604,7 @@ mod tests {
         let query: UnifiedSearchQuery =
             serde_json::from_value(serde_json::json!({"query": "notes"})).unwrap();
         assert_eq!(query.target, SearchTarget::Mixed);
+        assert_eq!(query.sort_order, SearchSortOrder::Relevance);
         assert!(!query.include_semantic);
         for target in ["snapshots", "mixed", "recaps"] {
             assert!(serde_json::from_value::<UnifiedSearchQuery>(
@@ -587,6 +616,59 @@ mod tests {
             serde_json::json!({"target": "everything"})
         )
         .is_err());
+        assert!(serde_json::from_value::<UnifiedSearchQuery>(
+            serde_json::json!({"sort_order": "newest"})
+        )
+        .is_ok());
+        assert!(serde_json::from_value::<UnifiedSearchQuery>(
+            serde_json::json!({"sort_order": "unknown"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn newest_fusion_keeps_recent_keywords_beyond_the_relevance_prefix() {
+        let mut old = snapshot(1, 1);
+        old.created_at = "2030-01-01T00:00:00Z".into();
+        old.match_evidence.as_mut().unwrap().relevance_score = 5000.0;
+        let mut recent = recap("recent", 5000, Some(201), None);
+        recent.keyword_score = Some(100.0);
+        let rows = fuse(
+            vec![old, snapshot(2, 4), snapshot(2, 4)],
+            vec![
+                recent,
+                recap("b", 4000, Some(2), None),
+                recap("a", 4000, Some(1), None),
+            ],
+            true,
+            SearchSortOrder::Newest,
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "recap:2026-10-10:recent",
+                "recap:2026-10-10:a",
+                "recap:2026-10-10:b",
+                "snapshot:2",
+                "snapshot:1",
+            ]
+        );
+        assert_eq!(rows[0].recap.as_ref().unwrap().keyword_rank, Some(201));
+    }
+
+    #[test]
+    fn pagination_cache_separates_result_orders() {
+        let mut query = UnifiedSearchQuery {
+            query: "notes".into(),
+            ..Default::default()
+        };
+        let relevance_key = query_key(&query);
+        query.offset = 40;
+        query.limit = 20;
+        query.ranking_revision = Some("a".repeat(64));
+        assert_eq!(relevance_key, query_key(&query));
+        query.sort_order = SearchSortOrder::Newest;
+        assert_ne!(relevance_key, query_key(&query));
     }
 
     #[test]

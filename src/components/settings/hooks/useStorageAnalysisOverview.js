@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { getAnalysisOverview } from '../../../lib/analysis_api';
 import { REFRESH_INTERVAL_MS } from '../analysisUtils';
+import { usePolling } from '../../../hooks/usePolling';
+import { useSettingsWindowActivity } from '../SettingsActivityContext';
 
 export function useStorageAnalysisOverview({ isOpen, activeTab, t }) {
+  const { busy } = useSettingsWindowActivity();
   const [storage, setStorage] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(true);
   const [analysisRefreshing, setAnalysisRefreshing] = useState(false);
@@ -32,12 +35,10 @@ export function useStorageAnalysisOverview({ isOpen, activeTab, t }) {
     loadAnalysisOverview(true);
   };
 
-  useEffect(() => {
-    if (!isOpen || activeTab !== 'maintenance') return undefined;
-    loadAnalysisOverview(false);
-    const timer = setInterval(() => loadAnalysisOverview(false), REFRESH_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [isOpen, activeTab, loadAnalysisOverview]);
+  usePolling(() => loadAnalysisOverview(false), {
+    intervalMs: REFRESH_INTERVAL_MS,
+    enabled: isOpen && activeTab === 'maintenance' && !busy,
+  });
 
   return {
     storage,

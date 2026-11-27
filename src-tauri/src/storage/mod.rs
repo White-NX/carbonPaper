@@ -11,10 +11,14 @@ mod ann_build;
 mod background_scheduler;
 pub(crate) mod backup;
 mod backup_format;
+mod backup_images;
 mod backup_keys;
+mod backup_prefetch;
 mod blind_index;
 mod blind_search;
 mod classification;
+mod clip_chronological;
+mod compaction;
 mod connection;
 pub(crate) mod database_snapshot;
 mod derived_index;
@@ -23,19 +27,27 @@ mod document_ref;
 mod encryption;
 mod image_io;
 mod initialization;
+mod layout;
 mod link_scoring;
 pub mod migration;
 mod mode;
+mod ocr_blocks;
+mod ocr_keys;
 mod policy;
 mod process;
+mod process_icons;
 mod processing_stage;
 mod protected;
 mod protected_migration;
 mod recap;
+mod recap_content;
 mod recap_protected;
 mod recap_search;
+mod rewrite_budget;
 mod schema;
 mod screenshot;
+mod screenshot_edit;
+mod screenshot_edit_ocr;
 mod screenshot_reader;
 mod search;
 pub(crate) mod search_plan;
@@ -44,12 +56,16 @@ mod semantic_cache;
 pub mod smart_cluster;
 mod timeline;
 mod types;
+mod usage;
+mod vector_blocks;
 mod vector_query_metrics;
 pub(crate) mod wire_time;
 
 pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
 pub use background_scheduler::BackgroundTaskState;
 pub(crate) use classification::{ClassificationFeedback, ClassificationLease};
+pub(crate) use clip_chronological::{ClipChronologicalHit, ClipChronologicalRequest};
+pub use compaction::StorageCompactionProgress;
 #[allow(unused_imports)]
 pub use derived_index::*;
 #[allow(unused_imports)]
@@ -60,11 +76,15 @@ pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub(crate) use initialization::{InitializationPhase, InitializationProgress};
 pub(crate) use mode::database_mode_policy_from_environment;
 pub(crate) use policy::disk_totals_for_path;
+pub(crate) use screenshot_edit_ocr::EditOcrJob;
+pub use screenshot_edit_ocr::EditOcrStatus;
 pub(crate) use screenshot_reader::ScreenshotReader;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use timeline::TimelineRecord;
 pub use types::*;
+pub(crate) use usage::categories::StoredCategory;
+pub(crate) use usage::UsageWriter;
 pub(crate) use vector_query_metrics::VectorQueryMetrics;
 
 use crate::credential_manager::{
@@ -99,6 +119,7 @@ impl From<String> for BackgroundReadError {
 pub struct StorageState {
     pub(crate) backup: backup::Control,
     pub(crate) processing_stage: Arc<crate::processing_stage::ProcessingStaging>,
+    pub(crate) usage_categories: crate::usage::categories::CategoryCache,
     protected: Arc<protected::ProtectedStorage>,
     pub(crate) agent_writer: Arc<agent_access::AgentWriter>,
     /// Database connection
@@ -122,6 +143,10 @@ pub struct StorageState {
     ocr_row_count: AtomicU64,
     /// Whether the lazy OCR indexer background thread has been started.
     lazy_indexer_started: AtomicBool,
+    storage_compaction_started: AtomicBool,
+    storage_compaction_progress: Mutex<compaction::ProgressState>,
+    /// Online compaction and incremental vacuum share one paced execution slot.
+    rewrite_budget: rewrite_budget::RewriteBudget,
     /// Whether thumbnail warmup has already completed this session
     pub(crate) thumbnail_warmup_done: AtomicBool,
     /// Whether startup VACUUM is currently running
@@ -171,6 +196,9 @@ pub struct StorageState {
     /// order itself holds no plaintext and expires on its own; see
     /// `search.rs::CachedSearchOrder`.
     search_order_cache: Mutex<Option<search::CachedSearchOrder>>,
+    /// A bounded chronological CLIP prefix and cursor, without plaintext query
+    /// or screenshot content. Its watcher invalidates it on database writes.
+    clip_chronological_cache: Mutex<Option<clip_chronological::CachedClipOrder>>,
     /// Incremented on every close and every open of the backing database file,
     /// always while the `db` mutex is held. A background writer that captured
     /// this value before being scheduled can tell whether it is still facing
@@ -186,6 +214,7 @@ struct NamedConnectionGuard<'a> {
     lock_holder: &'a Mutex<&'static str>,
     caller: &'static str,
     acquired_at: std::time::Instant,
+    rewrite_io: Option<rewrite_budget::ConnectionIoSample>,
 }
 
 impl Deref for NamedConnectionGuard<'_> {
@@ -204,6 +233,9 @@ impl DerefMut for NamedConnectionGuard<'_> {
 
 impl Drop for NamedConnectionGuard<'_> {
     fn drop(&mut self) {
+        if let Some(sample) = self.rewrite_io.take() {
+            sample.finish(self.guard.as_ref());
+        }
         let hold_duration = self.acquired_at.elapsed();
         if hold_duration.as_secs() >= 1 {
             tracing::warn!(
@@ -235,15 +267,16 @@ impl StorageState {
         let screenshot_dir = data_dir.join("screenshots");
         let processing_stage = Arc::new(crate::processing_stage::ProcessingStaging::new());
         let agent_writer = Arc::new(agent_access::AgentWriter::default());
-        let protected = Arc::new(protected::ProtectedStorage::new(
+        let protected = protected::ProtectedStorage::new(
             credential_state.clone(),
             processing_stage.clone(),
             agent_writer.clone(),
-        ));
+        );
 
         Self {
             backup: backup::Control::default(),
             processing_stage,
+            usage_categories: crate::usage::categories::CategoryCache::default(),
             protected,
             agent_writer,
             db: Mutex::new(None),
@@ -259,6 +292,9 @@ impl StorageState {
             lock_holder: Mutex::new(""),
             ocr_row_count: AtomicU64::new(0),
             lazy_indexer_started: AtomicBool::new(false),
+            storage_compaction_started: AtomicBool::new(false),
+            storage_compaction_progress: Mutex::new(compaction::ProgressState::default()),
+            rewrite_budget: rewrite_budget::RewriteBudget::default(),
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),
@@ -273,6 +309,7 @@ impl StorageState {
             clip_cache_load_lock: Mutex::new(()),
             semantic_cache_reset_generation: AtomicU64::new(0),
             search_order_cache: Mutex::new(None),
+            clip_chronological_cache: Mutex::new(None),
             db_generation: AtomicU64::new(0),
         }
     }
@@ -332,8 +369,23 @@ impl StorageState {
         self.startup_vacuum_in_progress.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn foreground_db_read(&self) -> connection::ActivityReadGuard {
-        self.foreground_db_activity.read("foreground_query")
+    pub(crate) fn foreground_db_read(&self) -> Result<connection::ActivityReadGuard, String> {
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        let activity = self
+            .foreground_db_activity
+            .try_read("foreground_query")
+            .ok_or(crate::maintenance::MAINTENANCE_IN_PROGRESS)?;
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        Ok(activity)
+    }
+
+    pub(crate) fn background_db_read(&self) -> connection::ActivityReadGuard {
+        self.foreground_db_activity
+            .background_read("background_query")
     }
 
     pub(crate) fn try_foreground_db_read(
@@ -413,6 +465,24 @@ impl StorageState {
         self.initialized.load(Ordering::Acquire)
     }
 
+    /// Producers and independent readers are fenced by the caller's maintenance
+    /// permit; retaining the primary handle also preserves caches and generation.
+    pub(crate) fn create_backup_snapshot_under_maintenance(
+        &self,
+        database_key: &[u8],
+        temporary_parent: &std::path::Path,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<database_snapshot::TemporaryDirectory, String> {
+        let guard = self.get_connection_named("backup_export.snapshot")?;
+        database_snapshot::create_export_snapshot(
+            guard.as_ref().ok_or("Database not initialized")?,
+            database_key,
+            temporary_parent,
+            || self.backup.check(),
+            progress,
+        )
+    }
+
     /// Acquire DB connection with caller identification for diagnostic logging.
     fn get_connection_named(
         &self,
@@ -438,6 +508,7 @@ impl StorageState {
             );
         }
         Ok(NamedConnectionGuard {
+            rewrite_io: rewrite_budget::ConnectionIoSample::begin(guard.as_ref()),
             guard,
             lock_holder: &self.lock_holder,
             caller,
@@ -463,6 +534,7 @@ impl StorageState {
             *holder = caller;
         }
         Ok(Some(NamedConnectionGuard {
+            rewrite_io: rewrite_budget::ConnectionIoSample::begin(guard.as_ref()),
             guard,
             lock_holder: &self.lock_holder,
             caller,
@@ -478,8 +550,19 @@ impl StorageState {
         &self,
         caller: &'static str,
     ) -> Result<connection::IndependentReadConnection, String> {
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
+        let activity = self
+            .independent_db_activity
+            .try_read(caller)
+            .ok_or(crate::maintenance::MAINTENANCE_IN_PROGRESS)?;
+        // Maintenance can become pending between the first check and acquiring
+        // the permit. Release promptly; an admitted reader still fences swaps.
+        if crate::maintenance::is_active() || self.is_database_maintenance_pending() {
+            return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+        }
         let started = std::time::Instant::now();
-        let activity = self.independent_db_activity.read(caller);
         if !self.is_initialized() {
             return Err("Database not initialized".to_string());
         }
@@ -523,20 +606,21 @@ impl StorageState {
 
     /// Run a read without holding the primary connection's mutex. The
     /// independent connection also participates in the maintenance gate.
+    /// Mutable access permits callback registration on the read-only handle.
     pub(super) fn with_read_connection_named<T>(
         &self,
         caller: &'static str,
-        operation: impl FnOnce(&Connection) -> Result<T, String>,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
         // In-memory unit fixtures have no file to open. Initialized, file-backed
         // tests exercise the same independent connection as production.
         #[cfg(test)]
         if !self.is_initialized() {
-            let guard = self.get_connection_named(caller)?;
-            return operation(guard.as_ref().ok_or("Database not initialized")?);
+            let mut guard = self.get_connection_named(caller)?;
+            return operation(guard.as_mut().ok_or("Database not initialized")?);
         }
-        let conn = self.open_read_connection_named(caller)?;
-        operation(&conn)
+        let mut conn = self.open_read_connection_named(caller)?;
+        operation(&mut conn)
     }
 
     /// Returns whether the current credential session is unlocked/valid.
@@ -583,6 +667,7 @@ impl StorageState {
     /// before its statement runs.
     pub(super) fn bump_db_generation(&self) {
         self.db_generation.fetch_add(1, Ordering::Release);
+        self.reset_storage_compaction_progress();
     }
 }
 
@@ -608,6 +693,40 @@ mod tests {
 
     const READ_TEST_TIMESTAMP: i64 = 1_700_000_040;
     const THREAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn independent_reads_reject_pending_and_active_maintenance_promptly() {
+        let (_temp, storage) = initialized_read_storage(mode::DatabaseModePolicy::Wal);
+        let reader = storage
+            .open_read_connection_named("test established reader")
+            .unwrap();
+        let pending = connection::MaintenanceRequestGuard::new(Arc::clone(
+            &storage.database_maintenance_pending,
+        ));
+        let started = Instant::now();
+        assert!(
+            matches!(storage.open_read_connection_named("test pending rejection"), Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Established readers remain usable and keep file swaps fenced.
+        assert!(
+            reader
+                .query_row("SELECT count(*) FROM screenshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        drop(pending);
+        drop(reader);
+        let maintenance = storage.database_maintenance("test active rejection");
+        assert!(
+            matches!(storage.open_read_connection_named("test active rejection"), Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS)
+        );
+        drop(maintenance);
+        assert!(storage
+            .open_read_connection_named("test resumed read")
+            .is_ok());
+    }
 
     fn test_storage() -> (tempfile::TempDir, StorageState) {
         let temp = tempfile::tempdir().expect("create temporary storage directory");
@@ -670,7 +789,7 @@ mod tests {
         assert_eq!(error, "Database not initialized");
     }
 
-    fn initialized_read_storage(
+    pub(super) fn initialized_read_storage(
         policy: mode::DatabaseModePolicy,
     ) -> (tempfile::TempDir, Arc<StorageState>) {
         let temp = tempfile::tempdir().expect("temporary encrypted storage");
@@ -834,6 +953,11 @@ mod tests {
         ] {
             let (_temp, storage) = initialized_read_storage(policy);
             let mut primary = storage.get_connection_named("held_primary_writer").unwrap();
+            primary
+                .as_ref()
+                .unwrap()
+                .execute("UPDATE screenshots SET status='committed' WHERE id=3", [])
+                .unwrap();
             let tx = primary
                 .as_mut()
                 .unwrap()
@@ -851,6 +975,28 @@ mod tests {
                 // All three application entry points must finish before the
                 // writer releases its mutex, and see only committed records.
                 assert_read_fixture(&reader_storage, "Browser");
+                assert_eq!(
+                    reader_storage
+                        .screenshots()
+                        .by_id(3)
+                        .unwrap()
+                        .unwrap()
+                        .process_name
+                        .as_deref(),
+                    Some("Browser")
+                );
+                assert!(reader_storage
+                    .screenshots()
+                    .recent(10)
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.screenshot_id == 3));
+                assert_eq!(reader_storage.screenshot_status(3).unwrap(), "committed");
+                assert!(reader_storage.get_delete_queue_status().is_ok());
+                assert!(reader_storage.count_smart_cluster_pending().is_ok());
+                assert!(reader_storage.edited_ocr_status(3).unwrap().is_none());
+                assert!(reader_storage.recap_config_revision().is_ok());
+                assert!(reader_storage.recap_list_days("fixture").is_ok());
                 finished_tx.send(()).unwrap();
             });
             let finished = finished_rx.recv_timeout(THREAD_TIMEOUT);

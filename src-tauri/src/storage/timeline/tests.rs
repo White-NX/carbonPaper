@@ -53,6 +53,33 @@ fn encrypted_history() -> (tempfile::TempDir, StorageState, Connection) {
 }
 
 #[test]
+fn process_icon_reference_takes_precedence_and_is_cached_across_screenshots() {
+    let (_temp, _storage, conn) = encrypted_history();
+    for (id, name) in [(10, "browser favicon"), (11, "application icon")] {
+        conn.execute("INSERT INTO page_icons(id,content_hash,icon_enc,icon_key_encrypted) VALUES(?1,?2,?3,X'02')",
+            params![id, name, encrypt_with_master_key(&[7; 32], name.as_bytes()).unwrap()]).unwrap();
+    }
+    conn.execute(
+        "UPDATE screenshots SET page_icon_id=10,process_icon_id=11 WHERE id IN (2,3)",
+        [],
+    )
+    .unwrap();
+    let rows = read_rows_by_ids(&conn, &[2, 3], &|| Ok(()), &mut Timings::default()).unwrap();
+    let mut timings = Timings::default();
+    let result = hydrate(
+        rows,
+        &|| Ok(()),
+        &mut |_, _| Ok(Some(Zeroizing::new(vec![7; 32]))),
+        &mut timings,
+    )
+    .unwrap();
+    assert!(result
+        .iter()
+        .all(|r| r.process_icon.as_deref() == Some("application icon")));
+    assert_eq!(timings.icon_cache_hits, 1);
+}
+
+#[test]
 fn headers_preserve_full_timeline_positions_without_loading_or_unwrapping_details() {
     let (_temp, _storage, conn) = encrypted_history();
     for limit in [3, 500] {

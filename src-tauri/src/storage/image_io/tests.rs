@@ -121,7 +121,7 @@ fn lookup_reads_opaque_image_keys_without_hydrating_metadata() {
 
 #[test]
 fn batch_locations_use_primary_keys_skip_deleted_rows_and_deduplicate() {
-    let (_directory, _storage, conn) = fixture();
+    let (_directory, _storage, mut conn) = fixture();
     insert_history(&conn, 20000);
     conn.execute_batch(
         "UPDATE screenshots SET is_deleted = 1 WHERE id = 19999;
@@ -252,7 +252,7 @@ fn lookup_reports_missing_rows_and_database_errors_and_keeps_auth_required() {
 
 #[test]
 fn full_image_path_resolution_releases_db_mutex_and_retains_maintenance_permit() {
-    let (_directory, storage, conn) = fixture();
+    let (_directory, storage, mut conn) = fixture();
     conn.execute(
         "INSERT INTO screenshots (id, image_path, image_hash, content_key_encrypted)
          VALUES (1, 'screenshots/one.png.enc', 'one', X'0102')",

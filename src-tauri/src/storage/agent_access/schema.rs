@@ -104,7 +104,7 @@ pub(super) const SOURCES: &[Source] = &[
         kind: "snapshot", key: SourceKey::Integer("s.id"),
         from: "screenshots s NOT INDEXED", visible: "s.is_deleted=0",
         projection: "SELECT CAST(s.id AS TEXT) source_key,json_object('screenshot_id',s.id,'captured_at_ms',CAST(strftime('%s',s.created_at) AS INTEGER)*1000,
-        'width',s.width,'height',s.height,'window_title',s.window_title,'process_name',cp_process(s.process_name),'source',s.source,'page_url',NULL,
+        'width',s.width,'height',s.height,'window_title',s.window_title,'process_name',CASE WHEN s.process_name_enc IS NULL THEN cp_process(s.process_name) END,'source',s.source,'page_url',NULL,
         'category',s.category,'status',s.status,'window_title_enc',hex(s.window_title_enc),'process_name_enc',hex(s.process_name_enc),'page_url_enc',hex(s.page_url_enc),
         'key_enc',hex(s.content_key_encrypted),'links_enc',hex(l.links_enc),'links_key',hex(l.links_key_encrypted)) payload FROM page CROSS JOIN screenshots s ON s.id=page.k1 LEFT JOIN link_sets l ON l.id=s.link_set_id",
     },
@@ -113,7 +113,7 @@ pub(super) const SOURCES: &[Source] = &[
         from: "ocr_results o NOT INDEXED CROSS JOIN screenshots s ON s.id=o.screenshot_id",
         visible: "o.is_deleted=0 AND s.is_deleted=0",
         projection: "SELECT CAST(o.id AS TEXT) source_key,json_object('ocr_id',o.id,'screenshot_id',o.screenshot_id,
-        'payload_digest',cp_agent_digest(o.text_enc),'key_enc',hex(o.text_key_encrypted)) payload FROM page CROSS JOIN ocr_results o ON o.id=page.k1",
+        'payload_digest',o.payload_digest,'key_enc',hex(o.wrapped_key)) payload FROM page CROSS JOIN agent_ocr_source o ON o.id=page.k1",
     },
     Source {
         kind: "cluster", key: SourceKey::Integer("c.id"),
@@ -162,12 +162,18 @@ pub(super) fn install_triggers(conn: &Connection) -> Result<(), String> {
     let triggers:[(&str,&str,&str);15]=[
         ("snapshot_insert","AFTER INSERT ON screenshots","SELECT cp_agent_emit('snapshot',CAST(NEW.id AS TEXT),'put',json_object('screenshot_id',NEW.id,'captured_at_ms',CAST(strftime('%s',NEW.created_at) AS INTEGER)*1000,
             'width',NEW.width,'height',NEW.height,'window_title',NEW.window_title,'process_name',NEW.process_name,'source',NEW.source,'page_url',NULL,'category',NEW.category,'status',NEW.status,
-            'encrypted',json(CASE WHEN NEW.window_title_enc IS NOT NULL OR NEW.process_name_enc IS NOT NULL OR NEW.page_url_enc IS NOT NULL OR NEW.link_set_id IS NOT NULL THEN 'true' ELSE 'false' END)))"),
-        ("snapshot_update","AFTER UPDATE OF category,status,is_deleted,window_title_enc,process_name_enc,page_url_enc,link_set_id,width,height,created_at ON screenshots","SELECT cp_agent_emit('snapshot_state',CAST(NEW.id AS TEXT),'put',json_object('screenshot_id',NEW.id,'category',NEW.category,'status',NEW.status,'deleted',json(CASE NEW.is_deleted WHEN 1 THEN 'true' ELSE 'false' END),
-            'requires_projection',json(CASE WHEN NEW.is_deleted=0 AND (NEW.window_title_enc IS NOT OLD.window_title_enc OR NEW.process_name_enc IS NOT OLD.process_name_enc OR NEW.page_url_enc IS NOT OLD.page_url_enc OR NEW.link_set_id IS NOT OLD.link_set_id OR NEW.width IS NOT OLD.width OR NEW.height IS NOT OLD.height OR NEW.created_at IS NOT OLD.created_at OR OLD.is_deleted=1) THEN 'true' ELSE 'false' END)))"),
+            'encrypted',json(CASE WHEN NEW.window_title_enc IS NOT NULL OR NEW.process_name_enc IS NOT NULL OR NEW.page_url_enc IS NOT NULL OR NEW.link_set_id IS NOT NULL OR NEW.process_name GLOB 'cpp1:*' THEN 'true' ELSE 'false' END)))"),
+        ("snapshot_update","AFTER UPDATE OF category,status,is_deleted,window_title_enc,process_name,process_name_enc,page_url_enc,link_set_id,width,height,created_at ON screenshots","SELECT cp_agent_emit('snapshot_state',CAST(NEW.id AS TEXT),'put',json_object('screenshot_id',NEW.id,'category',NEW.category,'status',NEW.status,'deleted',json(CASE NEW.is_deleted WHEN 1 THEN 'true' ELSE 'false' END),
+            'requires_projection',json(CASE WHEN NEW.is_deleted=0 AND (NEW.window_title_enc IS NOT OLD.window_title_enc OR NEW.process_name IS NOT OLD.process_name OR NEW.process_name_enc IS NOT OLD.process_name_enc OR NEW.page_url_enc IS NOT OLD.page_url_enc OR NEW.link_set_id IS NOT OLD.link_set_id OR NEW.width IS NOT OLD.width OR NEW.height IS NOT OLD.height OR NEW.created_at IS NOT OLD.created_at OR OLD.is_deleted=1) THEN 'true' ELSE 'false' END)))"),
         ("snapshot_delete","AFTER DELETE ON screenshots","SELECT cp_agent_emit('snapshot',CAST(OLD.id AS TEXT),'delete','{}')"),
-        ("ocr_insert","AFTER INSERT ON ocr_results","SELECT cp_agent_emit('ocr',CAST(NEW.id AS TEXT),'put',json_object('ocr_id',NEW.id,'screenshot_id',NEW.screenshot_id,'payload_digest',cp_agent_digest(NEW.text_enc)))"),
-        ("ocr_update","AFTER UPDATE OF text_enc,text_key_encrypted,is_deleted,screenshot_id ON ocr_results","SELECT cp_agent_emit('ocr',CAST(NEW.id AS TEXT),CASE NEW.is_deleted WHEN 1 THEN 'delete' ELSE 'put' END,json_object('ocr_id',NEW.id,'screenshot_id',NEW.screenshot_id,'payload_digest',cp_agent_digest(NEW.text_enc)))"),
+        ("ocr_insert","AFTER INSERT ON ocr_results","SELECT cp_agent_emit('ocr',CAST(NEW.id AS TEXT),'put',
+            json_object('ocr_id',NEW.id,'screenshot_id',NEW.screenshot_id,'payload_digest',o.payload_digest,'key_digest',o.key_digest))
+            FROM agent_ocr_source o WHERE o.id=NEW.id"),
+        ("ocr_update","AFTER UPDATE OF text_enc,text_key_encrypted,ocr_key_id,ocr_block_slot,is_deleted,screenshot_id ON ocr_results",
+            "SELECT cp_agent_emit('ocr',CAST(NEW.id AS TEXT),CASE NEW.is_deleted WHEN 1 THEN 'delete' ELSE 'put' END,
+            CASE NEW.is_deleted WHEN 1 THEN '{}' ELSE
+            (SELECT json_object('ocr_id',NEW.id,'screenshot_id',NEW.screenshot_id,'payload_digest',o.payload_digest,'key_digest',o.key_digest)
+            FROM agent_ocr_source o WHERE o.id=NEW.id) END)"),
         ("ocr_delete","AFTER DELETE ON ocr_results","SELECT cp_agent_emit('ocr',CAST(OLD.id AS TEXT),'delete','{}')"),
         ("cluster_delete","AFTER DELETE ON smart_clusters","SELECT cp_agent_emit('cluster',CAST(OLD.id AS TEXT),'delete','{}')"),
         ("summary_delete","AFTER DELETE ON smart_cluster_summaries","SELECT cp_agent_emit('summary',CAST(OLD.smart_cluster_id AS TEXT),'delete','{}')"),
@@ -189,8 +195,8 @@ pub(super) fn install_triggers(conn: &Connection) -> Result<(), String> {
         db(conn.execute_batch(&format!("DROP TRIGGER IF EXISTS agent_{name};CREATE TRIGGER agent_{name} {timing} BEGIN INSERT INTO agent_enqueue(envelope) {select};END;")))?;
     }
     let puts=[
-        ("cluster","smart_clusters","CAST(NEW.id AS TEXT)","json_object('cluster_id',NEW.id,'anchor_text',NEW.anchor_text,'display_name',NEW.display_name,'missing_name',json(CASE WHEN NEW.display_name IS NOT NULL AND NEW.display_name IS NULL THEN 'true' ELSE 'false' END),'enabled',json(CASE NEW.enabled WHEN 1 THEN 'true' ELSE 'false' END),'created_at_ms',CAST(strftime('%s',NEW.created_at) AS INTEGER)*1000,'updated_at_ms',CAST(strftime('%s',NEW.updated_at) AS INTEGER)*1000,'snapshot_count',0)"),
-        ("summary","smart_cluster_summaries","CAST(NEW.smart_cluster_id AS TEXT)","json_object('cluster_id',NEW.smart_cluster_id,'title',NEW.title,'summary',NEW.summary,'ocr_summary',NEW.ocr_summary,'key_points_json',NEW.key_points_json,'evidence_json',NEW.evidence_json,'source_snapshot_count',NEW.source_snapshot_count,'created_at_ms',CAST(strftime('%s',NEW.created_at) AS INTEGER)*1000,'updated_at_ms',CAST(strftime('%s',NEW.updated_at) AS INTEGER)*1000,'unavailable',json(CASE WHEN (NEW.title IS NOT NULL AND NEW.title IS NULL) OR (NEW.summary IS NOT NULL AND NEW.summary IS NULL) OR (NEW.ocr_summary IS NOT NULL AND NEW.ocr_summary IS NULL) OR (NEW.key_points_json IS NOT NULL AND NEW.key_points_json IS NULL) OR (NEW.evidence_json IS NOT NULL AND NEW.evidence_json IS NULL) THEN 'true' ELSE 'false' END))"),
+        ("cluster","smart_clusters","CAST(NEW.id AS TEXT)","json_object('cluster_id',NEW.id,'anchor_text',NEW.anchor_text,'display_name',NEW.display_name,'enabled',json(CASE NEW.enabled WHEN 1 THEN 'true' ELSE 'false' END),'created_at_ms',CAST(strftime('%s',NEW.created_at) AS INTEGER)*1000,'updated_at_ms',CAST(strftime('%s',NEW.updated_at) AS INTEGER)*1000,'snapshot_count',0)"),
+        ("summary","smart_cluster_summaries","CAST(NEW.smart_cluster_id AS TEXT)","json_object('cluster_id',NEW.smart_cluster_id,'title',NEW.title,'summary',NEW.summary,'ocr_summary',NEW.ocr_summary,'key_points_json',NEW.key_points_json,'evidence_json',NEW.evidence_json,'source_snapshot_count',NEW.source_snapshot_count,'created_at_ms',CAST(strftime('%s',NEW.created_at) AS INTEGER)*1000,'updated_at_ms',CAST(strftime('%s',NEW.updated_at) AS INTEGER)*1000)"),
         ("assignment","smart_cluster_assignments","NEW.smart_cluster_id||':'||NEW.screenshot_id","json_object('cluster_id',NEW.smart_cluster_id,'screenshot_id',NEW.screenshot_id,'rerank_score',NEW.rerank_score,'assigned_at_ms',CAST(strftime('%s',NEW.assigned_at) AS INTEGER)*1000)"),
         ("recap","recap_payloads","NEW.kind||':'||NEW.key","json_object('date',NEW.day,'key',NEW.key,'part',NEW.kind,'revision',NEW.revision,'payload_digest',cp_agent_digest(NEW.data))"),
         ("calendar","recap_calendars","NEW.day","json_set(NEW.data,'$.source_revision',COALESCE((SELECT revision FROM recap_days WHERE day=NEW.day),0))"),

@@ -1,7 +1,7 @@
 {
   "name": "carbonpaper",
   "private": true,
-  "version": "0.9.1",
+  "version": "0.9.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,9 +17,12 @@
     "test:mcp-contract": "node scripts/mcp-contract.mjs",
     "test:mcp-skill-contract": "node scripts/mcp-contract.mjs --skill-root ../carbonPaperSkill",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "clean:rust": "node scripts/clean-rust.mjs",
+    "test:rust-cache": "node --test scripts/rust-cache.test.mjs scripts/debug.test.mjs",
     "test:security": "node scripts/security-guards.cjs && node --test scripts/overlay-boundaries.test.mjs",
     "verify:wal-foundation": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-wal-foundation.ps1",
     "test:backend:fast": "npm run test:security && npm run test:rust",
+    "test:dev-workers": "node --test scripts/semantic-runtime-resources.test.mjs",
     "tauri": "tauri",
     "debug": "npm run prepare:dev-assets && node scripts/debug.mjs",
     "test:app-bound:dev": "node scripts/debug.mjs --smoke",
@@ -45,6 +48,7 @@
     "verify:ml-runtime": "src-tauri\\target\\release\\carbonpaper-ml.exe --verify-models --model-dir src-tauri\\pre-bundle\\ocr-models\\ppocrv5-ch-mobile-r1",
     "verify:office-runtime": "src-tauri\\target\\release\\carbonpaper-office.exe --probe",
     "verify:semantic-runtime": "node scripts/verify-semantic-runtime.mjs",
+    "verify:semantic-runtime:dev": "node scripts/verify-semantic-runtime.mjs --development",
     "prepare:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1",
     "prepare:dev-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -DevelopmentOnly",
     "prepare:ocr-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -OcrOnly",
@@ -56,9 +60,9 @@
     "tauri:build": "npm run test:app-bound:fast && npm run prepare:release-assets && node scripts/build-nmh.mjs --release && npm run build:ml:release && npm run build:office:release && npm run build:semantic-ml:release && npm run build:protected:release && npm run verify:ml-runtime && npm run verify:office-runtime && npm run verify:semantic-runtime && tauri build && node scripts/pack-portable.mjs && npm run verify:release-bundles"
   },
   "dependencies": {
-    "@tauri-apps/api": "~2.9.0",
-    "@tauri-apps/plugin-dialog": "^2.6.0",
-    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/api": "~2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-opener": "^2.7.3",
     "clsx": "^2.1.1",
     "i18next": "^25.8.12",
     "i18next-browser-languagedetector": "^7.0.1",
@@ -71,7 +75,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
-    "@tauri-apps/cli": "^2",
+    "@tauri-apps/cli": "^2.12.4",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",

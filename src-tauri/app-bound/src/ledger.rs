@@ -10,6 +10,15 @@ mod agent_access;
 mod recap;
 mod storage_keys;
 
+const USAGE_SQL: &str = "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
+    SELECT bytes FROM tasks WHERE owner=?1 AND state!='retired'
+    UNION ALL SELECT bytes FROM recap_objects WHERE owner=?1 AND state!='retired')";
+const EXPIRE_TASKS_SQL: &str = "UPDATE tasks SET state='retired',key_blob=NULL
+    WHERE owner=?1 AND state!='retired'
+    AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))";
+const PRUNE_TASKS_SQL: &str = "DELETE FROM tasks
+    WHERE owner=?1 AND state='retired' AND expires<?2";
+
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub sid: String,
@@ -42,12 +51,23 @@ impl Ledger {
         Self::from_connection(db(Connection::open(path))?)
     }
 
+    /// Teardown must never recreate a database removed by another collector.
+    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+        Self::from_connection(db(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        ))?)
+    }
+
     fn from_connection(conn: Connection) -> Result<Self> {
         db(conn.busy_timeout(std::time::Duration::from_secs(3)))?;
-        db(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE;
+        db(conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA auto_vacuum=INCREMENTAL;
             PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS broker_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
             INSERT OR IGNORE INTO broker_metadata VALUES ('schema', 1);
+            CREATE TABLE IF NOT EXISTS installed_service (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), runtime_id TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS owners (
                 sid TEXT PRIMARY KEY, runtime_id TEXT NOT NULL, enabled INTEGER NOT NULL,
                 retention_days INTEGER NOT NULL, capacity_bytes INTEGER NOT NULL,
@@ -56,12 +76,17 @@ impl Ledger {
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES owners(sid),
                 dataset TEXT NOT NULL, screenshot_id INTEGER NOT NULL, binding TEXT NOT NULL,
+                source_revision INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL CHECK(state IN ('prepared','active','retired')),
                 done INTEGER NOT NULL DEFAULT 0, abandoned INTEGER NOT NULL DEFAULT 0, key_blob BLOB, digest TEXT,
                 created INTEGER NOT NULL, expires INTEGER NOT NULL, prepared_until INTEGER NOT NULL,
                 bytes INTEGER NOT NULL, UNIQUE(owner, dataset, screenshot_id)
             );
             CREATE INDEX IF NOT EXISTS broker_tasks_owner ON tasks(owner, state, created);
+            CREATE INDEX IF NOT EXISTS broker_tasks_live
+                ON tasks(owner,state,expires,prepared_until,bytes,created) WHERE state!='retired';
+            CREATE INDEX IF NOT EXISTS broker_tasks_retired_expiry
+                ON tasks(owner,expires) WHERE state='retired';
             CREATE TABLE IF NOT EXISTS leases (
                 task TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                 consumer INTEGER NOT NULL, id TEXT NOT NULL, process TEXT NOT NULL,
@@ -73,13 +98,34 @@ impl Ledger {
             [],
             |r| r.get(0),
         ))?;
-        if schema != 1 {
+        if !matches!(schema, 1 | 2) {
             return Err(BrokerError::VersionMismatch);
+        }
+        let has_revision: bool = db(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='source_revision')",
+            [],
+            |row| row.get(0),
+        ))?;
+        if !has_revision {
+            db(conn.execute(
+                "ALTER TABLE tasks ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0",
+                [],
+            ))?;
         }
         Self::init_recap(&conn)?;
         Self::init_storage_keys(&conn)?;
         Self::init_agent_access(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Compacted revocations cannot be interpreted by the original service.
+    /// Keep this fence after owner removal, just like retained key authority.
+    pub(crate) fn requires_current_service(&self) -> Result<bool> {
+        db(self.conn.query_row(
+            "SELECT value>=2 FROM broker_metadata WHERE key='schema'",
+            [],
+            |row| row.get(0),
+        ))
     }
 
     /// Installer-only: caller SID is obtained from the unelevated requesting
@@ -108,6 +154,8 @@ impl Ledger {
         let tx = db(self.conn.transaction())?;
         db(tx.execute("DELETE FROM recap_objects WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM recap_revoked_sources WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revoked_ranges WHERE owner=?1", [sid]))?;
+        db(tx.execute("DELETE FROM recap_revocation_budgets WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM tasks WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_keys WHERE owner=?1", [sid]))?;
         db(tx.execute("DELETE FROM storage_public_keys WHERE owner=?1", [sid]))?;
@@ -121,6 +169,45 @@ impl Ledger {
         db(self.conn.query_row("SELECT COUNT(*) FROM owners", [], |r| {
             r.get::<_, i64>(0).map(|v| v as u64)
         }))
+    }
+
+    pub fn registered_owner_sids(&self) -> Result<Vec<String>> {
+        let mut statement = db(self.conn.prepare("SELECT sid FROM owners"))?;
+        let rows = db(statement.query_map([], |row| row.get(0)))?;
+        db(rows.collect())
+    }
+
+    pub fn apply_revocations(
+        &mut self,
+        sid: &str,
+        intents: &[crate::revocation::Revocation],
+    ) -> Result<()> {
+        if self.registered_runtime(sid)?.is_none() {
+            // A removed owner has no grants; stale inbox entries cannot bind
+            // a later, independent registration or prevent its installation.
+            return Ok(());
+        }
+        let tx = db(self.conn.transaction())?;
+        for intent in intents {
+            intent.validate()?;
+            match intent {
+                crate::revocation::Revocation::RetireOwner => {
+                    Self::retire_where(&tx, sid, None)?;
+                    db(tx.execute("UPDATE owners SET dataset_id=NULL WHERE sid=?1", [sid]))?;
+                }
+                crate::revocation::Revocation::Screenshots {
+                    dataset_id,
+                    screenshot_ids,
+                } => {
+                    for id in screenshot_ids {
+                        Self::revoke_recap_source(&tx, sid, dataset_id, *id)?;
+                        db(tx.execute("UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3", params![sid, dataset_id, id]))?;
+                        db(tx.execute("DELETE FROM leases WHERE task IN (SELECT id FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)", params![sid, dataset_id, id]))?;
+                    }
+                }
+            }
+        }
+        db(tx.commit())
     }
 
     pub fn registered_runtime(&self, sid: &str) -> Result<Option<String>> {
@@ -141,6 +228,48 @@ impl Ledger {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional())
+    }
+
+    /// One machine-wide, service-owned checkpoint. Readable launch pointers and
+    /// runtime manifests may be repaired without losing this version authority.
+    pub fn service_runtime(&self) -> Result<Option<String>> {
+        db(self
+            .conn
+            .query_row(
+                "SELECT runtime_id FROM installed_service WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional())
+    }
+
+    /// Committed owners also establish a minimum after interrupted installation.
+    /// Removing one never rewinds the independently retained service floor.
+    pub fn required_service_runtime(&self) -> Result<Option<String>> {
+        let mut required = self.service_runtime()?;
+        for sid in self.registered_owner_sids()? {
+            let id = self
+                .registered_runtime(&sid)?
+                .ok_or(BrokerError::Integrity)?;
+            required = crate::repair::newest_runtime(required, Some(id))?;
+        }
+        Ok(required)
+    }
+
+    pub(crate) fn remember_service_runtime(&self, runtime_id: &str) -> Result<()> {
+        let incoming = crate::repair::runtime_version(runtime_id)?;
+        if let Some(previous) = self.required_service_runtime()? {
+            let previous = crate::repair::runtime_version(&previous)?;
+            if incoming.cmp_precedence(&previous).is_lt() {
+                return Err(BrokerError::VersionMismatch);
+            }
+        }
+        db(self.conn.execute(
+            "INSERT INTO installed_service VALUES(1,?1)
+             ON CONFLICT(singleton) DO UPDATE SET runtime_id=excluded.runtime_id",
+            [runtime_id],
+        ))?;
+        Ok(())
     }
 
     pub fn restore_registration(
@@ -206,6 +335,10 @@ impl Ledger {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Separates the authenticated principal, policy, dataset and key protector at dispatch."
+    )]
     fn dispatch(
         conn: &Connection,
         who: &Principal,
@@ -375,11 +508,13 @@ impl Ledger {
             Request::PrepareTask {
                 dataset_id,
                 screenshot_id,
+                source_revision,
                 consumers,
                 payload_bytes,
             } => {
                 if !valid_id(&dataset_id)
                     || screenshot_id <= 0
+                    || source_revision < 0
                     || consumers == 0
                     || consumers & !Consumer::ALL_MASK != 0
                     || !(28..=MAX_INPUT_BYTES + 28).contains(&payload_bytes)
@@ -389,20 +524,38 @@ impl Ledger {
                 if dataset.as_deref() != Some(&dataset_id) {
                     return Err(BrokerError::DatasetMismatch);
                 }
-                let already: bool = db(conn.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3)",
-                    params![who.sid,dataset_id,screenshot_id], |r| r.get(0)))?;
-                if already {
+                // A source revision can replace a processing grant, but cannot
+                // restore authorization after the screenshot itself was deleted.
+                if Self::source_is_revoked(conn, &who.sid, &dataset_id, screenshot_id)? {
+                    return Err(BrokerError::Retired);
+                }
+                let previous: Option<(String,i64)> = db(conn.query_row(
+                    "SELECT id,source_revision FROM tasks WHERE owner=?1 AND dataset=?2 AND screenshot_id=?3",
+                    params![who.sid,dataset_id,screenshot_id], |row| Ok((row.get(0)?,row.get(1)?)),
+                ).optional())?;
+                if previous
+                    .as_ref()
+                    .is_some_and(|(_, revision)| source_revision <= *revision)
+                {
                     return Err(BrokerError::Retired);
                 }
                 let key = new_key();
                 // Protect before changing state so an OS failure cannot orphan
                 // an unprotected record or consume another task's capacity.
                 let sealed = protector.protect(&key)?;
+                // A newer immutable source may replace the slot. Old task IDs
+                // and leases become unusable, while the latest revision keeps
+                // same/older input grants from being recreated after retirement.
+                if let Some((previous_id, _)) = previous {
+                    db(conn.execute("DELETE FROM leases WHERE task=?1", [&previous_id]))?;
+                    db(conn.execute("DELETE FROM tasks WHERE id=?1", [&previous_id]))?;
+                }
                 Self::make_room(conn, &who.sid, payload_bytes, limits.capacity_bytes)?;
                 let task = TaskBinding {
                     task_id: random_id(),
                     dataset_id,
                     screenshot_id,
+                    source_revision,
                     input_version: INPUT_VERSION,
                     consumers,
                     payload_bytes,
@@ -410,9 +563,9 @@ impl Ledger {
                 };
                 let binding =
                     serde_json::to_string(&task).map_err(|_| BrokerError::InvalidRequest)?;
-                db(conn.execute("INSERT INTO tasks(id,owner,dataset,screenshot_id,binding,state,key_blob,created,expires,prepared_until,bytes)
-                    VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10)", params![task.task_id,who.sid,task.dataset_id,
-                    screenshot_id,binding,sealed,now,task.expires_at,now.saturating_add(PREPARE_TTL_SECS),payload_bytes as i64]))?;
+                db(conn.execute("INSERT INTO tasks(id,owner,dataset,screenshot_id,binding,state,key_blob,created,expires,prepared_until,bytes,source_revision)
+                    VALUES(?1,?2,?3,?4,?5,'prepared',?6,?7,?8,?9,?10,?11)", params![task.task_id,who.sid,task.dataset_id,
+                    screenshot_id,binding,sealed,now,task.expires_at,now.saturating_add(PREPARE_TTL_SECS),payload_bytes as i64,source_revision]))?;
                 Ok(Response::Prepared(PreparedTask { task, key }))
             }
             Request::ActivateTask {
@@ -590,7 +743,8 @@ impl Ledger {
         if !valid_id(id) {
             return Err(BrokerError::InvalidRequest);
         }
-        let row: Option<(String,String,u8,u8,Option<Vec<u8>>,Option<String>,i64)> = db(conn.query_row(
+        type StoredTaskRow = (String, String, u8, u8, Option<Vec<u8>>, Option<String>, i64);
+        let row: Option<StoredTaskRow> = db(conn.query_row(
             "SELECT binding,state,done,abandoned,key_blob,digest,expires FROM tasks WHERE id=?1 AND owner=?2", params![id,who.sid],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional())?;
         let Some((binding, state, done, abandoned, key, digest, expires)) = row else {
@@ -633,17 +787,14 @@ impl Ledger {
             supported_consumers: Consumer::ALL_MASK,
             supported_storage_keys: true,
             supported_agent_access: true,
+            supported_task_revisions: true,
         })
     }
 
     fn usage(conn: &Connection, sid: &str) -> Result<(u64, u64)> {
-        db(conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM (
-                SELECT bytes FROM tasks WHERE owner=?1 AND state!='retired'
-                UNION ALL SELECT bytes FROM recap_objects WHERE owner=?1 AND state!='retired')",
-            [sid],
-            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-        ))
+        db(conn.query_row(USAGE_SQL, [sid], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        }))
     }
 
     fn retire_where(conn: &Connection, sid: &str, dataset: Option<&str>) -> Result<()> {
@@ -656,18 +807,11 @@ impl Ledger {
 
     fn reap(conn: &Connection, sid: &str, now: i64, limits: Limits) -> Result<()> {
         Self::reap_recap(conn, sid, now)?;
-        db(conn.execute(
-            "UPDATE tasks SET state='retired',key_blob=NULL WHERE owner=?1 AND state!='retired'
-            AND (expires<=?2 OR (state='prepared' AND prepared_until<=?2))",
-            params![sid, now],
-        ))?;
+        db(conn.execute(EXPIRE_TASKS_SQL, params![sid, now]))?;
         Self::make_room(conn, sid, 0, limits.capacity_bytes)?;
         // Unknown IDs fail closed too, so old tombstones can be reclaimed once
         // no valid input grant could survive. Keys are never reconstructed.
-        db(conn.execute(
-            "DELETE FROM tasks WHERE owner=?1 AND state='retired' AND expires<?2",
-            params![sid, now - 60 * DAY_SECS],
-        ))?;
+        db(conn.execute(PRUNE_TASKS_SQL, params![sid, now - 60 * DAY_SECS]))?;
         Ok(())
     }
 
@@ -702,7 +846,34 @@ impl Ledger {
                 },
             )?;
         }
-        db(tx.commit())
+        db(tx.commit())?;
+        // Drain the pragma's result rows: stepping only once reclaims one page,
+        // regardless of the requested budget. Immutable grant pins stay intact.
+        let mut vacuum = db(self.conn.prepare("PRAGMA incremental_vacuum(256)"))?;
+        let mut rows = db(vacuum.query([]))?;
+        while db(rows.next())?.is_some() {}
+        Ok(())
+    }
+
+    /// Elevated install/uninstall runs this after stopping the service. Existing
+    /// databases need one VACUUM to enable future paced incremental reclamation.
+    pub fn enable_reclamation(&self) -> Result<()> {
+        let mode: i64 = db(self
+            .conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0)))?;
+        if mode == 0 {
+            db(self
+                .conn
+                .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"))?;
+        }
+        Ok(())
+    }
+
+    pub fn compact_if_empty(&self) -> Result<()> {
+        if self.registered_owners()? == 0 {
+            db(self.conn.execute_batch("VACUUM"))?;
+        }
+        Ok(())
     }
 
     fn make_room(conn: &Connection, sid: &str, incoming: u64, capacity: u64) -> Result<()> {
@@ -746,6 +917,146 @@ mod recap_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_version_checkpoint_is_bounded_monotonic_and_survives_owner_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        let mut ledger = Ledger::open(&path).unwrap();
+        let old = "1.2.3-0123456789abcdef";
+        let new = "1.2.4-0123456789abcdef";
+        ledger.register_owner("owner", old, false).unwrap();
+        ledger.remember_service_runtime(old).unwrap();
+        ledger.register_owner("other-owner", new, false).unwrap();
+        assert_eq!(
+            ledger.required_service_runtime().unwrap().as_deref(),
+            Some(new)
+        );
+        assert_eq!(
+            ledger.remember_service_runtime(old),
+            Err(BrokerError::VersionMismatch)
+        );
+        ledger.remember_service_runtime(new).unwrap();
+        ledger.unregister_owner("other-owner").unwrap();
+        assert_eq!(
+            ledger.remember_service_runtime(old),
+            Err(BrokerError::VersionMismatch)
+        );
+        ledger
+            .restore_registration("owner", Some((old.into(), false)))
+            .unwrap();
+        assert_eq!(
+            ledger.owner_registration("owner").unwrap(),
+            Some((old.into(), false))
+        );
+        assert_eq!(ledger.service_runtime().unwrap().as_deref(), Some(new));
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM installed_service", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(ledger);
+        assert_eq!(
+            Ledger::open(&path)
+                .unwrap()
+                .service_runtime()
+                .unwrap()
+                .as_deref(),
+            Some(new)
+        );
+    }
+
+    #[test]
+    fn legacy_ledger_indexes_keep_retained_history_out_of_request_scans() {
+        let (mut ledger, who, ds) = fixture();
+        let task = prepare(&mut ledger, &who, &ds, 1, Consumer::Clip.bit());
+        ledger.conn.execute(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1000)
+             INSERT INTO tasks(id,owner,dataset,screenshot_id,binding,state,created,expires,prepared_until,bytes)
+             SELECT printf('%064x',n),?1,?2,n+1000,'retained binding','retired',100,9999999,100,1024
+             FROM history", params![who.sid, ds],
+        ).unwrap();
+        ledger.conn.execute(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<1000)
+             INSERT INTO recap_objects(id,owner,dataset,slot,binding,state,created,expires,prepared_until,bytes)
+             SELECT printf('%064x',n),?1,?2,'old context','retained binding','retired',100,9999999,100,1024
+             FROM history", params![who.sid, ds],
+        ).unwrap();
+        // Reopen a pre-index ledger. Schema initialization must upgrade it
+        // without rewriting existing bindings, keys, leases or retention times.
+        ledger
+            .conn
+            .execute_batch(
+                "DROP INDEX broker_tasks_live; DROP INDEX broker_tasks_retired_expiry;
+            DROP INDEX recap_objects_live; DROP INDEX recap_objects_retired_created;",
+            )
+            .unwrap();
+        let mut ledger = Ledger::from_connection(ledger.conn).unwrap();
+        let Response::Status(status) = ledger
+            .handle(&who, Request::Status {}, 102, &TestProtection)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (status.active_tasks, status.active_bytes),
+            (1, task.task.payload_bytes)
+        );
+        assert!(acquire(&mut ledger, &who, &task.task.task_id, Consumer::Clip, 103).is_ok());
+
+        for (sql, indexes) in [
+            (USAGE_SQL, &["broker_tasks_live", "recap_objects_live"][..]),
+            (EXPIRE_TASKS_SQL, &["broker_tasks_live"][..]),
+            (PRUNE_TASKS_SQL, &["broker_tasks_retired_expiry"][..]),
+            (recap::EXPIRE_RECAP_SQL, &["recap_objects_live"][..]),
+            (
+                recap::PRUNE_RECAP_SQL,
+                &["recap_objects_retired_created"][..],
+            ),
+        ] {
+            let mut stmt = ledger
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let mut rows = stmt.raw_query();
+            let mut plan = String::new();
+            while let Some(row) = rows.next().unwrap() {
+                plan.push_str(&row.get::<_, String>(3).unwrap());
+                plan.push('\n');
+            }
+            for name in indexes {
+                assert!(
+                    plan.contains(name),
+                    "request query lost its history index: {sql}\n{plan}"
+                );
+            }
+        }
+        assert_eq!(
+            ledger
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE state='retired'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            ledger
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM recap_objects WHERE state='retired'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1000
+        );
+    }
     pub(super) struct TestProtection;
     impl KeyProtector for TestProtection {
         fn protect(&self, key: &TaskKey) -> Result<Vec<u8>> {
@@ -779,6 +1090,87 @@ mod tests {
             .unwrap();
         (ledger, who, dataset)
     }
+
+    #[test]
+    fn cleanup_cannot_recreate_a_removed_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        let ledger = Ledger::open(&path).unwrap();
+        drop(ledger);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            Ledger::open_existing(&path),
+            Err(BrokerError::Storage)
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn maintenance_reclaims_file_pages_without_deleting_live_grants_or_retained_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.db");
+        // Exercise an older database without pointer-map pages too.
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE previous_layout(value BLOB); INSERT INTO previous_layout VALUES(zeroblob(1024));").unwrap();
+        drop(connection);
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger.enable_reclamation().unwrap();
+        assert_eq!(
+            ledger
+                .conn
+                .pragma_query_value(None, "auto_vacuum", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let who = Principal {
+            sid: "test-user".into(),
+            runtime_id: "test-release".into(),
+            process_identity: "10:100".into(),
+            role: RuntimeRole::Desktop,
+        };
+        ledger
+            .register_owner(&who.sid, &who.runtime_id, true)
+            .unwrap();
+        let dataset = random_id();
+        ledger
+            .handle(
+                &who,
+                Request::AttachDataset {
+                    dataset_id: dataset.clone(),
+                },
+                100,
+                &TestProtection,
+            )
+            .unwrap();
+        let task = prepare(&mut ledger, &who, &dataset, 1, Consumer::MiniLm.bit());
+        ledger.conn.execute_batch("CREATE TABLE reclamation_fixture(payload BLOB); INSERT INTO reclamation_fixture VALUES(zeroblob(4*1024*1024)); DELETE FROM reclamation_fixture;").unwrap();
+        let free_before = ledger
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        assert!(free_before > 256);
+        ledger.maintenance(102).unwrap();
+        let free_after = ledger
+            .conn
+            .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(free_before - free_after >= 256);
+        assert!(std::fs::metadata(&path).unwrap().len() < size_before);
+        assert!(acquire(&mut ledger, &who, &task.task.task_id, Consumer::MiniLm, 103).is_ok());
+        ledger.maintenance(100 + 100 * DAY_SECS).unwrap();
+        assert_eq!(
+            acquire(
+                &mut ledger,
+                &who,
+                &task.task.task_id,
+                Consumer::MiniLm,
+                100 + 100 * DAY_SECS
+            )
+            .unwrap_err(),
+            BrokerError::Retired
+        );
+    }
     pub(super) fn prepare(
         ledger: &mut Ledger,
         who: &Principal,
@@ -792,6 +1184,7 @@ mod tests {
                 Request::PrepareTask {
                     dataset_id: dataset.into(),
                     screenshot_id: id,
+                    source_revision: 0,
                     consumers: mask,
                     payload_bytes: 40,
                 },
@@ -814,6 +1207,109 @@ mod tests {
             )
             .unwrap();
         prepared
+    }
+
+    #[test]
+    fn a_new_source_revision_replaces_old_grants_without_replaying_retired_inputs() {
+        let (mut ledger, who, dataset) = fixture();
+        let old = prepare(&mut ledger, &who, &dataset, 7, Consumer::Clip.bit());
+        let old_lease = acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 102).unwrap();
+        let request = |source_revision| Request::PrepareTask {
+            dataset_id: dataset.clone(),
+            screenshot_id: 7,
+            source_revision,
+            consumers: Consumer::Clip.bit(),
+            payload_bytes: 40,
+        };
+        let Response::Prepared(new) = ledger
+            .handle(&who, request(1), 103, &TestProtection)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_ne!(old.task.task_id, new.task.task_id);
+        assert_eq!(new.task.source_revision, 1);
+        assert_eq!(
+            acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 104).unwrap_err(),
+            BrokerError::Retired
+        );
+        assert_eq!(
+            ledger
+                .handle(
+                    &who,
+                    Request::ReleaseLease {
+                        task_id: old.task.task_id,
+                        consumer: Consumer::Clip,
+                        lease_id: old_lease.lease_id,
+                    },
+                    104,
+                    &TestProtection
+                )
+                .unwrap_err(),
+            BrokerError::Retired
+        );
+        for revision in [0, 1] {
+            assert_eq!(
+                ledger
+                    .handle(&who, request(revision), 105, &TestProtection)
+                    .unwrap_err(),
+                BrokerError::Retired
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_revocation_denies_new_revisions_after_task_history_is_pruned() {
+        let (mut ledger, who, dataset) = fixture();
+        let old = prepare(&mut ledger, &who, &dataset, 8, Consumer::Clip.bit());
+        ledger
+            .handle(
+                &who,
+                Request::RevokeScreenshots {
+                    dataset_id: dataset.clone(),
+                    screenshot_ids: vec![8, 9],
+                },
+                102,
+                &TestProtection,
+            )
+            .unwrap();
+        assert_eq!(
+            acquire(&mut ledger, &who, &old.task.task_id, Consumer::Clip, 103).unwrap_err(),
+            BrokerError::Retired
+        );
+        for now in [104, 100 + 100 * DAY_SECS] {
+            ledger.maintenance(now).unwrap();
+            // Deny both replacement of an existing grant and a deleted source
+            // that never had a task. The permanent fence outlives task history.
+            for screenshot_id in [8, 9] {
+                for source_revision in [0, 1, i64::MAX] {
+                    assert_eq!(
+                        ledger
+                            .handle(
+                                &who,
+                                Request::PrepareTask {
+                                    dataset_id: dataset.clone(),
+                                    screenshot_id,
+                                    source_revision,
+                                    consumers: Consumer::Clip.bit(),
+                                    payload_bytes: 40,
+                                },
+                                now,
+                                &TestProtection,
+                            )
+                            .unwrap_err(),
+                        BrokerError::Retired
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
     pub(super) fn acquire(
         ledger: &mut Ledger,
@@ -930,6 +1426,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds,
                         screenshot_id: 2,
+                        source_revision: 0,
                         consumers: 32,
                         payload_bytes: 100,
                     },
@@ -1199,6 +1696,7 @@ mod tests {
                 Request::PrepareTask {
                     dataset_id: ds,
                     screenshot_id: 7,
+                    source_revision: 0,
                     consumers: 1,
                     payload_bytes: 40,
                 },
@@ -1261,6 +1759,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds.clone(),
                         screenshot_id: id,
+                        source_revision: 0,
                         consumers: 1,
                         payload_bytes: 8 * 1024 * 1024,
                     },
@@ -1408,6 +1907,7 @@ mod tests {
                     Request::PrepareTask {
                         dataset_id: ds,
                         screenshot_id: 12,
+                        source_revision: 0,
                         consumers: 1,
                         payload_bytes: 40
                     },

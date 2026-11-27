@@ -5,12 +5,21 @@
 //! authenticated session.
 
 use crate::ai::agent::{self, AgentEvent, AgentLimits, AgentOutcome};
-use crate::ai::config::{is_local_url, AiSettings, AiSettingsView, ProviderInput};
+use crate::ai::catalog::{self, CatalogView, ModelListView};
+use crate::ai::config::{
+    is_local_url, AiSettings, AiSettingsView, ConnectionInput, ImageInput, ProviderInput,
+};
 use crate::ai::provider::{self, ConnectionTest, ProviderError};
 use crate::ai::AiRuntimeState;
 use crate::credential_manager::CredentialManagerState;
 use crate::storage::StorageState;
 use std::sync::Arc;
+
+fn settings_view(settings: &AiSettings, storage: &StorageState) -> AiSettingsView {
+    let mut view = settings.view();
+    catalog::enrich_settings_view(storage, &mut view);
+    view
+}
 
 /// Authentication: not required. Returns [`AiSettingsView`]. Frontend:
 /// `lib/ai_api.js`.
@@ -19,7 +28,7 @@ pub async fn ai_get_settings(
     storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<AiSettingsView, String> {
     let storage = storage_state.inner().clone();
-    tokio::task::spawn_blocking(move || Ok(AiSettings::load(&storage)?.view()))
+    tokio::task::spawn_blocking(move || Ok(settings_view(&AiSettings::load(&storage)?, &storage)))
         .await
         .map_err(|error| format!("Failed to read AI settings: {error}"))?
 }
@@ -34,10 +43,14 @@ pub async fn ai_save_provider(
 ) -> Result<AiSettingsView, String> {
     super::check_auth_required(&credential_state)?;
     let mut settings = AiSettings::load(&storage_state)?;
-    settings.upsert(&credential_state, provider)?;
+    let id = settings.upsert(&credential_state, provider)?;
+    let resolved = settings.resolve(&storage_state, &credential_state, &id)?;
+    if let Some(value) = catalog::cached_image_probe(&storage_state, &resolved) {
+        settings.set_image_input(&id, value);
+    }
     settings.save(&storage_state)?;
     sync_recap_config(&storage_state, &credential_state);
-    Ok(settings.view())
+    Ok(settings_view(&settings, &storage_state))
 }
 
 /// Authentication: required. Frontend: `lib/ai_api.js`.
@@ -52,7 +65,7 @@ pub async fn ai_delete_provider(
     settings.remove(&id)?;
     settings.save(&storage_state)?;
     sync_recap_config(&storage_state, &credential_state);
-    Ok(settings.view())
+    Ok(settings_view(&settings, &storage_state))
 }
 
 /// Authentication: required. Frontend: `lib/ai_api.js`.
@@ -67,7 +80,7 @@ pub async fn ai_set_default_provider(
     settings.set_default(&id)?;
     settings.save(&storage_state)?;
     sync_recap_config(&storage_state, &credential_state);
-    Ok(settings.view())
+    Ok(settings_view(&settings, &storage_state))
 }
 
 /// Authentication: required. Tests the provider as currently edited, which
@@ -83,14 +96,22 @@ pub async fn ai_test_provider(
     super::check_auth_required(&credential_state)?;
     let settings = AiSettings::load(&storage_state)?;
     let id = provider.id.clone();
-    let resolved = settings.resolve_input(&credential_state, provider)?;
+    let uses_saved_key = provider.api_key.is_none();
+    let original_key = id
+        .as_deref()
+        .and_then(|id| settings.find(id))
+        .and_then(|p| p.api_key_encrypted.clone());
+    let resolved = settings.resolve_input(&storage_state, &credential_state, provider)?;
     let result = provider::test_connection(&resolved).await;
 
-    if let (true, Some(id)) = (result.ok, id) {
+    if let (true, Some(id)) = (result.ok && uses_saved_key, id) {
         // Reload: the settings may have changed while the request ran.
         let mut latest = AiSettings::load(&storage_state)?;
         let unchanged = latest.find(&id).is_some_and(|p| {
-            p.kind == resolved.kind && p.base_url == resolved.base_url && p.model == resolved.model
+            p.kind == resolved.kind
+                && p.base_url == resolved.base_url
+                && p.model == resolved.model
+                && p.api_key_encrypted == original_key
         });
         if unchanged {
             latest.set_tool_calling(&id, result.tool_calling);
@@ -113,7 +134,71 @@ pub async fn ai_grant_remote_consent(
     settings.remote_consent = true;
     settings.save(&storage_state)?;
     sync_recap_config(&storage_state, &credential_state);
-    Ok(settings.view())
+    Ok(settings_view(&settings, &storage_state))
+}
+
+/// Authentication: not required. Public capability metadata only; no keys or
+/// screenshot data. Frontend: `lib/ai_api.js`.
+#[tauri::command]
+pub async fn ai_get_model_catalog(
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    refresh: Option<bool>,
+) -> Result<CatalogView, String> {
+    Ok(catalog::get_catalog(&storage_state, refresh.unwrap_or(false)).await)
+}
+
+/// Authentication: required. Reads the edited endpoint's scoped model cache or
+/// explicitly discovers its models. Frontend: `lib/ai_api.js`.
+#[tauri::command]
+pub async fn ai_discover_models(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    provider: ConnectionInput,
+    refresh: Option<bool>,
+) -> Result<ModelListView, String> {
+    super::check_auth_required(&credential_state)?;
+    let settings = AiSettings::load(&storage_state)?;
+    let resolved = settings.resolve_connection(&storage_state, &credential_state, provider)?;
+    catalog::discover_models(&storage_state, &resolved, refresh.unwrap_or(false)).await
+}
+
+/// Authentication: required. Sends a synthetic color image, never a saved
+/// screenshot, to test image understanding. Frontend: `lib/ai_api.js`.
+#[tauri::command]
+pub async fn ai_test_image_input(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    provider: ProviderInput,
+) -> Result<provider::ImageConnectionTest, String> {
+    super::check_auth_required(&credential_state)?;
+    let settings = AiSettings::load(&storage_state)?;
+    let id = provider.id.clone();
+    let uses_saved_key = provider.api_key.is_none();
+    let original_key = id
+        .as_deref()
+        .and_then(|id| settings.find(id))
+        .and_then(|p| p.api_key_encrypted.clone());
+    let resolved = settings.resolve_input(&storage_state, &credential_state, provider)?;
+    let mut result = provider::test_image_input(&resolved).await;
+    if let Err(error) = catalog::record_image_probe(&storage_state, &resolved, result.image_input) {
+        result.error = Some(error);
+    }
+    if uses_saved_key && result.image_input != ImageInput::Unknown {
+        if let Some(id) = id {
+            let mut latest = AiSettings::load(&storage_state)?;
+            let unchanged = latest.find(&id).is_some_and(|p| {
+                p.kind == resolved.kind
+                    && p.base_url == resolved.base_url
+                    && p.model == resolved.model
+                    && p.api_key_encrypted == original_key
+            });
+            if unchanged {
+                latest.set_image_input(&id, result.image_input);
+                latest.save(&storage_state)?;
+            }
+        }
+    }
+    Ok(result)
 }
 
 const MAX_QUESTION_CHARS: usize = 4_000;
@@ -131,6 +216,10 @@ const SEARCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300)
 /// `request_id` is chosen by the caller and names the run for
 /// [`ai_search_cancel`]. Errors use the `AI_*` codes. Frontend:
 /// `lib/ai_api.js`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn ai_search(
     app: tauri::AppHandle,
@@ -162,7 +251,8 @@ pub async fn ai_search(
     if !settings.remote_consent && !is_local_url(&stored.base_url) {
         return Err("AI_REMOTE_CONSENT_REQUIRED".into());
     }
-    let resolved = settings.resolve(&credential_state, &id)?;
+    let mut resolved = settings.resolve(&storage_state, &credential_state, &id)?;
+    resolved.image_input = catalog::resolve_image_input(&storage_state, &resolved);
 
     let cancel = runtime
         .register(&request_id)

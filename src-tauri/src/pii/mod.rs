@@ -242,6 +242,103 @@ impl Bounds {
     fn height(&self) -> f64 {
         self.bottom - self.top
     }
+
+    fn same_text_line(self, other: Self) -> bool {
+        let overlap = self.bottom.min(other.bottom) - self.top.max(other.top);
+        overlap >= 0.6 * self.height().max(other.height())
+    }
+}
+
+pub(crate) fn is_bank_card_fragment(text: &str) -> bool {
+    numbers::bank_card_fragment_len(text.trim()).is_some()
+}
+
+/// Marks the OCR boxes of a card number that spans nearby boxes on one line.
+pub(crate) fn split_bank_card_blocks(blocks: &[(&str, Option<Bounds>)]) -> Vec<bool> {
+    struct Block<'a> {
+        index: usize,
+        text: &'a str,
+        bounds: Bounds,
+        digits: Option<usize>,
+    }
+
+    let mut marked = vec![false; blocks.len()];
+    let mut positioned: Vec<_> = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &(text, bounds))| {
+            let text = text.trim();
+            Some(Block {
+                index,
+                text,
+                bounds: bounds?,
+                digits: numbers::bank_card_fragment_len(text),
+            })
+        })
+        .collect();
+    if positioned
+        .iter()
+        .filter(|block| block.digits.is_some())
+        .nth(1)
+        .is_none()
+    {
+        return marked;
+    }
+    positioned.sort_unstable_by(|a, b| a.bounds.left.total_cmp(&b.bounds.left));
+
+    let settings = PiiSettings::new([PiiKind::BankCard], false);
+    let mut joined = String::new();
+    let mut indices = Vec::new();
+    for (start, first) in positioned.iter().enumerate() {
+        let Some(mut digits) = first.digits else {
+            continue;
+        };
+        joined.clear();
+        joined.push_str(first.text);
+        indices.clear();
+        indices.push(first.index);
+
+        let mut current = start;
+        loop {
+            let left = positioned[current].bounds;
+            let min_left = left.right - 0.25 * left.height();
+            let from = positioned.partition_point(|block| {
+                block.bounds.left <= left.left || block.bounds.left < min_left
+            });
+            let next = (from..positioned.len())
+                .take_while(|&next| {
+                    positioned[next].bounds.left - left.right <= 1.5 * left.height()
+                })
+                .find(|&next| {
+                    let right = positioned[next].bounds;
+                    left.same_text_line(right) && first.bounds.same_text_line(right)
+                });
+            let Some(next) = next else {
+                break;
+            };
+            let Some(added) = positioned[next].digits else {
+                break;
+            };
+            digits += added;
+            if digits > 19 {
+                break;
+            }
+            joined.push(' ');
+            joined.push_str(positioned[next].text);
+            indices.push(positioned[next].index);
+            if digits >= 15
+                && detect(&joined, settings, Context::default())
+                    .iter()
+                    .any(|span| span.start == 0 && span.end == joined.len())
+            {
+                for &index in &indices {
+                    marked[index] = true;
+                }
+            }
+            current = next;
+        }
+    }
+    marked
 }
 
 /// Context for each OCR block of one screenshot: its own labels plus those of
@@ -280,10 +377,12 @@ fn nearest_left(blocks: &[(&str, Option<Bounds>)], i: usize, b: Bounds) -> Optio
         let overlap = b.bottom.min(o.bottom) - b.top.max(o.top);
         let same_line = overlap >= 0.5 * b.height().min(o.height());
         let gap = b.left - o.right;
-        if same_line && gap >= -0.5 * scale && gap <= 30.0 * scale {
-            if best.is_none_or(|(_, right)| o.right > right) {
-                best = Some((j, o.right));
-            }
+        if same_line
+            && gap >= -0.5 * scale
+            && gap <= 30.0 * scale
+            && best.is_none_or(|(_, right)| o.right > right)
+        {
+            best = Some((j, o.right));
         }
     }
     best.map(|(j, _)| j)
@@ -299,10 +398,12 @@ fn nearest_above(blocks: &[(&str, Option<Bounds>)], i: usize, b: Bounds) -> Opti
         let gap = b.top - o.bottom;
         let overlaps = o.left < b.right && b.left < o.right;
         let aligned = (o.left - b.left).abs() <= 2.0 * scale;
-        if gap >= -0.3 * scale && gap <= 1.5 * scale && (overlaps || aligned) {
-            if best.is_none_or(|(_, best_gap)| gap < best_gap) {
-                best = Some((j, gap));
-            }
+        if gap >= -0.3 * scale
+            && gap <= 1.5 * scale
+            && (overlaps || aligned)
+            && best.is_none_or(|(_, best_gap)| gap < best_gap)
+        {
+            best = Some((j, gap));
         }
     }
     best.map(|(j, _)| j)

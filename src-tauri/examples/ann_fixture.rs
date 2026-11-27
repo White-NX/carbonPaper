@@ -19,7 +19,7 @@ fn main() {
             .nth(1)
             .expect("output .cpdvec path is required"),
     );
-    let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let keys = ["a".to_string(), "b".to_string(), "c".to_string()];
     let vectors: Vec<Vec<f32>> = vec![
         // These first two normalized vectors deliberately reproduce the
         // production failure: after I8 quantization, raw inner product can

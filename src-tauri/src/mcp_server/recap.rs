@@ -98,7 +98,7 @@ pub(super) async fn tool_get_recap_days(
         }
         let storage = app.state::<Arc<StorageState>>();
         let generation = storage.db_generation();
-        let mut result = dates_result(storage.recap_list_days()?, &query, limit);
+        let mut result = dates_result(recap::read_days(&app)?, &query, limit);
         let mut calendars = serde_json::Map::new();
         for date in result["items"]
             .as_array()
@@ -218,12 +218,18 @@ fn day_result(
         .into_iter()
         .filter(|b| query.batch_start_ms.is_none_or(|start| b.start_ms == start))
     {
+        let summary_warnings = batch
+            .summary
+            .as_ref()
+            .map(|summary| recap::filtered_warnings(filter, &summary.warnings))
+            .unwrap_or_default();
         let overview = batch
             .summary
             .and_then(|s| filter_joined_text(filter, mode, &s.overview).ok());
         periods.push(json!({
             "start_ms": batch.start_ms, "end_ms": batch.end_ms,
             "status": batch.status, "overview": overview,
+            "citation_warnings": summary_warnings,
         }));
         let member_directory =
             crate::ai::recap::activity_contract::member_directory(&batch.records, filter);
@@ -236,10 +242,13 @@ fn day_result(
                     .iter()
                     .filter_map(|detail| {
                         if detail.evidence_ids.is_empty()
-                            || !detail
-                                .evidence_ids
-                                .iter()
-                                .all(|id| activity.sources.iter().any(|s| s.id == *id))
+                            || !detail.evidence_ids.iter().all(|id| {
+                                activity.sources.iter().any(|s| s.id == *id)
+                                    || activity
+                                        .warnings
+                                        .iter()
+                                        .any(|warning| warning.reference_ids.contains(&json!(id)))
+                            })
                         {
                             return None;
                         }
@@ -272,6 +281,7 @@ fn day_result(
                     "member_ids": evidence.member_screenshot_ids,
                     "membership_status": evidence.membership_status,
                     "batch_start_ms": batch.start_ms, "sources": sources,
+                    "citation_warnings": recap::filtered_warnings(filter, &activity.warnings),
                 }))
             })();
             if let Ok(item) = clean {
@@ -333,6 +343,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: Default::default(),
             can_undo: false,
@@ -355,6 +366,7 @@ mod tests {
                     overview: "Read the notes".into(),
                     overview_activity_ids: vec![],
                     topics: vec![],
+                    warnings: vec![],
                 }),
                 activities: vec![RecapActivity {
                     details: vec![],
@@ -367,7 +379,10 @@ mod tests {
                     sources: vec![source],
                     segments: vec![],
                     member_ids: vec![42],
+                    warnings: vec![],
                 }],
+                validation_version: 0,
+                budget_hash: String::new(),
             }],
         }
     }
@@ -453,6 +468,7 @@ mod tests {
                 keyword_score: Some(1000.0),
                 semantic_score: None,
                 match_evidence: None,
+                warnings: vec![],
             }],
             total: 1,
             complete: true,
@@ -622,5 +638,74 @@ mod tests {
         }
         assert!(serde_json::from_value::<DaysQuery>(json!({"offset":-1})).is_err());
         assert!(serde_json::from_value::<DayQuery>(json!({})).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recap_dates_paginate_actual_content_without_visited_empty_or_failed_days() {
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = crate::credential_manager::cng_tests::recap::storage_credentials(
+            temp.path().to_path_buf(),
+        );
+        let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+        storage.initialize().unwrap();
+        let privacy = recap::PrivacyFingerprint::new(Default::default()).unwrap();
+        for (date, status) in [
+            ("2010-07-28", "visited"),
+            ("2026-10-01", "ready"),
+            ("2026-10-02", "partial"),
+            ("2026-10-03", "empty"),
+            ("2026-10-04", "failed"),
+        ] {
+            let (start, end) = recap::day_bounds(date).unwrap();
+            let (revision, _, _) = storage
+                .recap_day_revision(date, start, end, &privacy)
+                .unwrap();
+            if status == "visited" {
+                continue;
+            }
+            let mut batch = fixture().batches.remove(0);
+            batch.start_ms = start;
+            batch.end_ms = end;
+            batch.status = status.into();
+            if matches!(status, "empty" | "failed") {
+                batch.activities.clear();
+                batch.summary = None;
+            }
+            if matches!(status, "partial" | "failed") {
+                batch.error = Some("AI_REQUEST_FAILED".into());
+            }
+            storage
+                .recap_write(
+                    "batch",
+                    date,
+                    date,
+                    revision,
+                    storage.db_generation(),
+                    &batch,
+                )
+                .unwrap();
+        }
+        let mut query: DaysQuery = serde_json::from_value(json!({"limit":1})).unwrap();
+        let limit = query.validate().unwrap();
+        let first = dates_result(
+            storage.recap_list_days(privacy.as_str()).unwrap(),
+            &query,
+            limit,
+        );
+        assert_eq!(first["items"], json!(["2026-10-02"]));
+        assert_eq!(first["total"], 2);
+        assert_eq!(first["returned_count"], 1);
+        assert_eq!(first["next_offset"], 1);
+        query.page.offset = 1;
+        let last = dates_result(
+            storage.recap_list_days(privacy.as_str()).unwrap(),
+            &query,
+            limit,
+        );
+        assert_eq!(last["items"], json!(["2026-10-01"]));
+        assert_eq!(last["total"], 2);
+        assert!(last["next_offset"].is_null());
+        storage.shutdown().unwrap();
     }
 }

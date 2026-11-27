@@ -49,7 +49,6 @@ mod mcp_token;
 mod minilm_contract;
 mod minilm_index;
 #[allow(dead_code)]
-#[allow(dead_code)]
 mod ml_protocol;
 mod ml_runtime;
 mod model_management;
@@ -57,6 +56,7 @@ mod monitor;
 mod native_messaging;
 mod nmh_pipe;
 mod nmh_protocol;
+mod ocr_layout;
 mod office_protocol;
 mod office_runtime;
 mod office_window;
@@ -64,8 +64,10 @@ mod onboarding;
 mod pii;
 mod power;
 mod processing_stage;
+mod screenshot_editor;
 mod windows_platform;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
+pub use app_bound::uninstall_for_package as uninstall_protected_component;
 mod recap_text_contract;
 mod registry_config;
 mod rerank;
@@ -85,6 +87,7 @@ mod storage_startup;
 mod task_error;
 mod tray_panel;
 mod updater;
+mod usage;
 pub use updater::verify_update_manifest_file;
 
 use analysis::AnalysisState;
@@ -244,6 +247,12 @@ pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) {
 pub struct LightweightModeState {
     pub is_lightweight: Mutex<bool>,
     pub auto_switch_timer: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl Default for LightweightModeState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LightweightModeState {
@@ -506,7 +515,6 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
                     .is_lightweight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = false;
-                tracing::info!("Window recreated from lightweight mode");
                 refresh_tray_menu(&app_handle);
                 if show_ocr_model_repair {
                     let _ = app_handle.emit("show-ocr-model-repair", ());
@@ -521,7 +529,7 @@ fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
                     .notification()
                     .builder()
                     .title("CarbonPaper")
-                    .body(&format!("{}: {}", texts.open_error, e))
+                    .body(format!("{}: {}", texts.open_error, e))
                     .show();
             }
         }
@@ -643,6 +651,9 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 pub(crate) fn quit_from_tray(app: &tauri::AppHandle) {
     IS_QUITTING.store(true, Ordering::Relaxed);
     cancel_auto_lightweight_timer(app);
+    if let Some(usage) = app.try_state::<Arc<usage::UsageRuntime>>() {
+        usage.stop();
+    }
     if let Some(credentials) = app.try_state::<Arc<CredentialManagerState>>() {
         credentials.clear_all_cached_keys();
     }
@@ -699,29 +710,33 @@ pub fn get_data_dir() -> std::path::PathBuf {
         .join("data")
 }
 
-// 动态创建主窗口
+// 动态创建主窗口，复用并显示并发请求已创建的窗口
 pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::WebviewWindowBuilder;
 
-    tracing::info!("Creating main window");
+    let state = app.state::<main_window::MainWindowPresentationState>();
+    let created = state.create_if_missing(
+        || app.get_webview_window("main").is_some(),
+        |generation| -> Result<(), Box<dyn std::error::Error>> {
+            tracing::info!("Creating main window");
+            let url = format!("index.html?startup={generation}");
+            let window = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+                .title("carbonpaper")
+                .inner_size(1300.0, 750.0)
+                .decorations(false)
+                .transparent(true)
+                .visible(false)
+                .build()?;
 
-    let generation = app
-        .state::<main_window::MainWindowPresentationState>()
-        .begin_creation();
-    let url = format!("index.html?startup={generation}");
-
-    let window = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
-        .title("carbonpaper")
-        .inner_size(1300.0, 750.0)
-        .decorations(false)
-        .transparent(true)
-        .visible(false)
-        .build()?;
-
-    // 应用 Acrylic 效果
-    let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
-
-    tracing::info!("Main window created successfully");
+            // 应用 Acrylic 效果
+            let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+            tracing::info!("Main window created successfully");
+            Ok(())
+        },
+    )?;
+    if !created {
+        main_window::request_show(app)?;
+    }
     Ok(())
 }
 
@@ -858,6 +873,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(Arc::new(usage::UsageRuntime::default()))
         .manage(ai::AiRuntimeState::default())
         .manage(ai::recap::RecapRuntime::default())
         .manage(ai::recap::RecapSearchRuntime::default())
@@ -870,6 +886,7 @@ pub fn run() {
         .manage(Arc::new(blind_index_repair::BlindIndexRepairState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
         .manage(Arc::new(clip_ann::ClipAnnState::default()))
+        .manage(clip_query::ClipQueryRequests::default())
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -877,6 +894,7 @@ pub fn run() {
         .manage(Arc::new(SensitiveFilterState::default()))
         .manage(credential_state)
         .manage(storage_state)
+        .manage(Arc::new(screenshot_editor::ScreenshotEditRuntime::default()))
         .manage(Arc::new(storage_startup::StorageStartupState::new()))
         .manage(Arc::new(commands::migration::HmacMigrationRuntime::default()))
         .manage(main_window::MainWindowPresentationState::new(!start_hidden))
@@ -913,7 +931,6 @@ pub fn run() {
         .on_page_load(main_window::on_page_load)
         .setup({
             let data_dir = data_dir.clone();
-            let start_hidden = start_hidden;
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
@@ -969,6 +986,7 @@ pub fn run() {
                 power::start_power_monitor(app.handle().clone());
                 idle::start_idle_monitor(app.handle().clone());
                 monitor::start_automation(app.handle().clone());
+                usage::start(app.handle().clone());
 
                 match native_messaging::sync_installed_extension() {
                     Ok(true) => tracing::info!("Browser extension synced to latest version"),
@@ -984,6 +1002,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::usage::usage_get_day,
+            commands::usage::usage_get_recorded_dates,
+            commands::usage::usage_get_app_details,
+            commands::usage::usage_set_app_category,
             commands::utility::set_app_language,
             commands::utility::set_app_theme,
             commands::utility::tray_take_navigation,
@@ -995,6 +1017,7 @@ pub fn run() {
             monitor::resume_monitor,
             monitor::get_monitor_status,
             monitor::monitor_search_nl,
+            monitor::monitor_cancel_search_nl,
             monitor::monitor_update_filters,
             monitor::monitor_get_filters,
             monitor::monitor_update_advanced_config,
@@ -1043,6 +1066,8 @@ pub fn run() {
             commands::storage::storage_get_thumbnail_warmup_status,
             commands::storage::storage_cancel_thumbnail_warmup,
             commands::storage::storage_get_screenshot_details,
+            commands::storage::storage_save_edited_screenshot,
+            commands::storage::storage_retry_edited_screenshot_ocr,
             commands::storage::storage_delete_screenshot,
             commands::storage::storage_delete_by_time_range,
             commands::storage::storage_list_processes,
@@ -1070,6 +1095,9 @@ pub fn run() {
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::ai::ai_get_settings,
+            commands::ai::ai_get_model_catalog,
+            commands::ai::ai_discover_models,
+            commands::ai::ai_test_image_input,
             commands::ai::ai_save_provider,
             commands::ai::ai_delete_provider,
             commands::ai::ai_set_default_provider,
@@ -1141,6 +1169,7 @@ pub fn run() {
             app_bound::app_bound_acknowledge_offer,
             app_bound::app_bound_set_policy,
             app_bound::app_bound_install,
+            app_bound::app_bound_repair,
             app_bound::app_bound_uninstall,
             background_scheduler::background_scheduler_status,
             get_autostart_status,
@@ -1222,6 +1251,9 @@ pub fn run() {
             }
             if let tauri::RunEvent::Exit = event {
                 agent_access::stop();
+                if let Some(usage) = app_handle.try_state::<Arc<usage::UsageRuntime>>() {
+                    usage.stop();
+                }
                 tray_panel::destroy(app_handle);
                 if let Some(scheduler) =
                     app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
@@ -1245,6 +1277,41 @@ fn apply_startup_window_policy(
     // here prevents both a visible flash and unnecessary WebView startup.
     if start_hidden {
         windows.retain(|window| window.label != "main");
+    }
+}
+
+pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {
+    use std::process::exit;
+
+    let file_data = match std::fs::read(key_file_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read master key file: {}", e);
+            exit(1);
+        }
+    };
+
+    let ciphertext = match credential_manager::decode_master_key_file(&file_data) {
+        Ok(ct) => ct,
+        Err(e) => {
+            eprintln!("Failed to decode master key file: {}", e);
+            exit(1);
+        }
+    };
+
+    match credential_manager::decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd) {
+        Ok(master_key) => {
+            print!("{}", hex::encode(&master_key));
+            exit(0);
+        }
+        Err(credential_manager::CredentialError::UserCancelled) => {
+            eprintln!("UserCancelled");
+            exit(2);
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            exit(1);
+        }
     }
 }
 
@@ -1283,40 +1350,5 @@ mod tests {
             MouseButton::Right,
             MouseButtonState::Up
         ));
-    }
-}
-
-pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {
-    use std::process::exit;
-
-    let file_data = match std::fs::read(key_file_path) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("Failed to read master key file: {}", e);
-            exit(1);
-        }
-    };
-
-    let ciphertext = match credential_manager::decode_master_key_file(&file_data) {
-        Ok(ct) => ct,
-        Err(e) => {
-            eprintln!("Failed to decode master key file: {}", e);
-            exit(1);
-        }
-    };
-
-    match credential_manager::decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd) {
-        Ok(master_key) => {
-            print!("{}", hex::encode(&master_key));
-            exit(0);
-        }
-        Err(credential_manager::CredentialError::UserCancelled) => {
-            eprintln!("UserCancelled");
-            exit(2);
-        }
-        Err(e) => {
-            eprintln!("{}", e);
-            exit(1);
-        }
     }
 }

@@ -100,36 +100,71 @@ pub(crate) fn digest(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
+/// Binds a permission to one row in an immutable, authenticated OCR block.
+/// A rewrite assigns a new key and block ID, so the ciphertext is read and
+/// authenticated once per block instead of hashed once per row.
+pub fn ocr_block_digest(block_id: i64, slot: i64, scope_tag: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"carbonpaper/agent/ocr-block/v1\0");
+    digest.update(block_id.to_le_bytes());
+    digest.update(slot.to_le_bytes());
+    digest.update(scope_tag);
+    digest.finalize().into()
+}
+
+pub(crate) struct RawOcrKey {
+    pub id: i64,
+    pub scope_tag: Vec<u8>,
+}
+
 pub(crate) struct RawOcr {
     pub id: i64,
     pub screenshot_id: i64,
-    pub ciphertext: Vec<u8>,
+    pub ciphertext: Option<Vec<u8>>,
     pub confidence: f64,
     pub coordinates: Vec<Vec<f64>>,
     pub processed_at_ms: Option<i64>,
+    pub key: Option<RawOcrKey>,
+    pub slot: Option<i64>,
 }
 impl RawOcr {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let slot: Option<i64> = row.get(15)?;
         Ok(Self {
             id: row.get(0)?,
             screenshot_id: row.get(1)?,
             ciphertext: row.get(2)?,
             confidence: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-            coordinates: (0..4)
-                .map(|i| {
-                    Ok(vec![
-                        row.get::<_, Option<f64>>(4 + i * 2)?.unwrap_or(0.0),
-                        row.get::<_, Option<f64>>(5 + i * 2)?.unwrap_or(0.0),
-                    ])
-                })
-                .collect::<rusqlite::Result<_>>()?,
+            coordinates: if slot.is_some() {
+                Vec::new()
+            } else {
+                (0..4)
+                    .map(|i| {
+                        Ok(vec![
+                            row.get::<_, Option<f64>>(4 + i * 2)?.unwrap_or(0.0),
+                            row.get::<_, Option<f64>>(5 + i * 2)?.unwrap_or(0.0),
+                        ])
+                    })
+                    .collect::<rusqlite::Result<_>>()?
+            },
             processed_at_ms: row.get(12)?,
+            key: row
+                .get::<_, Option<i64>>(13)?
+                .map(|id| -> rusqlite::Result<_> {
+                    Ok(RawOcrKey {
+                        id,
+                        scope_tag: row.get(14)?,
+                    })
+                })
+                .transpose()?,
+            slot,
         })
     }
 }
 const OCR_COLUMNS: &str = "o.id,o.screenshot_id,o.text_enc,o.confidence,
     o.box_x1,o.box_y1,o.box_x2,o.box_y2,o.box_x3,o.box_y3,o.box_x4,o.box_y4,
-    CAST(strftime('%s',o.created_at) AS INTEGER)*1000";
+    CAST(strftime('%s',o.created_at) AS INTEGER)*1000,
+    o.ocr_key_id,k.scope_tag,o.ocr_block_slot";
 
 pub(crate) struct RawVector {
     pub screenshot_id: i64,
@@ -213,40 +248,55 @@ impl ArchiveReader {
         })
     }
 
-    pub fn ocr(&self, screenshot_id: i64) -> Result<Vec<RawOcr>, String> {
-        self.ocr_query("o.screenshot_id=?1", &[screenshot_id])
+    pub fn ocr_for_screenshots(&self, ids: &[i64]) -> Result<Vec<RawOcr>, String> {
+        self.ocr_query("o.screenshot_id IN (SELECT value FROM json_each(?1))", ids)
     }
 
     pub fn ocr_ids(&self, ids: &[i64]) -> Result<Vec<RawOcr>, String> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
         self.ocr_query("o.id IN (SELECT value FROM json_each(?1))", ids)
     }
 
     fn ocr_query(&self, predicate: &str, ids: &[i64]) -> Result<Vec<RawOcr>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let sql = format!(
             "SELECT {OCR_COLUMNS} FROM ocr_results o
             JOIN screenshots s ON s.id=o.screenshot_id
+            LEFT JOIN ocr_keys k ON k.id=o.ocr_key_id AND k.screenshot_id=o.screenshot_id
             WHERE o.is_deleted=0 AND s.is_deleted=0 AND {predicate} ORDER BY o.id"
         );
-        let mut statement = storage(self.conn.prepare(&sql))?;
-        let rows = if predicate == "o.screenshot_id=?1" {
-            storage(statement.query_map([ids[0]], RawOcr::read))?
-        } else {
-            storage(statement.query_map(
-                [serde_json::to_string(ids).map_err(|_| "AGENT_INVALID_IDS")?],
-                RawOcr::read,
-            ))?
-        };
+        let mut statement = storage(self.conn.prepare_cached(&sql))?;
+        let rows = storage(statement.query_map(
+            [serde_json::to_string(ids).map_err(|_| "AGENT_INVALID_IDS")?],
+            RawOcr::read,
+        ))?;
         storage(rows.collect())
+    }
+
+    pub fn ocr_block(&self, id: i64, screenshot_id: i64) -> Result<(Vec<u8>, Option<i64>), String> {
+        let mut statement = storage(self.conn.prepare_cached(
+            "SELECT content_enc, CAST(strftime('%s',created_at) AS INTEGER)*1000
+             FROM ocr_blocks WHERE id=?1 AND screenshot_id=?2
+             AND length(content_enc) BETWEEN 28 AND ?3",
+        ))?;
+        storage(statement.query_row(
+            params![
+                id,
+                screenshot_id,
+                (crate::ocr_block_codec::MAX_BYTES + 33) as i64
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))
     }
 
     pub fn unindexed_ids(&self, cursor: i64, limit: usize) -> Result<Vec<i64>, String> {
         let mut stmt = storage(self.conn.prepare(
-            "SELECT o.id FROM ocr_results o
-            JOIN screenshots s ON s.id=o.screenshot_id WHERE o.text_hash='' AND o.id>?1
-            AND o.is_deleted=0 AND s.is_deleted=0 ORDER BY o.id LIMIT ?2",
+            "SELECT p.ocr_id FROM ocr_index_pending p
+            CROSS JOIN ocr_results o ON o.id=p.ocr_id
+            CROSS JOIN screenshots s ON s.id=o.screenshot_id
+            WHERE p.ocr_id>?1 AND o.is_deleted=0 AND s.is_deleted=0
+            ORDER BY p.ocr_id LIMIT ?2",
         ))?;
         let rows = storage(stmt.query_map(params![cursor, limit as i64], |r| r.get(0)))?;
         storage(rows.collect())
@@ -298,7 +348,7 @@ impl ArchiveReader {
             return Ok(Vec::new());
         }
         let mut stmt = storage(self.conn.prepare("SELECT s.id,e.index_kind,e.subject_key,e.model_id,e.model_revision,e.vector_f32
-            FROM screenshots s NOT INDEXED CROSS JOIN derived_embeddings e ON e.index_kind=?1
+            FROM screenshots s NOT INDEXED CROSS JOIN derived_embeddings_read e ON e.index_kind=?1
             AND e.subject_key=CASE ?1 WHEN 'clip_image' THEN s.image_hash ELSE CAST(s.id AS TEXT) END
             WHERE s.id>?2 AND s.is_deleted=0 ORDER BY s.id LIMIT ?3"))?;
         let rows = storage(stmt.query_map(params![kind, cursor, limit as i64], |r| {

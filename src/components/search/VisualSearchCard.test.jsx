@@ -5,7 +5,8 @@ import { VisualSearchCard } from './VisualSearchCard';
 import { fetchSearchImage, fetchThumbnail } from '../../lib/monitor_api';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key, options) =>
-  key === 'advancedSearch.visual.relevance' ? `${key}:${options.score}` : key }) }));
+  key === 'advancedSearch.visual.relevance' ? `${key}:${options.score}`
+    : key === 'advancedSearch.visual.elapsed' ? `${key}:${options.seconds}` : key }) }));
 vi.mock('../../lib/monitor_api', () => ({ fetchSearchImage: vi.fn(), fetchThumbnail: vi.fn() }));
 vi.mock('../../lib/preference_store', () => ({ usePreference: () => 'preview' }));
 
@@ -151,5 +152,16 @@ describe('visual search results', () => {
     expect(observers).toHaveLength(observerCount);
     fireEvent.click(screen.getByRole('button', { name: 'advancedSearch.visual.retry' }));
     expect(state.loadGalleryPage).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows visual loading, its own elapsed time and an actionable timeout hint', () => {
+    const state = controller({ phase: 'loading', results: [], summaryResults: [] });
+    const { rerender } = render(<VisualSearchCard controller={state} />);
+    expect(screen.getByText('advancedSearch.visual.loading')).toBeInTheDocument();
+    rerender(<VisualSearchCard controller={{ ...state, phase: 'error', errorKind: 'timeout',
+      errorMessage: 'query_deadline_exceeded', elapsedMs: 60000 }} />);
+    expect(screen.getByRole('status')).toHaveTextContent('advancedSearch.visual.timeout_hint');
+    expect(screen.getByText('advancedSearch.visual.elapsed:60.00')).toBeInTheDocument();
+    expect(screen.queryByText('query_deadline_exceeded')).not.toBeInTheDocument();
   });
 });

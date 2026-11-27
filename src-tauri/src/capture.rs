@@ -7,9 +7,8 @@ use crate::monitor::MonitorState;
 use crate::office_protocol::OfficeApplication;
 use crate::office_runtime::{OfficeCaptureContext, OfficeRuntimeState};
 use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
-use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::{ImageEncoder, RgbImage};
+use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -213,11 +212,12 @@ impl Drop for OcrTaskGuard {
 fn release_ocr_slot(capture_state: &CaptureState) {
     // Saturating subtraction avoids wrapping to u32::MAX if an old task
     // finishes after a monitor restart reset the counter to zero.
-    let _ = capture_state.in_flight_ocr_count.fetch_update(
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-        |count| Some(count.saturating_sub(1)),
-    );
+    let _ =
+        capture_state
+            .in_flight_ocr_count
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            });
 }
 
 impl Default for CaptureState {
@@ -494,12 +494,41 @@ impl CaptureState {
 
 // ==================== Active Window Detection ====================
 
+// Keep the browser metadata limit in background.js aligned with this UTF-16
+// payload limit. GetWindowTextW also needs a separate terminator slot.
+pub(crate) const MAX_WINDOW_TITLE_UNITS: usize = 512;
+
+pub(crate) fn window_title_from_utf16(units: &[u16]) -> String {
+    // Both native and extension truncation must leave complete surrogate pairs.
+    let units = if units
+        .last()
+        .is_some_and(|last| (0xd800..=0xdbff).contains(last))
+    {
+        &units[..units.len() - 1]
+    } else {
+        units
+    };
+    String::from_utf16_lossy(units)
+}
+
+pub(crate) fn window_title_prefix(title: &str) -> &str {
+    let mut units = 0;
+    for (index, character) in title.char_indices() {
+        units += character.len_utf16();
+        if units > MAX_WINDOW_TITLE_UNITS {
+            return &title[..index];
+        }
+    }
+    title
+}
+
 /// Information about the currently focused window (handle, title, rect, PID).
 pub struct ActiveWindowInfo {
-    hwnd_raw: isize,
-    title: String,
+    pub(crate) hwnd_raw: isize,
+    pub(crate) title: String,
+    pub(crate) title_at_limit: bool,
     rect: RECT,
-    pid: u32,
+    pub(crate) pid: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -519,10 +548,11 @@ impl ActiveWindowFingerprint {
             // Office root HWND can switch documents without changing handles.
             // Keep non-Office fingerprints title-free so dynamic browser,
             // terminal, or media titles do not create artificial focus scans.
-            title: office_document_hwnd
-                .is_some()
-                .then(|| info.title.clone())
-                .unwrap_or_default(),
+            title: if office_document_hwnd.is_some() {
+                info.title.clone()
+            } else {
+                Default::default()
+            },
             office_document_hwnd,
         }
     }
@@ -610,10 +640,10 @@ pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
         }
 
         // Get window title
-        let mut title_buf = [0u16; 512];
+        let mut title_buf = [0u16; MAX_WINDOW_TITLE_UNITS + 1];
         let len = GetWindowTextW(hwnd, &mut title_buf);
         let title = if len > 0 {
-            String::from_utf16_lossy(&title_buf[..len as usize])
+            window_title_from_utf16(&title_buf[..len as usize])
         } else {
             String::new()
         };
@@ -631,6 +661,7 @@ pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
         Some(ActiveWindowInfo {
             hwnd_raw: hwnd.0 as isize,
             title,
+            title_at_limit: len as usize == MAX_WINDOW_TITLE_UNITS,
             rect,
             pid,
         })
@@ -775,7 +806,10 @@ pub fn get_process_name_from_path(path: &str) -> String {
 fn get_process_command_line(pid: u32) -> Option<String> {
     use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
     let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessRefreshKind::new().with_cmd(UpdateKind::Always));
+    sys.refresh_process_specifics(
+        Pid::from_u32(pid),
+        ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+    );
     sys.process(Pid::from_u32(pid)).and_then(|p| {
         let cmd = p.cmd();
         if cmd.is_empty() {
@@ -792,6 +826,14 @@ fn get_process_command_line(pid: u32) -> Option<String> {
     })
 }
 
+pub(crate) fn process_has_privacy_flag(pid: u32) -> bool {
+    get_process_command_line(pid).is_some_and(|command| {
+        ["--incognito", "-inprivate", "-private", "--private-window"]
+            .iter()
+            .any(|flag| command.contains(flag))
+    })
+}
+
 // ==================== Window Exclusion ====================
 
 fn is_window_protected(hwnd_raw: isize) -> bool {
@@ -805,6 +847,27 @@ fn is_window_protected(hwnd_raw: isize) -> bool {
 }
 
 fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
+    let process = if settings.user_excluded_processes.is_empty() {
+        String::new()
+    } else {
+        get_process_path_from_pid(info.pid)
+            .map(|p| get_process_name_from_path(&p))
+            .unwrap_or_default()
+    };
+    if usage_window_excluded(info, settings, &process) {
+        return true;
+    }
+    let title_lower = info.title.to_lowercase();
+    let browser_keywords = ["edge", "chrome", "firefox", "browser", "浏览器"];
+    browser_keywords.iter().any(|bk| title_lower.contains(bk)) && process_has_privacy_flag(info.pid)
+}
+
+/// Uses the recorder's cached process identity; never enumerates processes.
+pub(crate) fn usage_window_excluded(
+    info: &ActiveWindowInfo,
+    settings: &ExclusionSettings,
+    process: &str,
+) -> bool {
     // Empty title
     if info.title.is_empty() {
         return true;
@@ -840,27 +903,7 @@ fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
     }
 
     // User-defined process name exclusion
-    if !settings.user_excluded_processes.is_empty() {
-        if let Some(path) = get_process_path_from_pid(info.pid) {
-            let pname = get_process_name_from_path(&path);
-            if !pname.is_empty() && settings.user_excluded_processes.contains(&pname) {
-                return true;
-            }
-        }
-    }
-
-    // Browser incognito command line check
-    let browser_keywords = ["edge", "chrome", "firefox", "browser", "浏览器"];
-    if browser_keywords.iter().any(|bk| title_lower.contains(bk)) {
-        if let Some(cmd_line) = get_process_command_line(info.pid) {
-            let privacy_flags = ["--incognito", "-inprivate", "-private", "--private-window"];
-            if privacy_flags.iter().any(|flag| cmd_line.contains(flag)) {
-                return true;
-            }
-        }
-    }
-
-    false
+    settings.user_excluded_processes.contains(process)
 }
 
 // ==================== dHash ====================
@@ -919,6 +962,7 @@ struct CapturedImage {
     width: u32,
     height: u32,
     rgb_image: Arc<RgbImage>,
+    observed_at: std::time::Instant,
 }
 
 pub(crate) fn encode_rgb_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
@@ -1333,6 +1377,7 @@ fn capture_foreground_window(
             width: final_w,
             height: final_h,
             rgb_image: Arc::new(rgb_image),
+            observed_at: crate::usage::frame_observed_at(&frame),
         };
 
         session.last_image = Some(captured.clone());
@@ -1342,159 +1387,8 @@ fn capture_foreground_window(
 
 // ==================== Process Icon Extraction ====================
 
-fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
-    use windows::Win32::Graphics::Gdi::*;
-    use windows::Win32::UI::Shell::ExtractIconExW;
-    use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
-
-    // SAFETY: the executable path is NUL-terminated and live for extraction; icon, DC,
-    // bitmap, and GDI handles returned by Windows are checked and released exactly once,
-    // while pixel buffers are sized from the queried bitmap dimensions.
-    unsafe {
-        // Convert path to wide string
-        let wide_path: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let mut icon_large = [windows::Win32::UI::WindowsAndMessaging::HICON::default(); 1];
-        let mut icon_small = [windows::Win32::UI::WindowsAndMessaging::HICON::default(); 1];
-
-        let count = ExtractIconExW(
-            windows::core::PCWSTR(wide_path.as_ptr()),
-            0,
-            Some(icon_large.as_mut_ptr()),
-            Some(icon_small.as_mut_ptr()),
-            1,
-        );
-
-        if count == 0 {
-            return None;
-        }
-
-        let hicon = if !icon_large[0].is_invalid() {
-            icon_large[0]
-        } else if !icon_small[0].is_invalid() {
-            icon_small[0]
-        } else {
-            return None;
-        };
-
-        // Convert HICON to PNG base64
-        let size: i32 = 32;
-        let hdc_screen = GetDC(None);
-        if hdc_screen.is_invalid() {
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
-        if hdc_mem.is_invalid() {
-            ReleaseDC(None, hdc_screen);
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        let hbm = CreateCompatibleBitmap(hdc_screen, size, size);
-        if hbm.is_invalid() {
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(None, hdc_screen);
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        let old_bm = SelectObject(hdc_mem, hbm);
-
-        // Clear background to transparent
-        let _ = PatBlt(hdc_mem, 0, 0, size, size, BLACKNESS);
-
-        // Draw icon
-        let draw_ok = windows::Win32::UI::WindowsAndMessaging::DrawIconEx(
-            hdc_mem,
-            0,
-            0,
-            hicon,
-            size,
-            size,
-            0,
-            None,
-            windows::Win32::UI::WindowsAndMessaging::DI_NORMAL,
-        );
-
-        if draw_ok.is_err() {
-            SelectObject(hdc_mem, old_bm);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(None, hdc_screen);
-            let _ = DestroyIcon(hicon);
-            return None;
-        }
-
-        // Extract pixel data using GetDIBits
-        let mut bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut pixels = vec![0u8; (size * size * 4) as usize];
-        let got_bits = GetDIBits(
-            hdc_mem,
-            hbm,
-            0,
-            size as u32,
-            Some(pixels.as_mut_ptr() as *mut _),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-
-        SelectObject(hdc_mem, old_bm);
-        let _ = DeleteObject(hbm);
-        let _ = DeleteDC(hdc_mem);
-        ReleaseDC(None, hdc_screen);
-        let _ = DestroyIcon(hicon);
-
-        // Destroy the other icon if both were extracted
-        if !icon_large[0].is_invalid() && !icon_small[0].is_invalid() {
-            let _ = DestroyIcon(icon_small[0]);
-        }
-
-        if got_bits == 0 {
-            return None;
-        }
-
-        // Convert BGRA to RGBA
-        let mut rgba_pixels = vec![0u8; pixels.len()];
-        for i in (0..pixels.len()).step_by(4) {
-            rgba_pixels[i] = pixels[i + 2]; // R
-            rgba_pixels[i + 1] = pixels[i + 1]; // G
-            rgba_pixels[i + 2] = pixels[i]; // B
-            rgba_pixels[i + 3] = pixels[i + 3]; // A
-        }
-
-        // Create PNG from RGBA pixels
-        let img = image::RgbaImage::from_raw(size as u32, size as u32, rgba_pixels)?;
-        let mut png_buf = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
-        if ImageEncoder::write_image(
-            encoder,
-            img.as_raw(),
-            size as u32,
-            size as u32,
-            image::ExtendedColorType::Rgba8,
-        )
-        .is_err()
-        {
-            return None;
-        }
-
-        Some(base64::engine::general_purpose::STANDARD.encode(&png_buf))
-    }
-}
+mod process_icon;
+pub(crate) use process_icon::extract_process_icon_base64;
 
 // ==================== Main Capture Loop ====================
 
@@ -1711,6 +1605,14 @@ pub async fn run_capture_loop(
         };
 
         // dHash dedup
+        if let Some(usage) = app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+            usage.observe_normal(
+                window_info.hwnd_raw,
+                window_info.pid,
+                &captured.rgb_image,
+                captured.observed_at,
+            );
+        }
         let current_hash = compute_dhash(&captured.rgb_image, 16);
         let preserve_office_context = scan_reason == "focus_change"
             && current_window_fingerprint.office_document_hwnd.is_some();
@@ -1921,6 +1823,10 @@ pub async fn run_capture_loop(
     tracing::info!("Rust capture loop ended");
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The handoff carries the capture identity and its owned image and state."
+)]
 async fn process_ocr_async(
     app: &tauri::AppHandle,
     storage: Arc<StorageState>,
@@ -2052,6 +1958,10 @@ impl OcrRouteConfig {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The OCR boundary carries capture metadata and the selected execution route."
+)]
 pub(crate) async fn process_ocr_inner(
     app: &tauri::AppHandle,
     storage: &StorageState,
@@ -2119,6 +2029,50 @@ pub(crate) async fn process_ocr_inner(
             error
         );
     }
+    finish_ocr_processing(
+        app,
+        storage,
+        screenshot_id,
+        clip_pixels,
+        image_hash,
+        window_title,
+        process_name,
+        timestamp_ms,
+        &ocr_results,
+        storage.db_generation(),
+    )
+    .await
+}
+
+/// Reuse capture's durable indexing and protected-processing path after an edit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Carries the original capture identity and new OCR evidence."
+)]
+pub(crate) async fn finish_ocr_processing(
+    app: &tauri::AppHandle,
+    storage: &StorageState,
+    screenshot_id: i64,
+    clip_pixels: Arc<RgbImage>,
+    image_hash: &str,
+    window_title: &str,
+    process_name: &str,
+    timestamp_ms: i64,
+    ocr_results: &[OcrResultInput],
+    expected_generation: u64,
+) -> Result<(), String> {
+    let runtime = app
+        .state::<Arc<crate::screenshot_editor::ScreenshotEditRuntime>>()
+        .inner()
+        .clone();
+    let gate = runtime.snapshot_gate(screenshot_id);
+    let _publication = gate.lock().await;
+    let _archive = storage.background_db_read();
+    if storage.db_generation() != expected_generation
+        || !storage.screenshot_image_is_current(screenshot_id, image_hash)?
+    {
+        return Ok(());
+    }
     if let Err(error) = storage.set_ocr_postprocess_status(screenshot_id, "pending", None) {
         tracing::warn!(
             "Rust OCR data was committed but postprocess status initialization failed screenshot_id={}: {}",
@@ -2163,7 +2117,7 @@ pub(crate) async fn process_ocr_inner(
     let stage_hash = image_hash.to_string();
     let stage_title = window_title.to_string();
     let stage_process = process_name.to_string();
-    let stage_blocks = crate::processing_stage::recap::CaptureEvidence::from_blocks(&ocr_results);
+    let stage_blocks = crate::processing_stage::recap::CaptureEvidence::from_blocks(ocr_results);
     let stage_app = app.clone();
     let staged = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         if !stage_storage.background_processing_enabled() {
@@ -2305,7 +2259,7 @@ pub(crate) async fn process_ocr_inner(
         window_title,
         process_name,
         timestamp_ms,
-        &ocr_results,
+        ocr_results,
     )
     .await
     {
@@ -2327,7 +2281,7 @@ pub(crate) async fn process_ocr_inner(
     Ok(())
 }
 
-fn convert_ml_ocr_blocks(
+pub(crate) fn convert_ml_ocr_blocks(
     blocks: Vec<crate::ml_protocol::MlOcrBlock>,
 ) -> Result<Vec<OcrResultInput>, String> {
     const MAX_BLOCKS: usize = 10_000;
@@ -2355,6 +2309,9 @@ fn convert_ml_ocr_blocks(
             continue;
         }
         results.push(OcrResultInput {
+            text_layout: block
+                .text_layout
+                .filter(|layout| crate::ocr_layout::validate(&block.text, layout).is_ok()),
             text: block.text,
             confidence: block.confidence.clamp(0.0, 1.0) as f64,
             box_coords: block
@@ -2539,6 +2496,7 @@ mod tests {
         let window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Roadmap - PowerPoint".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
@@ -2554,6 +2512,7 @@ mod tests {
         let window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Roadmap - PowerPoint".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
@@ -2581,12 +2540,14 @@ mod tests {
         let first_window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Terminal - bash".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
         let second_window = ActiveWindowInfo {
             hwnd_raw: first_window.hwnd_raw,
             title: "Terminal - cargo test".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: first_window.pid,
         };
@@ -2605,6 +2566,7 @@ mod tests {
         let window = ActiveWindowInfo {
             hwnd_raw: 100,
             title: "Document1 - Word".to_string(),
+            title_at_limit: false,
             rect: RECT::default(),
             pid: 200,
         };
@@ -2720,6 +2682,7 @@ mod tests {
     #[test]
     fn rust_ocr_conversion_clamps_confidence_and_preserves_four_points() {
         let converted = convert_ml_ocr_blocks(vec![crate::ml_protocol::MlOcrBlock {
+            text_layout: None,
             text: "hello".to_string(),
             confidence: 1.5,
             points: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
@@ -2735,11 +2698,13 @@ mod tests {
         let converted = convert_ml_ocr_blocks(vec![
             crate::ml_protocol::MlOcrBlock {
                 text: "bad".to_string(),
+                text_layout: None,
                 confidence: f32::NAN,
                 points: [[0.0; 2]; 4],
             },
             crate::ml_protocol::MlOcrBlock {
                 text: "x".repeat(16_385),
+                text_layout: None,
                 confidence: 0.5,
                 points: [[0.0; 2]; 4],
             },

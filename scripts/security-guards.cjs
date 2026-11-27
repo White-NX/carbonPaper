@@ -3,6 +3,10 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMMAND_TIERS = {
+  'commands::usage::usage_get_day': 'session_required',
+  'commands::usage::usage_get_recorded_dates': 'session_required',
+  'commands::usage::usage_get_app_details': 'session_required',
+  'commands::usage::usage_set_app_category': 'session_required',
   'commands::recap::recap_search': 'session_required',
   'commands::recap::recap_search_status': 'session_required',
   'commands::recap::recap_prepare_search': 'session_required',
@@ -20,6 +24,9 @@ const COMMAND_TIERS = {
   'commands::recap::recap_cancel': 'runtime_public',
   'commands::recap::recap_get_progress': 'session_required',
   'commands::ai::ai_get_settings': 'public',
+  'commands::ai::ai_get_model_catalog': 'public',
+  'commands::ai::ai_discover_models': 'session_required',
+  'commands::ai::ai_test_image_input': 'session_required',
   'commands::ai::ai_save_provider': 'session_required',
   'commands::ai::ai_delete_provider': 'session_required',
   'commands::ai::ai_set_default_provider': 'session_required',
@@ -37,6 +44,7 @@ const COMMAND_TIERS = {
   'app_bound::app_bound_acknowledge_offer': 'public',
   'app_bound::app_bound_set_policy': 'session_required',
   'app_bound::app_bound_install': 'session_required',
+  'app_bound::app_bound_repair': 'session_required',
   'app_bound::app_bound_uninstall': 'session_required',
   'commands::utility::set_app_language': 'public',
   'commands::utility::set_app_theme': 'public',
@@ -50,6 +58,7 @@ const COMMAND_TIERS = {
   'monitor::resume_monitor': 'runtime_public',
   'monitor::get_monitor_status': 'public',
   'monitor::monitor_search_nl': 'session_required',
+  'monitor::monitor_cancel_search_nl': 'session_required',
   'monitor::monitor_update_filters': 'session_required',
   'monitor::monitor_update_advanced_config': 'session_required',
   'monitor::monitor_nl_cluster_query': 'session_required',
@@ -73,6 +82,8 @@ const COMMAND_TIERS = {
   'commands::storage::storage_get_thumbnail_warmup_status': 'session_required',
   'commands::storage::storage_cancel_thumbnail_warmup': 'session_required',
   'commands::storage::storage_get_screenshot_details': 'session_required',
+  'commands::storage::storage_save_edited_screenshot': 'session_required',
+  'commands::storage::storage_retry_edited_screenshot_ocr': 'session_required',
   'office_runtime::office_resume_document': 'session_required',
   'commands::storage::storage_delete_screenshot': 'session_required',
   'commands::storage::storage_delete_by_time_range': 'session_required',
@@ -335,6 +346,7 @@ function checkCommandGuardImplementations() {
   "app_bound::app_bound_status",
   "app_bound::app_bound_set_policy",
   "app_bound::app_bound_install",
+  "app_bound::app_bound_repair",
   "app_bound::app_bound_uninstall"
 ];
   for (const command of settingsCommands) {

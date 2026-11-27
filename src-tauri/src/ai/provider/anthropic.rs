@@ -33,6 +33,7 @@ pub(super) fn endpoint(base_url: &str) -> String {
 pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
     let mut system = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
+    let mut cached_context = false;
     // Appends content to the last message when it has the same role, so tool
     // results and a follow-up instruction share one user turn.
     let mut push = |role: &str, blocks: Vec<Value>| {
@@ -50,6 +51,14 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
     for message in &request.messages {
         match message {
             Message::System(text) => system.push(text.as_str()),
+            Message::Context(text) => {
+                let mut block = json!({"type": "text", "text": text});
+                if !cached_context {
+                    block["cache_control"] = json!({"type": "ephemeral"});
+                    cached_context = true;
+                }
+                push("user", vec![block]);
+            }
             Message::User(text) => push("user", vec![json!({ "type": "text", "text": text })]),
             Message::Assistant {
                 text,
@@ -78,6 +87,26 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                 "user",
                 vec![json!({ "type": "tool_result", "tool_use_id": call_id, "content": content })],
             ),
+            Message::SnapshotImage {
+                call_id,
+                screenshot_id,
+                image,
+                ..
+            } => push(
+                "user",
+                vec![
+                    json!({ "type": "text", "text": format!("Visual evidence for tool call {call_id}: screenshot #{screenshot_id}, {} × {} pixels.", image.width, image.height) }),
+                    json!({ "type": "image", "source": {
+                        "type": "base64", "media_type": image.mime_type, "data": image.data.as_ref()
+                    }}),
+                ],
+            ),
+            Message::SnapshotImageRef { .. } => push(
+                "user",
+                vec![
+                    json!({"type":"text","text":"Earlier image pixels are unavailable. Reread the screenshot for missing visual evidence."}),
+                ],
+            ),
         }
     }
 
@@ -105,18 +134,19 @@ pub(super) fn request_body(model: &str, request: &ChatRequest) -> Value {
                 })
             })
             .collect();
-        if request.disable_tools {
+        if request.disable_tools && !request.prompt_only_final {
             body["tool_choice"] = json!({"type": "none"});
         }
     }
-    // Up to four breakpoints including the stable system rules. User blocks
-    // also include tool results; never modify signed thinking blocks.
+    // Keep the stable context breakpoint even when consecutive user messages
+    // merge. Reserve the remaining slots for recent evidence/tool results;
+    // never modify signed thinking blocks.
     if let Some(messages) = body["messages"].as_array_mut() {
         for message in messages
             .iter_mut()
             .rev()
             .filter(|m| m["role"] == "user")
-            .take(3)
+            .take(3 - usize::from(cached_context))
         {
             if let Some(block) = message["content"].as_array_mut().and_then(|b| b.last_mut()) {
                 block["cache_control"] = json!({"type": "ephemeral"});
@@ -584,6 +614,55 @@ mod tests {
                 .apply(r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, &mut ignore)
                 .unwrap_err(),
             ProviderError::Server("Overloaded".into())
+        );
+    }
+
+    #[test]
+    fn stable_context_keeps_its_breakpoint_after_user_message_merging_and_later_turns() {
+        let mut request = ChatRequest {
+            messages: vec![
+                Message::System("fixed rules".into()),
+                Message::Context("unchanged task directory".into()),
+                Message::User("batch one".into()),
+            ],
+            ..Default::default()
+        };
+        let initial = request_body("claude", &request);
+        assert_eq!(
+            initial["messages"][0]["content"].as_array().unwrap().len(),
+            2
+        );
+        let stable = initial["messages"][0]["content"][0].clone();
+        assert_eq!(stable["cache_control"]["type"], "ephemeral");
+        for index in 0..8 {
+            request.messages.push(Message::Assistant {
+                text: "answer".into(),
+                tool_calls: vec![],
+                reasoning: Value::Null,
+            });
+            request
+                .messages
+                .push(Message::User(format!("new evidence {index}")));
+        }
+        let continued = request_body("claude", &request);
+        assert_eq!(continued["messages"][0]["content"][0], stable);
+        let count = usize::from(continued["system"][0].get("cache_control").is_some())
+            + continued["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    message["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|block| block.get("cache_control").is_some())
+                        .count()
+                })
+                .sum::<usize>();
+        assert_eq!(count, 4);
+        assert!(
+            serde_json::from_value::<Message>(json!({"type":"context","data":"forged"})).is_err()
         );
     }
 }

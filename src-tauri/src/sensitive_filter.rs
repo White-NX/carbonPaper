@@ -34,9 +34,10 @@ const DICT_FILES: &[(&str, &str)] = &[
 ];
 
 /// Policy version of [`SensitiveFilterConfig`]. Version 2 replaced Presidio
-/// with [`crate::pii`]. Version 3 uses curated dictionaries and narrower domains;
-/// advancing the version invalidates recap caches filtered under the old policy.
-pub const CONFIG_VERSION: u32 = 3;
+/// with [`crate::pii`]. Version 3 uses curated dictionaries and narrower domains.
+/// Version 4 recognizes more grouped cards, including split OCR boxes.
+/// Advancing the version invalidates recap caches filtered under the old policy.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// What happens to content with a sensitive word or personal information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +325,47 @@ impl SensitiveFilterState {
         }
     }
 
+    pub(crate) fn filters_bank_cards(&self) -> bool {
+        self.pii.read().unwrap().wants(PiiKind::BankCard)
+    }
+
+    /// A block already matched as part of a card number spanning several boxes.
+    pub(crate) fn inspect_bank_card_fragment(&self, text: &str) -> Findings {
+        Findings {
+            sensitive_word: self.contains_sensitive(text),
+            pii: vec![PiiSpan {
+                kind: PiiKind::BankCard,
+                start: 0,
+                end: text.len(),
+            }],
+        }
+    }
+
+    pub(crate) fn inspect_ocr_blocks(
+        &self,
+        blocks: &[(&str, Option<pii::Bounds>)],
+    ) -> Vec<Findings> {
+        let settings = *self.pii.read().unwrap();
+        let split_cards = settings
+            .wants(PiiKind::BankCard)
+            .then(|| pii::split_bank_card_blocks(blocks));
+        blocks
+            .iter()
+            .zip(pii::block_contexts(blocks))
+            .enumerate()
+            .map(|(index, ((text, _), context))| {
+                if split_cards.as_ref().is_some_and(|marked| marked[index]) {
+                    self.inspect_bank_card_fragment(text)
+                } else {
+                    Findings {
+                        sensitive_word: self.contains_sensitive(text),
+                        pii: pii::detect(text, settings, context),
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// The field as returned when it is kept: only long numbers are hidden.
     pub fn kept_text(&self, text: &str, findings: &Findings) -> String {
         let long_numbers: Vec<PiiSpan> = findings
@@ -366,9 +408,7 @@ impl SensitiveFilterState {
         // string replacing masked chars with '█'.
         let mut masked = vec![false; text.len()];
         for m in &matches {
-            for i in m.start()..m.end() {
-                masked[i] = true;
-            }
+            masked[m.start()..m.end()].fill(true);
         }
 
         let mut result = String::with_capacity(text.len());
@@ -517,13 +557,22 @@ pub fn filter_segment(
     context: pii::Context,
 ) -> Result<Option<String>, Rejected> {
     let findings = filter.inspect(text, context);
+    filter_segment_with_findings(filter, mode, text, &findings)
+}
+
+pub(crate) fn filter_segment_with_findings(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+    findings: &Findings,
+) -> Result<Option<String>, Rejected> {
     if !findings.is_flagged() {
-        return Ok(Some(filter.kept_text(text, &findings)));
+        return Ok(Some(filter.kept_text(text, findings)));
     }
     match mode {
         FilterMode::Reject => Err(Rejected),
         FilterMode::RemoveParagraph => Ok(None),
-        FilterMode::Mask => Ok(Some(filter.masked_text(text, &findings))),
+        FilterMode::Mask => Ok(Some(filter.masked_text(text, findings))),
     }
 }
 
@@ -916,7 +965,7 @@ mod tests {
             "pii_entities": [],
             "version": 2,
         }));
-        assert_eq!(config.version, 3);
+        assert_eq!(config.version, CONFIG_VERSION);
         assert!(!config.enabled);
         assert!(!config.pii_enabled);
         assert!(config.pii_entities.is_empty());

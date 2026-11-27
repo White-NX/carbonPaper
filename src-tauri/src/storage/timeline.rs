@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -123,18 +124,18 @@ impl StorageState {
             check()?;
             let raw = {
                 let opening = Instant::now();
-                let conn = self.open_read_connection_named("get_timeline_records")?;
+                let mut conn = self.open_read_connection_named("get_timeline_records")?;
                 timings.read_open = opening.elapsed();
                 check()?;
                 let stop = Arc::clone(cancelled);
                 let credentials = Arc::clone(&self.credential_state);
-                let _cancellation = SqlCancellation::install(&conn, move || {
+                let cancellation = SqlCancellation::install(&mut conn, move || {
                     stop.load(Ordering::Acquire)
                         || !credentials.is_session_valid()
                         || credentials.silent_read_auth_required()
                         || credentials.session_marker() != admitted_session
                 })?;
-                let result = read(&conn, &check, &mut timings);
+                let result = read(&cancellation, &check, &mut timings);
                 // SQLite reports SQLITE_INTERRUPT; preserve the public cancel
                 // or auth error instead of exposing a generic database failure.
                 check()?;
@@ -203,16 +204,24 @@ impl StorageState {
 
 /// The callback also runs inside sqlite3_step, before the first grouped/sorted
 /// row is returned. Removing it on every exit prevents poisoning later reads.
-struct SqlCancellation<'a>(&'a Connection);
+struct SqlCancellation<'a>(&'a mut Connection);
 
 impl<'a> SqlCancellation<'a> {
     fn install(
-        conn: &'a Connection,
+        conn: &'a mut Connection,
         stop: impl FnMut() -> bool + Send + 'static,
     ) -> Result<Self, String> {
         conn.progress_handler(1000, Some(stop))
             .map_err(|error| error.to_string())?;
         Ok(Self(conn))
+    }
+}
+
+impl Deref for SqlCancellation<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
     }
 }
 
@@ -231,7 +240,7 @@ fn timeline_projection(include_details: bool) -> &'static str {
         "s.id, s.image_path, s.created_at,
          CAST(strftime('%s', s.created_at) AS INTEGER), s.window_title, cp_process(s.process_name),
          s.metadata, s.window_title_enc, s.process_name_enc, s.metadata_enc,
-         s.content_key_encrypted, s.page_icon_id,
+         s.content_key_encrypted, COALESCE(s.process_icon_id, s.page_icon_id),
          pi.icon_enc, pi.icon_key_encrypted, s.category"
     } else {
         // Do not fetch ciphertext or large metadata blobs just to draw frame positions.
@@ -258,7 +267,7 @@ fn timeline_rows_sql_with_details(bucket: Option<i64>, include_details: bool) ->
     // reverse the join and restart the GROUP BY coroutine for every screenshot.
     let projection = timeline_projection(include_details);
     let icon_join = if include_details {
-        "LEFT JOIN page_icons pi ON pi.id = s.page_icon_id"
+        "LEFT JOIN page_icons pi ON pi.id = COALESCE(s.process_icon_id, s.page_icon_id)"
     } else {
         ""
     };
@@ -387,7 +396,7 @@ fn read_rows_by_ids(
     // Force rowid seeks for this bounded ID list, including before ANALYZE.
     let sql = format!(
         "SELECT {} FROM screenshots s NOT INDEXED
-         LEFT JOIN page_icons pi ON pi.id = s.page_icon_id
+         LEFT JOIN page_icons pi ON pi.id = COALESCE(s.process_icon_id, s.page_icon_id)
          WHERE s.is_deleted = 0 AND s.id IN ({}) ORDER BY s.created_at, s.id",
         timeline_projection(true),
         vec!["?"; ids.len()].join(",")

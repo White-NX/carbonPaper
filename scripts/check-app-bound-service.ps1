@@ -12,6 +12,7 @@ $ProgressPreference = 'SilentlyContinue'
 $serviceTest = 'windows::install::tests::existing_service_repair_reapplies_restart_policy'
 $administratorTests = @(
     @{ test = $serviceTest; prefix = 'service' },
+    @{ test = 'windows::revocation::tests::restricted_client_can_append_but_cannot_read_overwrite_or_erase_revocations'; prefix = 'revocation' },
     @{ test = 'windows::update::tests::elevated_update_rejects_corruption_and_preserves_protected_acls'; prefix = 'updater' },
     @{ test = 'windows::update::process::tests::elevated_coordinator_keeps_parent_and_runs_with_restricted_permissions'; prefix = 'coordinator' }
 )

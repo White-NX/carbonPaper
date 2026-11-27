@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use tauri::{webview::PageLoadEvent, Manager};
 
 pub struct MainWindowPresentationState {
+    creation: Mutex<()>,
     presentation: Mutex<Presentation>,
 }
 
@@ -20,6 +21,7 @@ struct Presentation {
 impl MainWindowPresentationState {
     pub fn new(show_requested: bool) -> Self {
         Self {
+            creation: Mutex::new(()),
             presentation: Mutex::new(Presentation {
                 generation: 0,
                 ready: false,
@@ -28,7 +30,24 @@ impl MainWindowPresentationState {
         }
     }
 
-    pub fn begin_creation(&self) -> u64 {
+    /// Keep lookup and construction together so overlapping opens reuse the
+    /// same WebView without advancing its startup generation.
+    pub fn create_if_missing<E>(
+        &self,
+        exists: impl FnOnce() -> bool,
+        create: impl FnOnce(u64) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        // Page-ready callbacks use only the presentation lock and must remain
+        // free to run while the WebView builder waits for the event loop.
+        let _creation = self.creation.lock().unwrap_or_else(|e| e.into_inner());
+        if exists() {
+            return Ok(false);
+        }
+        create(self.begin_creation())?;
+        Ok(true)
+    }
+
+    fn begin_creation(&self) -> u64 {
         let mut presentation = self.presentation.lock().unwrap_or_else(|e| e.into_inner());
         presentation.generation = presentation.generation.wrapping_add(1);
         presentation.ready = false;
@@ -168,5 +187,66 @@ mod tests {
         assert!(!presentation.acknowledge(0));
         assert!(!presentation.ready);
         assert!(presentation.acknowledge(generation));
+    }
+
+    #[test]
+    fn concurrent_opens_share_one_window_and_startup_generation() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let state = MainWindowPresentationState::new(false);
+        let window_generation = AtomicU64::new(0);
+        let creations = AtomicUsize::new(0);
+        let start = Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let requests: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        state
+                            .create_if_missing(
+                                || window_generation.load(Ordering::Acquire) != 0,
+                                |generation| {
+                                    creations.fetch_add(1, Ordering::Relaxed);
+                                    // Keep the window absent while other opens arrive.
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                    window_generation.store(generation, Ordering::Release);
+                                    Ok::<(), ()>(())
+                                },
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect();
+            requests
+                .into_iter()
+                .map(|request| request.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(creations.load(Ordering::Relaxed), 1);
+        assert_eq!(results.into_iter().filter(|created| *created).count(), 1);
+        assert_eq!(window_generation.load(Ordering::Acquire), 1);
+        assert!(state.presentation.lock().unwrap().acknowledge(1));
+    }
+
+    #[test]
+    fn failed_creation_allows_retry_with_a_new_startup_generation() {
+        let state = MainWindowPresentationState::new(false);
+        let result = state.create_if_missing(|| false, |_| Err("WebView failed"));
+        assert_eq!(result, Err("WebView failed"));
+
+        assert!(state
+            .create_if_missing(
+                || false,
+                |generation| {
+                    assert_eq!(generation, 2);
+                    Ok::<(), &str>(())
+                }
+            )
+            .unwrap());
+        let mut presentation = state.presentation.lock().unwrap();
+        assert!(!presentation.acknowledge(1));
+        assert!(presentation.acknowledge(2));
     }
 }

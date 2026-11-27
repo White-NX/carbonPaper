@@ -26,7 +26,9 @@ use crate::semantic_runtime::{
     SemanticEmbeddingResult, SemanticRuntimeState, SemanticRuntimeStatus, SemanticTimeouts,
 };
 use crate::sensitive_filter::SensitiveFilterState;
-use crate::storage::{search_plan::QueryPlan, search_rank, SearchMatchEvidence, StorageState};
+use crate::storage::{
+    search_plan::QueryPlan, search_rank, SearchMatchEvidence, SearchSortOrder, StorageState,
+};
 use crate::task_error::TaskError;
 
 const ENCODE_BATCH: usize = 4;
@@ -57,6 +59,7 @@ pub enum SearchMode {
 pub struct RecapSearchQuery {
     pub query: String,
     pub mode: SearchMode,
+    pub sort_order: SearchSortOrder,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub include_details: bool,
@@ -73,6 +76,7 @@ impl Default for RecapSearchQuery {
         Self {
             query: String::new(),
             mode: SearchMode::Hybrid,
+            sort_order: SearchSortOrder::Relevance,
             start_date: None,
             end_date: None,
             include_details: true,
@@ -153,6 +157,8 @@ pub struct RecapSearchHit {
     pub start_ms: i64,
     pub end_ms: i64,
     pub sources: Vec<SourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<RecapWarning>,
     #[serde(flatten)]
     pub evidence: ActivityEvidence,
     pub keyword_rank: Option<usize>,
@@ -639,6 +645,16 @@ impl Drop for Corpus {
             for detail in &mut activity.details {
                 detail.text.zeroize();
             }
+            for warning in &mut activity.warnings {
+                warning.field.zeroize();
+                warning.reason.zeroize();
+                for reference in &mut warning.reference_ids {
+                    if let serde_json::Value::String(text) = reference {
+                        text.zeroize();
+                    }
+                    *reference = serde_json::Value::Null;
+                }
+            }
             for source in &mut activity.sources {
                 source.process_name.zeroize();
                 source.window_title.zeroize();
@@ -863,13 +879,14 @@ fn filtered_activity(
     activity.task_title =
         crate::mcp_server::filter_identity(filter, mode, &activity.task_title).ok()?;
     activity.text = crate::mcp_server::filter_joined_text(filter, mode, &activity.text).ok()?;
+    activity.warnings = super::privacy::filtered_warnings(filter, &activity.warnings);
     for source in &mut activity.sources {
         source.process_name =
             crate::mcp_server::filter_identity(filter, mode, &source.process_name).ok()?;
         source.window_title =
             crate::mcp_server::filter_identity(filter, mode, &source.window_title).ok()?;
     }
-    if activity.sources.is_empty() {
+    if activity.sources.is_empty() && activity.warnings.is_empty() {
         return None;
     }
     activity.details = activity
@@ -877,10 +894,13 @@ fn filtered_activity(
         .into_iter()
         .filter_map(|mut detail| {
             if detail.evidence_ids.is_empty()
-                || !detail
-                    .evidence_ids
-                    .iter()
-                    .all(|id| activity.sources.iter().any(|s| s.id == *id))
+                || !detail.evidence_ids.iter().all(|id| {
+                    activity.sources.iter().any(|s| s.id == *id)
+                        || activity
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.reference_ids.contains(&serde_json::json!(id)))
+                })
             {
                 return None;
             }
@@ -1340,6 +1360,7 @@ fn activity_hit(
         start_ms: activity.start_ms,
         end_ms: activity.end_ms,
         sources: activity.sources,
+        warnings: activity.warnings,
         evidence,
         keyword_rank: None,
         semantic_rank: None,
@@ -1359,6 +1380,7 @@ fn hit_activity(hit: &RecapSearchHit) -> RecapActivity {
         start_ms: hit.start_ms,
         end_ms: hit.end_ms,
         sources: hit.sources.clone(),
+        warnings: hit.warnings.clone(),
         member_ids: hit.evidence.member_screenshot_ids.clone(),
         segments: vec![],
     }
@@ -1486,6 +1508,7 @@ fn keyword_search(
     for (i, hit) in hits.iter_mut().enumerate() {
         hit.keyword_rank = Some(i + 1);
     }
+    sort_hits(&mut hits, query.sort_order);
     current.context().check(app)?;
     Ok((hits, complete && prepared))
 }
@@ -1635,6 +1658,21 @@ fn rank_with_report(
             })
             .then(a.cmp(b))
     });
+    if query.sort_order == SearchSortOrder::Newest {
+        ranked.sort_by(|(a, _), (b, _)| {
+            corpus.documents[*b]
+                .activity
+                .start_ms
+                .cmp(&corpus.documents[*a].activity.start_ms)
+                .then_with(|| corpus.documents[*a].date.cmp(&corpus.documents[*b].date))
+                .then_with(|| {
+                    corpus.documents[*a]
+                        .activity
+                        .id
+                        .cmp(&corpus.documents[*b].activity.id)
+                })
+        });
+    }
     let total = ranked.len();
     let hits = ranked
         .into_iter()
@@ -1655,6 +1693,7 @@ fn rank_with_report(
                 start_ms: a.start_ms,
                 end_ms: a.end_ms,
                 sources: a.sources.clone(),
+                warnings: a.warnings.clone(),
                 evidence: d.evidence.clone(),
                 keyword_rank,
                 semantic_rank,
@@ -1681,6 +1720,7 @@ fn query_key(query: &RecapSearchQuery) -> String {
         &serde_json::json!([
             query.query.trim(),
             query.mode,
+            query.sort_order,
             query.start_date,
             query.end_date,
             query.include_details,
@@ -1732,6 +1772,7 @@ fn rank_semantic_with_keywords(
             .then_with(|| a.date.cmp(&b.date))
             .then_with(|| a.activity_id.cmp(&b.activity_id))
     });
+    sort_hits(&mut items, query.sort_order);
     semantic.total = items.len();
     semantic.items = items
         .into_iter()
@@ -1742,6 +1783,17 @@ fn rank_semantic_with_keywords(
     semantic.execution.keyword_executed = query.mode != SearchMode::Semantic;
     semantic.execution.keyword_matches = keyword_count;
     semantic
+}
+
+fn sort_hits(hits: &mut [RecapSearchHit], sort_order: SearchSortOrder) {
+    if sort_order == SearchSortOrder::Newest {
+        hits.sort_by(|a, b| {
+            b.start_ms
+                .cmp(&a.start_ms)
+                .then_with(|| a.date.cmp(&b.date))
+                .then_with(|| a.activity_id.cmp(&b.activity_id))
+        });
+    }
 }
 
 pub async fn search(
@@ -2229,6 +2281,7 @@ mod tests {
                 text: "采用内存缓存降低查询延迟".into(),
                 evidence_ids: vec![1],
             }],
+            warnings: vec![],
         }
     }
 
@@ -2661,6 +2714,59 @@ mod tests {
         assert_eq!(original, query_key(&query));
         query.include_details = false;
         assert_ne!(original, query_key(&query));
+        query.include_details = true;
+        query.sort_order = SearchSortOrder::Newest;
+        assert_ne!(original, query_key(&query));
+    }
+
+    #[test]
+    fn newest_recap_pages_keep_keyword_ranks_while_reordering_occurrence_times() {
+        let mut old = activity("CarbonPaper", "CarbonPaper release");
+        old.id = "old".into();
+        old.start_ms = 1000;
+        old.end_ms = 1000;
+        let mut recent = activity("Notes", "CarbonPapr release");
+        recent.id = "recent".into();
+        recent.start_ms = 2000;
+        recent.end_ms = 2000;
+        let corpus = Corpus {
+            identity: Identity {
+                generation: 0,
+                epoch: 0,
+                privacy: String::new(),
+                serial: 0,
+                session: None,
+            },
+            documents: vec![
+                Document::new("2026-10-10".into(), 0, 0, old),
+                Document::new("2026-10-10".into(), 0, 0, recent),
+            ],
+            total_chunks: 0,
+            dates: 1,
+            vectors: Mutex::new(HashMap::new()),
+        };
+        let mut query = RecapSearchQuery {
+            query: "carbonpaper".into(),
+            mode: SearchMode::Keyword,
+            ..Default::default()
+        };
+        let keywords = rank_with_report(&corpus, &query, None).items;
+        assert_eq!(
+            keywords
+                .iter()
+                .map(|hit| hit.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old", "recent"]
+        );
+        query.sort_order = SearchSortOrder::Newest;
+        query.limit = 1;
+        let first = rank_semantic_with_keywords(&corpus, &query, None, keywords.clone());
+        assert_eq!(first.items[0].activity_id, "recent");
+        assert_eq!(first.items[0].keyword_rank, Some(2));
+        query.offset = 1;
+        let second = rank_semantic_with_keywords(&corpus, &query, None, keywords);
+        assert_eq!(second.items[0].activity_id, "old");
+        assert_eq!(second.items[0].keyword_rank, Some(1));
     }
 
     #[test]

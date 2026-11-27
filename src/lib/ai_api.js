@@ -1,7 +1,8 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
 
-export const DEFAULT_AI_CONTEXT_TOKENS = 32768;
+export const DEFAULT_AI_CONTEXT_TOKENS = 128000;
+export const LOCAL_AI_CONTEXT_TOKENS = 32768;
 export const MIN_AI_CONTEXT_TOKENS = 8192;
 export const MAX_AI_CONTEXT_TOKENS = 2000000;
 
@@ -16,10 +17,13 @@ export function getAiSettings() {
 }
 
 /** `apiKey`: `undefined` keeps the stored key, `''` clears it. */
-export function saveAiProvider({ id, name, kind, baseUrl, model, apiKey, contextTokens = DEFAULT_AI_CONTEXT_TOKENS }) {
-  return withAuth(() => invoke('ai_save_provider', {
-    provider: { id: id || null, name, kind, base_url: baseUrl, model, api_key: apiKey ?? null, context_tokens: contextTokens },
-  }), { autoPrompt: true });
+function providerInput({ id, name, kind, baseUrl, model, apiKey, contextTokens = null, allowImages = false, imageInputOverride = 'auto' }) {
+  return { id: id || null, name, kind, base_url: baseUrl, model, api_key: apiKey ?? null,
+    context_tokens: contextTokens, allow_images: allowImages, image_input_override: imageInputOverride };
+}
+
+export function saveAiProvider(input) {
+  return withAuth(() => invoke('ai_save_provider', { provider: providerInput(input) }), { autoPrompt: true });
 }
 
 export function deleteAiProvider(id) {
@@ -30,10 +34,22 @@ export function setDefaultAiProvider(id) {
   return withAuth(() => invoke('ai_set_default_provider', { id }), { autoPrompt: true });
 }
 
-export function testAiProvider({ id, name, kind, baseUrl, model, apiKey, contextTokens = DEFAULT_AI_CONTEXT_TOKENS }) {
-  return withAuth(() => invoke('ai_test_provider', {
-    provider: { id: id || null, name, kind, base_url: baseUrl, model, api_key: apiKey ?? null, context_tokens: contextTokens },
-  }), { autoPrompt: true });
+export function testAiProvider(input) {
+  return withAuth(() => invoke('ai_test_provider', { provider: providerInput(input) }), { autoPrompt: true });
+}
+
+export function getAiModelCatalog({ refresh = false } = {}) {
+  return invoke('ai_get_model_catalog', { refresh });
+}
+
+export function discoverAiModels({ id, kind, baseUrl, apiKey }, { refresh = false } = {}) {
+  return withAuth(() => invoke('ai_discover_models', {
+    provider: { id: id || null, kind, base_url: baseUrl, api_key: apiKey ?? null }, refresh,
+  }), { autoPrompt: refresh });
+}
+
+export function testAiImageInput(input) {
+  return withAuth(() => invoke('ai_test_image_input', { provider: providerInput(input) }), { autoPrompt: true });
 }
 
 export function grantAiRemoteConsent() {
@@ -66,6 +82,7 @@ export function aiErrorKey(error) {
     'AI_PROVIDER_INVALID_URL', 'AI_PROVIDER_FIELD_TOO_LONG', 'AI_PROVIDER_KEY_UNREADABLE',
     'AI_NO_PROVIDER', 'AI_BUSY', 'AI_EMPTY_QUESTION', 'AI_PROVIDER_NOT_FOUND', 'MAINTENANCE_IN_PROGRESS',
     'AI_INVALID_CONTEXT_BUDGET', 'AI_CONTEXT_LIMIT',
+    'AI_IMAGES_DISABLED', 'AI_METADATA_CACHE_FAILED',
   ];
   if (text.includes('AUTH_REQUIRED')) return 'ai.errors.AUTH_REQUIRED';
   return known.includes(code) ? `ai.errors.${code}` : 'ai.errors.unknown';

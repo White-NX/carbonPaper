@@ -13,6 +13,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+type DerivedAnnSnapshot = (u64, u64, u64, u32, String, String, u32);
+
 pub(super) const ANN_TAIL_UPDATES_SQL: &str = r#"
     SELECT c.subject_key,
            CASE WHEN j.status = 'completed'
@@ -26,7 +28,7 @@ pub(super) const ANN_TAIL_UPDATES_SQL: &str = r#"
                   AND j.source_fingerprint = e.source_fingerprint
                 THEN cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key) END
     FROM derived_ann_changes c INDEXED BY idx_derived_ann_changes_epoch
-    LEFT JOIN derived_embeddings e
+    LEFT JOIN derived_embeddings_read e
       ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
     LEFT JOIN derived_index_jobs j
       ON j.index_kind = c.index_kind AND j.subject_key = c.subject_key
@@ -263,6 +265,10 @@ impl StorageState {
         .transpose()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Records the complete persisted ANN failure state in one update."
+    )]
     pub fn record_derived_ann_build_failure(
         &self,
         index_kind: DerivedIndexKind,
@@ -604,7 +610,7 @@ impl StorageState {
                            AND j.source_fingerprint = e.source_fingerprint
                         THEN cp_unseal(e.vector_f32,'vectors',e.index_kind||':'||e.subject_key) END
                     FROM derived_ann_changes c
-                    LEFT JOIN derived_embeddings e
+                    LEFT JOIN derived_embeddings_read e
                       ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
                     LEFT JOIN derived_index_jobs j
                       ON j.index_kind = c.index_kind AND j.subject_key = c.subject_key
@@ -665,8 +671,9 @@ impl StorageState {
             return Err("query_deadline_exceeded_during_ann_tail".to_string());
         }
         let result = self.with_vector_scan_connection("derived_ann_tail_updates", |conn| {
-            let _deadline = crate::storage::connection::QueryDeadline::install(conn, deadline)
+            let deadline_guard = crate::storage::connection::QueryDeadline::install(conn, deadline)
                 .map_err(|error| error.to_string())?;
+            let conn = &*deadline_guard;
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|error| error.to_string())?;
@@ -723,7 +730,7 @@ impl StorageState {
     pub(crate) fn derived_index_snapshot_for_ann(
         &self,
         index_kind: DerivedIndexKind,
-    ) -> Result<(u64, u64, u64, u32, String, String, u32), String> {
+    ) -> Result<DerivedAnnSnapshot, String> {
         self.with_vector_scan_connection("derived_index_snapshot_for_ann", |conn| {
             let snapshot = derived_index_snapshot_metadata_from_conn(conn, index_kind)?;
             let contract = snapshot

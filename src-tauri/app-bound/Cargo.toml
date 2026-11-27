@@ -9,12 +9,19 @@ name = "carbonpaper_app_bound"
 [features]
 development-runtime = ["dep:runas"]
 
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
+
 # Used only when this standalone crate builds the development service/helpers.
 # The Tauri desktop keeps its ordinary dev profile and hot-reload behavior.
 [profile.dev-service]
 inherits = "dev"
 opt-level = 2
-debug = true
+debug = 1
 debug-assertions = true
 
 [[bin]]
@@ -37,7 +44,7 @@ base64 = "0.22"
 ed25519-dalek = "2"
 hex = "0.4"
 rand = "0.8"
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

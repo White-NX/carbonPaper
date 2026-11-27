@@ -1226,6 +1226,7 @@ async fn postprocess_maintenance_pass(app: &AppHandle) {
     let maintenance_result = tokio::task::spawn_blocking(move || {
         if maintenance_storage.background_processing_enabled() {
             let _ = maintenance_storage.processing_stage.refresh();
+            maintenance_storage.request_protected_key_publication();
         } else {
             let _ = maintenance_storage.processing_stage.disable_if_installed();
         }
@@ -1361,6 +1362,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             text: result.text,
             confidence: result.confidence,
             box_coords: result.box_coords,
+            text_layout: result.text_layout,
         })
         .collect::<Vec<_>>();
         let enqueue_result = crate::capture::enqueue_ocr_postprocess(

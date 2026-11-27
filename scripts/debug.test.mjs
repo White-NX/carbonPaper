@@ -50,7 +50,7 @@ test('native development builds and tests use an optimized profile with assertio
   assert.ok(profile, 'native profile must exist in the standalone crate');
   assert.match(profile, /inherits\s*=\s*"dev"/);
   assert.match(profile, /opt-level\s*=\s*[23]/);
-  assert.match(profile, /debug\s*=\s*true/);
+  assert.match(profile, /debug\s*=\s*1\b/);
   assert.match(profile, /debug-assertions\s*=\s*true/);
   for (const [command, args] of [
     ['build', ['--bin', 'carbonpaper-key-service', '--bin', 'carbonpaper-protected-setup']],

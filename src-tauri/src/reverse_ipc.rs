@@ -12,35 +12,10 @@ use crate::windows_platform::{self, ProcessIdentity};
 use rand::RngCore;
 use serde::Serialize;
 use std::os::windows::io::AsRawHandle;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HANDLE;
-
-/// Return whether `pid` is `expected_ancestor_pid` or a bounded-depth descendant.
-fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
-    if pid == expected_ancestor_pid {
-        return true;
-    }
-    let Some(processes) = crate::windows_platform::process_tree() else {
-        return false;
-    };
-
-    let mut current = pid;
-    for _ in 0..8 {
-        let Some(parent) = processes.get(&current).map(|(parent, _)| *parent) else {
-            return false;
-        };
-        if parent == expected_ancestor_pid {
-            return true;
-        }
-        if parent == 0 || parent == current {
-            return false;
-        }
-        current = parent;
-    }
-    false
-}
 
 /// Compute deterministic NMH pipe name from current user's Windows SID.
 /// Both CarbonPaper and carbonpaper-nmh.exe use this same formula.
@@ -66,7 +41,7 @@ pub fn generate_nmh_auth_token(data_dir: &std::path::Path) -> Result<String, Str
 
 /// Read the NMH auth token from the data dir.
 #[allow(dead_code)]
-pub fn read_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
+pub fn read_nmh_auth_token(data_dir: &Path) -> Result<String, String> {
     let token_path = data_dir.join("nmh_auth_token");
     std::fs::read_to_string(&token_path)
         .map_err(|e| format!("Failed to read NMH auth token: {}", e))
@@ -96,6 +71,7 @@ impl NmhPipeServer {
             .map_err(|e| format!("Cannot create NMH bootstrap pipe: {e}"))?;
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
+        let close_app = app.clone();
         let handler: nmh_pipe::RequestHandler = Arc::new(move |peer, request| {
             let storage = storage.clone();
             let capture = capture_state.clone();
@@ -104,9 +80,13 @@ impl NmhPipeServer {
                 async move { process_nmh_request(&request, &peer, storage, capture, app).await },
             )
         });
-        let on_close: nmh_pipe::CloseHandler = Arc::new(|peer| {
+        let on_close: nmh_pipe::CloseHandler = Arc::new(move |peer| {
             let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             remove_peer_sessions(&mut sessions, peer, None);
+            use tauri::Manager;
+            if let Some(usage) = close_app.try_state::<Arc<crate::usage::UsageRuntime>>() {
+                usage.clear_browser(peer.pid);
+            }
         });
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
@@ -256,7 +236,50 @@ async fn process_nmh_request(
             let cmd_pipe_name = req["cmd_pipe_name"].as_str().unwrap_or("");
             let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             remove_peer_sessions(&mut sessions, peer, Some(cmd_pipe_name));
+            use tauri::Manager;
+            if let Some(usage) = app_handle.try_state::<Arc<crate::usage::UsageRuntime>>() {
+                usage.clear_browser(peer.pid);
+            }
             StorageResponse::success(serde_json::json!({"unregistered": true}))
+        }
+        "usage_browser_metadata" => {
+            let session = {
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(session) = sessions.iter_mut().find(|s| s.nmh_peer == *peer) else {
+                    return StorageResponse::error(
+                        "NMH usage metadata requires a registered session",
+                    );
+                };
+                session.last_seen_ms = chrono::Utc::now().timestamp_millis();
+                session.clone()
+            };
+            let browser = match windows_platform::inspect_process(session.browser_pid) {
+                Ok(browser)
+                    if browser.created_at == session.browser_created_at
+                        && browser
+                            .image
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&session.browser_exe_path) =>
+                {
+                    browser
+                }
+                _ => return StorageResponse::error("NMH browser identity changed"),
+            };
+            if !is_extension_enhanced_browser(&session.browser_exe_name) {
+                return StorageResponse::success(serde_json::json!({"accepted":false}));
+            }
+            let data = match req.get("metadata") {
+                Some(data) if data.is_object() => data,
+                _ => return StorageResponse::error("Missing usage browser metadata"),
+            };
+            use tauri::Manager;
+            match app_handle
+                .state::<Arc<crate::usage::UsageRuntime>>()
+                .browser_metadata(peer.pid, browser.pid, &session.browser_exe_path, data)
+            {
+                Ok(()) => StorageResponse::success(serde_json::json!({"accepted":true})),
+                Err(error) => StorageResponse::error(&error),
+            }
         }
         "save_extension_screenshot" => {
             // Only the OS-verified owner can refresh this session.
@@ -639,7 +662,13 @@ pub fn find_nmh_session_for_pid(window_pid: u32, process_path: &str) -> Option<N
     }
     prune_dead_sessions();
     let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-    select_session(&sessions, window_pid, process_path, is_pid_descendant_of).cloned()
+    select_session(
+        &sessions,
+        window_pid,
+        process_path,
+        windows_platform::is_pid_descendant_of,
+    )
+    .cloned()
 }
 
 /// Whether any registered NMH session belongs to a process with this
@@ -729,6 +758,10 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
 }
 
 /// Send losslessly decoded extension pixels to the Rust OCR pipeline and commit results.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The OCR handoff keeps verified extension metadata and its selected route explicit."
+)]
 async fn process_extension_ocr(
     app: &tauri::AppHandle,
     storage: &StorageState,
@@ -772,6 +805,7 @@ async fn process_extension_ocr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn storage_responses_serialize_success_and_error_without_opposite_fields() {

@@ -16,6 +16,7 @@ export const searchSnapshotsAndRecaps = (query, options = {}) => withAuth(async 
       limit: options.limit || 40,
       include_semantic: options.includeSemantic ?? false,
       target: options.target ?? 'mixed',
+      sort_order: options.sortOrder ?? 'relevance',
       ranking_revision: options.rankingRevision ?? null,
     },
   });

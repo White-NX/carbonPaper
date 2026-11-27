@@ -5,8 +5,8 @@ use crate::{
     pii,
     repository::AgentRepository,
     sensitive_filter::{
-        filter_identity, filter_joined_text, filter_segment, filter_url, Rejected,
-        SensitiveFilterState,
+        filter_identity, filter_joined_text, filter_segment, filter_segment_with_findings,
+        filter_url, Rejected, SensitiveFilterState,
     },
     types::*,
 };
@@ -76,19 +76,27 @@ fn clean_blocks(
     blocks: Vec<OcrText>,
     filter: &SensitiveFilterState,
 ) -> Result<Vec<OcrText>, Rejected> {
-    let layout: Vec<_> = blocks
-        .iter()
-        .map(|v| (v.text.as_str(), pii::Bounds::from_points(&v.box_coords)))
-        .collect();
-    let contexts = pii::block_contexts(&layout);
-    let mut kept = Vec::new();
-    for (mut block, context) in blocks.into_iter().zip(contexts) {
-        if let Some(text) = filter_segment(filter, filter.mode(), &block.text, context)? {
+    let findings = filter.inspect_ocr_blocks(&ocr_layout(&blocks));
+    let mode = filter.mode();
+    let mut kept = Vec::with_capacity(blocks.len());
+    for (mut block, finding) in blocks.into_iter().zip(findings) {
+        if let Some(text) = filter_segment_with_findings(filter, mode, &block.text, &finding)? {
             block.text = text;
             kept.push(block);
         }
     }
     Ok(kept)
+}
+pub(crate) fn ocr_layout(blocks: &[OcrText]) -> Vec<(&str, Option<pii::Bounds>)> {
+    blocks
+        .iter()
+        .map(|block| {
+            (
+                block.text.as_str(),
+                pii::Bounds::from_points(&block.box_coords),
+            )
+        })
+        .collect()
 }
 fn clean_summary(mut v: SummaryText, filter: &SensitiveFilterState) -> Option<SummaryText> {
     for slot in [&mut v.title, &mut v.summary, &mut v.ocr_summary] {

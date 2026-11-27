@@ -113,8 +113,8 @@ impl StorageState {
                 let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
                     let mut stmt = conn
                         .prepare(
-                            "SELECT id, text_enc, text_key_encrypted
-                         FROM ocr_results
+                            "SELECT id, text_enc, text_key_ref
+                         FROM ocr_results_read
                          WHERE id > ?1 AND is_deleted = 0
                          ORDER BY id ASC
                          LIMIT ?2",

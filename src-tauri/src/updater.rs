@@ -51,7 +51,7 @@ fn update_signature_public_key_b64() -> Result<String, String> {
         .ok_or_else(|| "Update signature public key is not configured".to_string())
 }
 
-fn verify_update_manifest_signature(manifest: &UpdateManifest) -> Result<(), String> {
+pub(crate) fn verify_update_manifest_signature(manifest: &UpdateManifest) -> Result<(), String> {
     let public_key = base64::engine::general_purpose::STANDARD
         .decode(update_signature_public_key_b64()?)
         .map_err(|e| format!("Invalid update public key encoding: {e}"))?;

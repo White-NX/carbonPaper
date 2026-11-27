@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpat
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyPrivilegedImports } from './privileged-imports.mjs';
+import { developmentInstanceId, pruneDevelopmentCaches, touchDevelopmentCache } from './rust-cache.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 export const DEVELOPMENT_NATIVE_PROFILE = 'dev-service';
@@ -21,8 +22,7 @@ export function tauriDevArguments(workspace, args = []) {
 export function developmentConfiguration(workspace, { scope = 'interactive', localAppData = process.env.LOCALAPPDATA } = {}) {
   if (!localAppData) throw new Error('LOCALAPPDATA is required for the Windows development instance');
   const canonical = realpathSync(workspace);
-  const instance = createHash('sha256').update(`${canonical.toLowerCase()}\0${path.resolve(localAppData).toLowerCase()}\0${scope}`)
-    .digest('hex').slice(0, 16);
+  const instance = developmentInstanceId(canonical, { localAppData, scope });
   const directory = path.join(localAppData, `CarbonPaperDev-${instance}`);
   mkdirSync(directory, { recursive: true });
   const seedPath = path.join(directory, 'signing-seed.txt');
@@ -63,6 +63,7 @@ function sha256(file) { return createHash('sha256').update(readFileSync(file)).d
 export function prepareNativeComponents(configuration) {
   const crate = path.join(configuration.workspace, 'src-tauri', 'app-bound');
   const target = path.join(crate, 'target', `development-${configuration.instance}`);
+  touchDevelopmentCache(configuration.workspace, target);
   const environment = { ...configuration.environment, CARGO_TARGET_DIR: target,
     RUSTFLAGS: `${configuration.environment.RUSTFLAGS || ''} -C target-feature=+crt-static`.trim() };
   delete environment.CARGO_ENCODED_RUSTFLAGS;
@@ -77,7 +78,8 @@ export function prepareNativeComponents(configuration) {
   for (const file of [...rustFiles(path.join(crate, 'src')), ...rustFiles(path.join(agentCrate, 'src')),
     ...rustFiles(path.join(configuration.workspace, 'src-tauri', 'src', 'pii')),
     ...['mcp_contract.rs', 'sensitive_filter.rs', 'semantic_models.rs', 'ml_protocol.rs', 'mcp_server/page.rs',
-      'recap_text_contract.rs', 'storage/search_plan.rs', 'storage/search_rank.rs']
+      'ocr_layout.rs', 'recap_text_contract.rs', 'storage/blind_index.rs', 'storage/ocr_blocks/codec.rs',
+      'storage/ocr_keys/wire.rs', 'storage/search_plan.rs', 'storage/search_rank.rs']
       .map(name => path.join(configuration.workspace, 'src-tauri', 'src', name)),
     path.join(agentCrate, 'Cargo.toml'), path.join(agentCrate, 'Cargo.lock'), path.join(agentCrate, 'build.rs'), path.join(crate, 'Cargo.toml'),
     path.join(crate, 'Cargo.lock'), path.join(crate, 'build.rs')].sort()) {
@@ -118,6 +120,8 @@ async function main() {
   if (process.env.CARBONPAPER_APP_BOUND_DEV_INSTANCE && process.env.CARBONPAPER_APP_BOUND_DEV_INSTANCE !== configuration.instance) {
     throw new Error('The requested development instance does not match this workspace');
   }
+  const expired = pruneDevelopmentCaches(root);
+  if (expired.length) console.log(`[app-bound dev] Removed ${expired.length} expired build cache(s).`);
   const native = prepareNativeComponents(configuration);
   if (mode === '--prepare-native') return;
   if (mode === '--test-core') {

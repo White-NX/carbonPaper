@@ -163,7 +163,7 @@ async fn smart_cluster_completes_after_other_consumers_on_a_locked_restart() {
         &anchors,
         |query, docs| {
             assert_eq!(query, "development");
-            assert_eq!(docs, [expected_doc.clone()]);
+            assert_eq!(docs.as_slice(), std::slice::from_ref(&expected_doc));
             ready(Ok(vec![4.0]))
         },
         || None,

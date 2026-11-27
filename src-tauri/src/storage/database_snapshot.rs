@@ -37,6 +37,9 @@ pub(crate) const DATABASE_RUNTIME_FILE_NAMES: [&str; 4] = [
 ];
 
 pub(crate) const BACKUP_FORMAT_VERSION: u32 = 2;
+// Complete exports retain format 2 compatibility. Only declared omissions use
+// format 3, so older importers explicitly reject archives they cannot preserve.
+pub(crate) const PORTABLE_BACKUP_FORMAT_VERSION: u32 = 3;
 const RESTORE_ENTRY_NAMES: [&str; 8] = [
     DATABASE_FILE_NAME,
     DATABASE_WAL_FILE_NAME,
@@ -103,15 +106,37 @@ pub(crate) struct BackupManifest {
     pub(crate) format_version: u32,
     pub(crate) journal_mode: String,
     pub(crate) database_files: Vec<BackupDatabaseFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) missing_screenshots: Vec<MissingScreenshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MissingScreenshot {
+    pub(crate) screenshot_id: i64,
+    pub(crate) image_path: String,
+    pub(crate) reason: MissingScreenshotReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MissingScreenshotReason {
+    NotFound,
 }
 
 impl BackupManifest {
     pub(crate) fn mode(&self) -> Result<SnapshotJournalMode, String> {
-        if self.format_version != BACKUP_FORMAT_VERSION {
+        if !matches!(
+            self.format_version,
+            BACKUP_FORMAT_VERSION | PORTABLE_BACKUP_FORMAT_VERSION
+        ) {
             return Err(format!(
                 "Unsupported backup format version: {}",
                 self.format_version
             ));
+        }
+        if self.format_version == BACKUP_FORMAT_VERSION && !self.missing_screenshots.is_empty() {
+            return Err("Missing screenshot declarations require backup format 3".into());
         }
         SnapshotJournalMode::parse(&self.journal_mode)
     }
@@ -185,11 +210,13 @@ impl Drop for TemporaryDirectory {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct DatabaseSnapshot {
     directory: TemporaryDirectory,
     pub(crate) manifest: BackupManifest,
 }
 
+#[cfg(test)]
 impl DatabaseSnapshot {
     pub(crate) fn path(&self) -> &Path {
         self.directory.path()
@@ -265,6 +292,10 @@ pub(crate) fn fingerprint_file(path: &Path) -> Result<BackupDatabaseFile, String
 }
 
 pub(crate) fn copy_file_verified(source: &Path, target: &Path) -> Result<u64, String> {
+    Ok(copy_file_fingerprinted(source, target)?.size)
+}
+
+fn copy_file_fingerprinted(source: &Path, target: &Path) -> Result<BackupDatabaseFile, String> {
     let source_metadata = std::fs::symlink_metadata(source).map_err(|error| {
         format!(
             "Failed to inspect source file {}: {error}",
@@ -287,13 +318,30 @@ pub(crate) fn copy_file_verified(source: &Path, target: &Path) -> Result<u64, St
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create directory {}: {error}", parent.display()))?;
     }
-    std::fs::copy(source, target).map_err(|error| {
-        format!(
-            "Failed to copy {} to {}: {error}",
-            source.display(),
-            target.display()
-        )
-    })?;
+    let mut input = File::open(source)
+        .map_err(|error| format!("Failed to open {}: {error}", source.display()))?;
+    // Never follow or truncate a preexisting target, including a symlink.
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|error| format!("Failed to create {}: {error}", target.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| format!("Failed to read {}: {error}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("Failed to write {}: {error}", target.display()))?;
+        hasher.update(&buffer[..read]);
+    }
+    output.flush().map_err(|error| error.to_string())?;
+    drop(output);
 
     let source_size = source_metadata.len();
     let target_metadata = std::fs::symlink_metadata(target)
@@ -311,7 +359,7 @@ pub(crate) fn copy_file_verified(source: &Path, target: &Path) -> Result<u64, St
             source.display()
         ));
     }
-    let source_hash = sha256_file(source)?;
+    let source_hash = hex::encode(hasher.finalize());
     let target_hash = sha256_file(target)?;
     if source_hash != target_hash {
         return Err(format!(
@@ -319,7 +367,15 @@ pub(crate) fn copy_file_verified(source: &Path, target: &Path) -> Result<u64, St
             source.display()
         ));
     }
-    Ok(target_size)
+    Ok(BackupDatabaseFile {
+        path: target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("Invalid copied file name")?
+            .to_string(),
+        size: target_size,
+        sha256: target_hash,
+    })
 }
 
 fn database_names_for_snapshot(
@@ -398,17 +454,18 @@ pub(crate) fn copy_database_group(
     for name in names {
         let source = source_directory.join(name);
         let target = target_directory.join(name);
-        copy_file_verified(&source, &target)?;
-        database_files.push(fingerprint_file(&target)?);
+        database_files.push(copy_file_fingerprinted(&source, &target)?);
     }
 
     Ok(BackupManifest {
         format_version: BACKUP_FORMAT_VERSION,
         journal_mode: mode.as_str().to_string(),
         database_files,
+        missing_screenshots: Vec::new(),
     })
 }
 
+#[cfg(test)]
 pub(crate) fn create_database_snapshot(
     source_directory: &Path,
     journal_mode: &str,
@@ -420,6 +477,85 @@ pub(crate) fn create_database_snapshot(
         directory,
         manifest,
     })
+}
+
+/// Copy a consistent SQLCipher view, including committed WAL pages, without
+/// closing the resident store. The caller fences producers and owns its primary
+/// connection for this operation. This mutable export copy has no fingerprint:
+/// its final bytes are hashed once, while writing the archive after normalization.
+pub(crate) fn create_export_snapshot(
+    source: &Connection,
+    database_key: &[u8],
+    temporary_parent: &Path,
+    mut check: impl FnMut() -> Result<(), String>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<TemporaryDirectory, String> {
+    use rusqlite::backup::{Backup, StepResult};
+    use std::time::{Duration, Instant};
+
+    check()?;
+    progress(0, 0);
+    let started = Instant::now();
+    let directory = TemporaryDirectory::create(temporary_parent, "carbonpaper-export-snapshot")?;
+    let mut destination = Connection::open(directory.path().join(DATABASE_FILE_NAME))
+        .map_err(|error| format!("Failed to open export snapshot: {error}"))?;
+    connection::configure_sqlcipher_connection(&destination, database_key)
+        .map_err(|error| format!("Failed to configure encrypted export snapshot: {error}"))?;
+    {
+        let backup = Backup::new(source, &mut destination)
+            .map_err(|error| format!("Failed to start database snapshot: {error}"))?;
+        let mut stalled_since = None;
+        loop {
+            check()?;
+            let result = backup
+                .step(256)
+                .map_err(|error| format!("Failed to copy database snapshot: {error}"))?;
+            let status = backup.progress();
+            progress(
+                (status.pagecount - status.remaining).max(0) as u64,
+                status.pagecount.max(0) as u64,
+            );
+            match result {
+                StepResult::Done => break,
+                StepResult::More => stalled_since = None,
+                StepResult::Busy | StepResult::Locked => {
+                    if stalled_since.get_or_insert_with(Instant::now).elapsed()
+                        >= connection::BUSY_TIMEOUT
+                    {
+                        return Err("Database snapshot remained busy".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return Err("Unexpected database snapshot state".into()),
+            }
+        }
+    }
+    check()?;
+    // SQLite copies the source journal-mode header. Checkpoint and normalize
+    // only the destination so subsequent key/path edits need no WAL sidecars.
+    let checkpoint: (i64, i64, i64) = destination
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| error.to_string())?;
+    if checkpoint.0 != 0 {
+        return Err("Export snapshot checkpoint is busy".into());
+    }
+    let mode: String = destination
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err("Export snapshot could not leave WAL mode".into());
+    }
+    destination
+        .close()
+        .map_err(|(_, error)| error.to_string())?;
+    tracing::info!(
+        phase = "snapshot",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Backup export phase completed"
+    );
+    Ok(directory)
 }
 
 /// Directories a backup carries besides the database group. `chroma_db` is
@@ -859,10 +995,16 @@ where
                 format_version: BACKUP_FORMAT_VERSION,
                 journal_mode: SnapshotJournalMode::Delete.as_str().to_string(),
                 database_files: vec![database],
+                missing_screenshots: Vec::new(),
             },
             true,
         )
     };
+    if !portable && !manifest.missing_screenshots.is_empty() {
+        return Err(
+            "Missing screenshot declarations require an authenticated portable backup".into(),
+        );
+    }
     validate_database_file_set(&manifest, &actual)?;
 
     Ok(ExtractedBackup {

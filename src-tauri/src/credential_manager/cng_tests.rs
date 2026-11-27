@@ -104,6 +104,24 @@ fn native_fixture() -> (CredentialManagerState, Vec<u8>) {
     (state, ciphertext)
 }
 
+#[test]
+fn native_row_key_unwrap_enforces_the_fixed_content_key_length() {
+    let key = ephemeral_key();
+    for length in [31, MASTER_KEY_LEN, 33] {
+        let plain = vec![7; length];
+        let encrypted = wrap_for_test(&key, &plain);
+        let result = key.unwrap_row_key(&encrypted);
+        if length == MASTER_KEY_LEN {
+            assert_eq!(result.unwrap(), plain);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    let mut corrupt = wrap_for_test(&key, &[7; MASTER_KEY_LEN]);
+    corrupt[0] ^= 1;
+    assert!(key.unwrap_row_key(&corrupt).is_err());
+}
+
 fn public_blob(key: &CngKeyHandle) -> Vec<u8> {
     let blob = HSTRING::from("RSAPUBLICBLOB");
     let mut length = 0;
@@ -181,15 +199,24 @@ pub(crate) fn reopen_storage_credentials(
 }
 
 #[test]
-fn native_rsa_decryption_preserves_plaintext_lengths_and_rejects_truncated_ciphertext() {
+fn native_rsa_preserves_plaintext_lengths_and_enforces_the_row_key_contract() {
     let key = ephemeral_key();
     for length in [1, MASTER_KEY_LEN, 96] {
         let plaintext = vec![7; length];
         let ciphertext = wrap_for_test(&key, &plaintext);
-        assert_eq!(key.unwrap_row_key(&ciphertext).unwrap(), plaintext);
-        assert!(key
-            .unwrap_row_key(&ciphertext[..ciphertext.len() / 2])
-            .is_err());
+        assert_eq!(
+            key.decrypt_for_window(&ciphertext, None).unwrap(),
+            plaintext
+        );
+        let unwrapped = key.unwrap_row_key(&ciphertext);
+        if length == MASTER_KEY_LEN {
+            assert_eq!(unwrapped.unwrap(), plaintext);
+        } else {
+            assert!(unwrapped.is_err());
+        }
+        let truncated = &ciphertext[..ciphertext.len() / 2];
+        assert!(key.decrypt_for_window(truncated, None).is_err());
+        assert!(key.unwrap_row_key(truncated).is_err());
     }
 }
 

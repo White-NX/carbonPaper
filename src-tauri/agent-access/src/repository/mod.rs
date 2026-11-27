@@ -1,4 +1,5 @@
 use crate::{
+    ocr_block_codec, ocr_key_wire, ocr_layout,
     source::{self, ArchiveReader, RawOcr},
     types::*,
 };
@@ -331,7 +332,10 @@ impl AgentRepository {
         if self.snapshot(id)?.is_none() {
             return Ok(Vec::new());
         }
-        self.hydrate_ocr(self.source()?.ocr(id)?)
+        self.ocr_for_screenshots(&[id])
+    }
+    pub(crate) fn ocr_for_screenshots(&self, ids: &[i64]) -> Result<Vec<OcrText>, String> {
+        self.hydrate_ocr(self.source()?.ocr_for_screenshots(ids)?)
     }
     pub fn ocr_ids(&self, ids: &[i64]) -> Result<Vec<OcrText>, String> {
         self.hydrate_ocr(self.source()?.ocr_ids(ids)?)
@@ -354,14 +358,23 @@ impl AgentRepository {
     fn hydrate_ocr(&self, rows: Vec<RawOcr>) -> Result<Vec<OcrText>, String> {
         let mut access = db(self.conn.prepare_cached("SELECT screenshot_id,payload_digest,key_envelope FROM ocr_access WHERE ocr_id=?1 AND key_envelope IS NOT NULL"))?;
         let mut output = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut blocks = HashMap::<i64, (ocr_block_codec::Decoded, Option<i64>)>::new();
+        let mut block_bytes = 0;
+        for mut row in rows {
             let grant: Option<(i64, Vec<u8>, Vec<u8>)> = db(access
                 .query_row([row.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional())?;
             let Some((screenshot, digest, sealed)) = grant else {
                 return Err("AGENT_SYNC_INCOMPLETE: OCR authorization is unavailable".into());
             };
-            if screenshot != row.screenshot_id || source::digest(&row.ciphertext) != digest {
+            let source_digest = match (row.slot, &row.key, row.ciphertext.as_deref()) {
+                (Some(slot), Some(key), None) => {
+                    source::ocr_block_digest(key.id, slot, &key.scope_tag).to_vec()
+                }
+                (None, _, Some(bytes)) => source::digest(bytes),
+                _ => return Err("AGENT_INVALID_OCR_SOURCE".into()),
+            };
+            if screenshot != row.screenshot_id || digest != source_digest {
                 return Err("AGENT_SOURCE_CHANGED".into());
             }
             let key = source::open_key(
@@ -372,11 +385,51 @@ impl AgentRepository {
                 &digest,
                 &sealed,
             )?;
-            let plain = Zeroizing::new(
-                carbonpaper_app_bound::crypto::decrypt_storage_bytes(&key, &row.ciphertext)
-                    .map_err(|_| "AGENT_SOURCE_INTEGRITY_FAILED")?,
-            );
-            let text = String::from_utf8(plain.to_vec()).map_err(|_| "AGENT_INVALID_OCR")?;
+            let dataset = &self.binding.dataset_id;
+            let integrity = |_| "AGENT_SOURCE_INTEGRITY_FAILED";
+            if let Some(group) = &row.key {
+                ocr_key_wire::verify_scope(&key, dataset, screenshot, group.id, &group.scope_tag)
+                    .map_err(integrity)?;
+            }
+            let text = if let (Some(slot), Some(group)) = (row.slot, &row.key) {
+                if !blocks.contains_key(&group.id) {
+                    let (ciphertext, processed_at) =
+                        self.source()?.ocr_block(group.id, screenshot)?;
+                    let aad = ocr_key_wire::block_aad(dataset, screenshot, group.id)
+                        .map_err(integrity)?;
+                    let plain = Zeroizing::new(
+                        ocr_key_wire::open(&key, &aad, &ciphertext).map_err(integrity)?,
+                    );
+                    let block = ocr_block_codec::Decoded::open(&plain)?;
+                    if block_bytes + block.size() > 4 * 1024 * 1024 {
+                        blocks.clear();
+                        block_bytes = 0;
+                    }
+                    block_bytes += block.size();
+                    blocks.insert(group.id, (block, processed_at));
+                }
+                let (block, processed_at) = &blocks[&group.id];
+                let slot = usize::try_from(slot).map_err(|_| "AGENT_INVALID_OCR_SOURCE")?;
+                let metadata = block.metadata_for(slot, row.id)?;
+                row.confidence = metadata.confidence;
+                row.coordinates = metadata.box_coords.into_iter().map(Vec::from).collect();
+                row.processed_at_ms = row.processed_at_ms.or(*processed_at);
+                block.text(slot, row.id)?.to_owned()
+            } else {
+                let ciphertext = row
+                    .ciphertext
+                    .as_deref()
+                    .ok_or("AGENT_INVALID_OCR_SOURCE")?;
+                let plain = Zeroizing::new(if let Some(group) = &row.key {
+                    let aad = ocr_key_wire::aad(dataset, screenshot, group.id, row.id)
+                        .map_err(integrity)?;
+                    ocr_key_wire::open(&key, &aad, ciphertext).map_err(integrity)?
+                } else {
+                    carbonpaper_app_bound::crypto::decrypt_storage_bytes(&key, ciphertext)
+                        .map_err(|_| "AGENT_SOURCE_INTEGRITY_FAILED")?
+                });
+                ocr_layout::decode_text(&plain)?.to_owned()
+            };
             output.push(OcrText {
                 ocr_id: row.id,
                 screenshot_id: row.screenshot_id,

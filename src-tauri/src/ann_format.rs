@@ -147,6 +147,10 @@ pub struct Header {
 }
 
 impl Header {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Constructs the fixed authenticated header from snapshot and model metadata."
+    )]
     pub fn for_snapshot(
         generation: u64,
         covered_epoch: u64,
@@ -385,7 +389,7 @@ impl Header {
             .ok_or("ANN sidecar offset table overflow")?;
         if self.key_offsets_offset != HEADER_BYTES
             || self.keys_offset != self.key_offsets_offset.saturating_add(offset_bytes)
-            || self.vectors_offset % VECTOR_ALIGNMENT != 0
+            || !self.vectors_offset.is_multiple_of(VECTOR_ALIGNMENT)
             || self
                 .keys_offset
                 .checked_add(self.keys_bytes)
@@ -423,6 +427,10 @@ pub(crate) enum AnnReadError {
 
 enum FlatBacking {
     Mapped(Mmap),
+    #[allow(
+        dead_code,
+        reason = "The separately compiled ML worker reads owned checkpoint bytes."
+    )]
     Owned(Vec<u8>),
 }
 impl std::ops::Deref for FlatBacking {
@@ -478,6 +486,10 @@ impl MappedFlatIndex {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "The ML worker uses string errors; desktop reads use open_checked."
+    )]
     pub fn open(path: &Path, encryption: Arc<CipherKey>) -> Result<Self, String> {
         Self::open_checked(path, encryption)
             .map_err(|error| format!("Failed to load ANN sidecar {}: {error}", path.display()))
@@ -488,11 +500,17 @@ impl MappedFlatIndex {
         encryption: Arc<CipherKey>,
     ) -> Result<Self, AnnReadError> {
         let file = File::open(path)?;
+        // SAFETY: published sidecars are immutable; writers publish replacements.
+        // This index owns the mapping and file, and bounds-checks parsed offsets.
         let map = unsafe { MmapOptions::new().map(&file) }?;
         Self::from_backing(Some(file), FlatBacking::Mapped(map), encryption)
             .map_err(AnnReadError::Invalid)
     }
 
+    #[allow(
+        dead_code,
+        reason = "The separately compiled ML worker reads owned checkpoint bytes."
+    )]
     pub fn from_bytes(bytes: Vec<u8>, encryption: Arc<CipherKey>) -> Result<Self, String> {
         Self::from_backing(None, FlatBacking::Owned(bytes), encryption)
     }
@@ -546,8 +564,10 @@ impl MappedFlatIndex {
         let plaintext = self.encryption.open(&identity, bytes)?;
         let vector = Zeroizing::new(
             plaintext
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect::<Vec<_>>(),
         );
         if vector.len() != self.header.dimensions as usize
@@ -726,7 +746,7 @@ impl FlatFileWriter {
         let mut payload = Vec::new();
         let payload_bytes = keys
             .iter()
-            .map(|key| key.as_bytes().len())
+            .map(|key| key.len())
             .try_fold(0usize, |total, len| total.checked_add(len))
             .ok_or("ANN key bytes overflow")?;
         payload.reserve(payload_bytes);
@@ -737,7 +757,7 @@ impl FlatFileWriter {
             }
             offsets.extend_from_slice(&next_offset.to_le_bytes());
             next_offset = next_offset
-                .checked_add(key.as_bytes().len() as u64)
+                .checked_add(key.len() as u64)
                 .ok_or("ANN key bytes overflow")?;
             payload.extend_from_slice(key.as_bytes());
         }
@@ -860,9 +880,7 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, String> {
 }
 
 fn validate_text(name: &str, value: &str, field_bytes: usize) -> Result<(), String> {
-    if value.as_bytes().len() > field_bytes.saturating_sub(2)
-        || value.as_bytes().len() > MAX_TEXT_BYTES
-    {
+    if value.len() > field_bytes.saturating_sub(2) || value.len() > MAX_TEXT_BYTES {
         return Err(format!("ANN {name} is too long"));
     }
     Ok(())
@@ -870,7 +888,7 @@ fn validate_text(name: &str, value: &str, field_bytes: usize) -> Result<(), Stri
 
 fn put_text(bytes: &mut [u8], offset: usize, width: usize, value: &str) -> Result<(), String> {
     validate_text("header text", value, width)?;
-    let len = value.as_bytes().len();
+    let len = value.len();
     bytes[offset..offset + 2].copy_from_slice(&(len as u16).to_le_bytes());
     bytes[offset + 2..offset + 2 + len].copy_from_slice(value.as_bytes());
     Ok(())
@@ -984,7 +1002,7 @@ mod tests {
         let path = dir.join("clip.cpdvec");
         let keys = vec!["图像-a".to_string(), "hash-b".to_string()];
         let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let key_bytes = keys.iter().map(|key| key.as_bytes().len() as u64).sum();
+        let key_bytes = keys.iter().map(|key| key.len() as u64).sum();
         let header = Header::for_snapshot(
             7,
             11,

@@ -3,6 +3,8 @@
 use super::*;
 use sha2::Digest;
 
+type StoredStorageKeyRow = (String, Option<Vec<u8>>, Option<String>, bool);
+
 impl Ledger {
     pub(super) fn init_storage_keys(conn: &Connection) -> Result<()> {
         db(conn.execute_batch("CREATE TABLE IF NOT EXISTS storage_public_keys (
@@ -94,7 +96,7 @@ impl Ledger {
         }) {
             return Err(BrokerError::Integrity);
         }
-        let stored: Option<(String, Option<Vec<u8>>, Option<String>, bool)> = db(conn
+        let stored: Option<StoredStorageKeyRow> = db(conn
             .query_row(
                 "SELECT binding,key_blob,key_digest,write_origin FROM storage_keys WHERE owner=?1 AND id=?2 AND dataset=?3",
                 params![who.sid, binding.key_id, binding.dataset_id],

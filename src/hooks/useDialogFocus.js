@@ -3,10 +3,13 @@ import { useActiveOverlay } from '../components/overlay/coordinator';
 import { OVERLAY_FOCUS_ORDER } from '../components/overlay/layers';
 
 export const DialogVisibilityContext = createContext(true);
-export function useDialogVisibility(isOpen, allowWhenLocked = false) {
+export function useDialogVisibility(isOpen, allowWhenLocked = false, ownerOverlay = null) {
   const authenticated = useContext(DialogVisibilityContext);
   const activeOverlay = useActiveOverlay();
-  const hasScreen = activeOverlay === null || (allowWhenLocked && activeOverlay === 'auth');
+  // A startup prompt may own a child confirmation while it holds the screen.
+  // Its children still yield to authentication and every other startup slot.
+  const hasScreen = activeOverlay === null || activeOverlay === ownerOverlay
+    || (allowWhenLocked && activeOverlay === 'auth');
   return Boolean(isOpen && (authenticated || allowWhenLocked) && hasScreen);
 }
 

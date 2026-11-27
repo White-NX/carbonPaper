@@ -245,7 +245,7 @@ fn safe_shapes(text: &str) -> Vec<Range<usize>> {
         }
         let parts: Vec<&str> = m
             .as_str()
-            .trim_start_matches(|c| c == 'v' || c == 'V')
+            .trim_start_matches(['v', 'V'])
             .split('.')
             .collect();
         let digits: usize = parts.iter().map(|part| part.len()).sum();

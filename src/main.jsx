@@ -1,10 +1,11 @@
-import React from 'react'
+import React, { lazy, Suspense } from 'react'
 import ReactDOM from 'react-dom/client'
-import App from './App.jsx'
-import SnapshotPreviewStandalone from './components/SnapshotPreviewStandalone.jsx'
-import SettingsWindow from './components/settings/SettingsWindow.jsx'
 import './index.css'
 import './i18n'
+
+const App = lazy(() => import('./App.jsx'))
+const SnapshotPreviewStandalone = lazy(() => import('./components/SnapshotPreviewStandalone.jsx'))
+const SettingsWindow = lazy(() => import('./components/settings/SettingsWindow.jsx'))
 
 const params = new URLSearchParams(window.location.search)
 const RootComponent = params.get('window') === 'snapshot-preview'
@@ -13,6 +14,8 @@ const RootComponent = params.get('window') === 'snapshot-preview'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <RootComponent />
+    <Suspense fallback={null}>
+      <RootComponent />
+    </Suspense>
   </React.StrictMode>,
 )

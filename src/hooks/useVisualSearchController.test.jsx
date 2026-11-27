@@ -20,6 +20,26 @@ describe('visual search controller', () => {
     searchScreenshots.mockReset().mockResolvedValue([]);
     fetchThumbnailBatch.mockReset().mockImplementation(async (ids) => Object.fromEntries(ids.map((id) => [id, `thumbnail-${id}`])));
   });
+
+  it('preserves first-page timeout diagnostics and reports visual elapsed time', async () => {
+    const message = 'CLIP search unavailable: query_deadline_exceeded';
+    searchScreenshots.mockRejectedValueOnce(new Error(message));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { result } = renderHook(useVisualSearchController, { initialProps: props() });
+    await waitFor(() => expect(result.current.phase).toBe('error'));
+    expect(result.current.errorKind).toBe('timeout');
+    expect(result.current.errorMessage).toBe(message);
+    expect(result.current.elapsedMs).toEqual(expect.any(Number));
+    expect(log).toHaveBeenCalledWith('Visual search failed:', message);
+    log.mockRestore();
+  });
+
+  it('does not report ANN readiness for chronological searches', async () => {
+    const { result } = renderHook(useVisualSearchController, { initialProps: { ...props(), sortOrder: 'newest' } });
+    await waitFor(() => expect(result.current.phase).toBe('ready'));
+    expect(result.current.indexReady).toBeNull();
+    expect(getClipSearchStatus).not.toHaveBeenCalled();
+  });
   afterEach(() => vi.useRealTimers());
 
   it('reports pending readiness while retrieval runs and refreshes it without restarting the search', async () => {
@@ -266,5 +286,26 @@ describe('visual search controller', () => {
     rerender({ ...initial, active: false });
     rerender({ ...initial, query: '', debouncedQuery: '' });
     expect(searchScreenshots).toHaveBeenCalledTimes(3);
+  });
+
+  it('starts a new result set on sorting changes and keeps the order through gallery pagination', async () => {
+    let finishOld;
+    searchScreenshots.mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }))
+      .mockImplementation(async (_query, _mode, options) => options.limit === 50 ? galleryPage(options.offset + 100) : page(100));
+    const initial = props();
+    const { result, rerender } = renderHook(useVisualSearchController, { initialProps: initial });
+    await waitFor(() => expect(finishOld).toEqual(expect.any(Function)));
+    const previousKey = result.current.searchKey;
+    rerender({ ...initial, sortOrder: 'newest' });
+    expect(result.current.searchKey).not.toBe(previousKey);
+    expect(result.current.results).toEqual([]);
+    await act(async () => finishOld(page()));
+    await waitFor(() => expect(result.current.results[0]?.screenshot_id).toBe(101));
+    expect(searchScreenshots.mock.calls.map(([, , options]) => options.sortOrder)).toEqual(['relevance', 'newest']);
+    await act(async () => result.current.loadGalleryPage());
+    await act(async () => result.current.loadGalleryPage());
+    expect(searchScreenshots.mock.calls.slice(1).map(([, , options]) => [options.sortOrder, options.offset, options.limit]))
+      .toEqual([['newest', 0, 10], ['newest', 0, 50], ['newest', 50, 50]]);
+    expect(result.current.results.map((match) => match.screenshot_id)).not.toContain(1);
   });
 });

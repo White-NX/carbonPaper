@@ -90,6 +90,30 @@ pub fn read_day_view(
     })
 }
 
+/// Calendar and MCP discovery share the same content, privacy and session rules.
+pub fn read_days(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
+    let credentials = app.state::<Arc<CredentialManagerState>>();
+    if !credentials.is_session_valid() {
+        return Err("AUTH_REQUIRED".into());
+    }
+    if crate::maintenance::is_active() {
+        return Err("MAINTENANCE_IN_PROGRESS".into());
+    }
+    let storage = app.state::<Arc<StorageState>>();
+    let generation = storage.db_generation();
+    let privacy = privacy_fingerprint(app)?;
+    let dates = storage.recap_list_days(privacy.as_str())?;
+    if !credentials.is_session_valid() {
+        return Err("AUTH_REQUIRED".into());
+    }
+    if generation != storage.db_generation()
+        || privacy.as_str() != privacy_fingerprint(app)?.as_str()
+    {
+        return Err("RECAP_SOURCE_CHANGED".into());
+    }
+    Ok(dates)
+}
+
 /// Project a corrected day while fencing session, privacy and source changes.
 /// Tool callers use this without loading UI icons or exporting diagnostics.
 pub(crate) fn with_current_day<T>(
@@ -297,6 +321,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: RecapUsage::default(),
             can_undo: false,
@@ -333,6 +358,7 @@ mod tests {
             mainlines: None,
             mainlines_error: None,
             mainlines_updated_at_ms: 0,
+            mainlines_pending: false,
             mainlines_attempts: vec![],
             usage: RecapUsage::default(),
             can_undo: false,

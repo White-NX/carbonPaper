@@ -49,6 +49,26 @@ impl crate::processing_stage::Broker for OfflineBroker {
 }
 
 struct RetirementFailureBroker(AtomicBool);
+
+struct QueuedOfflineBroker(std::sync::Mutex<Vec<carbonpaper_app_bound::revocation::Revocation>>);
+impl crate::processing_stage::Broker for QueuedOfflineBroker {
+    fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
+        Ok(true)
+    }
+    fn supported(&self) -> bool {
+        true
+    }
+    fn call(&self, _: Request) -> carbonpaper_app_bound::protocol::Result<Response> {
+        Err(BrokerError::Unavailable)
+    }
+    fn persist_revocation(
+        &self,
+        intent: carbonpaper_app_bound::revocation::Revocation,
+    ) -> carbonpaper_app_bound::protocol::Result<bool> {
+        self.0.lock().unwrap().push(intent);
+        Ok(true)
+    }
+}
 impl crate::processing_stage::Broker for RetirementFailureBroker {
     fn installed(&self) -> carbonpaper_app_bound::protocol::Result<bool> {
         if self.0.swap(false, Ordering::SeqCst) {
@@ -89,6 +109,14 @@ fn encrypted(storage: &StorageState, value: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
+    populate_with_layout(storage, plaintext_image, None)
+}
+
+fn populate_with_layout(
+    storage: &StorageState,
+    plaintext_image: bool,
+    text_layout: Option<&crate::ml_protocol::MlOcrTextLayout>,
+) -> i64 {
     let credentials = &storage.credential_state;
     let directory = storage.data_dir.lock().unwrap().clone();
     credentials.cache_master_key_for_tests(vec![9; 32]);
@@ -115,7 +143,10 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
         encrypt_with_master_key(&key, &image).unwrap()
     };
     std::fs::write(directory.join(relative), data).unwrap();
-    let (ocr, ocr_key) = encrypted(storage, "私密备份搜索内容".as_bytes());
+    let fresh_ocr_key = text_layout.map(|_| storage.new_ocr_write_key().unwrap());
+    let legacy_ocr = text_layout
+        .is_none()
+        .then(|| encrypted(storage, "私密备份搜索内容".as_bytes()));
     {
         let guard = storage.db.lock().unwrap();
         let conn = guard.as_ref().unwrap();
@@ -125,12 +156,53 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
             .unwrap();
         conn.execute("INSERT INTO screenshots(id,image_path,image_hash,window_title_enc,content_key_encrypted,process_name,created_at,status)
             VALUES(7,?1,'image-fixture',?2,?3,?4,'2026-11-05 10:00:00','committed')", params![relative, title, wrap, process]).unwrap();
-        conn.execute("INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
-            VALUES(11,7,'',?1,?2,0.99,0,0,1,0,1,1,0,1)", params![ocr, ocr_key]).unwrap();
+        let ocr = if let Some(key) = fresh_ocr_key {
+            let record = crate::storage::ocr_blocks::Record {
+                id: 11,
+                text: "私密备份搜索内容".into(),
+                text_layout: text_layout.cloned(),
+                confidence: 0.99,
+                box_coords: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            };
+            crate::storage::ocr_blocks::insert_records(conn, 7, &[record], Some(&key), || {
+                storage.new_ocr_write_key()
+            })
+            .unwrap();
+            let records = [
+                (12, "discarded backup member"),
+                (13, "retained backup member"),
+            ]
+            .map(|(id, text)| crate::storage::ocr_blocks::Record {
+                id,
+                text: text.into(),
+                text_layout: None,
+                confidence: 0.95,
+                box_coords: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            });
+            crate::storage::ocr_blocks::insert_records(conn, 7, &records, None, || {
+                storage.new_ocr_write_key()
+            })
+            .unwrap();
+            conn.execute("DELETE FROM ocr_results WHERE id=12", [])
+                .unwrap();
+            Vec::new()
+        } else {
+            let (data, key) = legacy_ocr.unwrap();
+            conn.execute("INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,text_key_encrypted,confidence,box_x1,box_y1,box_x2,box_y2,box_x3,box_y3,box_x4,box_y4)
+                VALUES(11,7,'',?1,?2,0.99,0,0,1,0,1,1,0,1)", params![data,key]).unwrap();
+            data
+        };
+        let ocr_reference = conn
+            .query_row(
+                "SELECT text_key_ref FROM ocr_results_read WHERE id=11",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
         storage
             .index_batch_internal_on_conn(
                 conn,
-                vec![(11, ocr, ocr_key)],
+                vec![(11, ocr, ocr_reference)],
                 &credentials.get_hmac_key().unwrap(),
             )
             .unwrap();
@@ -142,6 +214,13 @@ fn populate(storage: &StorageState, plaintext_image: bool) -> i64 {
             let (data, key) = encrypted(storage, value);
             conn.execute(sql, params![data, key]).unwrap();
         }
+        let vector = storage
+            .protected
+            .seal("vectors", "clip_image:image-fixture", &[0, 0, 128, 63])
+            .unwrap();
+        conn.execute("INSERT INTO derived_embeddings(index_kind,subject_key,dimensions,vector_f32,model_id,model_revision,embedding_version,source_fingerprint)
+            VALUES('clip_image','image-fixture',1,?1,'fixture','1',1,'source')", [&vector]).unwrap();
+        while crate::storage::vector_blocks::compact(conn).unwrap() != 0 {}
         conn.execute("INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash,covered_until_ms) VALUES('2026-11-05',0,2000000000000,'fixture',2000000000000)", []).unwrap();
         let (payload, key) = encrypted(storage, br#"{"private":"settings"}"#);
         conn.execute("INSERT INTO recap_payloads(kind,key,day,revision,data,row_key) VALUES('settings','fixture','2026-11-05',0,?1,?2)", params![payload, key]).unwrap();
@@ -188,21 +267,18 @@ fn image_bytes() -> Vec<u8> {
     STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4bAAAAAASUVORK5CYII=").unwrap()
 }
 
-fn export(storage: &StorageState, path: &Path) {
+fn export(storage: &StorageState, path: &Path) -> BackupSummary {
     let _maintenance = storage.database_maintenance("test backup export");
     let _operation = storage.backup.begin();
-    let mode = storage
-        .prepare_database_snapshot_under_maintenance()
-        .unwrap();
+    storage.prepare_ocr_blocks_for_backup().unwrap();
     let directory = storage.data_dir.lock().unwrap().clone();
     let key = storage.database_key().unwrap();
     let master = Zeroizing::new(get_cached_master_key(&storage.credential_state).unwrap());
-    storage.shutdown_under_maintenance().unwrap();
-    let snapshot =
-        database_snapshot::create_database_snapshot(&directory, &mode, directory.parent().unwrap())
-            .unwrap();
+    let snapshot = storage
+        .create_backup_snapshot_under_maintenance(&key, directory.parent().unwrap(), |_, _| {})
+        .unwrap();
     write_portable(
-        &snapshot,
+        snapshot.path(),
         &directory,
         &storage.credential_state,
         &key,
@@ -212,7 +288,362 @@ fn export(storage: &StorageState, path: &Path) {
         &storage.backup,
         |_, _, _| {},
     )
+    .unwrap()
+}
+
+#[test]
+fn missing_committed_image_preserves_ocr_and_metadata_across_credentials() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("missing.cpbackup");
+    let source_directory = root.path().join("source");
+    let source = storage(&source_directory);
+    populate(&source, false);
+    std::fs::remove_file(source_directory.join("screenshots/私密截图.png.enc")).unwrap();
+    let generation = source.db_generation();
+    let dataset = source.processing_dataset_id().unwrap();
+    let summary = export(&source, &archive);
+    assert_eq!(summary.missing_screenshots, 1);
+    assert!(source.is_initialized());
+    assert_eq!(source.db_generation(), generation);
+    assert_eq!(source.processing_dataset_id().unwrap(), dataset);
+    drop(source);
+
+    let destination_directory = root.path().join("destination");
+    let destination = storage(&destination_directory);
+    let _operation = destination.backup.begin();
+    let prepared = prepare(&destination, &archive, root.path());
+    assert_eq!(
+        prepared.extracted.manifest.format_version,
+        database_snapshot::PORTABLE_BACKUP_FORMAT_VERSION
+    );
+    assert_eq!(
+        prepared.extracted.manifest.missing_screenshots[0].screenshot_id,
+        7
+    );
+    {
+        let _maintenance = destination.database_maintenance("test missing screenshot import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    let credentials = destination.credential_state.clone();
+    destination.shutdown().unwrap();
+    drop(_operation);
+    drop(destination);
+    drop(prepared);
+    let credentials = crate::credential_manager::cng_tests::reopen_storage_credentials(
+        &credentials,
+        &destination_directory,
+    );
+    let reopened = open_storage(&destination_directory, credentials);
+    assert_eq!(
+        reopened.get_screenshot_ocr_results(7).unwrap()[0].text,
+        "私密备份搜索内容"
+    );
+    let screenshot = reopened.screenshots().by_id(7).unwrap().unwrap();
+    assert_eq!(
+        screenshot.window_title.as_deref(),
+        Some("Private window title")
+    );
+    let conn = reopened.db.lock().unwrap();
+    let record: (i64, String) = conn
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT is_deleted,image_path FROM screenshots WHERE id=7",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(record, (0, "screenshots/私密截图.png.enc".into()));
+    assert!(!destination_directory.join(record.1).exists());
+}
+
+#[test]
+fn export_recovers_a_stale_pending_path_only_in_its_snapshot() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("recovered.cpbackup");
+    let source_directory = root.path().join("source");
+    let source = storage(&source_directory);
+    populate(&source, false);
+    let pending = "screenshots/私密截图.png.enc.pending";
+    source
+        .db
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .execute("UPDATE screenshots SET image_path=?1 WHERE id=7", [pending])
+        .unwrap();
+    let summary = export(&source, &archive);
+    assert_eq!(summary.repaired_paths, 1);
+    assert_eq!(summary.missing_screenshots, 0);
+    assert_eq!(
+        source
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT image_path FROM screenshots WHERE id=7", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        pending
+    );
+    drop(source);
+    let destination = storage(&root.path().join("destination"));
+    let _operation = destination.backup.begin();
+    let prepared = prepare(&destination, &archive, root.path());
+    {
+        let _maintenance = destination.database_maintenance("test pending image import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    destination.credential_state.update_auth_time();
+    assert_eq!(
+        STANDARD
+            .decode(destination.read_image_by_id(7).unwrap().0)
+            .unwrap(),
+        image_bytes()
+    );
+}
+
+#[test]
+fn images_removed_after_inventory_are_declared_in_the_completed_archive() {
+    for removal_phase in ["scan", "files"] {
+        let root = TempDir::new().unwrap();
+        let source_directory = root.path().join("source");
+        let archive = root.path().join("late-missing.cpbackup");
+        let source = storage(&source_directory);
+        populate(&source, false);
+        let _operation = source.backup.begin();
+        let snapshot = source
+            .create_backup_snapshot_under_maintenance(
+                &source.database_key().unwrap(),
+                root.path(),
+                |_, _| {},
+            )
+            .unwrap();
+        let mut removed = false;
+        let summary = write_portable(
+            snapshot.path(),
+            &source_directory,
+            &source.credential_state,
+            &source.database_key().unwrap(),
+            &[9; 32],
+            "backup-password",
+            &archive,
+            &source.backup,
+            |phase, _, _| {
+                if phase == removal_phase && !removed {
+                    std::fs::remove_file(source_directory.join("screenshots/私密截图.png.enc"))
+                        .unwrap();
+                    removed = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(removed);
+        assert_eq!(summary.missing_screenshots, 1);
+        let destination = storage(&root.path().join("destination"));
+        let _operation = destination.backup.begin();
+        let prepared = prepare(&destination, &archive, root.path());
+        assert_eq!(prepared.extracted.manifest.missing_screenshots.len(), 1);
+        assert_eq!(
+            prepared.extracted.manifest.missing_screenshots[0].screenshot_id,
+            7
+        );
+    }
+}
+
+#[test]
+fn corrupt_image_aborts_export_with_context_and_preserves_the_previous_backup() {
+    let root = TempDir::new().unwrap();
+    let source_directory = root.path().join("source");
+    let archive = root.path().join("existing.cpbackup");
+    std::fs::write(&archive, b"previous valid backup").unwrap();
+    let source = storage(&source_directory);
+    populate(&source, false);
+    let image = source_directory.join("screenshots/私密截图.png.enc");
+    let mut bytes = std::fs::read(&image).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&image, bytes).unwrap();
+    let _operation = source.backup.begin();
+    let snapshot = source
+        .create_backup_snapshot_under_maintenance(
+            &source.database_key().unwrap(),
+            root.path(),
+            |_, _| {},
+        )
+        .unwrap();
+    let error = write_portable(
+        snapshot.path(),
+        &source_directory,
+        &source.credential_state,
+        &source.database_key().unwrap(),
+        &[9; 32],
+        "backup-password",
+        &archive,
+        &source.backup,
+        |_, _, _| {},
+    )
+    .unwrap_err();
+    assert!(error
+        .contains("Screenshot authentication failed (id=7, path=screenshots/私密截图.png.enc)"));
+    assert_eq!(std::fs::read(&archive).unwrap(), b"previous valid backup");
+    assert!(!std::fs::read_dir(root.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".partial")));
+}
+
+#[test]
+fn streamed_key_validation_rejects_corrupt_metadata_ocr_scope_and_ocr_content() {
+    for (corrupt, expected) in [
+        (
+            "metadata",
+            "Content authentication failed for screenshots.window_title_enc",
+        ),
+        ("ocr_scope", "Invalid OCR key or payload binding"),
+        ("ocr_content", "Decryption failed"),
+        ("ocr_block_scope", "Invalid OCR key or payload binding"),
+        ("ocr_block_content", "Invalid OCR key or payload binding"),
+        (
+            "legacy_ocr_content",
+            "Content authentication failed for ocr_results.text_enc",
+        ),
+    ] {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("source");
+        let archive = root.path().join("previous.cpbackup");
+        let source = storage(&directory);
+        populate(&source, false);
+        // Cover legacy envelopes alongside explicit inline groups and blocks.
+        if matches!(
+            corrupt,
+            "ocr_scope" | "ocr_content" | "ocr_block_scope" | "ocr_block_content"
+        ) {
+            let key = source.new_ocr_write_key().unwrap();
+            let guard = source.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            if corrupt.starts_with("ocr_block_") {
+                let record = crate::storage::ocr_blocks::Record {
+                    id: 12,
+                    text: "grouped backup content".into(),
+                    text_layout: None,
+                    confidence: 0.99,
+                    box_coords: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                };
+                crate::storage::ocr_blocks::insert_records(conn, 7, &[record], Some(&key), || {
+                    source.new_ocr_write_key()
+                })
+                .unwrap();
+            } else {
+                let dataset = crate::storage::ocr_keys::dataset(conn).unwrap();
+                key.insert(conn, &dataset, 7).unwrap();
+                let data = key
+                    .encrypt(&dataset, 7, 12, b"grouped backup content")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO ocr_results(id,screenshot_id,text_hash,text_enc,ocr_key_id) VALUES(12,7,'',?1,?2)",
+                    params![data, key.id],
+                )
+                .unwrap();
+            }
+        }
+        std::fs::write(&archive, b"previous valid backup").unwrap();
+        let _operation = source.backup.begin();
+        let snapshot = source
+            .create_backup_snapshot_under_maintenance(
+                &source.database_key().unwrap(),
+                root.path(),
+                |_, _| {},
+            )
+            .unwrap();
+        let conn = Connection::open(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+        connection::configure_sqlcipher_connection(&conn, &source.database_key().unwrap()).unwrap();
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+            false,
+        )
+        .unwrap();
+        let sql = match corrupt {
+            "metadata" => "UPDATE screenshots SET window_title_enc=zeroblob(28) WHERE id=7",
+            "ocr_scope" | "ocr_block_scope" => "UPDATE ocr_keys SET scope_tag=zeroblob(32)",
+            "ocr_content" => "UPDATE ocr_results SET text_enc=zeroblob(28) WHERE id=12",
+            "ocr_block_content" => "UPDATE ocr_blocks SET content_enc=zeroblob(28)",
+            _ => "UPDATE ocr_results SET text_enc=zeroblob(28) WHERE id=11",
+        };
+        assert_eq!(conn.execute(sql, []).unwrap(), 1);
+        conn.close().unwrap();
+        let error = write_portable(
+            snapshot.path(),
+            &directory,
+            &source.credential_state,
+            &source.database_key().unwrap(),
+            &[9; 32],
+            "backup-password",
+            &archive,
+            &source.backup,
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{corrupt}: {error}");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"previous valid backup");
+    }
+}
+
+#[test]
+fn undeclared_missing_image_rejects_import_before_installing() {
+    let root = TempDir::new().unwrap();
+    let original = root.path().join("original.cpbackup");
+    let incomplete = root.path().join("incomplete.cpbackup");
+    let source = storage(&root.path().join("source"));
+    populate(&source, false);
+    export(&source, &original);
+    drop(source);
+    // Build an authenticated archive with a missing payload but no declaration:
+    // encryption/ZIP integrity cannot substitute for the completeness contract.
+    let flag = Arc::new(AtomicBool::new(false));
+    let reader = EncryptedReader::open(
+        File::open(&original).unwrap(),
+        "backup-password",
+        flag.clone(),
+    )
     .unwrap();
+    let mut input = zip::ZipArchive::new(reader).unwrap();
+    let encrypted =
+        EncryptedWriter::new(File::create(&incomplete).unwrap(), "backup-password", flag).unwrap();
+    let mut output = zip::ZipWriter::new_stream(encrypted);
+    for index in 0..input.len() {
+        let mut entry = input.by_index(index).unwrap();
+        let name = entry.name().unwrap().into_owned();
+        if name == "screenshots/私密截图.png.enc" {
+            continue;
+        }
+        output
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+    }
+    output.finish().unwrap().into_inner().finish().unwrap();
+    let destination = storage(&root.path().join("destination"));
+    let generation = destination.db_generation();
+    let _operation = destination.backup.begin();
+    let result = prepare_import(
+        &incomplete,
+        root.path(),
+        &destination.credential_state,
+        &destination.database_key().unwrap(),
+        "backup-password",
+        &destination.backup,
+        |_, _, _| {},
+    );
+    assert!(result
+        .err()
+        .unwrap()
+        .contains("BACKUP_UNDECLARED_MISSING_SCREENSHOT"));
+    assert_eq!(destination.db_generation(), generation);
+    assert_eq!(destination.count_active_screenshots().unwrap(), 0);
 }
 
 fn prepare(storage: &StorageState, archive: &Path, parent: &Path) -> PreparedBackup {
@@ -339,7 +770,39 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
     let root = TempDir::new().unwrap();
     let archive = root.path().join("portable.cpbackup");
     let source = storage(&root.path().join("source"));
-    let cluster = populate(&source, false);
+    let text_layout = crate::ml_protocol::MlOcrTextLayout {
+        matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+        source_size: [2, 2],
+        input_width: 32,
+        valid_width: 32,
+        time_steps: 8,
+        centers: (0..8).map(|i| 2 * i + 1).collect(),
+        text_lengths: vec![3; 8],
+    };
+    let cluster = populate_with_layout(&source, false, Some(&text_layout));
+    let dirty_key = {
+        let guard = source.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT ocr_block_slot FROM ocr_results WHERE id=11",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM ocr_block_gc", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        conn.query_row("SELECT block_id FROM ocr_block_gc", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
     let source_hmac = source.credential_state.get_hmac_key().unwrap();
     let source_db_key = source.database_key().unwrap();
     let source_dataset = source.processing_dataset_id().unwrap();
@@ -427,6 +890,18 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
         "私密备份搜索内容"
     );
     assert_eq!(
+        reopened.get_screenshot_ocr_results(7).unwrap()[0]
+            .text_layout
+            .as_ref(),
+        Some(&text_layout)
+    );
+    let restored_ocr = reopened.get_screenshot_ocr_results(7).unwrap();
+    assert_eq!(
+        restored_ocr.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![11, 13]
+    );
+    assert_eq!(restored_ocr[1].text, "retained backup member");
+    assert_eq!(
         reopened
             .get_smart_cluster_summary(cluster)
             .unwrap()
@@ -447,11 +922,35 @@ fn independent_cng_keys_restore_all_domains_and_survive_a_cold_reopen() {
     let guard = reopened.db.lock().unwrap();
     let conn = guard.as_ref().unwrap();
     assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM ocr_blocks", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM ocr_block_gc", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM ocr_keys WHERE id=?1",
+            [dirty_key],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
         conn.query_row("SELECT count(*) FROM app_bound_receipts", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
         0
     );
+    assert_eq!(conn.query_row(
+        "SELECT cp_unseal(vector_f32,'vectors',index_kind||':'||subject_key) FROM derived_embeddings_read WHERE subject_key='image-fixture'",
+        [], |r| r.get::<_, Vec<u8>>(0)).unwrap(), vec![0,0,128,63]);
     assert_eq!(
         conn.query_row(
             "SELECT revision FROM screenshot_processing_revisions WHERE screenshot_id=7",
@@ -713,6 +1212,36 @@ fn retirement_failure_reopens_the_original_content_with_new_processing_authority
 }
 
 #[test]
+fn protected_retirement_inbox_allows_backup_import_while_the_service_is_offline() {
+    let root = TempDir::new().unwrap();
+    let archive = root.path().join("portable.cpbackup");
+    let source = storage(&root.path().join("source"));
+    populate(&source, false);
+    export(&source, &archive);
+    let mut destination = storage(&root.path().join("destination"));
+    let previous_processing = destination.processing_dataset_id().unwrap();
+    let prepared = prepare(&destination, &archive, root.path());
+    let broker = Arc::new(QueuedOfflineBroker(std::sync::Mutex::new(Vec::new())));
+    destination.replace_processing_stage_for_tests(
+        crate::processing_stage::ProcessingStaging::with_test_broker(broker.clone()),
+    );
+    let _operation = destination.backup.begin();
+    {
+        let _maintenance = destination.database_maintenance("test offline backup import");
+        install_prepared(&destination, &prepared).unwrap();
+    }
+    assert!(destination.is_initialized());
+    assert_ne!(
+        destination.processing_dataset_id().unwrap(),
+        previous_processing
+    );
+    assert_eq!(
+        *broker.0.lock().unwrap(),
+        vec![carbonpaper_app_bound::revocation::Revocation::RetireOwner]
+    );
+}
+
+#[test]
 fn cancelled_export_and_unknown_key_slots_never_replace_an_existing_backup() {
     let root = TempDir::new().unwrap();
     let archive = root.path().join("existing.cpbackup");
@@ -721,15 +1250,16 @@ fn cancelled_export_and_unknown_key_slots_never_replace_an_existing_backup() {
     populate(&source, false);
     let directory = source.data_dir.lock().unwrap().clone();
     let _maintenance = source.database_maintenance("test cancellation");
-    let mode = source
-        .prepare_database_snapshot_under_maintenance()
+    let snapshot = source
+        .create_backup_snapshot_under_maintenance(
+            &source.database_key().unwrap(),
+            root.path(),
+            |_, _| {},
+        )
         .unwrap();
-    source.shutdown_under_maintenance().unwrap();
-    let snapshot =
-        database_snapshot::create_database_snapshot(&directory, &mode, root.path()).unwrap();
     let _operation = source.backup.begin();
     let result = write_portable(
-        &snapshot,
+        snapshot.path(),
         &directory,
         &source.credential_state,
         &source.database_key().unwrap(),
@@ -753,7 +1283,7 @@ fn cancelled_export_and_unknown_key_slots_never_replace_an_existing_backup() {
         .unwrap();
     drop(conn);
     assert!(write_portable(
-        &snapshot,
+        snapshot.path(),
         &directory,
         &source.credential_state,
         &source.database_key().unwrap(),

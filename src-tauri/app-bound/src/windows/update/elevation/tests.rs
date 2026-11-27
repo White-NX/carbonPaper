@@ -125,11 +125,13 @@ fn locked_executables_launch_through_the_shell_in_paths_with_spaces() {
     let _paths = DirectoryLocks::for_execution(directory.path()).unwrap();
     let _executable = locked_file(&original).unwrap();
     let process = shell_execute(&original, directory.path(), "open", &["--list".into()]).unwrap();
-    assert_eq!(
-        unsafe { WaitForSingleObject(process.0, 30_000) },
-        WAIT_OBJECT_0
-    );
+    // SAFETY: the shell's owned process handle remains live through this wait
+    // and exit-code query; both APIs operate only on that subprocess.
+    let finished = unsafe { WaitForSingleObject(process.0, 30_000) };
+    assert_eq!(finished, WAIT_OBJECT_0);
     let mut exit = 1;
+    // SAFETY: the process owner is still live and `exit` is initialized output
+    // storage exclusively borrowed for the synchronous query.
     unsafe { GetExitCodeProcess(process.0, &mut exit) }.unwrap();
     assert_eq!(exit, 0);
     assert!(fs::write(&original, b"changed before UAC execution").is_err());

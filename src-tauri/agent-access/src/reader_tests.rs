@@ -94,6 +94,15 @@ fn visual_search_reads_existing_vectors_and_observes_source_deletion() {
     assert_eq!(before["indexed_snapshots"], 2);
     assert_eq!(before["items"][0]["screenshot_id"], 1);
     assert_eq!(before["items"][0]["ocr_text"], "source OCR 1");
+    crate::test_source::connection(&binding)
+        .execute_batch(
+            "INSERT INTO vector_blocks(id,data)
+                SELECT 1,vector_f32 FROM derived_embeddings WHERE subject_key='image-1';
+             UPDATE derived_embeddings SET vector_block_id=1,vector_offset=0,
+                vector_length=length(vector_f32),vector_f32=X'' WHERE subject_key='image-1';",
+        )
+        .unwrap();
+    assert_eq!(search(&repo), before);
     crate::test_source::connection(&binding).execute("DELETE FROM derived_embeddings WHERE index_kind='clip_image' AND subject_key='image-1'",[]).unwrap();
     repo.apply(&ExportEvent {
         dataset_id: binding.dataset_id.clone(),
@@ -190,6 +199,57 @@ fn ocr_authorizations_reject_swapped_ciphertexts_and_other_datasets() {
     )
     .unwrap();
     assert_eq!(reopened.ocr(1).unwrap_err(), "AGENT_DATASET_MISMATCH");
+}
+
+#[test]
+fn split_card_fragments_are_hidden_in_detail_and_search_evidence() {
+    let (_dir, mut repo, binding) = fixture();
+    let filter = SensitiveFilterState::default();
+    filter.update_config(SensitiveFilterConfig {
+        mode: "mask".into(),
+        pii_entities: vec![crate::pii::PiiKind::BankCard.name().into()],
+        ..filter.get_config()
+    });
+    put(&mut repo, &binding, 1, snapshot(1, 1000, "notes"));
+    for (index, text) in ["2233", "0012", "3456", "0020"].into_iter().enumerate() {
+        let left = 10.0 + 206.0 * index as f64;
+        let id = index as i64 + 2;
+        put(
+            &mut repo,
+            &binding,
+            id,
+            crate::test_source::Record::Ocr(OcrText {
+                ocr_id: id,
+                screenshot_id: 1,
+                text: text.into(),
+                box_coords: vec![
+                    vec![left, 10.0],
+                    vec![left + 200.0, 10.0],
+                    vec![left + 200.0, 30.0],
+                    vec![left, 30.0],
+                ],
+                ..Default::default()
+            }),
+        );
+    }
+    let details = call(
+        &repo,
+        &filter,
+        "get_snapshot_details",
+        json!({"screenshot_id":1}),
+    );
+    let blocks = details["ocr_results"].as_array().unwrap();
+    assert_eq!(blocks.len(), 4);
+    assert!(blocks.iter().all(|block| block["text"] == "[CN_BANK_CARD]"));
+    let hits = call(
+        &repo,
+        &filter,
+        "search_ocr_text",
+        json!({"query":"0012","fuzzy":false}),
+    );
+    let hit = &hits["items"][0];
+    assert_eq!(hit["text"], "[CN_BANK_CARD]");
+    assert!(hit.get("match_evidence").is_none());
 }
 
 #[test]

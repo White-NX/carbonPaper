@@ -210,6 +210,8 @@ pub struct TaskBinding {
     pub task_id: String,
     pub dataset_id: String,
     pub screenshot_id: i64,
+    #[serde(default, skip_serializing_if = "zero_revision")]
+    pub source_revision: i64,
     pub input_version: u32,
     pub consumers: u8,
     pub payload_bytes: u64,
@@ -220,6 +222,10 @@ impl TaskBinding {
     pub fn aad(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(|_| BrokerError::InvalidRequest)
     }
+}
+
+fn zero_revision(value: &i64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -253,6 +259,8 @@ pub struct BrokerStatus {
     pub supported_storage_keys: bool,
     #[serde(default)]
     pub supported_agent_access: bool,
+    #[serde(default)]
+    pub supported_task_revisions: bool,
 }
 
 /// The reader is a separately verified executable, never a role supplied over IPC.
@@ -453,6 +461,8 @@ pub enum Request {
     PrepareTask {
         dataset_id: String,
         screenshot_id: i64,
+        #[serde(default, skip_serializing_if = "zero_revision")]
+        source_revision: i64,
         consumers: u8,
         payload_bytes: u64,
     },
@@ -704,6 +714,7 @@ mod tests {
             Request::PrepareTask {
                 dataset_id: "sensitive-dataset".into(),
                 screenshot_id: 42,
+                source_revision: 0,
                 consumers: 7,
                 payload_bytes: 1024,
             },
@@ -771,6 +782,17 @@ mod tests {
             ]
         );
         assert!(names.iter().all(|name| !name.contains("sensitive")));
+    }
+
+    #[test]
+    fn legacy_task_bindings_keep_their_original_authenticated_bytes() {
+        let legacy = r#"{"task_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","dataset_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","screenshot_id":7,"input_version":1,"consumers":1,"payload_bytes":34,"expires_at":99}"#;
+        let mut binding: TaskBinding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(binding.source_revision, 0);
+        assert_eq!(binding.aad().unwrap(), legacy.as_bytes());
+        binding.source_revision = 1;
+        assert_ne!(binding.aad().unwrap(), legacy.as_bytes());
+        assert_eq!(serde_json::to_value(binding).unwrap()["source_revision"], 1);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 [package]
 name = "carbonpaper"
-version = "0.9.1"
+version = "0.9.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+rust-version = "1.100"
 default-run = "carbonpaper"
 
 [features]
@@ -16,7 +17,8 @@ app-bound-dev = ["carbonpaper-app-bound/development-runtime", "carbonpaper-agent
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "carbonpaper_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# The Windows desktop binaries consume the Rust library directly.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "carbonpaper-nmh"
@@ -31,19 +33,20 @@ name = "carbonpaper-office"
 path = "src/bin/office.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 walkdir = "2.5.0"
 base64 = "0.22"
 
 [dependencies]
 carbonpaper-app-bound = { path = "app-bound" }
 carbonpaper-agent-access = { path = "agent-access" }
+carbonpaper-backup-core = { path = "backup-core" }
 zeroize = "1"
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-opener = "2"
-tauri-plugin-notification = "2"
-tauri-plugin-single-instance = "2.3.7"
-tauri-plugin-dialog = "2"
+tauri = { version = "2.12.5", features = ["tray-icon"] }
+tauri-plugin-opener = "2.7.3"
+tauri-plugin-notification = "2.8.1"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-dialog = "2.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 indexmap = { version = "2", features = ["serde"] }
@@ -63,7 +66,8 @@ percent-encoding = "2.3.2"
 sysinfo = "0.30"
 walkdir = "2.5.0"
 rand = "0.8"
-rusqlite = { version = "=0.40.2", default-features = false, features = [
+rusqlite = { version = "=0.42.0", default-features = false, features = [
+    "backup",
     "cache",
     "hooks",
     "functions",
@@ -72,6 +76,7 @@ rusqlite = { version = "=0.40.2", default-features = false, features = [
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+url = "2"
 iana-time-zone = "0.1"
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 aead = { version = "0.5", features = ["stream"] }
@@ -88,10 +93,11 @@ roaring = "0.11.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
+zstd = "0.13"
 window-vibrancy = "0.5"
 raw-window-handle = "0.6"
 open = "5"
-rapidocr-core = { version = "=0.2.2", default-features = false, features = ["tokio", "directml"] }
+rapidocr-core = { version = "=0.3.1", default-features = false, features = ["download-binaries", "tokio", "directml"] }
 memmap2 = "0.9"
 usearch = { version = "=2.26.0", default-features = false }
 
@@ -102,6 +108,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.7"
 windows = { version = "0.58", features = [
+    "Foundation_Collections",
+    "Gaming_Input",
+    "Win32_UI_Input_XboxController",
+    "Win32_System_StationsAndDesktops",
     "Foundation_Numerics",
     "Win32_Security",
     "Win32_Security_Cryptography",
@@ -148,21 +158,36 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = "2.5.5"
 
 [dev-dependencies]
 tempfile = "3"
-rusqlite = { version = "=0.40.2", default-features = false, features = ["functions"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["functions"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
+
+# Keep application backtraces useful without retaining full dependency symbols.
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
 
 # Optimize the concrete storage crypto entry point and its primitive callees.
 # Generic AES code instantiated in the desktop crate would still run at opt=0.
 # The desktop's application/session code keeps its ordinary debug profile.
 [profile.dev.package.carbonpaper-app-bound]
 opt-level = 3
+debug = 1
+
+# Backup crypto and zeroizing buffers have concrete entry points so their hot
+# code stays optimized even when the desktop instantiates generic I/O at opt=0.
+[profile.dev.package.carbonpaper-backup-core]
+opt-level = 3
+debug = 1
 
 [profile.dev.package.aes-gcm]
 opt-level = 3
@@ -192,4 +217,14 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.base64]
+opt-level = 3
+
+# Backup fingerprints must not spend seconds per block in debug builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
 opt-level = 3

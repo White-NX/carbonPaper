@@ -759,7 +759,10 @@ pub(super) fn recall(
         telemetry.stages.bitmaps += watch.lap();
     }
 
-    if multi_word && candidates.len() < escalate_until && cross_block.is_some() {
+    if let Some(cross_block) = cross_block
+        .as_mut()
+        .filter(|_| multi_word && candidates.len() < escalate_until)
+    {
         reached = Tier::Screenshot;
         let mut per_keyword: Vec<RoaringBitmap> = Vec::with_capacity(keyword_groups.len());
         for groups in &keyword_groups {
@@ -775,8 +778,7 @@ pub(super) fn recall(
         telemetry.stages.bitmaps += watch.lap();
 
         if !per_keyword.is_empty() {
-            let mut blocks =
-                cross_block.as_mut().unwrap()(&per_keyword, allowed, &mut telemetry.counts)?;
+            let mut blocks = cross_block(&per_keyword, allowed, &mut telemetry.counts)?;
             if blocks.len() > VERIFY_CAP {
                 blocks = blocks.split_off(blocks.len() - VERIFY_CAP);
             }

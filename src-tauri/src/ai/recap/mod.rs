@@ -1,6 +1,10 @@
 //! Bounded, evidence-backed daily recaps. Classification is optional.
 pub(crate) mod activity_contract;
+pub(crate) mod budget;
+mod delivery;
 mod evidence_agent;
+mod history;
+mod mainline_state;
 mod mainlines;
 mod privacy;
 mod progress;
@@ -15,8 +19,10 @@ mod snapshot;
 mod summary;
 pub mod types;
 mod unified;
+mod validation;
 mod views;
 
+pub(crate) use privacy::filtered_warnings;
 pub(crate) use privacy::PrivacyFingerprint;
 #[cfg(test)]
 pub(crate) use runner::initial_request;
@@ -30,4 +36,4 @@ pub use snapshot::{read_snapshot_context, SnapshotRecapContext};
 pub use types::*;
 pub use unified::{search as search_unified, UnifiedSearchQuery, UnifiedSearchResult};
 pub(crate) use views::with_current_day;
-pub use views::{read_day_view, read_records, RecapRecordPage};
+pub use views::{read_day_view, read_days, read_records, RecapRecordPage};

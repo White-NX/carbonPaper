@@ -70,6 +70,19 @@ impl MonitorState {
         self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_IDLE
     }
 
+    /// Lightweight usage follows native user intent even when battery/game
+    /// policy or unavailable OCR models suppress the screenshot pipeline.
+    pub(crate) fn usage_recording_intended(&self) -> bool {
+        let policy = self
+            .automation
+            .policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !policy.manual_stop
+            && !policy.usage_paused()
+            && (policy.requested_start || get_monitor_autostart() || self.is_running())
+    }
+
     pub(crate) fn pause_until_ms(&self) -> Option<i64> {
         self.automation
             .policy
@@ -112,7 +125,7 @@ impl MonitorState {
     /// lifecycle alone, so it cannot end a session claimed in the meantime.
     fn take_over_for_stop(&self) -> bool {
         self.lifecycle
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 (current != LIFECYCLE_IDLE).then_some(LIFECYCLE_DRAINING)
             })
             .is_ok()
@@ -293,9 +306,15 @@ fn dispatch_typed_monitor_command(
     Ok(serde_json::json!({ "status": "success" }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves flat Tauri invoke parameters and independently injected application state."
+)]
 #[tauri::command]
 pub async fn monitor_search_nl(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    requests: State<'_, crate::clip_query::ClipQueryRequests>,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     query: String,
     limit: Option<u32>,
@@ -306,10 +325,20 @@ pub async fn monitor_search_nl(
     end_time: Option<f64>,
     _fuzzy: Option<bool>,
     include_ocr: Option<bool>,
+    sort_order: Option<crate::storage::SearchSortOrder>,
+    request_id: Option<String>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let process_names = process_names.unwrap_or_default();
     let categories = categories.unwrap_or_default();
+    let ticket = request_id
+        .as_deref()
+        .map(|id| requests.begin(window.label(), id))
+        .transpose()?;
+    let cancelled = ticket
+        .as_ref()
+        .map(|ticket| ticket.cancelled.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
     // `fuzzy` is retained in the command contract but does not apply to
     // text-to-image similarity.
@@ -324,10 +353,24 @@ pub async fn monitor_search_nl(
             end_time,
         )
         .with_ocr(include_ocr.unwrap_or(true))
+        .with_sort_order(sort_order.unwrap_or_default())
+        .with_cancellation(cancelled)
         .with_categories(&categories),
     )
     .await?;
     Ok(serde_json::json!({ "status": "success", "results": results, "backend": "rust" }))
+}
+
+/// Cancel only a CLIP request owned by the calling window.
+#[tauri::command]
+pub fn monitor_cancel_search_nl(
+    window: tauri::WebviewWindow,
+    requests: State<'_, crate::clip_query::ClipQueryRequests>,
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    request_id: String,
+) -> Result<(), String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    requests.cancel(window.label(), &request_id)
 }
 
 #[tauri::command]
@@ -442,25 +485,23 @@ pub async fn monitor_nl_cluster_query(
         crate::semantic_query::try_rust_nl_query(&app, &query, n_results).await
     };
     match outcome {
-        crate::semantic_query::RustQueryOutcome::Served(response) => return Ok(response),
+        crate::semantic_query::RustQueryOutcome::Served(response) => Ok(response),
         crate::semantic_query::RustQueryOutcome::Unavailable(reason) => {
-            return Err(format!("Semantic retrieval unavailable: {reason}"));
+            Err(format!("Semantic retrieval unavailable: {reason}"))
         }
         // The user stopped it.
         //
         // Returned as a success with `cancelled` set rather than as an error:
         // the view has to tell "you stopped this" apart from "this broke", and
         // an `Err` is rendered as a failure by every caller of this command.
-        crate::semantic_query::RustQueryOutcome::Cancelled => {
-            return Ok(serde_json::json!({
-                "status": "cancelled",
-                "cancelled": true,
-                "results": [],
-                "reranked": false,
-                "rerank_variant": null,
-                "backend": "rust",
-            }));
-        }
+        crate::semantic_query::RustQueryOutcome::Cancelled => Ok(serde_json::json!({
+            "status": "cancelled",
+            "cancelled": true,
+            "results": [],
+            "reranked": false,
+            "rerank_variant": null,
+            "backend": "rust",
+        })),
     }
 }
 
@@ -632,6 +673,9 @@ async fn apply_control(
 ) -> Result<String, String> {
     let state = app.state::<MonitorState>();
     let _control = state.control.lock().await;
+    if action == MonitorAction::TogglePause && !state.is_running() {
+        return Ok("Monitor stopped".into());
+    }
     if let MonitorAction::PauseFor(minutes) = action {
         if minutes == 0 || minutes > 24 * 60 || !state.is_running() {
             return Err("Invalid timed pause or monitor is not running".into());
@@ -654,7 +698,7 @@ async fn apply_control(
                 .state::<Arc<CaptureState>>()
                 .paused
                 .load(Ordering::SeqCst);
-            policy.user_action(action, paused);
+            policy.user_action(action, paused, state.is_running());
         }
         if action == MonitorAction::ExpireTimedPause {
             policy.expire_timed_pause();
@@ -711,11 +755,7 @@ async fn apply_control(
         }
         MonitorAction::TogglePause => {
             if state.is_running() {
-                let paused = app
-                    .state::<Arc<CaptureState>>()
-                    .paused
-                    .load(Ordering::SeqCst);
-                set_capture_paused(app, !paused)
+                set_capture_paused(app, initially_paused)
             } else {
                 Ok("Monitor stopped".into())
             }
@@ -769,8 +809,8 @@ async fn start_capture(app: &AppHandle, initially_paused: bool) -> Result<String
         return Ok("Monitor is already running".into());
     };
     state.stopping.store(false, Ordering::SeqCst);
-    spawn_capture_loop(&app, session, initially_paused);
-    crate::refresh_tray_menu(&app);
+    spawn_capture_loop(app, session, initially_paused);
+    crate::refresh_tray_menu(app);
     Ok("Monitor started".into())
 }
 
@@ -1005,12 +1045,12 @@ async fn stop_capture(app: &AppHandle) -> Result<String, String> {
         }
     }
 
-    drain_capture_session(&app, &capture_state, "stop_monitor").await;
+    drain_capture_session(app, &capture_state, "stop_monitor").await;
 
     if took_over {
         state.finish_drain();
     }
-    crate::refresh_tray_menu(&app);
+    crate::refresh_tray_menu(app);
     let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": true}));
 
     Ok("Monitor stopped".into())

@@ -248,6 +248,48 @@ fn only_jobs_a_worker_could_actually_pick_up_are_claimable() {
 }
 
 #[test]
+fn claimable_jobs_keep_global_order_and_limit_across_retry_and_pending_states() {
+    let (_temp, storage) = test_storage();
+    for (subject, status, updated, attempts, retry) in [
+        ("1", "pending", "2026-01-02 00:00:00", 0, None),
+        ("2", "failed", "2026-01-01 00:00:00", 1, None),
+        ("3", "waiting_for_auth", "2026-01-01 00:00:00", 0, None),
+        ("4", "failed", "2025-01-01 00:00:00", 5, None),
+        (
+            "5",
+            "pending",
+            "2024-01-01 00:00:00",
+            0,
+            Some("9999-12-31 23:59:59"),
+        ),
+    ] {
+        let spec = job(DerivedIndexKind::SemanticText, subject);
+        ensure_active_subject(&storage, &spec);
+        storage.upsert_derived_index_job(&spec).unwrap();
+        let guard = storage.db.lock().unwrap();
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE derived_index_jobs SET status=?2,updated_at=?3,attempts=?4,next_retry_at=?5
+             WHERE index_kind='semantic_text' AND subject_key=?1",
+                params![subject, status, updated, attempts, retry],
+            )
+            .unwrap();
+    }
+    let subjects = |limit| {
+        storage
+            .claimable_derived_index_jobs(DerivedIndexKind::SemanticText, 5, limit)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.spec.subject_key)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(subjects(2), ["2", "3"]);
+    assert_eq!(subjects(100), ["2", "3", "1"]);
+}
+
+#[test]
 fn index_candidates_are_screenshots_with_text_no_ledger_row_and_inside_retention() {
     let (_temp, storage) = test_storage();
     for id in [10, 11, 12, 13] {

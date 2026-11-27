@@ -50,6 +50,20 @@ export function recapErrorKey(error) {
   return `recap.errors.${code || 'unknown'}`;
 }
 
+/** Only controller-owned token limit codes and numeric fields enter notices. */
+export function recapBudgetIssue(error) {
+  const value = String(error?.message ?? error ?? '');
+  const code = value.split(':', 1)[0];
+  const scope = ['RECAP_BUDGET_EXHAUSTED', 'RECAP_DAILY_INPUT_EXHAUSTED', 'RECAP_DAILY_OUTPUT_EXHAUSTED', 'RECAP_MAINLINE_HEADROOM'].includes(code) ? 'daily'
+    : ['RECAP_RUN_INPUT_EXHAUSTED', 'RECAP_RUN_OUTPUT_EXHAUSTED'].includes(code) ? 'run'
+      : code === 'AI_CONTEXT_LIMIT' ? 'context' : null;
+  if (!scope) return null;
+  const fields = value.match(/^[A-Z_]+: limit=(\d+), used=(\d+), requested=(\d+), available=(\d+)$/);
+  const numbers = fields?.slice(1).map(Number);
+  const valid = numbers?.every(number => Number.isSafeInteger(number) && number >= 0) && numbers[2] > numbers[3];
+  return { scope, ...(valid ? { requested: numbers[2], available: numbers[3] } : {}) };
+}
+
 /** Join adjacent displayed occurrences only when the task and description agree.
  * Keep each original activity so correction controls still address backend IDs.
  */

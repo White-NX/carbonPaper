@@ -8,7 +8,10 @@ pub mod development;
 pub mod ledger;
 pub mod manifest;
 pub mod payload;
+pub mod privileged;
 pub mod protocol;
+pub mod repair;
+pub mod revocation;
 #[cfg(windows)]
 pub mod windows;
 

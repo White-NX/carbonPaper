@@ -2072,9 +2072,10 @@ pub struct BackgroundIndexProgress {
     pub clip: IndexTaskProgress,
     pub recap: crate::ai::recap::RecapIndexProgress,
     pub ann: crate::clip_ann::AnnBuildProgress,
+    pub storage_compaction: crate::storage::StorageCompactionProgress,
 }
 
-/// Read manual screenshot indexing and automatic recap indexing together.
+/// Read indexing and cached database-optimization progress together.
 /// Recap counts come from the existing authorized corpus scan; this poll only
 /// reconciles scheduling state and never decrypts or loads the recap corpus.
 ///
@@ -2104,6 +2105,7 @@ pub async fn get_background_index_progress(
     let recap = recap_run.sync_scheduler_progress(&app, recap_task, recap_revision);
     Ok(BackgroundIndexProgress {
         recap,
+        storage_compaction: storage.storage_compaction_progress(),
         ann: ann_run.build_progress(
             tasks
                 .iter()

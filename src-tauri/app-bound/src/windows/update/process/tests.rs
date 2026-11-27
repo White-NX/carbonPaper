@@ -79,11 +79,17 @@ async fn check_coordinator_process() {
     )
     .await;
     let process = HANDLE(child.process.as_raw_handle());
+    // SAFETY: this queries the effective caller token without passing pointers.
     let before = unsafe { IsUserAnAdmin() }.as_bool();
     assert!(!context
-        .with_permissions(|| unsafe { IsUserAnAdmin() }.as_bool())
+        .with_permissions(|| {
+            // SAFETY: this only queries the temporarily restricted thread token.
+            unsafe { IsUserAnAdmin() }.as_bool()
+        })
         .unwrap());
-    assert_eq!(unsafe { IsUserAnAdmin() }.as_bool(), before);
+    // SAFETY: the query has no pointer inputs and observes this restored thread.
+    let after = unsafe { IsUserAnAdmin() }.as_bool();
+    assert_eq!(after, before);
     // SAFETY: the child is blocked on its private stdin, so its actual process
     // and primary token remain live for the parent/SID/permission inspection.
     unsafe {
@@ -165,11 +171,13 @@ async fn check_coordinator_process() {
     }
     pipe.get_mut().write_all(b"COMMIT\n").await.unwrap();
     read_marker(&mut pipe, "COORDINATOR_COMMITTED", process).await;
-    assert_eq!(
-        unsafe { WaitForSingleObject(process, 10_000) },
-        WAIT_OBJECT_0
-    );
+    // SAFETY: `child` retains this SYNCHRONIZE-capable process handle during
+    // the wait, with no transfer of ownership to Win32.
+    let finished = unsafe { WaitForSingleObject(process, 10_000) };
+    assert_eq!(finished, WAIT_OBJECT_0);
     let mut exit = 1;
+    // SAFETY: the subprocess owner is still live and `exit` is initialized
+    // writable output for the synchronous exit-code query.
     unsafe { GetExitCodeProcess(process, &mut exit) }.unwrap();
     assert_eq!(exit, 0);
 
@@ -185,10 +193,12 @@ async fn check_coordinator_process() {
             directory.path(),
         )
         .unwrap();
-    assert_eq!(
-        unsafe { WaitForSingleObject(HANDLE(restart.process.as_raw_handle()), 10_000) },
-        WAIT_OBJECT_0
-    );
+    // SAFETY: `restart` retains the subprocess handle throughout the wait;
+    // the API only observes this process and retains no borrowed memory.
+    let restarted = unsafe { WaitForSingleObject(HANDLE(restart.process.as_raw_handle()), 10_000) };
+    assert_eq!(restarted, WAIT_OBJECT_0);
+    // SAFETY: the restart owner remains live and `exit` is writable output
+    // borrowed only for this synchronous query.
     unsafe { GetExitCodeProcess(HANDLE(restart.process.as_raw_handle()), &mut exit) }.unwrap();
     assert_eq!(exit, 0);
 }
@@ -202,6 +212,8 @@ async fn read_marker(pipe: &mut BufReader<NamedPipeServer>, marker: &str, proces
             output.push_str(&line);
             if count == 0 {
                 let mut exit = 0;
+                // SAFETY: the caller retains the subprocess handle while this
+                // marker reader runs; `exit` is initialized query output.
                 unsafe { GetExitCodeProcess(process, &mut exit) }.unwrap();
                 panic!("coordinator exited before {marker} with code {exit:#x}: {output}");
             }

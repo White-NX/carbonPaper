@@ -13,7 +13,7 @@ function mergeRun(previous, incoming) {
 }
 
 export function isIndexTaskPending(run) {
-  return ['queued', 'preparing', 'running', 'stopping', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait'].includes(run?.phase)
+  return ['queued', 'preparing', 'running', 'stopping', 'waiting_for_unlock', 'waiting_for_verification', 'waiting_for_maintenance', 'retry_wait'].includes(run?.phase)
     || Boolean(run?.running);
 }
 
@@ -21,6 +21,7 @@ export function useBackgroundIndexProgress(active = true) {
   const [progress, setProgress] = useState({
     semantic: EMPTY_RUN, clip: EMPTY_RUN, recap: EMPTY_RUN,
     ann: { ...EMPTY_RUN, recovery_needed: false, percent: null },
+    storage_compaction: { phase: 'idle', running: false, percent: null },
   });
   const mounted = useRef(false);
   const inFlight = useRef(null);
@@ -41,6 +42,7 @@ export function useBackgroundIndexProgress(active = true) {
           clip: mergeRun(previous.clip, next.clip),
           recap: mergeRun(previous.recap, next.recap),
           ann: mergeRun(previous.ann, next.ann),
+          storage_compaction: mergeRun(previous.storage_compaction, next.storage_compaction),
         }));
       }
       return next;
@@ -78,6 +80,13 @@ export function useBackgroundIndexProgress(active = true) {
   useTauriEventListener('clip-ann-build-progress', ({ payload }) => {
     if (!payload) return;
     setProgress((previous) => ({ ...previous, ann: mergeRun(previous.ann, payload) }));
+  }, [], active);
+  useTauriEventListener('storage-compaction-progress', ({ payload }) => {
+    if (!payload) return;
+    setProgress((previous) => ({
+      ...previous,
+      storage_compaction: mergeRun(previous.storage_compaction, payload),
+    }));
   }, [], active);
   useTauriEventListener('recap-search-progress', ({ payload }) => {
     if (payload) {

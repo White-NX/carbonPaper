@@ -46,6 +46,7 @@ async fn server(
             api_key: None,
             tool_calling: ToolCalling::Supported,
             context_tokens: 32_000,
+            ..Default::default()
         },
         seen,
     )
@@ -103,14 +104,14 @@ fn request() -> ChatRequest {
                 call_id: "old".into(),
                 content: "found evidence".into(),
             },
-            Message::User(FORCE_ANSWER_PROMPT.into()),
         ],
         tools: vec![ToolSpec {
             name: "search".into(),
             description: "Search".into(),
             parameters: json!({"type":"object"}),
         }],
-        disable_tools: true,
+        disable_tools: false,
+        prompt_only_final: false,
         ..Default::default()
     }
 }
@@ -194,7 +195,6 @@ async fn followup_replays_serialized_tool_bodies_and_native_reasoning_verbatim()
             &provider::http_client().unwrap(),
             &config,
             req,
-            false,
             &mut |_| {},
             &Cancellation::default(),
             &mut outcome(),
@@ -237,6 +237,105 @@ fn transcript_preserves_original_tool_payload_when_request_context_is_pruned() {
     );
 }
 
+#[tokio::test]
+async fn followup_keeps_identified_game_when_replayed_searches_exceed_legacy_budget() {
+    let budget = crate::ai::config::LOCAL_CONTEXT_TOKENS;
+    let question = "我前几日看到一款航海冒险游戏，请帮我找到它叫什么名字。";
+    let answer = "这个游戏叫《潮汐之旅》（Tidebound）。[#47]";
+    for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+        let (mut config, seen) = server(kind, vec![reply(kind, "测试回答。", false)]).await;
+        config.context_tokens = budget;
+        config.allow_images = true;
+        config.image_input = ImageInput::Supported;
+        let mut first = outcome();
+        first.answer = answer.into();
+        let mut catalog = tools::specs(ToolScope::ReadOnly);
+        catalog.push(vision::spec());
+        let mut initial = ChatRequest {
+            messages: vec![
+                Message::System(system_prompt() + VISION_RULES),
+                Message::User(first.time_context.question(question)),
+            ],
+            tools: catalog,
+            max_tokens: Some(AgentLimits::default().max_answer_tokens.min(budget / 4)),
+            ..Default::default()
+        };
+        // Each individual read fits, but the returned transcript keeps every
+        // original read even after the first run has pruned its request context.
+        for index in 0..6 {
+            let id = format!("read-{index}");
+            record_message(
+                &mut initial.messages,
+                &mut first,
+                Message::Assistant {
+                    text: "查看相关商店页面。".into(),
+                    reasoning: Value::Null,
+                    tool_calls: vec![ToolCall {
+                        id: id.clone(),
+                        name: "get_snapshot_details".into(),
+                        arguments: json!({"screenshot_id": 42 + index}).to_string(),
+                    }],
+                },
+            );
+            let result = tools::summarize(
+                "get_snapshot_details",
+                json!({
+                    "screenshot_id": 42 + index,
+                    "text": format!("{}\n{}",
+                        if index == 5 { "潮汐之旅 (Tidebound)" } else { "其他游戏的商店页面" },
+                        "游戏商店页面，角色扮演与冒险类游戏、玩家评测和发行信息。\n".repeat(300)),
+                }),
+            );
+            record_message(
+                &mut initial.messages,
+                &mut first,
+                Message::ToolResult {
+                    call_id: id,
+                    content: result.content,
+                },
+            );
+            context::fit_request(&mut initial, &mut 1, kind, budget).unwrap();
+        }
+        assert!(first.messages.len() > initial.messages.len());
+        first.messages.push(Message::Assistant {
+            text: answer.into(),
+            reasoning: Value::Null,
+            tool_calls: vec![],
+        });
+        let mut serialized = serde_json::to_value(&first).unwrap();
+        serialized["question"] = json!(question);
+        let history: ConversationTurn = serde_json::from_value(serialized).unwrap();
+        let mut messages = conversation_messages(&[history]);
+        let mut current = messages.len();
+        messages.push(Message::User("这个游戏的封面长什么样？".into()));
+        let mut followup = ChatRequest {
+            messages,
+            tools: initial.tools,
+            max_tokens: initial.max_tokens,
+            ..Default::default()
+        };
+        let before = context::estimated_input_tokens(kind, &followup);
+        assert!(before > context::input_allowance(&followup, budget));
+        context::fit_request(&mut followup, &mut current, kind, budget).unwrap();
+        complete_step(
+            &provider::http_client().unwrap(),
+            &config,
+            followup,
+            &mut |_| {},
+            &Cancellation::default(),
+            &mut outcome(),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        let sent = seen[0]["messages"].to_string();
+        assert!(seen[0]["tools"].to_string().contains("view_snapshot"));
+        assert!(sent.contains(question), "the previous question was lost");
+        assert!(sent.contains(answer), "the identified game was lost");
+        assert!(sent.contains("omitted_tool_context"));
+    }
+}
+
 #[test]
 fn legacy_history_and_prefetched_results_remain_supported() {
     let legacy: ConversationTurn =
@@ -267,140 +366,84 @@ fn legacy_history_and_prefetched_results_remain_supported() {
 }
 
 #[tokio::test]
-async fn final_bad_request_retries_without_tools_and_keeps_paired_history() {
+async fn searches_past_twenty_steps_keep_tools_and_paired_context_available() {
     for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
-        let (config, seen) = server(
-            kind,
-            vec![
-                (400, "unsupported tool_choice".into()),
-                reply(kind, "Answer", false),
-            ],
-        )
-        .await;
-        let mut outcome = outcome();
-        let response = complete_step(
-            &provider::http_client().unwrap(),
-            &config,
-            request(),
-            true,
-            &mut |_| {},
-            &Cancellation::default(),
-            &mut outcome,
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.text, "Answer");
-        assert_eq!(outcome.steps, 2);
-        assert_eq!(outcome.tool_calls, 1);
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert!(seen[0].get("tools").is_some());
-        assert!(seen[0].get("tool_choice").is_some());
-        assert!(seen[1].get("tools").is_none());
-        assert!(seen[1].get("tool_choice").is_none());
-        assert_eq!(seen[0]["messages"], seen[1]["messages"]);
-        assert_eq!(config.tool_calling, ToolCalling::Supported);
-    }
-}
-
-#[tokio::test]
-async fn ignored_tool_choice_retries_in_a_new_streaming_step_and_counts_both_requests() {
-    for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
-        let (config, seen) = server(
-            kind,
-            vec![
-                reply(kind, "Searching again", true),
-                reply(kind, "Final answer", false),
-            ],
-        )
-        .await;
-        let mut outcome = outcome();
-        let mut steps = Vec::<String>::new();
-        let response = complete_step(
-            &provider::http_client().unwrap(),
-            &config,
-            request(),
-            true,
-            &mut |event| match event {
-                AgentEvent::StepStarted { .. } => steps.push(String::new()),
-                AgentEvent::TextDelta { text } => steps.last_mut().unwrap().push_str(&text),
-                _ => {}
-            },
-            &Cancellation::default(),
-            &mut outcome,
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.text, "Final answer");
-        assert_eq!(steps, ["Searching again", "Final answer"]);
-        assert_eq!(
-            outcome.usage,
-            Usage {
-                input_tokens: 6,
-                output_tokens: 4
-            }
-        );
-        assert_eq!(outcome.tool_calls, 1);
-        assert_eq!(seen.lock().unwrap().len(), 2);
-    }
-}
-
-#[tokio::test]
-async fn fallback_is_bounded_and_never_accepts_tools_or_an_empty_answer() {
-    for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
-        for (text, tool) in [("", true), (" ", false), ("plan", true)] {
-            let (config, seen) =
-                server(kind, vec![reply(kind, "", true), reply(kind, text, tool)]).await;
-            let error = complete_step(
-                &provider::http_client().unwrap(),
+        let mut replies: Vec<_> = (0..25).map(|_| reply(kind, "Searching", true)).collect();
+        replies.push(reply(kind, "Answer [#42]", false));
+        let (config, seen) = server(kind, replies).await;
+        let mut state = outcome();
+        let mut req = request();
+        let client = provider::http_client().unwrap();
+        for index in 0..26 {
+            let response = complete_step(
+                &client,
                 &config,
-                request(),
-                true,
+                req.clone(),
                 &mut |_| {},
                 &Cancellation::default(),
-                &mut outcome(),
+                &mut state,
             )
             .await
-            .unwrap_err();
-            assert!(matches!(error, ProviderError::InvalidResponse(_)));
-            assert_eq!(seen.lock().unwrap().len(), 2);
+            .unwrap();
+            assert_eq!(state.steps, index + 1);
+            if index == 25 {
+                assert!(response.tool_calls.is_empty());
+                assert_eq!(response.text, "Answer [#42]");
+            } else {
+                assert!(!response.tool_calls.is_empty());
+                record_message(
+                    &mut req.messages,
+                    &mut state,
+                    Message::Assistant {
+                        text: response.text,
+                        reasoning: response.reasoning,
+                        tool_calls: response.tool_calls.clone(),
+                    },
+                );
+                for call in response.tool_calls {
+                    record_message(
+                        &mut req.messages,
+                        &mut state,
+                        Message::ToolResult {
+                            call_id: call.id,
+                            content: "found evidence".into(),
+                        },
+                    );
+                }
+            }
         }
-        let (config, seen) = server(
-            kind,
-            vec![(400, "bad tools".into()), (400, "still bad".into())],
-        )
-        .await;
-        let error = complete_step(
-            &provider::http_client().unwrap(),
-            &config,
-            request(),
-            true,
-            &mut |_| {},
-            &Cancellation::default(),
-            &mut outcome(),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ProviderError::BadRequest(_)));
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 26);
+        for body in seen.iter() {
+            assert!(body.get("tools").is_some());
+            assert!(body.get("tool_choice").is_none());
+            assert!(!body.to_string().contains("budget is exhausted"));
+        }
+        assert_eq!(
+            state.usage,
+            Usage {
+                input_tokens: 78,
+                output_tokens: 52
+            }
+        );
+        assert!(!state.stopped_early);
     }
 }
 
 #[tokio::test]
-async fn ordinary_errors_and_successful_answers_do_not_retry() {
+async fn provider_errors_and_successful_answers_do_not_retry() {
     let kind = ProviderKind::OpenaiCompatible;
-    for (status, last, expected) in [
-        (401, true, "AI_UNAUTHORIZED"),
-        (429, true, "AI_RATE_LIMITED"),
-        (500, true, "AI_SERVER_ERROR"),
-        (400, false, "AI_BAD_REQUEST"),
+    for (status, expected) in [
+        (401, "AI_UNAUTHORIZED"),
+        (429, "AI_RATE_LIMITED"),
+        (500, "AI_SERVER_ERROR"),
+        (400, "AI_BAD_REQUEST"),
     ] {
         let (config, seen) = server(kind, vec![(status, "failure".into())]).await;
         let error = complete_step(
             &provider::http_client().unwrap(),
             &config,
             request(),
-            last,
             &mut |_| {},
             &Cancellation::default(),
             &mut outcome(),
@@ -415,7 +458,6 @@ async fn ordinary_errors_and_successful_answers_do_not_retry() {
         &provider::http_client().unwrap(),
         &config,
         request(),
-        true,
         &mut |_| {},
         &Cancellation::default(),
         &mut outcome(),
@@ -424,14 +466,10 @@ async fn ordinary_errors_and_successful_answers_do_not_retry() {
     .unwrap();
     assert_eq!(seen.lock().unwrap().len(), 1);
     let (config, seen) = server(kind, vec![reply(kind, "", false)]).await;
-    let mut plain = request();
-    plain.tools.clear();
-    plain.disable_tools = false;
     let error = complete_step(
         &provider::http_client().unwrap(),
         &config,
-        plain,
-        true,
+        request(),
         &mut |_| {},
         &Cancellation::default(),
         &mut outcome(),
@@ -443,7 +481,7 @@ async fn ordinary_errors_and_successful_answers_do_not_retry() {
 }
 
 #[tokio::test]
-async fn cancellation_during_the_first_response_prevents_the_fallback() {
+async fn cancellation_during_a_response_prevents_further_requests() {
     let kind = ProviderKind::OpenaiCompatible;
     let (config, seen) = server(kind, vec![reply(kind, "plan", true)]).await;
     let cancel = Cancellation::default();
@@ -451,7 +489,6 @@ async fn cancellation_during_the_first_response_prevents_the_fallback() {
         &provider::http_client().unwrap(),
         &config,
         request(),
-        true,
         &mut |event| {
             if matches!(event, AgentEvent::TextDelta { .. }) {
                 cancel.cancel();

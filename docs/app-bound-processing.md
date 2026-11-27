@@ -245,9 +245,35 @@ When service access is unavailable, newly captured material still follows the
 archive path and deferred history work waits for normal authorization. Immediate
 protected-startup failures leave the original package's repair UI usable. A fresh
 signed package can also be launched with `--repair-protected-runtime` to reach
-that UI directly. Repair validates and restores missing or corrupted protected
-files from that package; files mapped by a running process can require closing
-that process and retrying. Use the current or a newer release for repair.
+that UI directly. Repair checks the registered version and local signed files
+first, including the original installation directory and its component cache.
+It reapplies the service configuration and restores its files and launch records
+without changing the user's enabled preference or retained grants.
+
+If local components are unavailable, repair downloads the registered version's
+`carbonpaper_<version>_x64_service-repair.zip` and signed `service-repair.json`
+from GitHub Release. This ZIP contains the service, setup helper, and the existing
+`protected-runtime.json/.sig`; it omits workers and model resources. The release
+metadata binds the runtime identity, ZIP checksum and size. Each ZIP is limited
+to 64 MiB compressed and 128 MiB expanded. The cache under
+`%LocalAppData%/CarbonPaper/app-bound-repair/` retains component versions needed by
+the owner and shared service; temporary archives and extraction directories are
+removed after the attempt, or on the next attempt after interruption.
+
+Missing or corrupted workers and bundled resources use a valid local complete
+package when available. Otherwise the UI asks before downloading the matching
+portable ZIP and displays its size when available. Releases without a component
+package also offer this complete-package fallback. **Repair from a local
+package** accepts an official component or portable ZIP and verifies its signed
+contents; it can be used with network features disabled. On machines with
+different owner and service versions, both matching sources may be needed.
+
+The `installed_service` ledger record retains the shared service's version floor
+independently of runtime manifests. `System/repair-runtime.json` provides readable
+discovery; elevated repair consults the ledger and committed owners before
+reconstructing launch records. Legacy service registrations still contribute
+their version until this checkpoint is established. Files mapped by a running
+process can require closing that process and retrying.
 
 Removal revokes the requesting user's tasks and unregisters that owner. The
 machine-wide service is removed when no owners remain. Protected runtime copies
@@ -264,6 +290,7 @@ and [app_bound.rs](../src-tauri/src/app_bound.rs):
 | `app_bound_acknowledge_offer` | Main window; persist Later/dismissal |
 | `app_bound_set_policy` | Main window and session; enable/disable and limits; enabling also requires the background master switch |
 | `app_bound_install` | Main window and session; validate signed package, request UAC, activate or repair, restart unelevated |
+| `app_bound_repair` | Main/settings window and session; select verified local or downloaded sources, request UAC, restore the registered runtime and service, restart when needed |
 | `app_bound_uninstall` | Main window and session; request UAC, revoke/unregister, discard local staged inputs |
 
 None of these commands returns task keys or staged plaintext. Native

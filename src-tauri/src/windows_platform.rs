@@ -220,3 +220,47 @@ pub(crate) fn process_tree() -> Option<HashMap<u32, (u32, String)>> {
         Some(processes)
     }
 }
+
+/// Bounded parent traversal shared by capture routing and usage association.
+pub(crate) fn process_ancestors(pid: u32) -> Option<Vec<u32>> {
+    Some(ancestor_pids(pid, &process_tree()?))
+}
+
+pub(crate) fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
+    pid == expected_ancestor_pid
+        || process_ancestors(pid).is_some_and(|parents| parents.contains(&expected_ancestor_pid))
+}
+
+fn ancestor_pids(pid: u32, processes: &HashMap<u32, (u32, String)>) -> Vec<u32> {
+    let mut parents = Vec::with_capacity(8);
+    let mut current = pid;
+    for _ in 0..8 {
+        let Some(&(parent, _)) = processes.get(&current) else {
+            break;
+        };
+        if parent == 0 || parent == pid || parent == current || parents.contains(&parent) {
+            break;
+        }
+        parents.push(parent);
+        current = parent;
+    }
+    parents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn process_ancestry_is_bounded_and_stops_at_missing_parents_and_cycles() {
+        let mut tree: HashMap<u32, (u32, String)> = (1..=12)
+            .map(|pid| (pid, (pid - 1, String::new())))
+            .collect();
+        assert_eq!(ancestor_pids(12, &tree), (4..12).rev().collect::<Vec<_>>());
+        assert_eq!(ancestor_pids(3, &tree), [2, 1]);
+        assert!(ancestor_pids(99, &tree).is_empty());
+        tree.insert(1, (3, String::new()));
+        assert_eq!(ancestor_pids(3, &tree), [2, 1]);
+        tree.insert(2, (2, String::new()));
+        assert_eq!(ancestor_pids(3, &tree), [2]);
+    }
+}

@@ -96,8 +96,26 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // Git ignores do not apply to Vite's watcher. Local previews can contain
+      // entire browser profiles, so exclude their directories before traversal.
+      ignored: [
+        "**/src-tauri/**",
+        "**/*.local",
+        "**/*.local/**",
+        "**/.release-assets/**",
+        "**/coverage/**",
+        "**/.claude/**",
+        "**/.pytest_cache/**",
+        "**/.tmp_pytest/**",
+        "**/__pycache__/**",
+        "**/.mypy_cache/**",
+        "**/.ruff_cache/**",
+        "**/.venv/**",
+        "**/venv/**",
+        "**/tools/disk-wear-runs/**",
+        "**/work/ui-layout-review/**",
+        "**/*.log",
+      ],
     },
   },
 }));

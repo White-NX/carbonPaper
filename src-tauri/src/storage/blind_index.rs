@@ -185,11 +185,11 @@ pub(super) fn ensure_schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch("RELEASE carbonpaper_blind_index_format")
             .map_err(|e| error("commit format upgrade", e))
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
         if let Err(e) = conn.execute_batch(
             "ROLLBACK TO carbonpaper_blind_index_format; RELEASE carbonpaper_blind_index_format",
         ) {
-            return Err(format!("{}; rollback failed: {e}", result.unwrap_err()));
+            return Err(format!("{error}; rollback failed: {e}"));
         }
     }
     result

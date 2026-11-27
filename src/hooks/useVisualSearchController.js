@@ -10,7 +10,8 @@ const EMPTY_RESULTS = [];
 const EMPTY_THUMBNAILS = {};
 const emptyState = (key, phase = 'idle') => ({ key, phase, results: EMPTY_RESULTS,
   thumbnails: EMPTY_THUMBNAILS, offset: 0, summaryCount: VISUAL_SEARCH_SUMMARY_SIZE,
-  hasMore: false, loadingMore: false, pageError: false, pageErrorMessage: null });
+  hasMore: false, loadingMore: false, pageError: false, pageErrorMessage: null,
+  elapsedMs: null, errorMessage: null, errorKind: null });
 
 function normalizeResult(item) {
   const metadata = item.metadata || {};
@@ -25,14 +26,14 @@ function normalizeResult(item) {
 
 /** Visual retrieval updates independently from the text and recap channels. */
 export function useVisualSearchController({ active, query, debouncedQuery, processNames,
-  categories, startTime, endTime, refreshKey, sharedThumbnails = EMPTY_THUMBNAILS }) {
+  categories, startTime, endTime, refreshKey, sortOrder = 'relevance', sharedThumbnails = EMPTY_THUMBNAILS }) {
   const [retryRevision, setRetryRevision] = useState(0);
   const queue = useMemo(() => createLatestTaskQueue(), []);
   const generation = useRef(0);
   const pageRequest = useRef(null);
   const normalized = query.trim();
   const ready = active && Boolean(normalized) && normalized === debouncedQuery.trim();
-  const searchKey = JSON.stringify([normalized, processNames, categories, startTime, endTime, refreshKey]);
+  const searchKey = JSON.stringify([normalized, processNames, categories, startTime, endTime, refreshKey, sortOrder]);
   const key = JSON.stringify([searchKey, retryRevision]);
   const [state, setState] = useState(() => emptyState(key));
   const [indexReady, setIndexReady] = useState(null);
@@ -47,27 +48,32 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
       return () => queue.cancel();
     }
     setState(emptyState(key, 'loading'));
+    const startedAt = performance.now();
     const limit = VISUAL_SEARCH_SUMMARY_SIZE;
     queue.run(`${key}:0:${limit}`, (signal) => searchScreenshots(normalized, 'nl', {
-      limit, offset: 0, processNames, categories, startTime, endTime, fuzzy: false, includeOcr: false, signal,
+      limit, offset: 0, processNames, categories, startTime, endTime, sortOrder, fuzzy: false, includeOcr: false, signal,
     })).then((items) => {
       if (generation.current !== version) return;
       setState({ ...emptyState(key, 'ready'), results: items.map(normalizeResult),
-        offset: items.length, hasMore: items.length === limit });
+        offset: items.length, hasMore: items.length === limit, elapsedMs: performance.now() - startedAt });
     }).catch((error) => {
       if (generation.current === version && error?.name !== 'AbortError') {
-        setState(emptyState(key, 'error'));
+        const errorMessage = error?.message || String(error);
+        console.error('Visual search failed:', errorMessage);
+        setState({ ...emptyState(key, 'error'), errorMessage,
+          errorKind: errorMessage.includes('query_deadline_exceeded') ? 'timeout' : 'unavailable',
+          elapsedMs: performance.now() - startedAt });
       }
     });
     return () => { generation.current += 1; queue.cancel(); };
-  }, [active, ready, key, normalized, processNames, categories, startTime, endTime, queue]);
+  }, [active, ready, key, normalized, processNames, categories, startTime, endTime, sortOrder, queue]);
 
   usePolling(async () => {
     const version = generation.current;
     const status = await getClipSearchStatus();
     if (generation.current !== version) return;
     setIndexReady(typeof status?.ready === 'boolean' ? status.ready : null);
-  }, { intervalMs: 5000, enabled: ready });
+  }, { intervalMs: 5000, enabled: ready && sortOrder === 'relevance' });
 
   const loadPage = useCallback(async (limit, restart = false) => {
     if (!ready || current.phase !== 'ready' || !current.hasMore || current.loadingMore || pageRequest.current) return;
@@ -78,7 +84,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
     setState((previous) => ({ ...previous, loadingMore: true, pageError: false, pageErrorMessage: null }));
     try {
       const items = await queue.run(pageKey, (signal) => searchScreenshots(normalized, 'nl', {
-        limit, offset, processNames, categories, startTime, endTime,
+        limit, offset, processNames, categories, startTime, endTime, sortOrder,
         fuzzy: false, includeOcr: false, signal,
       }));
       if (generation.current !== version) return;
@@ -100,7 +106,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
       if (pageRequest.current === pageKey) pageRequest.current = null;
     }
   }, [ready, current.phase, current.hasMore, current.loadingMore, current.offset, key, normalized,
-    processNames, categories, startTime, endTime, queue]);
+    processNames, categories, startTime, endTime, sortOrder, queue]);
 
   const loadMore = useCallback(() => loadPage(VISUAL_SEARCH_SUMMARY_SIZE), [loadPage]);
   // Establish a full first gallery page before continuing from its raw offset.
@@ -142,7 +148,7 @@ export function useVisualSearchController({ active, query, debouncedQuery, proce
 
   const thumbnails = useMemo(() => ready ? { ...sharedThumbnails, ...current.thumbnails } : EMPTY_THUMBNAILS,
     [ready, sharedThumbnails, current.thumbnails]);
-  return { ...current, indexReady: ready ? indexReady : null, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
+  return { ...current, indexReady: ready && sortOrder === 'relevance' ? indexReady : null, searchKey, thumbnails, galleryReady, loadGalleryPage, summaryResults: current.results.slice(0, current.summaryCount),
     summaryExpanded: current.summaryCount > VISUAL_SEARCH_SUMMARY_SIZE,
     summaryHasMore: current.results.length > current.summaryCount || current.hasMore,
     summaryPageError, showMore, loadMore, retry };

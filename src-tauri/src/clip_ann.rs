@@ -31,6 +31,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -265,19 +266,14 @@ struct ArmCoordinator {
     rebuild_required: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ArmStatus {
+    #[default]
     Idle,
     Loading,
     Ready,
     Missing,
     Failed,
-}
-
-impl Default for ArmStatus {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 struct GenerationReader {
@@ -954,9 +950,14 @@ fn exact_candidates(
                 .map(|v| (row.subject_key.as_str(), dot_product(query, v)))
         }),
         None,
+        None,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exact scans keep generation, tail visibility, and interruption controls explicit"
+)]
 fn exact_candidates_with_tail<'a>(
     generation: &GenerationReader,
     query: &[f32],
@@ -965,6 +966,7 @@ fn exact_candidates_with_tail<'a>(
     changed: impl Fn(&str) -> bool,
     tail_scores: impl Iterator<Item = (&'a str, f32)>,
     metrics: Option<&crate::storage::VectorQueryMetrics>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<ScoredSubject>, String> {
     let started = Instant::now();
     if let Some(metrics) = metrics {
@@ -976,6 +978,9 @@ fn exact_candidates_with_tail<'a>(
     }
     let mut top = BoundedTopK::new(k);
     for ordinal in 0..generation.flat.rows() {
+        if ordinal % 64 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("query_cancelled".into());
+        }
         if ordinal % 256 == 0 {
             if let Some(metrics) = metrics {
                 metrics.update(|progress| {
@@ -1002,6 +1007,9 @@ fn exact_candidates_with_tail<'a>(
         });
     }
     for (index, (key, score)) in tail_scores.enumerate() {
+        if index % 64 == 0 && cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("query_cancelled".into());
+        }
         if index % 1024 == 0
             && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         {
@@ -1110,7 +1118,6 @@ fn spawn_arm(app: AppHandle, state: Arc<ClipAnnState>, arm_token: u64) {
                 restore_recovery_progress(&app, &state, arm_token).await;
                 drop(_operation_guard);
                 spawn_missing_generation_bootstrap(app, state, arm_token);
-                return;
             }
             Ok(Ok(StartupArmOutcome::Discarded)) => {}
             Ok(Err(error)) => {
@@ -1420,6 +1427,8 @@ fn open_generation_validated(
     let options: usearch::IndexOptions = metadata.into();
     let index = Index::new(&options)
         .map_err(|error| GenerationLoadError::Deferred(format!("ANN view init failed: {error}")))?;
+    // SAFETY: the authenticated graph bytes stay immutable in GenerationReader.
+    // Its index is dropped before the backing bytes, including on load failure.
     unsafe { index.view_from_buffer(&ann_bytes) }.map_err(|error| {
         GenerationLoadError::RebuildRequired(format!("ANN buffer view failed: {error}"))
     })?;
@@ -1519,6 +1528,10 @@ impl PendingBuilder {
         self.0.as_ref().expect("pending ANN builder is available")
     }
 
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("pending ANN builder is available")
+    }
+
     fn take(&mut self) -> Child {
         self.0.take().expect("pending ANN builder is available")
     }
@@ -1540,6 +1553,8 @@ unsafe impl Send for BuilderJob {}
 
 impl Drop for BuilderJob {
     fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the successful CreateJobObjectW
+        // handle; Drop closes it once after its last use.
         unsafe {
             let _ = CloseHandle(self.0);
         }
@@ -1547,6 +1562,8 @@ impl Drop for BuilderJob {
 }
 
 fn create_builder_job() -> Result<BuilderJob, String> {
+    // SAFETY: the new job handle is either returned to its owner or closed on
+    // failure. The initialized limits buffer is sized and live through the call.
     unsafe {
         let handle = CreateJobObjectW(None, None)
             .map_err(|error| format!("Failed to create ANN builder job: {error:?}"))?;
@@ -1570,6 +1587,8 @@ fn create_builder_job() -> Result<BuilderJob, String> {
 }
 
 fn assign_builder_job(job: &BuilderJob, child: &Child) -> Result<(), String> {
+    // SAFETY: both owners retain their valid kernel handles during this call.
+    // The API assigns the process without taking either handle's ownership.
     unsafe {
         let process_handle = HANDLE(child.as_raw_handle() as *mut _);
         AssignProcessToJobObject(job.0, process_handle)
@@ -1769,13 +1788,15 @@ mod tests {
         writer.finish().unwrap();
         let flat = MappedFlatIndex::open(&flat_path, encryption.clone()).unwrap();
 
-        let mut options = usearch::IndexOptions::default();
-        options.dimensions = dimensions as usize;
-        options.metric = MetricKind::IP;
-        options.quantization = ScalarKind::I8;
-        options.connectivity = ANN_CONNECTIVITY as usize;
-        options.expansion_add = ANN_EXPANSION_ADD as usize;
-        options.expansion_search = 96;
+        let options = usearch::IndexOptions {
+            dimensions: dimensions as usize,
+            metric: MetricKind::IP,
+            quantization: ScalarKind::I8,
+            connectivity: ANN_CONNECTIVITY as usize,
+            expansion_add: ANN_EXPANSION_ADD as usize,
+            expansion_search: 96,
+            ..Default::default()
+        };
         let built = Index::new(&options).unwrap();
         built.reserve(keys.len()).unwrap();
         for (ordinal, vector) in vectors.iter().enumerate() {
@@ -1802,6 +1823,8 @@ mod tests {
         drop(built);
         let metadata = Index::metadata_from_buffer(&ann_bytes).unwrap();
         let index = Index::new(&metadata.into()).unwrap();
+        // SAFETY: these bytes were serialized by usearch and remain immutable
+        // in the fixture reader, whose index is dropped before the buffer.
         unsafe { index.view_from_buffer(&ann_bytes) }.unwrap();
         apply_expansion_search(&index, 96).unwrap();
 
@@ -2275,13 +2298,15 @@ mod tests {
         writer.push_vector(&[1.0, 0.0]).unwrap();
         writer.finish().unwrap();
         let flat = MappedFlatIndex::open(&flat_path, crate::ann_format::test_key()).unwrap();
-        let mut options = usearch::IndexOptions::default();
-        options.dimensions = 2;
-        options.metric = MetricKind::IP;
-        options.quantization = ScalarKind::I8;
-        options.connectivity = ANN_CONNECTIVITY as usize;
-        options.expansion_add = ANN_EXPANSION_ADD as usize;
-        options.expansion_search = 96;
+        let options = usearch::IndexOptions {
+            dimensions: 2,
+            metric: MetricKind::IP,
+            quantization: ScalarKind::I8,
+            connectivity: ANN_CONNECTIVITY as usize,
+            expansion_add: ANN_EXPANSION_ADD as usize,
+            expansion_search: 96,
+            ..Default::default()
+        };
         let built = Index::new(&options).unwrap();
         built.reserve(1).unwrap();
         built.add(1, &[1.0, 0.0]).unwrap();
@@ -2303,6 +2328,8 @@ mod tests {
         drop(built);
         let metadata = Index::metadata_from_buffer(&ann_bytes).unwrap();
         let index = Index::new(&metadata.into()).unwrap();
+        // SAFETY: the fixture owns the serialized graph bytes for the reader's
+        // lifetime; its index is dropped before those immutable backing bytes.
         unsafe { index.view_from_buffer(&ann_bytes) }.unwrap();
 
         let state = ClipAnnState::default();

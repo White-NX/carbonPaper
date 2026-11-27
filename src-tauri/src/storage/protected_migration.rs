@@ -194,7 +194,7 @@ impl StorageState {
         }
         let mut cursor = 0i64;
         loop {
-            let mut query=conn.prepare("SELECT rowid,index_kind,subject_key,vector_f32 FROM derived_embeddings WHERE rowid>?1 ORDER BY rowid LIMIT 512").map_err(|e|e.to_string())?;
+            let mut query=conn.prepare("SELECT rowid,index_kind,subject_key,vector_f32 FROM derived_embeddings_read WHERE rowid>?1 ORDER BY rowid LIMIT 512").map_err(|e|e.to_string())?;
             let rows = query
                 .query_map([cursor], |r| {
                     Ok((

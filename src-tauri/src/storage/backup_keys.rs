@@ -1,16 +1,20 @@
 //! Explicit inventory of portable key slots in a database snapshot.
 //!
-//! The bundle is streamed directly into the encrypted archive. On import it is
-//! held in zeroizing memory, never staged as a plaintext file. Slot digests bind
+//! The bundle is held in zeroizing memory and written into the encrypted archive,
+//! never staged as a plaintext file. Slot digests bind
 //! each recovered key to the exact original wrapping and snapshot row.
 
-use super::{backup_format::check_cancelled, connection, database_snapshot};
+use super::{
+    backup_format::check_cancelled, backup_images::relative_image_path, connection,
+    database_snapshot, image_io::regular_image_file_exists,
+};
 use crate::credential_manager::{
     decrypt_with_master_key, encrypt_with_master_key, load_public_key_from_file,
     unwrap_storage_domain_key, wrap_storage_domain_key, CredentialManagerState,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use carbonpaper_app_bound::payload::{payload_key_id, CipherKey};
+use carbonpaper_backup_core::ZeroizingBuffer;
 use rand::RngCore;
 use rusqlite::{config::DbConfig, params, Connection};
 use sha2::{Digest, Sha256};
@@ -19,6 +23,7 @@ use std::{
     io::Write,
     path::Path,
     sync::atomic::AtomicBool,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -83,6 +88,16 @@ const DOMAINS: &[Domain] = &[
         wrapping: "wrapped_key",
         payloads: &[],
     },
+    Domain {
+        table: "ocr_keys",
+        wrapping: "wrapped_key",
+        payloads: &[],
+    },
+    Domain {
+        table: "usage_intervals_legacy",
+        wrapping: "identity_key_enc",
+        payloads: &["identity_enc"],
+    },
 ];
 
 fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
@@ -98,6 +113,7 @@ fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>, String> {
 }
 
 fn inventory(conn: &Connection) -> Result<Vec<(usize, HashSet<String>)>, String> {
+    super::ocr_keys::backup::validate_references(conn)?;
     let mut tables = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
         .map_err(|e| e.to_string())?;
@@ -129,8 +145,13 @@ fn inventory(conn: &Connection) -> Result<Vec<(usize, HashSet<String>)>, String>
                 ));
             }
             for payload in domain.payloads.iter().filter(|p| available.contains(**p)) {
+                let legacy_only = if table == "ocr_results" && available.contains("ocr_key_id") {
+                    " AND ocr_key_id IS NULL"
+                } else {
+                    ""
+                };
                 let missing: bool = conn.query_row(&format!(
-                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {payload} IS NOT NULL AND length({payload})>0 AND ({} IS NULL OR length({})=0))",
+                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {payload} IS NOT NULL AND length({payload})>0 AND ({} IS NULL OR length({})=0){legacy_only})",
                     domain.wrapping, domain.wrapping), [], |r| r.get(0)).map_err(|e| e.to_string())?;
                 if missing {
                     return Err(format!("Missing content key for {table}.{payload}"));
@@ -192,6 +213,18 @@ impl<'a> Bundle<'a> {
     pub(super) fn master_key(&self) -> &[u8] {
         &self.bytes[40..72]
     }
+    pub(super) fn screenshot_keys(&self) -> HashMap<i64, &'a [u8]> {
+        self.bytes[HEADER_BYTES..]
+            .chunks_exact(SLOT_BYTES)
+            .filter(|slot| slot[0] == 0)
+            .map(|slot| {
+                (
+                    i64::from_le_bytes(slot[1..9].try_into().unwrap()),
+                    &slot[41..73],
+                )
+            })
+            .collect()
+    }
     fn fingerprint(&self) -> String {
         hex::encode(&self.bytes[72..104])
     }
@@ -209,18 +242,42 @@ fn validate_row(
     key: &[u8],
 ) -> Result<(), String> {
     let d = &DOMAINS[index];
-    for column in d.payloads.iter().filter(|p| available.contains(**p)) {
-        let bytes: Option<Vec<u8>> = conn
-            .query_row(
-                &format!("SELECT {column} FROM {} WHERE rowid=?1", d.table),
-                [rowid],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+    if d.table == "ocr_keys" {
+        return super::ocr_keys::backup::validate_key(conn, rowid, key);
+    }
+    let payloads = d
+        .payloads
+        .iter()
+        .copied()
+        .filter(|column| available.contains(*column))
+        .collect::<Vec<_>>();
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    // Fetch a row's envelopes together. Preparing and seeking the same row once
+    // per metadata field magnifies key preparation on a large screenshot history.
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT {} FROM {} WHERE rowid=?1",
+            payloads.join(","),
+            d.table
+        ))
+        .map_err(|error| error.to_string())?;
+    let envelopes = statement
+        .query_row([rowid], |row| {
+            (0..payloads.len())
+                .map(|index| row.get::<_, Option<Vec<u8>>>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| error.to_string())?;
+    for (column, bytes) in payloads.iter().zip(envelopes) {
         if let Some(bytes) = bytes.filter(|b| !b.is_empty()) {
             let _plaintext =
                 Zeroizing::new(decrypt_with_master_key(key, &bytes).map_err(|_| {
-                    format!("Content authentication failed for {}.{column}", d.table)
+                    format!(
+                        "Content authentication failed for {}.{column} (rowid={rowid})",
+                        d.table
+                    )
                 })?);
         }
     }
@@ -235,6 +292,17 @@ fn protected_key(
 ) -> Result<CipherKey, String> {
     let (id, purpose, dataset, saved_fingerprint): (String, String, String, String) = conn.query_row(
         "SELECT key_id,purpose,dataset_id,public_key_fingerprint FROM protected_storage_keys WHERE rowid=?1", [rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
+    protected_key_fields(id, dataset, purpose, &saved_fingerprint, fingerprint, key)
+}
+
+fn protected_key_fields(
+    id: String,
+    dataset: String,
+    purpose: String,
+    saved_fingerprint: &str,
+    fingerprint: &str,
+    key: &[u8],
+) -> Result<CipherKey, String> {
     if saved_fingerprint != fingerprint
         || !matches!(purpose.as_str(), "metadata" | "vectors" | "ann")
         || !carbonpaper_app_bound::protocol::valid_id(&dataset)
@@ -246,6 +314,9 @@ fn protected_key(
 
 // identities must match protected_migration::text_identity and the writers.
 fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> Result<(), String> {
+    if columns(conn, "derived_embeddings")?.contains("vector_block_id") {
+        super::vector_blocks::validate(conn)?;
+    }
     for (table, identity, column, text) in [
         (
             "smart_clusters",
@@ -308,6 +379,13 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
             true,
         ),
         ("tasks", "'task_label:'||id", "label", true),
+        ("usage_apps", "'usage_app:'||token", "info_enc", false),
+        (
+            "usage_contexts",
+            "'usage_context:'||token",
+            "info_enc",
+            false,
+        ),
         (
             "protected_process_names",
             "'process:'||token",
@@ -330,9 +408,15 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
         if !columns(conn, table)?.contains(column) {
             continue;
         }
+        let source =
+            if table == "derived_embeddings" && columns(conn, table)?.contains("vector_block_id") {
+                "derived_embeddings_read"
+            } else {
+                table
+            };
         let mut query = conn
             .prepare(&format!(
-                "SELECT {identity},{column} FROM {table} WHERE {column} IS NOT NULL"
+                "SELECT {identity},{column} FROM {source} WHERE {column} IS NOT NULL"
             ))
             .map_err(|e| e.to_string())?;
         let mut rows = query.query([]).map_err(|e| e.to_string())?;
@@ -350,6 +434,9 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
             } else {
                 let value: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
                 if !carbonpaper_app_bound::payload::is_sealed(&value) {
+                    if matches!(table, "usage_apps" | "usage_contexts") {
+                        return Err("Unprotected usage catalog in backup".into());
+                    }
                     continue;
                 }
                 value
@@ -358,28 +445,148 @@ fn validate_protected(conn: &Connection, keys: &HashMap<String, CipherKey>) -> R
             let key = keys
                 .get(&id)
                 .ok_or("Missing protected backup content key")?;
-            let _plaintext = key.open(&identity, &data)?;
+            let _plaintext = ZeroizingBuffer::from(key.open(&identity, &data)?);
         }
     }
     Ok(())
 }
 
-pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn usage_backup_validation_requires_keys_and_authenticates_catalog_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::storage::usage::initialize(&conn).unwrap();
+        let key =
+            CipherKey::new("a".repeat(32), "b".repeat(32), "metadata".into(), &[7; 32]).unwrap();
+        let app = key.seal("usage_app:app", b"private application").unwrap();
+        let context = key
+            .seal("usage_context:context", b"private title and URL")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO usage_apps(id,token,info_enc) VALUES(1,'app',?1)",
+            [&app],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO usage_contexts(id,token,app_id,category,info_enc) VALUES(1,'context',1,'游戏',?1)",[&context]).unwrap();
+        assert!(validate_protected(&conn, &HashMap::new()).is_err());
+        let keys = HashMap::from([(key.id.clone(), key)]);
+        validate_protected(&conn, &keys).unwrap();
+        conn.execute("UPDATE usage_contexts SET info_enc=?1", [&app])
+            .unwrap();
+        assert!(validate_protected(&conn, &keys).is_err());
+        conn.execute(
+            "UPDATE usage_contexts SET info_enc=?1",
+            [b"plaintext".as_slice()],
+        )
+        .unwrap();
+        assert!(validate_protected(&conn, &keys).is_err());
+    }
+
+    #[test]
+    fn preserved_usage_row_keys_round_trip_through_a_portable_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::storage::test_storage_with_schema(directory.path().into());
+        let guard = storage
+            .get_connection_named("usage.legacy.backup.test")
+            .unwrap();
+        let conn = guard.as_ref().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_intervals_legacy (
+                id INTEGER PRIMARY KEY,identity_enc BLOB NOT NULL,identity_key_enc BLOB NOT NULL);",
+        )
+        .unwrap();
+        let row_key = [19; 32];
+        let encrypted = encrypt_with_master_key(&row_key, b"legacy private identity").unwrap();
+        let wrapped = wrap_storage_domain_key(&storage.credential_state, &row_key).unwrap();
+        conn.execute(
+            "INSERT INTO usage_intervals_legacy VALUES(1,?1,?2)",
+            params![encrypted, wrapped],
+        )
+        .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut bytes = ZeroizingBuffer::new();
+        write_bundle(
+            conn,
+            &storage.credential_state,
+            &[1; 32],
+            &[2; 32],
+            &mut bytes,
+            &cancelled,
+            |_, _| {},
+        )
+        .unwrap();
+        let bundle = Bundle::parse(&bytes).unwrap();
+        let legacy_domain = DOMAINS
+            .iter()
+            .position(|domain| domain.table == "usage_intervals_legacy")
+            .unwrap();
+        let slot = (0..bundle.count)
+            .map(|index| bundle.slot(index))
+            .find(|slot| slot[0] as usize == legacy_domain)
+            .unwrap();
+        assert_eq!(&slot[41..73], &row_key);
+
+        let restored = CredentialManagerState::new(directory.path().join("restored"));
+        restored.fixture_public_key(b"usage-backup-restored-recipient");
+        rewrap(
+            conn,
+            &bundle,
+            &restored,
+            directory.path(),
+            &cancelled,
+            &[],
+            |_, _| {},
+        )
+        .unwrap();
+        let (saved, rewrapped): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT identity_enc,identity_key_enc FROM usage_intervals_legacy WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, encrypted);
+        assert_ne!(rewrapped, wrapped);
+        let recovered = Zeroizing::new(unwrap_storage_domain_key(&restored, &rewrapped).unwrap());
+        assert_eq!(recovered.as_slice(), row_key);
+        assert_eq!(
+            decrypt_with_master_key(&recovered, &saved).unwrap(),
+            b"legacy private identity"
+        );
+    }
+}
+
+pub(super) fn write_bundle<F: FnMut(u64, u64)>(
     conn: &Connection,
     credentials: &CredentialManagerState,
     database_key: &[u8],
     master_key: &[u8],
-    writer: &mut W,
+    writer: &mut ZeroizingBuffer,
     cancelled: &AtomicBool,
     mut progress: F,
 ) -> Result<(), String> {
     if database_key.len() != 32 || master_key.len() != 32 {
         return Err("Invalid backup root key length".into());
     }
+    let inventory_started = Instant::now();
     let present = inventory(conn)?;
     let count = slot_count(conn, &present)?;
     let public = load_public_key_from_file(credentials).map_err(|e| e.to_string())?;
     let fingerprint = Sha256::digest(public);
+    let fingerprint_hex = hex::encode(fingerprint);
+    let ocr_dataset = if present.iter().any(|(index, _)| *index == 8) {
+        Some(super::ocr_keys::dataset(conn)?)
+    } else {
+        None
+    };
+    let inventory_ms = inventory_started.elapsed().as_millis() as u64;
+    // The exact bundle size is known from the frozen inventory. Reserve once
+    // so growing the bundle never reallocates live plaintext content keys.
+    writer
+        .reserve_capacity(HEADER_BYTES + count as usize * SLOT_BYTES)
+        .map_err(|error| error.to_string())?;
     writer
         .write_all(MAGIC)
         .and_then(|_| writer.write_all(database_key))
@@ -389,47 +596,129 @@ pub(super) fn write_bundle<W: Write, F: FnMut(u64, u64)>(
         .map_err(|e| e.to_string())?;
     let mut completed = 0u64;
     let mut protected = HashMap::new();
+    let mut ocr_groups = HashMap::new();
+    let mut scratch = ZeroizingBuffer::new();
+    let mut unwrap_time = Duration::ZERO;
+    let mut row_authentication_time = Duration::ZERO;
     progress(0, count);
     for (index, available) in present {
         let d = &DOMAINS[index];
+        let payloads = d
+            .payloads
+            .iter()
+            .copied()
+            .filter(|column| available.contains(*column))
+            .collect::<Vec<_>>();
+        let mut selected = vec!["rowid", d.wrapping];
+        selected.extend(&payloads);
+        if index == 7 {
+            selected.extend(["key_id", "purpose", "dataset_id", "public_key_fingerprint"]);
+        } else if index == 8 {
+            selected.extend(["screenshot_id", "scope_tag"]);
+        }
         let mut query = conn
             .prepare(&format!(
-                "SELECT rowid,{} FROM {} WHERE {} IS NOT NULL AND length({})>0 ORDER BY rowid",
-                d.wrapping, d.table, d.wrapping, d.wrapping
+                "SELECT {} FROM {} WHERE {} IS NOT NULL AND length({})>0 ORDER BY rowid",
+                selected.join(","),
+                d.table,
+                d.wrapping,
+                d.wrapping
             ))
             .map_err(|e| e.to_string())?;
         let mut rows = query.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             check_cancelled(cancelled).map_err(|e| e.to_string())?;
             let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let wrapping: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            let wrapping = row
+                .get_ref(1)
+                .map_err(|e| e.to_string())?
+                .as_blob()
+                .map_err(|e| e.to_string())?;
             if wrapping.len() > 4096 {
                 return Err("Invalid backup key wrapping length".into());
             }
+            let unwrap_started = Instant::now();
             let key = Zeroizing::new(
-                unwrap_storage_domain_key(credentials, &wrapping).map_err(|e| e.to_string())?,
+                unwrap_storage_domain_key(credentials, wrapping).map_err(|e| e.to_string())?,
             );
+            unwrap_time += unwrap_started.elapsed();
             if key.len() != 32 {
                 return Err("Invalid backup content key length".into());
             }
-            validate_row(conn, index, rowid, &available, &key)?;
+            let authentication_started = Instant::now();
+            for (column_index, column) in payloads.iter().enumerate() {
+                let value = row.get_ref(2 + column_index).map_err(|e| e.to_string())?;
+                if value == rusqlite::types::ValueRef::Null {
+                    continue;
+                }
+                let bytes = value.as_blob().map_err(|e| e.to_string())?;
+                if !bytes.is_empty() {
+                    carbonpaper_app_bound::crypto::authenticate_storage_bytes(
+                        &key,
+                        bytes,
+                        b"",
+                        &mut scratch,
+                    )
+                    .map_err(|_| {
+                        format!(
+                            "Content authentication failed for {}.{column} (rowid={rowid})",
+                            d.table
+                        )
+                    })?;
+                }
+            }
             if index == 7 {
-                let cipher = protected_key(conn, rowid, &key, &hex::encode(fingerprint))?;
+                let cipher = protected_key_fields(
+                    row.get(2).map_err(|e| e.to_string())?,
+                    row.get(4).map_err(|e| e.to_string())?,
+                    row.get(3).map_err(|e| e.to_string())?,
+                    row.get::<_, String>(5).map_err(|e| e.to_string())?.as_str(),
+                    &fingerprint_hex,
+                    &key,
+                )?;
                 protected.insert(cipher.id.clone(), cipher);
             }
+            if index == 8 {
+                super::ocr_keys::backup::validate_key_fields(
+                    ocr_dataset.as_deref().ok_or("Missing OCR backup dataset")?,
+                    row.get(2).map_err(|e| e.to_string())?,
+                    rowid,
+                    row.get_ref(3)
+                        .map_err(|e| e.to_string())?
+                        .as_blob()
+                        .map_err(|e| e.to_string())?,
+                    &key,
+                )?;
+                ocr_groups.insert(rowid, Zeroizing::new(key.to_vec()));
+            }
+            row_authentication_time += authentication_started.elapsed();
             writer
                 .write_all(&[index as u8])
                 .and_then(|_| writer.write_all(&rowid.to_le_bytes()))
-                .and_then(|_| writer.write_all(&Sha256::digest(&wrapping)))
+                .and_then(|_| writer.write_all(&Sha256::digest(wrapping)))
                 .and_then(|_| writer.write_all(&key))
                 .map_err(|e| e.to_string())?;
             completed += 1;
-            if completed % 20 == 0 || completed == count {
+            if completed.is_multiple_of(20) || completed == count {
                 progress(completed, count);
             }
         }
     }
-    validate_protected(conn, &protected)
+    let ocr_started = Instant::now();
+    super::ocr_keys::backup::validate_members(conn, &ocr_groups, cancelled)?;
+    let ocr_authentication_ms = ocr_started.elapsed().as_millis() as u64;
+    let protected_started = Instant::now();
+    validate_protected(conn, &protected)?;
+    tracing::info!(
+        key_slots = count,
+        inventory_ms,
+        unwrap_ms = unwrap_time.as_millis() as u64,
+        row_authentication_ms = row_authentication_time.as_millis() as u64,
+        ocr_authentication_ms,
+        protected_authentication_ms = protected_started.elapsed().as_millis() as u64,
+        "Backup key preparation timings"
+    );
+    Ok(())
 }
 
 fn without_triggers<T>(
@@ -478,6 +767,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
     credentials: &CredentialManagerState,
     directory: &Path,
     cancelled: &AtomicBool,
+    missing_screenshots: &[database_snapshot::MissingScreenshot],
     mut progress: F,
 ) -> Result<(), String> {
     let present = inventory(conn)?;
@@ -491,6 +781,7 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let mut completed = 0u64;
         let mut protected = HashMap::new();
+        let mut ocr_groups = HashMap::new();
         progress(0, bundle.count);
         for (index, available) in &present {
             let d = &DOMAINS[*index];
@@ -518,12 +809,15 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
                     let cipher = protected_key(&tx, rowid, key, &bundle.fingerprint())?;
                     protected.insert(cipher.id.clone(), cipher);
                 }
+                if *index == 8 {
+                    ocr_groups.insert(rowid, Zeroizing::new(key.to_vec()));
+                }
                 let wrapping =
                     wrap_storage_domain_key(credentials, key).map_err(|e| e.to_string())?;
                 let checked = Zeroizing::new(
                     unwrap_storage_domain_key(credentials, &wrapping).map_err(|e| e.to_string())?,
                 );
-                if &*checked != key {
+                if *checked != key {
                     return Err("Restored content key verification failed".into());
                 }
                 tx.execute(
@@ -532,13 +826,14 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
                 )
                 .map_err(|e| e.to_string())?;
                 completed += 1;
-                if completed % 20 == 0 || completed == bundle.count {
+                if completed.is_multiple_of(20) || completed == bundle.count {
                     progress(completed, bundle.count);
                 }
             }
         }
+        super::ocr_keys::backup::validate_members(&tx, &ocr_groups, cancelled)?;
         validate_protected(&tx, &protected)?;
-        normalize_images(&tx, directory, credentials, cancelled, true)?;
+        normalize_images(&tx, directory, credentials, cancelled, missing_screenshots)?;
         if !columns(&tx, "protected_storage_keys")?.is_empty() {
             tx.execute(
                 "UPDATE protected_storage_keys SET public_key_fingerprint=?1",
@@ -556,43 +851,30 @@ pub(super) fn rewrap<F: FnMut(u64, u64)>(
     })
 }
 
-fn relative_image_path(path: &str) -> Result<String, String> {
-    let path = path.replace('\\', "/");
-    let relative = if path.starts_with("screenshots/") {
-        path.as_str()
-    } else {
-        let start = path
-            .to_ascii_lowercase()
-            .rfind("/screenshots/")
-            .ok_or("Unsupported screenshot path in backup")?;
-        &path[start + 1..]
-    };
-    let name = database_snapshot::normalize_archive_name(relative, false)?;
-    if !name.starts_with("screenshots/") || name.starts_with("screenshots/thumbs/") {
-        return Err("Unsupported screenshot path in backup".into());
-    }
-    Ok(name)
-}
-
 // Convert referenced legacy images in staging. Verified duplicate remnants are
 // removed; unrelated plaintext fails closed rather than being lost or exposed.
-pub(super) fn validate_source_images(
-    conn: &Connection,
-    directory: &Path,
-    credentials: &CredentialManagerState,
-    cancelled: &AtomicBool,
-) -> Result<(), String> {
-    normalize_images(conn, directory, credentials, cancelled, false)
-}
-
 fn normalize_images(
     conn: &Connection,
     directory: &Path,
     credentials: &CredentialManagerState,
     cancelled: &AtomicBool,
-    restore: bool,
+    missing_screenshots: &[database_snapshot::MissingScreenshot],
 ) -> Result<(), String> {
+    let mut declared_missing = HashMap::new();
+    for missing in missing_screenshots {
+        if relative_image_path(&missing.image_path)? != missing.image_path
+            || missing.screenshot_id <= 0
+            || declared_missing
+                .insert(missing.screenshot_id, missing.image_path.as_str())
+                .is_some()
+        {
+            return Err("Invalid missing screenshot inventory".into());
+        }
+    }
     if columns(conn, "screenshots")?.is_empty() {
+        if !declared_missing.is_empty() {
+            return Err("Missing screenshot inventory does not match the database".into());
+        }
         return Ok(());
     }
     let mut query = conn.prepare("SELECT rowid,image_path,content_key_encrypted,is_deleted,status FROM screenshots ORDER BY rowid").map_err(|e| e.to_string())?;
@@ -624,19 +906,22 @@ fn normalize_images(
         }
         let relative = relative_image_path(&path)?;
         let file = directory.join(&relative);
-        if !file.exists() {
+        if !regular_image_file_exists(&file)? {
             if deleted == 0 && status.as_deref() != Some("aborted") {
-                return Err("A screenshot file is missing from the backup".into());
+                if declared_missing.remove(&rowid) != Some(relative.as_str()) {
+                    return Err(format!(
+                        "BACKUP_UNDECLARED_MISSING_SCREENSHOT: id={rowid}, path={relative}"
+                    ));
+                }
+                tracing::warn!(phase = "restore", screenshot_id = rowid, image_path = %relative,
+                    outcome = "metadata_preserved", "Restored a record with a declared missing screenshot");
             }
-            if restore {
-                // Tombstones still feed deferred cleanup after import. Rebase
-                // their paths even when there is no file left to re-encrypt.
-                conn.execute(
-                    "UPDATE screenshots SET image_path=?1 WHERE rowid=?2",
-                    params![relative, rowid],
-                )
-                .map_err(|e| e.to_string())?;
-            }
+            // Preserve records and OCR, and rebase deferred cleanup paths.
+            conn.execute(
+                "UPDATE screenshots SET image_path=?1 WHERE rowid=?2",
+                params![relative, rowid],
+            )
+            .map_err(|e| e.to_string())?;
             continue;
         }
         let data = Zeroizing::new(std::fs::read(&file).map_err(|e| e.to_string())?);
@@ -662,38 +947,33 @@ fn normalize_images(
                     .map_err(|_| "Screenshot authentication failed")?,
             );
             relative.clone()
-        } else if restore {
+        } else {
             let encrypted = encrypt_with_master_key(&key, &data).map_err(|e| e.to_string())?;
             let destination = format!("{relative}.enc");
             let target = directory.join(&destination);
-            if target.exists() {
+            if regular_image_file_exists(&target)? {
                 return Err("Conflicting legacy screenshot files in backup".into());
             }
             database_snapshot::write_staged_file(&target, &encrypted)?;
             std::fs::remove_file(&file).map_err(|e| e.to_string())?;
             destination
-        } else {
-            relative.clone()
         };
-        let wrapping = if restore {
-            Some(wrap_storage_domain_key(credentials, &key).map_err(|e| e.to_string())?)
-        } else {
-            wrapping
-        };
+        let wrapping = Some(wrap_storage_domain_key(credentials, &key).map_err(|e| e.to_string())?);
         key.fill(0);
-        if restore {
-            conn.execute(
-                "UPDATE screenshots SET image_path=?1,content_key_encrypted=?2 WHERE rowid=?3",
-                params![destination, wrapping, rowid],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        conn.execute(
+            "UPDATE screenshots SET image_path=?1,content_key_encrypted=?2 WHERE rowid=?3",
+            params![destination, wrapping, rowid],
+        )
+        .map_err(|e| e.to_string())?;
         referenced.insert(destination.to_ascii_lowercase(), (rowid, wrapping));
     }
+    if !declared_missing.is_empty() {
+        return Err("Missing screenshot inventory does not match the database and files".into());
+    }
     let root = directory.join("screenshots");
-    // ZIP omits an empty payload directory; referenced missing files were
-    // rejected above, and the restore transaction recreates an empty root.
-    if !root.exists() {
+    // ZIP omits an empty payload directory; missing references were checked
+    // against the manifest above, and restore recreates an empty root.
+    if !root.try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
     for entry in walkdir::WalkDir::new(&root)
@@ -732,9 +1012,7 @@ fn normalize_images(
         if *plaintext != *expected {
             return Err("BACKUP_UNREFERENCED_PLAINTEXT".into());
         }
-        if restore {
-            std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
-        }
+        std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

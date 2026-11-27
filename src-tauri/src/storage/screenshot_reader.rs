@@ -17,6 +17,7 @@ impl<'a> ScreenshotReader<'a> {
 
     /// Returns the earliest records in the range, with an optional SQL limit.
     /// Timestamps at this boundary are Unix seconds.
+    #[cfg(test)]
     pub(crate) fn in_time_range(
         &self,
         start_ts: f64,
@@ -95,38 +96,38 @@ impl<'a> ScreenshotReader<'a> {
     /// Lists recent captures without joining OCR rows, so each screenshot
     /// appears once and SQLite can stop at the indexed limit.
     pub(crate) fn recent(&self, limit: i64) -> Result<Vec<RecentCapture>, String> {
-        let raw_rows = {
-            let guard = self.storage.get_connection_named("recent_screenshots")?;
-            let conn = guard.as_ref().ok_or("Database not initialized")?;
-            let mut statement = conn
-                .prepare(
-                    "SELECT id, image_path, window_title, cp_process(process_name),
+        let raw_rows = self
+            .storage
+            .with_read_connection_named("recent_screenshots", |conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT id, image_path, window_title, cp_process(process_name),
                             window_title_enc, process_name_enc, content_key_encrypted,
                             category, created_at
                      FROM screenshots
                      WHERE is_deleted = 0 AND (status IS NULL OR status != 'aborted')
                      ORDER BY created_at DESC, id DESC LIMIT ?1",
-                )
-                .map_err(|error| format!("Failed to prepare recent captures query: {error}"))?;
-            let rows = statement
-                .query_map([limit.clamp(1, 500)], |row| {
-                    Ok(RawRecentCaptureRow {
-                        id: row.get(0)?,
-                        image_path: row.get(1)?,
-                        window_title_plain: row.get(2)?,
-                        process_name_plain: row.get(3)?,
-                        window_title_enc: row.get(4)?,
-                        process_name_enc: row.get(5)?,
-                        content_key_enc: row.get(6)?,
-                        category: row.get(7)?,
-                        created_at: row.get(8)?,
+                    )
+                    .map_err(|error| format!("Failed to prepare recent captures query: {error}"))?;
+                let rows = statement
+                    .query_map([limit.clamp(1, 500)], |row| {
+                        Ok(RawRecentCaptureRow {
+                            id: row.get(0)?,
+                            image_path: row.get(1)?,
+                            window_title_plain: row.get(2)?,
+                            process_name_plain: row.get(3)?,
+                            window_title_enc: row.get(4)?,
+                            process_name_enc: row.get(5)?,
+                            content_key_enc: row.get(6)?,
+                            category: row.get(7)?,
+                            created_at: row.get(8)?,
+                        })
                     })
-                })
-                .map_err(|error| format!("Failed to query recent captures: {error}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("Failed to read recent capture row: {error}"))?;
-            rows
-        };
+                    .map_err(|error| format!("Failed to query recent captures: {error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Failed to read recent capture row: {error}"))?;
+                Ok(rows)
+            })?;
         Ok(raw_rows
             .into_iter()
             .map(|row| row.into_capture(&self.storage.credential_state))
@@ -134,20 +135,20 @@ impl<'a> ScreenshotReader<'a> {
     }
 
     pub(crate) fn by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
-        let raw_row = {
-            let guard = self.storage.get_connection_named("screenshot_by_id")?;
-            let conn = guard.as_ref().ok_or("Database not initialized")?;
-            conn.query_row(
-                &format!(
-                    "{} WHERE s.id = ?1 AND s.is_deleted = 0",
-                    RawScreenshotRow::SELECT
-                ),
-                [id],
-                RawScreenshotRow::from_row,
-            )
-            .optional()
-            .map_err(|error| format!("Failed to get screenshot: {error}"))?
-        };
+        let raw_row = self
+            .storage
+            .with_read_connection_named("screenshot_by_id", |conn| {
+                conn.query_row(
+                    &format!(
+                        "{} WHERE s.id = ?1 AND s.is_deleted = 0",
+                        RawScreenshotRow::SELECT
+                    ),
+                    [id],
+                    RawScreenshotRow::from_row,
+                )
+                .optional()
+                .map_err(|error| format!("Failed to get screenshot: {error}"))
+            })?;
         Ok(raw_row.map(|row| row.into_record(&self.storage.credential_state)))
     }
 
@@ -157,22 +158,20 @@ impl<'a> ScreenshotReader<'a> {
             Some(hash) => ("s.image_hash", hash),
             None => ("s.image_path", path),
         };
-        let raw_row = {
-            let guard = self
-                .storage
-                .get_connection_named("screenshot_by_image_path")?;
-            let conn = guard.as_ref().ok_or("Database not initialized")?;
-            conn.query_row(
-                &format!(
-                    "{} WHERE {column} = ?1 AND s.is_deleted = 0",
-                    RawScreenshotRow::SELECT,
-                ),
-                [value],
-                RawScreenshotRow::from_row,
-            )
-            .optional()
-            .map_err(|error| format!("Failed to get screenshot by path: {error}"))?
-        };
+        let raw_row =
+            self.storage
+                .with_read_connection_named("screenshot_by_image_path", |conn| {
+                    conn.query_row(
+                        &format!(
+                            "{} WHERE {column} = ?1 AND s.is_deleted = 0",
+                            RawScreenshotRow::SELECT,
+                        ),
+                        [value],
+                        RawScreenshotRow::from_row,
+                    )
+                    .optional()
+                    .map_err(|error| format!("Failed to get screenshot by path: {error}"))
+                })?;
         Ok(raw_row.map(|row| row.into_record(&self.storage.credential_state)))
     }
 }

@@ -6,6 +6,51 @@ use crate::credential_manager::CredentialManagerState;
 use rusqlite::{types::Value, OpenFlags, StatementStatus};
 use std::sync::Arc;
 
+#[test]
+fn block_search_materializes_text_geometry_and_shared_timestamps() {
+    let directory = tempfile::tempdir().unwrap();
+    let credentials = crate::credential_manager::cng_tests::storage_credentials(directory.path());
+    let storage = StorageState::new(directory.path().into(), credentials);
+    let conn = Connection::open_in_memory().unwrap();
+    storage.init_tables(&conn).unwrap();
+    conn.execute("INSERT INTO screenshots(id,image_path,image_hash,created_at) VALUES(7,'synthetic.enc','synthetic','2026-11-19 09:00:00')", []).unwrap();
+    let records =
+        [(1, "按钮"), (2, "备份搜索内容")].map(|(id, text)| crate::storage::ocr_blocks::Record {
+            id,
+            text: text.into(),
+            text_layout: None,
+            confidence: 0.987654321,
+            box_coords: [[1.25, 2.5], [103.5, 4.75], [100.25, 30.5], [0.5, 29.25]],
+        });
+    let key = storage.new_ocr_write_key().unwrap();
+    crate::storage::ocr_blocks::insert_records(&conn, 7, &records, Some(&key), || {
+        storage.new_ocr_write_key()
+    })
+    .unwrap();
+    conn.execute("UPDATE ocr_blocks SET created_at='2026-11-19 10:00:00'", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE ocr_results SET created_at='2026-11-19 11:00:00' WHERE id=2",
+        [],
+    )
+    .unwrap();
+    let known_text = HashMap::from([(2, "备份搜索内容".to_string())]);
+    let rows = storage
+        .materialize_ordered(&conn, &[2, 1], &known_text, &mut SearchStages::default())
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2, 1]);
+    for row in &rows {
+        let original = &records[(row.id - 1) as usize];
+        assert_eq!(row.text, original.text);
+        assert_eq!(row.confidence.to_bits(), original.confidence.to_bits());
+        assert_eq!(row.box_coords, original.box_coords.map(Vec::from).to_vec());
+        assert_eq!(row.screenshot_id, 7);
+        assert_eq!(row.screenshot_created_at, "2026-11-19T09:00:00Z");
+    }
+    assert_eq!(rows[0].created_at, "2026-11-19T11:00:00Z");
+    assert_eq!(rows[1].created_at, "2026-11-19T10:00:00Z");
+}
+
 fn populate(conn: &Connection, blocks: i64, payload_bytes: i64) {
     let directory = tempfile::tempdir().unwrap();
     let credential = Arc::new(CredentialManagerState::new(directory.path().into()));
@@ -49,6 +94,7 @@ fn previous_rows_sql(columns: &str, count: usize) -> String {
     format!(
         "SELECT {columns}
          FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id
+         LEFT JOIN ocr_keys k ON k.id=r.ocr_key_id
          WHERE r.id IN ({placeholders}) AND r.is_deleted = 0 AND s.is_deleted = 0"
     )
 }
@@ -299,7 +345,9 @@ fn write_report(name: &str, reports: Vec<serde_json::Value>) {
 fn compare_snapshot_queries() {
     let path = std::env::var("CARBONPAPER_OCR_BENCH_DB").expect("set snapshot path");
     let before = std::fs::metadata(&path).unwrap();
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut connection =
+        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let conn = &connection;
     // The database page key is derived from the public key by the production
     // connection policy. This optional path reads only metadata and encrypted
     // payloads; it never opens a private key or unwraps any field encryption.
@@ -316,11 +364,12 @@ fn compare_snapshot_queries() {
         };
     conn.execute_batch("PRAGMA query_only = ON; PRAGMA cache_size = -2048;")
         .unwrap();
-    let _deadline = super::super::connection::QueryDeadline::install(
-        &conn,
+    let deadline_guard = super::super::connection::QueryDeadline::install(
+        &mut connection,
         Some(Instant::now() + Duration::from_secs(300)),
     )
     .unwrap();
+    let conn = &*deadline_guard;
     let (blocks, max_id): (i64, i64) = conn
         .query_row("SELECT count(*), max(id) FROM ocr_results", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -364,8 +413,8 @@ fn compare_snapshot_queries() {
             }),
         ));
     }
-    drop(_deadline);
-    drop(conn);
+    drop(deadline_guard);
+    drop(connection);
     let after = std::fs::metadata(path).unwrap();
     assert_eq!(before.len(), after.len());
     assert_eq!(before.modified().unwrap(), after.modified().unwrap());

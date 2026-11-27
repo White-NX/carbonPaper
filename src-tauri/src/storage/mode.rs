@@ -94,6 +94,8 @@ fn is_local_filesystem(path: &Path) -> bool {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let mut volume_path = [0u16; 512];
+    // SAFETY: `wide` is terminated and remains live; the API fills a bounded
+    // UTF-16 output slice whose terminated volume path is queried immediately.
     unsafe {
         if GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut volume_path).is_err() {
             return false;

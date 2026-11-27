@@ -59,7 +59,7 @@ fn luhn_complete(body: &str) -> String {
                 }
             })
             .sum();
-        if sum % 10 == 0 {
+        if sum.is_multiple_of(10) {
             return candidate;
         }
     }
@@ -187,6 +187,27 @@ fn bank_cards_by_checksum_scheme_or_grouping() {
         kinds("银行卡号：6222 8655645 9204 789", all_kinds()),
         [PiiKind::BankCard]
     );
+}
+
+#[test]
+fn bank_cards_in_the_mastercard_2_series_keep_the_grouping_fallback() {
+    let settings = only(PiiKind::BankCard);
+    let grouped = "2233 0012 3456 0020";
+    assert_eq!(grouped.replace(' ', ""), luhn_complete("223300123456002"));
+    assert_eq!(found(grouped, settings), [(PiiKind::BankCard, grouped)]);
+
+    // A misread digit can break the checksum while leaving the grouping intact.
+    for changed in [
+        "2221 0012 3456 0120",
+        "2233 0012 3456 0120",
+        "2720 0012 3456 0120",
+    ] {
+        assert_eq!(found(changed, settings), [(PiiKind::BankCard, changed)]);
+    }
+
+    for ordinary in ["2220 0012 3456 0120", "2721 0012 3456 0120"] {
+        assert!(found(ordinary, settings).is_empty(), "{ordinary}");
+    }
 }
 
 #[test]

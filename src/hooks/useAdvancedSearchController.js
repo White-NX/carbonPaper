@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import {
   fetchThumbnailBatch,
   getCategoriesFromDb,
@@ -45,6 +46,7 @@ export function useAdvancedSearchController({
     setQueryState({ query: value, sourceQuery: incomingQuery, refreshKey: reloadToken });
   }, [incomingQuery, reloadToken]);
   const [searchTarget, setSearchTarget] = useState('mixed');
+  const [sortOrder, setSortOrder] = useState('relevance');
   const [recapSemantic, setRecapSemantic] = useState(true);
   const [results, setResults] = useState([]);
   const [thumbnailCache, setThumbnailCache] = useState({});
@@ -61,6 +63,7 @@ export function useAdvancedSearchController({
   const [rangePreset, setRangePreset] = useState('any');
   const [elapsedMs, setElapsedMs] = useState(null);
   const [resultSetKey, setResultSetKey] = useState(0);
+  const [editRevision, setEditRevision] = useState(0);
   const [recentQueries, setRecentQueries] = useState(() => loadRecentSearches());
   const [landingCaptures, setLandingCaptures] = useState([]);
   const offsetRef = useRef(0);
@@ -84,6 +87,26 @@ export function useAdvancedSearchController({
   const optionsTokenRef = useRef(null);
   const landingTokenRef = useRef(null);
 
+  useEffect(() => {
+    let disposed = false;
+    const changed = (event) => {
+      if (disposed || !event.payload?.screenshot_id) return;
+      searchIdRef.current += 1;
+      keywordQueue.cancel();
+      semanticQueue.cancel();
+      optionsTokenRef.current = null;
+      landingTokenRef.current = null;
+      setResults([]);
+      setThumbnailCache({});
+      setEditRevision((previous) => previous + 1);
+    };
+    const subscriptions = Promise.all([
+      listen('screenshot-edited', changed),
+      listen('screenshot-ocr-updated', (event) => { if (event.payload?.status === 'completed') changed(event); }),
+    ]);
+    return () => { disposed = true; subscriptions.then((unlisten) => unlisten.forEach((dispose) => dispose())); };
+  }, [keywordQueue, semanticQueue]);
+
   const debouncedQuery = useDebouncedValue(query, 400);
   useEffect(() => {
     searchIdRef.current += 1;
@@ -96,7 +119,7 @@ export function useAdvancedSearchController({
     setThumbnailCache({});
     setHasMore(false);
     setTotals(null);
-  }, [query, active, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, keywordQueue, semanticQueue]);
+  }, [query, active, searchTarget, sortOrder, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, editRevision, keywordQueue, semanticQueue]);
   useEffect(() => () => {
     searchIdRef.current += 1;
     keywordQueue.cancel();
@@ -136,7 +159,7 @@ export function useAdvancedSearchController({
     return () => {
       mounted = false;
     };
-  }, [active, reloadToken]);
+  }, [active, reloadToken, editRevision]);
 
   const queryTokens = useMemo(() => {
     return debouncedQuery.trim()
@@ -186,7 +209,7 @@ export function useAdvancedSearchController({
     rankingRevisionRef.current = null;
     try {
       const options = { limit: PAGE_SIZE, processNames: selectedProcesses,
-        categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget,
+        categories: searchTarget === 'recaps' ? [] : selectedCategories, target: searchTarget, sortOrder,
         includeSemantic: false, startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate) };
       const apply = (response, semantic) => {
         const items = response.items.map((item) => item.kind === 'snapshot'
@@ -201,7 +224,7 @@ export function useAdvancedSearchController({
         setElapsedMs(performance.now() - startedAt); setLoading(false);
         if (items.length) setRecentQueries(pushRecentSearch(normalizedQuery, 'ocr'));
       };
-      const requestKey = JSON.stringify([normalizedQuery, options, reloadToken]);
+      const requestKey = JSON.stringify([normalizedQuery, options, reloadToken, editRevision]);
       const keywords = await keywordQueue.run(requestKey,
         (signal) => searchSnapshotsAndRecaps(normalizedQuery, { ...options, signal }));
       if (searchIdRef.current !== currentSearchId) return;
@@ -234,7 +257,7 @@ export function useAdvancedSearchController({
         setLoading(false);
       }
     }
-  }, [active, query, debouncedQuery, searchTarget, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters, reloadToken, keywordQueue, semanticQueue]);
+  }, [active, query, debouncedQuery, searchTarget, sortOrder, useRecapSemantic, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasFilters, reloadToken, editRevision, keywordQueue, semanticQueue]);
 
   useEffect(() => {
     // Query/filter changes and explicit refresh share one trigger. A separate
@@ -264,7 +287,7 @@ export function useAdvancedSearchController({
       setLandingCaptures(sampleRecentCaptures(fetched, LANDING_CAPTURE_COUNT));
     })();
     return () => { mounted = false; };
-  }, [active, isLanding, reloadToken]);
+  }, [active, isLanding, reloadToken, editRevision]);
 
   useEffect(() => {
     if (!active) return undefined;
@@ -293,12 +316,12 @@ export function useAdvancedSearchController({
     try {
       const options = {
         limit: PAGE_SIZE, offset: offsetRef.current,
-        includeSemantic: stageRef.current, target: searchTarget, processNames: selectedProcesses,
+        includeSemantic: stageRef.current, target: searchTarget, sortOrder, processNames: selectedProcesses,
         rankingRevision: rankingRevisionRef.current,
         categories: searchTarget === 'recaps' ? [] : selectedCategories,
         startTime: computeTimestamp(startDate), endTime: computeTimestamp(endDate),
       };
-      const requestKey = JSON.stringify([debouncedQuery.trim(), options, reloadToken]);
+      const requestKey = JSON.stringify([debouncedQuery.trim(), options, reloadToken, editRevision]);
       const response = await (stageRef.current ? semanticQueue : keywordQueue).run(requestKey,
         (signal) => searchSnapshotsAndRecaps(debouncedQuery.trim(), { ...options, signal }));
       if (searchIdRef.current !== currentSearchId) return;
@@ -340,7 +363,7 @@ export function useAdvancedSearchController({
         setLoadingMore(false);
       }
     }
-  }, [debouncedQuery, searchTarget, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating, reloadToken, keywordQueue, semanticQueue]);
+  }, [debouncedQuery, searchTarget, sortOrder, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading, semanticUpdating, reloadToken, editRevision, keywordQueue, semanticQueue]);
 
   useEffect(() => {
     if (!active) return;
@@ -427,6 +450,8 @@ export function useAdvancedSearchController({
     debouncedQuery,
     searchTarget,
     setSearchTarget,
+    sortOrder,
+    setSortOrder,
     recapSemantic,
     setRecapSemantic,
     useRecapSemantic,

@@ -82,7 +82,7 @@ impl StorageState {
         // Open SQLCipher encrypted database
         let t1 = std::time::Instant::now();
         let db_path = data_dir.join("screenshots.db");
-        let conn =
+        let mut conn =
             Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
         let open_dur = t1.elapsed();
 
@@ -104,7 +104,9 @@ impl StorageState {
         // Initialize table schema
         let t3 = std::time::Instant::now();
         progress(InitializationProgress::phase(InitializationPhase::Schema));
+        self.agent_writer.register(&mut conn)?;
         self.init_tables(&conn)?;
+        self.init_agent_access_tables(&conn)?;
         let tables_dur = t3.elapsed();
         let protected_started = std::time::Instant::now();
         #[cfg(test)]
@@ -159,16 +161,10 @@ impl StorageState {
                 tracing::warn!("Processing staging is unavailable: {error}");
             }
         }
-        if let Err(error) = self.publish_protected_keys() {
-            self.processing_stage.shutdown();
-            *self.db.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            self.protected.reset();
-            return Err(error);
-        }
-
-        // Publish readiness only after the protected write keys and staging
-        // boundary are settled, so capture cannot enter a half-open archive.
+        // The validated local write keys are ready. Optional service grants
+        // are published on their own lane and cannot undo archive readiness.
         self.initialized.store(true, Ordering::Release);
+        self.request_protected_key_publication();
 
         tracing::info!(
             "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?}, protected_content={:?})",
@@ -219,6 +215,7 @@ impl StorageState {
 
     /// Initialize database tables.
     pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+        super::layout::register_and_check(conn).map_err(|e| e.to_string())?;
         #[cfg(test)]
         if crate::credential_manager::get_cached_public_key(&self.credential_state).is_none() {
             self.credential_state
@@ -289,6 +286,28 @@ impl StorageState {
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
             );
+
+            -- Edits publish their image before recognition. The image hash and
+            -- lease fence late OCR results, and the queue survives UI/process exit.
+            CREATE TABLE IF NOT EXISTS screenshot_edit_ocr_jobs (
+                screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+                image_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','processing','waiting_for_auth','completed','failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NOT NULL DEFAULT 0,
+                lease TEXT,
+                error TEXT,
+                queued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_screenshot_edit_ocr_ready
+                ON screenshot_edit_ocr_jobs(status,next_retry_at,queued_at);
+            CREATE TRIGGER IF NOT EXISTS screenshot_edit_ocr_source_changed
+            AFTER UPDATE OF image_hash,is_deleted ON screenshots
+            WHEN NEW.is_deleted=1 OR NEW.image_hash IS NOT OLD.image_hash BEGIN
+                DELETE FROM screenshot_edit_ocr_jobs WHERE screenshot_id=NEW.id;
+            END;
 
             -- Document references use their own row key so delayed native
             -- discovery never has to unwrap or rewrite screenshot metadata.
@@ -777,7 +796,6 @@ impl StorageState {
 
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_image_hash ON screenshots(image_hash);
-            CREATE INDEX IF NOT EXISTS idx_text_hash ON ocr_results(text_hash);
             CREATE INDEX IF NOT EXISTS idx_screenshot_id ON ocr_results(screenshot_id);
             CREATE INDEX IF NOT EXISTS idx_created_at ON screenshots(created_at);
             CREATE INDEX IF NOT EXISTS idx_process_name ON screenshots(process_name);
@@ -855,8 +873,12 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        super::vector_blocks::initialize(conn)?;
+        super::ocr_keys::initialize(conn)?;
         super::migration::dedup::migrate(conn)?;
+        super::compaction::initialize(conn)?;
         Self::init_recap_tables(conn)?;
+        super::usage::initialize(conn)?;
         let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
         if recovered > 0 {
             tracing::info!(
@@ -867,7 +889,7 @@ impl StorageState {
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
         super::blind_index::ensure_schema(conn)?;
-        self.init_agent_access_tables(conn)?;
+        super::layout::initialize(conn)?;
         #[cfg(test)]
         {
             self.protected.allow_plaintext_fixtures(true);
@@ -1216,6 +1238,7 @@ impl StorageState {
 
         // Content-addressed dedup references
         Self::add_column_if_missing(conn, "screenshots", "page_icon_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "screenshots", "process_icon_id", "INTEGER")?;
         Self::add_column_if_missing(conn, "screenshots", "link_set_id", "INTEGER")?;
 
         // Classification columns
@@ -1576,6 +1599,8 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to create soft-delete indexes: {}", e))?;
 
+        super::clip_chronological::init_index(conn)?;
+
         Ok(())
     }
 
@@ -1659,7 +1684,7 @@ impl StorageState {
         Ok(recovered)
     }
 
-    fn add_column_if_missing(
+    pub(super) fn add_column_if_missing(
         conn: &Connection,
         table: &str,
         column: &str,

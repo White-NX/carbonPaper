@@ -1,11 +1,16 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { verifySemanticRuntimeResources } from './semantic-runtime-resources.mjs';
 
 const root = process.cwd();
-const exe = path.join(root, 'src-tauri', 'pre-bundle', 'carbonpaper-semantic-worker.exe');
-const runtimeDir = path.join(root, 'src-tauri', 'pre-bundle', 'onnxruntime', '1.24.2');
-const ort = path.join(runtimeDir, 'onnxruntime.dll');
+const isDevelopment = process.argv.includes('--development');
+const resourceDirectory = isDevelopment
+  ? path.join(root, 'src-tauri', 'target', 'debug')
+  : path.join(root, 'src-tauri', 'pre-bundle');
+const exe = path.join(resourceDirectory, 'carbonpaper-semantic-worker.exe');
+const runtimeFiles = verifySemanticRuntimeResources(root, resourceDirectory);
+const ort = runtimeFiles.find((file) => file.name === 'onnxruntime.dll').path;
 for (const file of [exe, ort]) {
   if (!existsSync(file)) throw new Error(`Semantic runtime smoke-test file is missing: ${file}`);
 }
@@ -25,7 +30,11 @@ const child = spawn(
     '--onnx-models-root', path.join(root, '.release-assets', 'semantic-smoke-models-onnx'),
     '--ort-dylib', ort,
   ],
-  { stdio: ['pipe', 'pipe', 'inherit'] },
+  {
+    windowsHide: true,
+    env: { ...process.env, PATH: path.dirname(ort) + path.delimiter + (process.env.PATH || '') },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  },
 );
 
 let buffered = Buffer.alloc(0);

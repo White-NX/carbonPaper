@@ -9,8 +9,7 @@ pub(super) fn frozen_input_page_sql() -> String {
     // With both cursor bounds, SQLite can choose a range scan of the job
     // primary key for every embedding. The completed-job covering index keeps
     // this join a point lookup, including every visibility contract field.
-    let source = super::derived_index::visible_embedding_source_with_indexes(
-        "",
+    let source = super::derived_index::visible_embedding_payload_source(
         "INDEXED BY idx_derived_jobs_completed_visibility",
     );
     format!(

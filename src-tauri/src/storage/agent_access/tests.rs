@@ -551,6 +551,25 @@ fn older_preparations_migrate_the_resume_cursor_without_rewriting_source_state()
 fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full_text() {
     let (_directory, storage, authority) = fixture();
     let historical = seed_history(&storage);
+    let bounds = vec![
+        vec![10.0, 20.0],
+        vec![50.0, 20.0],
+        vec![50.0, 40.0],
+        vec![10.0, 40.0],
+    ];
+    storage
+        .commit_screenshot(
+            historical,
+            Some(&vec![super::super::OcrResultInput {
+                text: "historical block".into(),
+                text_layout: None,
+                confidence: 0.75,
+                box_coords: bounds.clone(),
+            }]),
+            None,
+            None,
+        )
+        .unwrap();
     storage.begin_agent_access().unwrap();
     storage.sync_agent_access().unwrap();
     assert_eq!(authority.lock().unwrap().phase, "ready");
@@ -563,10 +582,11 @@ fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full
             .as_deref(),
         Some("historical window")
     );
-    assert_eq!(
-        view(&storage).ocr(historical).unwrap()[0].text,
-        "historical OCR"
-    );
+    let history = view(&storage).ocr(historical).unwrap();
+    assert_eq!(history[0].text, "historical OCR");
+    assert_eq!(history[1].text, "historical block");
+    assert_eq!(history[1].box_coords, bounds);
+    assert_eq!(history[1].confidence, 0.75);
     storage.credential_state.invalidate_session();
     let request = super::super::SaveScreenshotRequest {
         image_data: base64::Engine::encode(
@@ -583,6 +603,7 @@ fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full
         ),
         ocr_results: Some(vec![super::super::OcrResultInput {
             text: "future OCR".into(),
+            text_layout: None,
             confidence: 1.0,
             box_coords: vec![
                 vec![0.0, 0.0],
@@ -615,6 +636,21 @@ fn history_backfill_never_opens_image_files_and_future_locked_capture_keeps_full
         Some("future window")
     );
     assert_eq!(text.ocr(future).unwrap()[0].text, "future OCR");
+    {
+        let guard = storage
+            .get_connection_named("agent_test_compact_ocr")
+            .unwrap();
+        let source = guard.as_ref().unwrap();
+        let (slot, indexed): (i64, String) = source
+            .query_row(
+                "SELECT ocr_block_slot, text_hash FROM ocr_results WHERE screenshot_id=?1",
+                [future],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(indexed, super::super::compaction::OCR_INDEXED);
+    }
     let result = carbonpaper_agent_access::dispatcher::call(
         &text,
         &carbonpaper_agent_access::sensitive_filter::SensitiveFilterState::default(),

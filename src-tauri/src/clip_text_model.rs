@@ -182,7 +182,7 @@ fn fields(bytes: &[u8]) -> Result<Vec<Field<'_>>, &'static str> {
     Ok(result)
 }
 
-fn name<'a>(bytes: &'a [u8], number: u32) -> Result<&'a str, &'static str> {
+fn name(bytes: &[u8], number: u32) -> Result<&str, &'static str> {
     let parts = fields(bytes)?;
     let field = parts
         .iter()

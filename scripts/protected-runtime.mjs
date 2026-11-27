@@ -126,7 +126,7 @@ export async function signProtectedRuntime(root, signingKeyBase64) {
   return manifest;
 }
 
-export async function verifyProtectedRuntime(directory, rawPublicKey) {
+export function readProtectedManifest(directory, rawPublicKey) {
   assertNoLinks(directory, manifestName);
   assertNoLinks(directory, signatureName);
   const bytes = readBounded(path.join(directory, manifestName), 1024 * 1024);
@@ -134,6 +134,11 @@ export async function verifyProtectedRuntime(directory, rawPublicKey) {
   if (!verify(null, Buffer.concat([signingContext, bytes]), publicKey(rawPublicKey), signature)) throw new Error('Invalid protected runtime signature');
   const manifest = JSON.parse(bytes);
   validateManifest(manifest);
+  return manifest;
+}
+
+export async function verifyProtectedRuntime(directory, rawPublicKey) {
+  const manifest = readProtectedManifest(directory, rawPublicKey);
   for (const [relative, expected] of Object.entries(manifest.files)) {
     assertNoLinks(directory, relative);
     const actual = await hashFile(path.join(directory, relative));

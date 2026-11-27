@@ -67,6 +67,12 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
         )}
       </h2>
 
+      {waiting ? <p className="mb-3 text-xs text-ide-muted">
+        {t('advancedSearch.visual.loading')}
+      </p> : Number.isFinite(controller.elapsedMs) && <p className="mb-3 text-xs tabular-nums text-ide-muted">
+        {t('advancedSearch.visual.elapsed', { seconds: (controller.elapsedMs / 1000).toFixed(2) })}
+      </p>}
+
       {controller.indexReady === false && <Banner className="mb-3">
         <p role="status">{t('advancedSearch.visual.index_pending')}</p>
       </Banner>}
@@ -79,7 +85,9 @@ export function VisualSearchCard({ controller, onSelectResult, onOpenFloatingPre
           </div>
         ) : phase === 'error' ? (
           <div className="flex flex-wrap items-center gap-3 py-2">
-            <p role="status" className="text-xs leading-relaxed text-ide-muted">{t('advancedSearch.visual.retry_hint')}</p>
+            <p role="status" className="text-xs leading-relaxed text-ide-muted">
+              {t(controller.errorKind === 'timeout' ? 'advancedSearch.visual.timeout_hint' : 'advancedSearch.visual.retry_hint')}
+            </p>
             <Button size="xs" icon={RefreshCw} onClick={retry}>{t('advancedSearch.visual.retry')}</Button>
           </div>
         ) : visibleResults.length === 0 ? (

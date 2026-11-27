@@ -14,6 +14,14 @@ const MAX_RETRY = 30;
 const MAX_FAVICON_BYTES = 256 * 1024;
 const FAVICON_FETCH_TIMEOUT_MS = 5000;
 const MAX_FAVICON_DATA_URL_CHARS = 128 + 4 * Math.ceil(MAX_FAVICON_BYTES / 3);
+// Matches capture.rs's payload limit; the native buffer has one extra NUL slot.
+const MAX_WINDOW_TITLE_UNITS = 512;
+
+function usageTitlePrefix(title) {
+  const prefix = title.slice(0, MAX_WINDOW_TITLE_UNITS);
+  const last = prefix.charCodeAt(prefix.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? prefix.slice(0, -1) : prefix;
+}
 
 let nmPort = null;
 // Conservative default: do not connect until persisted state is loaded.
@@ -22,6 +30,41 @@ let settingsLoaded = false;
 let isConnected = false;
 let reconnectTimer = null;
 let lastCaptureHash = null;
+let usageMetadataSupported = false;
+let metadataRevision = 0;
+let metadataTimer = null;
+
+// Native-port connections keep this MV3 worker alive. A small heartbeat also
+// expires stale URLs after focus changes, sleep or a desktop-app restart.
+async function reportUsageMetadata() {
+  if (!isEnabled || !isConnected || !nmPort || !usageMetadataSupported) return;
+  const port = nmPort;
+  const revision = ++metadataRevision;
+  try {
+    const window = await chrome.windows.getLastFocused();
+    let payload = { type: 'usage_metadata', focused: false };
+    if (window.focused) {
+      const [tab] = await chrome.tabs.query({ active: true, windowId: window.id });
+      if (window.incognito || tab?.incognito) {
+        payload = { type: 'usage_metadata', focused: true, private: true };
+      } else if (tab?.url && /^https?:\/\//i.test(tab.url) && tab.title) {
+        payload = { type: 'usage_metadata', focused: true, private: false, url: tab.url.slice(0, 8192), title: usageTitlePrefix(tab.title) };
+      }
+    }
+    if (revision === metadataRevision && port === nmPort && isEnabled) port.postMessage(payload);
+  } catch {
+    if (revision === metadataRevision && port === nmPort && isEnabled) {
+      try { port.postMessage({ type: 'usage_metadata', focused: false }); } catch { /* disconnected */ }
+    }
+  }
+}
+
+function clearUsageMetadataTimer() {
+  metadataRevision += 1;
+  usageMetadataSupported = false;
+  if (metadataTimer !== null) clearInterval(metadataTimer);
+  metadataTimer = null;
+}
 
 function ensureNativeConnection(reason = 'unknown') {
   if (!settingsLoaded || !isEnabled || isConnected) return;
@@ -67,6 +110,7 @@ function connectNative() {
   }
 
   try {
+    clearUsageMetadataTimer();
     nmPort = chrome.runtime.connectNative(NM_HOST_NAME);
     isConnected = true;
 
@@ -75,11 +119,17 @@ function connectNative() {
         // Main app is requesting a capture
         captureCurrentTab();
       } else if (message.type === 'nmh_ready') {
+        usageMetadataSupported = message.usage_metadata === true;
+        if (usageMetadataSupported) {
+          reportUsageMetadata();
+          metadataTimer = setInterval(reportUsageMetadata, 15000);
+        }
         // Startup diagnostic from NMH
         console.log('[CarbonPaper] NMH ready — browser:', message.browser_exe,
           '(pid', message.browser_pid + ')',
           'cmd_pipe:', message.cmd_pipe, 'data_pipe:', message.data_pipe);
       } else if (message.type === 'nmh_registered') {
+        reportUsageMetadata();
         // NMH successfully registered its capture session with the main app
         console.log('[CarbonPaper] NMH session registered — browser:',
           message.browser_exe, '(pid', message.browser_pid + ')');
@@ -109,6 +159,7 @@ function connectNative() {
     });
 
     nmPort.onDisconnect.addListener(() => {
+      clearUsageMetadataTimer();
       isConnected = false;
       nmPort = null;
       const lastError = chrome.runtime.lastError;
@@ -142,6 +193,7 @@ async function captureCurrentTab(retry = 0) {
     // Get the active tab
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || !tab.id) return;
+    if (tab.incognito) return;
 
     // Skip chrome:// and edge:// pages
     if (tab.url && (tab.url.startsWith('chrome://') || tab.url.startsWith('edge://') ||
@@ -334,12 +386,18 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.tabs.onActivated.addListener(() => {
   ensureNativeConnection('tabs.onActivated');
+  reportUsageMetadata();
+});
+
+chrome.tabs.onUpdated.addListener((_tabId, change, tab) => {
+  if (tab.active && (change.url !== undefined || change.title !== undefined || change.status === 'complete')) reportUsageMetadata();
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (windowId !== chrome.windows.WINDOW_ID_NONE) {
     ensureNativeConnection('windows.onFocusChanged');
   }
+  reportUsageMetadata();
 });
 
 // Listen for state changes from popup
@@ -352,6 +410,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (isEnabled) {
       connectNative();
     } else {
+      clearUsageMetadataTimer();
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

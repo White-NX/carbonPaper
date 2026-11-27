@@ -235,12 +235,8 @@ pub async fn run_scheduled_slice(
         )
         .await;
     }
-    if !manual && quantum.is_some() {
-        return index_pipeline::run_automatic_quantum::<MinilmPipeline>(
-            app,
-            quantum.expect("quantum context"),
-        )
-        .await;
+    if let Some(quantum) = quantum.filter(|_| !manual) {
+        return index_pipeline::run_automatic_quantum::<MinilmPipeline>(app, quantum).await;
     }
     run_scheduled_request(app, manual, true, None).await
 }
@@ -1123,9 +1119,11 @@ mod tests {
 
     #[test]
     fn indexing_configuration_respects_protocol_and_deadline_envelopes() {
-        assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
-        assert!(DRAIN_BATCH <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
-        assert!(MAX_ATTEMPTS > 0);
+        const {
+            assert!(ENCODE_CHUNK > 0 && ENCODE_CHUNK <= DRAIN_BATCH);
+            assert!(DRAIN_BATCH <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+            assert!(MAX_ATTEMPTS > 0);
+        }
         assert!(!EMBED_TIMEOUT.is_zero() && EMBED_TIMEOUT <= MANUAL_DEADLINE);
         assert!(MANUAL_FOREGROUND_WAIT_BUDGET < MANUAL_DEADLINE);
     }

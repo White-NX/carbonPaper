@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
+import { invalidateTimelineImage } from '../lib/timeline_image_cache';
 
 /**
  * 把后端给的时间统一换算成毫秒。
@@ -53,8 +54,16 @@ export function useSelectedSnapshot() {
   const [highlightedEventId, setHighlightedEventId] = useState(null);
   const [timelineJump, setTimelineJump] = useState(null);
   const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
+  const selectedIdRef = useRef(null);
+  const detailsRef = useRef(null);
+  const detailsVersionRef = useRef(0);
+  const imageVersionRef = useRef(0);
+  selectedIdRef.current = selectedEvent?.id ?? null;
+  detailsRef.current = selectedDetails;
 
   useEffect(() => {
+    const detailsVersion = ++detailsVersionRef.current;
+    const imageVersion = ++imageVersionRef.current;
     if (!selectedEvent) {
       setSelectedDetails(null);
       setSelectedImageSrc(null);
@@ -81,10 +90,11 @@ export function useSelectedSnapshot() {
     const loadDetails = async () => {
       try {
         const det = await getScreenshotDetails(targetId, targetPath);
-        if (cancelled) return;
+        if (cancelled || detailsVersion !== detailsVersionRef.current) return;
         if (det && det.error) {
           throw new Error(det.error);
         }
+        detailsRef.current = det;
         setSelectedDetails(det);
 
         if (selectedEvent._fromNlSearch) {
@@ -104,7 +114,7 @@ export function useSelectedSnapshot() {
     const loadImage = async () => {
       try {
         const img = await fetchImage(targetId, targetPath);
-        if (cancelled) return;
+        if (cancelled || imageVersion !== imageVersionRef.current) return;
         if (!img) {
           console.warn('Image fetch returned null for ID:', selectedEvent.id);
         }
@@ -132,8 +142,10 @@ export function useSelectedSnapshot() {
     let unlisten;
     listen('office-document-ref-updated', async (event) => {
       if (event.payload?.screenshot_id !== targetId) return;
-      const details = await getScreenshotDetails(targetId, selectedEvent.path || selectedEvent.image_path);
-      if (!disposed && details && !details.error) {
+      const version = ++detailsVersionRef.current;
+      const details = await getScreenshotDetails(targetId, selectedEvent.path || selectedEvent.image_path, { fresh: true });
+      if (!disposed && version === detailsVersionRef.current && details && !details.error) {
+        detailsRef.current = details;
         setSelectedDetails(details);
       }
     }).then((dispose) => {
@@ -145,6 +157,37 @@ export function useSelectedSnapshot() {
       unlisten?.();
     };
   }, [selectedEvent]);
+
+  const refreshDetails = useCallback(async (id, imageHash, version) => {
+    const details = await getScreenshotDetails(id, null, { fresh: true });
+    if (selectedIdRef.current === id && detailsVersionRef.current === version
+      && details?.record?.image_hash === imageHash && !details.error) {
+      detailsRef.current = details;
+      setSelectedDetails(details);
+    }
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten;
+    listen('screenshot-ocr-updated', (event) => {
+      const status = event.payload;
+      if (disposed || status?.screenshot_id !== selectedIdRef.current
+        || status.image_hash !== detailsRef.current?.record?.image_hash) return;
+      const next = { ...detailsRef.current, edit_ocr: status };
+      detailsRef.current = next;
+      setSelectedDetails(next);
+      if (status.status === 'completed') setTimelineRefreshKey((previous) => previous + 1);
+      const version = ++detailsVersionRef.current;
+      refreshDetails(status.screenshot_id, status.image_hash, version).catch((error) => {
+        console.warn('Failed to refresh snapshot recognition:', error);
+      });
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    });
+    return () => { disposed = true; unlisten?.(); };
+  }, [refreshDetails]);
 
   const ocrBoxes = useMemo(() => {
     return (selectedDetails?.ocr_results || []).map((item, index) => {
@@ -185,6 +228,29 @@ export function useSelectedSnapshot() {
     setTimelineRefreshKey((prev) => prev + 1);
   }, []);
 
+  const refreshEditedSnapshot = useCallback((result, imageSrc) => {
+    invalidateTimelineImage(result.screenshot_id);
+    setTimelineRefreshKey((previous) => previous + 1);
+    if (selectedIdRef.current !== result.screenshot_id) return;
+    const version = ++detailsVersionRef.current;
+    const next = {
+      ...detailsRef.current,
+      record: { ...detailsRef.current?.record, id: result.screenshot_id, image_hash: result.image_hash,
+        image_path: result.image_path, status: 'committed' },
+      ocr_results: [],
+      edit_ocr: { screenshot_id: result.screenshot_id, image_hash: result.image_hash, status: result.ocr_status || 'pending' },
+    };
+    detailsRef.current = next;
+    setSelectedDetails(next);
+    if (imageSrc) {
+      imageVersionRef.current += 1;
+      setSelectedImageSrc(imageSrc);
+    }
+    refreshDetails(result.screenshot_id, result.image_hash, version).catch((error) => {
+      console.warn('Failed to refresh the saved snapshot:', error);
+    });
+  }, [refreshDetails]);
+
   return {
     selectedEvent,
     setSelectedEvent,
@@ -200,5 +266,6 @@ export function useSelectedSnapshot() {
     ocrBoxes,
     clearSelection,
     bumpTimelineRefresh,
+    refreshEditedSnapshot,
   };
 }

@@ -132,6 +132,8 @@ pub fn set_cpu_rate(job: HANDLE, percent: Option<u32>) -> Result<(), String> {
     // Windows rejects ControlFlags=0 with ERROR_INVALID_PARAMETER when CPU
     // rate control has never been enabled for this Job Object. Query first so
     // restoring an already-unlimited worker is an idempotent operation.
+    // SAFETY: the caller retains the job handle; `current` is initialized,
+    // correctly sized output storage borrowed only for this synchronous query.
     unsafe {
         QueryInformationJobObject(
             job,

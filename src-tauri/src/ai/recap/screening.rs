@@ -128,11 +128,14 @@ pub(super) async fn screen(
             ctx.generation,
         )?;
         let url = format!("{}/systemone", settings.base_url.trim_end_matches('/'));
+        let submitted = std::sync::atomic::AtomicBool::new(false);
         let response: Value = guarded(ctx, async {
+            ctx.check_before_request()?;
             let mut request = client.post(&url).json(&body);
             if let Some(key) = settings.api_key.as_deref().filter(|k| !k.is_empty()) {
                 request = request.bearer_auth(key);
             }
+            submitted.store(true, std::sync::atomic::Ordering::SeqCst);
             let response = request.send().await.map_err(|_| "AI_NETWORK_ERROR")?;
             if !response.status().is_success() {
                 tracing::warn!(target: "recap", day = %ctx.day, run,
@@ -150,7 +153,23 @@ pub(super) async fn screen(
                 .await
                 .map_err(|_| "RECAP_SCREENING_INVALID_RESPONSE".into())
         })
-        .await?;
+        .await
+        .map_err(|error| {
+            if !submitted.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Err(release_error) = ctx
+                    .storage
+                    .recap_release_unsubmitted(reservation, ctx.generation)
+                {
+                    super::runner::log_failure(
+                        &ctx.day,
+                        run,
+                        "reservation_release",
+                        &release_error,
+                    );
+                }
+            }
+            error
+        })?;
         if let Some(input) = response
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)

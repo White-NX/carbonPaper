@@ -3,8 +3,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 
-use super::{BackgroundReadError, StorageState};
-use crate::ai::recap::{PrivacyFingerprint, RecapSettings, RecapUsage};
+use super::{recap_content, BackgroundReadError, StorageState};
+use crate::ai::recap::{budget, PrivacyFingerprint, RecapSettings, RecapUsage};
 use crate::calendar::CalendarDay;
 
 const PAYLOAD_KEYS_SQL: &str =
@@ -61,6 +61,7 @@ impl StorageState {
              INSERT OR IGNORE INTO recap_summary_jobs(day,version)
                 SELECT DISTINCT day,1 FROM recap_payloads WHERE kind='corrections';"
         ).map_err(|e| e.to_string())?;
+        recap_content::initialize(conn)?;
         // Batch checkpoints also queue relationship updates after interruption,
         // without advancing the correction version used by protected runs.
         conn.execute_batch(
@@ -89,7 +90,7 @@ impl StorageState {
             let relevant: &[&str] = match table {
                 "screenshots" => &["id", "created_at", "window_title", "process_name", "window_title_enc",
                     "process_name_enc", "page_url_enc", "content_key_encrypted", "is_deleted"],
-                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "is_deleted"],
+                "ocr_results" => &["id", "screenshot_id", "text", "text_enc", "text_key_encrypted", "ocr_key_id", "is_deleted"],
                 _ => &["screenshot_id", "ref_enc", "content_key_encrypted"],
             };
             let mut changes = relevant.iter().filter(|c| columns.iter().any(|name| name == **c))
@@ -364,13 +365,12 @@ impl StorageState {
             return Err("AUTH_REQUIRED".into());
         }
         let generation = self.db_generation();
-        let row: Option<(Vec<u8>, Vec<u8>)> = {
-            let guard = self.get_connection_named("recap_read")?;
-            guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?.query_row(
+        let row: Option<(Vec<u8>, Vec<u8>)> = self.with_read_connection_named("recap_read", |conn| {
+            conn.query_row(
                 "SELECT data,row_key FROM recap_payloads WHERE kind=?1 AND key=?2 AND (?3 IS NULL OR revision=?3)",
                 params![kind,key,revision], |r| Ok((r.get(0)?,r.get(1)?))
-            ).optional().map_err(|e| e.to_string())?
-        };
+            ).optional().map_err(|e| e.to_string())
+        })?;
         let Some((data, key)) = row else {
             return Ok(None);
         };
@@ -412,6 +412,10 @@ impl StorageState {
         self.recap_write_background_checked(kind, key, day, revision, generation, value, |_| Ok(()))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the recap commit envelope and its transaction-local validation callback."
+    )]
     pub(crate) fn recap_write_background_checked<T: Serialize>(
         &self,
         kind: &str,
@@ -430,6 +434,10 @@ impl StorageState {
 
     /// Encryption needs only the public key. The protected caller must validate
     /// its independent service-owned authorization before entering this writer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserves the recap commit envelope and its transaction-local validation callback."
+    )]
     pub(super) fn recap_commit_payload_checked<T: Serialize>(
         &self,
         kind: &str,
@@ -441,6 +449,7 @@ impl StorageState {
         check: impl FnOnce(&Connection) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut bytes = serde_json::to_vec(value).map_err(|_| "RECAP_INVALID_CACHE")?;
+        let content = (kind == "batch").then(|| recap_content::has_content(&bytes));
         let encrypted = self.encrypt_payload_with_row_key(&bytes);
         Self::zeroize_bytes(&mut bytes);
         let (data, row_key) = encrypted?;
@@ -449,6 +458,8 @@ impl StorageState {
             return Err("RECAP_SOURCE_CHANGED".into());
         }
         let conn = guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let conn = &*tx;
         check(conn)?;
         if revision >= 0
             && !conn
@@ -464,7 +475,10 @@ impl StorageState {
         conn.execute("INSERT INTO recap_payloads(kind,key,day,revision,data,row_key) VALUES (?1,?2,?3,?4,?5,?6)
             ON CONFLICT(kind,key) DO UPDATE SET day=excluded.day,revision=excluded.revision,data=excluded.data,row_key=excluded.row_key",
             params![kind,key,day,revision,data,row_key]).map_err(|e| e.to_string())?;
-        Ok(())
+        if let Some(content) = content {
+            recap_content::record_content(conn, key, content)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Resolve a snapshot against saved calendars, including dates older than
@@ -509,21 +523,6 @@ impl StorageState {
                 .collect(),
             only_deleted,
         }))
-    }
-
-    pub(crate) fn recap_list_days(&self) -> Result<Vec<String>, String> {
-        let guard = self.get_connection_named("recap_list_days")?;
-        let mut stmt = guard
-            .as_ref()
-            .ok_or("RECAP_STORAGE_UNAVAILABLE")?
-            .prepare("SELECT day FROM recap_days WHERE day NOT IN (SELECT day FROM recap_deleted_days) ORDER BY day DESC LIMIT 730")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| r.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string());
-        rows
     }
 
     pub(crate) fn recap_delete_day(&self, day: &str, generation: u64) -> Result<(), String> {
@@ -626,12 +625,14 @@ impl StorageState {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let mut statement = conn
                     .prepare(&format!(
-                        "SELECT metadata,metadata_enc,content_key_encrypted FROM screenshots
-                     WHERE id IN ({placeholders}) AND is_deleted=0
-                     AND (status IS NULL OR status<>'aborted')
-                     AND (source IS NULL OR source<>'extension')
-                     AND (metadata IS NOT NULL OR metadata_enc IS NOT NULL)
-                     ORDER BY id DESC"
+                        "SELECT s.metadata,s.metadata_enc,s.content_key_encrypted,
+                            pi.icon_enc,pi.icon_key_encrypted FROM screenshots s
+                     LEFT JOIN page_icons pi ON pi.id=s.process_icon_id
+                     WHERE s.id IN ({placeholders}) AND s.is_deleted=0
+                     AND (s.status IS NULL OR s.status<>'aborted')
+                     AND (s.source IS NULL OR s.source<>'extension')
+                     AND (s.metadata IS NOT NULL OR s.metadata_enc IS NOT NULL OR s.process_icon_id IS NOT NULL)
+                     ORDER BY s.id DESC"
                     ))
                     .map_err(|e| e.to_string())?;
                 let rows = statement
@@ -640,6 +641,8 @@ impl StorageState {
                             row.get::<_, Option<String>>(0)?,
                             row.get::<_, Option<Vec<u8>>>(1)?,
                             row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
                         ))
                     })
                     .map_err(|e| e.to_string())?
@@ -648,9 +651,28 @@ impl StorageState {
                 rows
             };
             // Decrypt outside the database mutex; stop as soon as an icon is found.
-            for (plain, encrypted, key) in rows {
+            for (plain, encrypted, key, icon_enc, icon_key) in rows {
                 if !self.is_session_valid() {
                     return Err("AUTH_REQUIRED".into());
+                }
+                if let (Some(data), Some(key)) = (icon_enc, icon_key) {
+                    match self.decrypt_payload_with_row_key_silent(&data, &key) {
+                        Ok(bytes) => {
+                            let icon = String::from_utf8(bytes)
+                                .ok()
+                                .filter(|i| !i.trim().is_empty());
+                            if !self.is_session_valid() {
+                                return Err("AUTH_REQUIRED".into());
+                            }
+                            if icon.is_some() {
+                                return Ok(icon);
+                            }
+                        }
+                        Err(BackgroundReadError::AuthRequired) => {
+                            return Err("AUTH_REQUIRED".into())
+                        }
+                        Err(_) => {}
+                    }
                 }
                 let mut bytes = match (encrypted, key) {
                     (Some(data), Some(key)) => {
@@ -700,6 +722,10 @@ impl StorageState {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keeps request identity, input/output budgets and the generation fence explicit."
+    )]
     pub(crate) fn recap_reserve(
         &self,
         day: &str,
@@ -710,11 +736,17 @@ impl StorageState {
         settings: &RecapSettings,
         generation: u64,
     ) -> Result<i64, String> {
-        self.recap_reserve_with_limit(day, role, run, input, output, settings, generation, 2)
+        self.recap_reserve_with_limit(
+            day, role, run, input, output, settings, generation, 2, false,
+        )
     }
 
     /// Evidence agents share the same cumulative token and daily limits. A
     /// larger request count never gives each step a fresh token allowance.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Adds the per-request limit to the same budget reservation interface."
+    )]
     pub(crate) fn recap_reserve_with_limit(
         &self,
         day: &str,
@@ -725,6 +757,7 @@ impl StorageState {
         settings: &RecapSettings,
         generation: u64,
         request_limit: u64,
+        mainline: bool,
     ) -> Result<i64, String> {
         let mut guard = self.get_connection_named("recap_reserve")?;
         if generation != self.db_generation() {
@@ -745,22 +778,51 @@ impl StorageState {
             })
             .map_err(|e| e.to_string())
         };
-        let daily = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE day=? AND role=?",day)?;
-        let batch = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE run_id=? AND role=?",run)?;
+        let daily = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE day=? AND role=? AND settled>=0",day)?;
+        let batch = totals("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*) FROM recap_usage WHERE run_id=? AND role=? AND settled>=0",run)?;
         if role == "screening" {
-            if daily.0.saturating_add(input) > settings.screening_input_tokens {
-                return Err("RECAP_BUDGET_EXHAUSTED".into());
+            budget::Limit {
+                code: "RECAP_SCREENING_INPUT_EXHAUSTED",
+                limit: settings.screening_input_tokens,
+                used: daily.0,
             }
-        } else if batch.2 >= request_limit.min(16)
-            || batch.0.saturating_add(input) > settings.batch_input_tokens
-            || batch.1.saturating_add(output) > settings.batch_output_tokens
-            || daily.0.saturating_add(input) > settings.daily_input_tokens
-            || daily.1.saturating_add(output) > settings.daily_output_tokens
-        {
-            return Err("RECAP_BUDGET_EXHAUSTED".into());
+            .check(input)?;
+        } else {
+            let allowance = budget::allowance(
+                settings,
+                &RecapUsage {
+                    input_tokens: daily.0,
+                    output_tokens: daily.1,
+                    requests: daily.2,
+                    ..Default::default()
+                },
+                &RecapUsage {
+                    input_tokens: batch.0,
+                    output_tokens: batch.1,
+                    requests: batch.2,
+                    ..Default::default()
+                },
+                request_limit,
+                mainline,
+            );
+            allowance.requests.check(1)?;
+            budget::Limit {
+                code: "RECAP_DAILY_INPUT_EXHAUSTED",
+                limit: settings.daily_input_tokens,
+                used: daily.0,
+            }
+            .check(input)?;
+            budget::Limit {
+                code: "RECAP_DAILY_OUTPUT_EXHAUSTED",
+                limit: settings.daily_output_tokens,
+                used: daily.1,
+            }
+            .check(output)?;
+            allowance.input.check(input)?;
+            allowance.output.check(output)?;
         }
-        let input = i64::try_from(input).map_err(|_| "RECAP_BUDGET_EXHAUSTED")?;
-        let output = i64::try_from(output).map_err(|_| "RECAP_BUDGET_EXHAUSTED")?;
+        let input = i64::try_from(input).map_err(|_| "RECAP_INVALID_SETTINGS")?;
+        let output = i64::try_from(output).map_err(|_| "RECAP_INVALID_SETTINGS")?;
         tx.execute("INSERT INTO recap_usage(day,role,run_id,input_tokens,output_tokens) VALUES (?,?,?,?,?)",params![day,role,run,input,output]).map_err(|e| e.to_string())?;
         let id = tx.last_insert_rowid();
         tx.commit().map_err(|e| e.to_string())?;
@@ -792,13 +854,54 @@ impl StorageState {
         Ok(())
     }
 
+    /// Called only when the guarded request future never reached submission.
+    /// Submitted failures and unknown usage keep their conservative reservation.
+    pub(crate) fn recap_release_unsubmitted(&self, id: i64, generation: u64) -> Result<(), String> {
+        let guard = self.get_connection_named("recap_release_unsubmitted")?;
+        if generation != self.db_generation() {
+            return Err("RECAP_SOURCE_CHANGED".into());
+        }
+        guard.as_ref().ok_or("RECAP_STORAGE_UNAVAILABLE")?
+            // Preserve the reservation identity so a late duplicate release
+            // cannot target a newer request that reused its row ID.
+            .execute("UPDATE recap_usage SET input_tokens=0,output_tokens=0,settled=-1 WHERE id=? AND settled=0", [id])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub(crate) fn recap_usage(&self, day: &str) -> Result<RecapUsage, String> {
         self.with_read_connection_named("recap_usage", |conn| conn.query_row(
             "SELECT coalesce(sum(CASE WHEN role='generation' THEN input_tokens ELSE 0 END),0),
              coalesce(sum(CASE WHEN role='generation' THEN output_tokens ELSE 0 END),0),
-             coalesce(sum(CASE WHEN role='screening' THEN input_tokens ELSE 0 END),0),count(*) FROM recap_usage WHERE day=?", [day],
-            |r| Ok(RecapUsage {input_tokens:r.get::<_,i64>(0)?.max(0) as u64,output_tokens:r.get::<_,i64>(1)?.max(0) as u64,screening_input_tokens:r.get::<_,i64>(2)?.max(0) as u64,requests:r.get::<_,i64>(3)?.max(0) as u64})
+             coalesce(sum(CASE WHEN role='screening' THEN input_tokens ELSE 0 END),0),count(*),
+             coalesce(sum(CASE WHEN role='generation' AND settled=0 THEN input_tokens ELSE 0 END),0),
+             coalesce(sum(CASE WHEN role='generation' AND settled=0 THEN output_tokens ELSE 0 END),0),
+             coalesce(sum(CASE WHEN settled=0 THEN 1 ELSE 0 END),0),
+             coalesce(sum(CASE WHEN role='screening' AND settled=0 THEN input_tokens ELSE 0 END),0)
+             FROM recap_usage WHERE day=? AND settled>=0", [day],
+            |r| Ok(RecapUsage {input_tokens:r.get::<_,i64>(0)?.max(0) as u64,output_tokens:r.get::<_,i64>(1)?.max(0) as u64,screening_input_tokens:r.get::<_,i64>(2)?.max(0) as u64,requests:r.get::<_,i64>(3)?.max(0) as u64,
+                unconfirmed_input_tokens:r.get::<_,i64>(4)?.max(0) as u64,unconfirmed_output_tokens:r.get::<_,i64>(5)?.max(0) as u64,
+                unconfirmed_requests:r.get::<_,i64>(6)?.max(0) as u64,unconfirmed_screening_input_tokens:r.get::<_,i64>(7)?.max(0) as u64})
         ).map_err(|e| e.to_string()))
+    }
+
+    pub(crate) fn recap_run_usage(&self, run: &str) -> Result<RecapUsage, String> {
+        self.with_read_connection_named("recap_run_usage", |conn| {
+            conn.query_row(
+                "SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),count(*)
+                 FROM recap_usage WHERE run_id=?1 AND role='generation' AND settled>=0",
+                [run],
+                |row| {
+                    Ok(RecapUsage {
+                        input_tokens: row.get::<_, i64>(0)?.max(0) as u64,
+                        output_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                        requests: row.get::<_, i64>(2)?.max(0) as u64,
+                        ..Default::default()
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -897,6 +1000,247 @@ mod tests {
         StorageState::init_recap_tables(&conn).unwrap();
         *storage.db.lock().unwrap() = Some(conn);
         (temp, storage)
+    }
+
+    #[test]
+    fn recap_dates_ignore_empty_metadata_before_applying_the_calendar_limit() {
+        let (_temp, s) = storage();
+        {
+            let guard = s.db.lock().unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<800)
+                 INSERT INTO recap_days(day,start_ms,end_ms,privacy_hash)
+                    SELECT date('2024-01-01','+'||x||' days'),0,1,'privacy' FROM n;
+                 INSERT INTO recap_days VALUES('2010-07-28',0,1,0,'privacy',1);
+                 INSERT INTO recap_days VALUES('2010-07-29',0,1,1,'privacy',1);
+                 INSERT INTO recap_days VALUES('2010-07-30',0,1,0,'other-privacy',1);
+                 INSERT INTO recap_days VALUES('2010-07-31',0,1,0,'privacy',1);
+                 INSERT INTO recap_days VALUES('2010-08-01',0,1,0,'privacy',1);
+                 INSERT INTO recap_payloads VALUES('batch','content','2010-07-28',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','same-day','2010-07-28',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','stale','2010-07-29',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','private','2010-07-30',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','deleted','2010-07-31',0,x'00',x'00');
+                 INSERT INTO recap_payloads VALUES('batch','empty','2010-08-01',0,x'00',x'00');
+                 INSERT INTO recap_deleted_days VALUES('2010-07-31');",
+            )
+            .unwrap();
+            for key in ["content", "same-day", "stale", "private", "deleted"] {
+                recap_content::record_content(conn, key, true).unwrap();
+            }
+            recap_content::record_content(conn, "empty", false).unwrap();
+            let plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    recap_content::CONTENT_DAYS_SQL
+                ))
+                .unwrap()
+                .query_map(["privacy"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains("USING COVERING INDEX idx_recap_payload_day_kind_revision_key"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+        assert_eq!(s.recap_list_days("privacy").unwrap(), vec!["2010-07-28"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recap_dates_require_content_across_rewrites_legacy_backfill_and_deletion() {
+        use crate::ai::recap::{RecapActivity, RecapBatch, SourceRef};
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = crate::credential_manager::cng_tests::recap::storage_credentials(
+            temp.path().to_path_buf(),
+        );
+        let s = StorageState::new(temp.path().to_path_buf(), credentials.clone());
+        s.initialize().unwrap();
+        let privacy = privacy(true);
+        let visited = "2010-07-28";
+        let (start, end) = crate::ai::recap::day_bounds(visited).unwrap();
+        s.recap_day_revision(visited, start, end, &privacy).unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+
+        let date = "2026-10-01";
+        let (start, end) = crate::ai::recap::day_bounds(date).unwrap();
+        let (revision, _, _) = s.recap_day_revision(date, start, end, &privacy).unwrap();
+        let generation = s.db_generation();
+        let source = SourceRef {
+            id: 42,
+            timestamp_ms: start + 1000,
+            process_name: "editor.exe".into(),
+            window_title: "Example document".into(),
+        };
+        s.recap_write(
+            "index",
+            date,
+            date,
+            revision,
+            generation,
+            &vec![source.clone()],
+        )
+        .unwrap();
+        let mut batch = RecapBatch {
+            start_ms: start,
+            end_ms: end,
+            status: "empty".into(),
+            records: vec![source.clone()],
+            ..Default::default()
+        };
+        s.recap_write("batch", date, date, revision, generation, &batch)
+            .unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+        batch.status = "failed".into();
+        batch.error = Some("AI_REQUEST_FAILED".into());
+        s.recap_write("batch", date, date, revision, generation, &batch)
+            .unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+        batch.status = "partial".into();
+        batch.activities.push(RecapActivity {
+            id: "activity".into(),
+            task_id: "task".into(),
+            task_title: "Read the notes".into(),
+            text: "Reviewed the document.".into(),
+            start_ms: source.timestamp_ms,
+            end_ms: source.timestamp_ms,
+            sources: vec![source],
+            ..Default::default()
+        });
+        s.recap_write("batch", date, date, revision, generation, &batch)
+            .unwrap();
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+
+        // Failure to persist a flag must also roll back the payload replacement.
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_recap_content BEFORE INSERT ON recap_batch_content BEGIN
+             SELECT RAISE(ABORT,'injected content flag failure'); END;",
+            )
+            .unwrap();
+        let empty = RecapBatch {
+            status: "empty".into(),
+            ..Default::default()
+        };
+        assert!(s
+            .recap_write("batch", date, date, revision, generation, &empty)
+            .is_err());
+        assert_eq!(
+            s.recap_read::<RecapBatch>("batch", date, Some(revision))
+                .unwrap()
+                .unwrap()
+                .activities
+                .len(),
+            1
+        );
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_recap_content;")
+            .unwrap();
+
+        // Legacy empty and failed checkpoints must stay absent after upgrade.
+        for (other_date, status) in [("2026-10-02", "empty"), ("2026-10-03", "failed")] {
+            let (other_start, other_end) = crate::ai::recap::day_bounds(other_date).unwrap();
+            let (other_revision, _, _) = s
+                .recap_day_revision(other_date, other_start, other_end, &privacy)
+                .unwrap();
+            let other = RecapBatch {
+                start_ms: other_start,
+                end_ms: other_end,
+                status: status.into(),
+                error: (status == "failed").then(|| "AI_REQUEST_FAILED".into()),
+                ..Default::default()
+            };
+            s.recap_write(
+                "batch",
+                other_date,
+                other_date,
+                other_revision,
+                generation,
+                &other,
+            )
+            .unwrap();
+        }
+        // Simulate upgrading a database whose encrypted batches lack flags.
+        s.db.lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("DELETE FROM recap_batch_content", [])
+            .unwrap();
+        let session = credentials.snapshot_import_state();
+        credentials.invalidate_session();
+        credentials.revoke_background_lease();
+        assert_eq!(
+            s.recap_list_days(privacy.as_str()).unwrap_err(),
+            "AUTH_REQUIRED"
+        );
+        assert_eq!(
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .query_row("SELECT count(*) FROM recap_batch_content", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        credentials.restore_import_state(session);
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+        s.shutdown().unwrap();
+        s.initialize().unwrap();
+        // Indexed dates remain discoverable without unwrapping any row keys.
+        let session = credentials.snapshot_import_state();
+        credentials.invalidate_session();
+        credentials.revoke_background_lease();
+        assert!(!s.is_silent_read_authorized());
+        assert_eq!(s.recap_list_days(privacy.as_str()).unwrap(), vec![date]);
+        credentials.restore_import_state(session);
+
+        let changed_privacy = self::privacy(false);
+        let (new_revision, _, _) = s
+            .recap_day_revision(date, start, end, &changed_privacy)
+            .unwrap();
+        assert!(s.recap_list_days(privacy.as_str()).unwrap().is_empty());
+        assert!(s
+            .recap_list_days(changed_privacy.as_str())
+            .unwrap()
+            .is_empty());
+        s.recap_write("batch", date, date, new_revision, s.db_generation(), &batch)
+            .unwrap();
+        assert_eq!(
+            s.recap_list_days(changed_privacy.as_str()).unwrap(),
+            vec![date]
+        );
+        s.recap_delete_day(date, s.db_generation()).unwrap();
+        assert!(s
+            .recap_list_days(changed_privacy.as_str())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.db.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM recap_batch_content WHERE key=?",
+                    [date],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        s.shutdown().unwrap();
     }
 
     #[test]
@@ -1093,6 +1437,7 @@ mod tests {
                 INSERT INTO recap_payloads VALUES('batch','other','2026-01-02',0,x'00',x'00');",
             )
             .unwrap();
+            recap_content::record_content(conn, "other", true).unwrap();
             for kind in [
                 "batch",
                 "summary",
@@ -1138,7 +1483,7 @@ mod tests {
         assert!(!s
             .recap_revision_matches("2026-01-01", 7, generation)
             .unwrap());
-        assert_eq!(s.recap_list_days().unwrap(), vec!["2026-01-02"]);
+        assert_eq!(s.recap_list_days("privacy").unwrap(), vec!["2026-01-02"]);
         s.recap_allow_generation("2026-01-01", generation).unwrap();
         assert!(!s.recap_is_deleted("2026-01-01").unwrap());
         assert_eq!(
@@ -1337,9 +1682,11 @@ mod tests {
             .unwrap();
         assert_eq!(s.recap_usage("day").unwrap().input_tokens, 7000);
         assert_eq!(
-            s.recap_reserve("day", "generation", "two", 4000, 1000, &settings, g)
-                .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            budget::code(
+                &s.recap_reserve("day", "generation", "two", 4000, 1000, &settings, g)
+                    .unwrap_err()
+            ),
+            "RECAP_DAILY_INPUT_EXHAUSTED"
         );
         // Some compatible endpoints report absent usage fields as zero. Such
         // responses must not turn potentially billable work into a free run.
@@ -1353,9 +1700,11 @@ mod tests {
         s.recap_reserve("day", "generation", "one", 1000, 100, &settings, g)
             .unwrap();
         assert_eq!(
-            s.recap_reserve("day", "generation", "one", 1, 1, &settings, g)
-                .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            budget::code(
+                &s.recap_reserve("day", "generation", "one", 1, 1, &settings, g)
+                    .unwrap_err()
+            ),
+            "RECAP_REQUEST_LIMIT"
         );
         s.recap_reserve("day", "screening", "one", 3000, 0, &settings, g)
             .unwrap();
@@ -1367,7 +1716,7 @@ mod tests {
         let (_temp, s) = storage();
         let settings = RecapSettings::default();
         let generation = s.db_generation();
-        for _ in 0..16 {
+        for _ in 0..budget::HARD_REQUEST_LIMIT {
             s.recap_reserve_with_limit(
                 "day",
                 "generation",
@@ -1377,27 +1726,31 @@ mod tests {
                 &settings,
                 generation,
                 u64::MAX,
+                false,
             )
             .unwrap();
         }
         assert_eq!(
-            s.recap_reserve_with_limit(
-                "day",
-                "generation",
-                "agent-run",
-                1,
-                1,
-                &settings,
-                generation,
-                u64::MAX
-            )
-            .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            budget::code(
+                &s.recap_reserve_with_limit(
+                    "day",
+                    "generation",
+                    "agent-run",
+                    1,
+                    1,
+                    &settings,
+                    generation,
+                    u64::MAX,
+                    false,
+                )
+                .unwrap_err()
+            ),
+            "RECAP_REQUEST_LIMIT"
         );
         let usage = s.recap_usage("day").unwrap();
         assert_eq!(
             (usage.requests, usage.input_tokens, usage.output_tokens),
-            (16, 1600, 1600)
+            (32, 3200, 3200)
         );
         let limited = RecapSettings {
             batch_input_tokens: 1000,
@@ -1412,22 +1765,188 @@ mod tests {
             &limited,
             generation,
             16,
+            false,
         )
         .unwrap();
         assert_eq!(
-            s.recap_reserve_with_limit(
+            budget::code(
+                &s.recap_reserve_with_limit(
+                    "day",
+                    "generation",
+                    "bounded-run",
+                    101,
+                    1,
+                    &limited,
+                    generation,
+                    16,
+                    false,
+                )
+                .unwrap_err()
+            ),
+            "RECAP_RUN_INPUT_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn unsubmitted_reservations_release_allowance_and_confirmed_usage_is_preserved() {
+        let (_temp, storage) = storage();
+        let settings = RecapSettings::default();
+        let generation = storage.db_generation();
+        let pending = storage
+            .recap_reserve(
                 "day",
                 "generation",
-                "bounded-run",
-                101,
-                1,
-                &limited,
+                "unsubmitted",
+                1000,
+                100,
+                &settings,
                 generation,
-                16
             )
-            .unwrap_err(),
-            "RECAP_BUDGET_EXHAUSTED"
+            .unwrap();
+        let usage = storage.recap_usage("day").unwrap();
+        assert_eq!(usage.unconfirmed_requests, 1);
+        assert_eq!(usage.unconfirmed_input_tokens, 1000);
+        storage
+            .recap_release_unsubmitted(pending, generation)
+            .unwrap();
+        assert_eq!(storage.recap_usage("day").unwrap().requests, 0);
+        let confirmed = storage
+            .recap_reserve(
+                "day",
+                "generation",
+                "submitted",
+                1000,
+                100,
+                &settings,
+                generation,
+            )
+            .unwrap();
+        assert_ne!(pending, confirmed);
+        storage
+            .recap_release_unsubmitted(pending, generation)
+            .unwrap();
+        assert_eq!(storage.recap_run_usage("submitted").unwrap().requests, 1);
+        storage
+            .recap_settle(confirmed, 200, 50, generation)
+            .unwrap();
+        storage
+            .recap_release_unsubmitted(confirmed, generation)
+            .unwrap();
+        let usage = storage.recap_usage("day").unwrap();
+        assert_eq!(
+            (usage.requests, usage.input_tokens, usage.output_tokens),
+            (1, 200, 50)
         );
+        assert_eq!(usage.unconfirmed_requests, 0);
+    }
+
+    #[test]
+    fn mainlines_can_spend_reserved_headroom_and_configuration_controls_request_counts() {
+        let (_temp, storage) = storage();
+        let settings = RecapSettings {
+            daily_input_tokens: 10_000,
+            daily_output_tokens: 1000,
+            batch_input_tokens: 10_000,
+            batch_output_tokens: 1000,
+            mainline_reserve_percent: 10,
+            ..Default::default()
+        };
+        let generation = storage.db_generation();
+        storage
+            .recap_reserve_with_limit(
+                "day",
+                "generation",
+                "period",
+                9000,
+                900,
+                &settings,
+                generation,
+                16,
+                false,
+            )
+            .unwrap();
+        let error = storage
+            .recap_reserve_with_limit(
+                "day",
+                "generation",
+                "period2",
+                100,
+                10,
+                &settings,
+                generation,
+                16,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(budget::code(&error), "RECAP_MAINLINE_HEADROOM");
+        storage
+            .recap_reserve_with_limit(
+                "day",
+                "generation",
+                "mainlines",
+                1000,
+                100,
+                &settings,
+                generation,
+                16,
+                true,
+            )
+            .unwrap();
+        let usage = storage.recap_usage("day").unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10_000, 1000));
+        let shared = RecapSettings {
+            mainline_reserve_percent: 0,
+            ..settings
+        };
+        storage
+            .recap_reserve_with_limit(
+                "shared",
+                "generation",
+                "shared",
+                10_000,
+                1000,
+                &shared,
+                generation,
+                16,
+                false,
+            )
+            .unwrap();
+        for rounds in [12, 24] {
+            let settings = RecapSettings {
+                evidence_rounds: rounds,
+                ..Default::default()
+            };
+            let run = format!("depth-{rounds}");
+            for _ in 0..settings.request_limit() {
+                storage
+                    .recap_reserve_with_limit(
+                        "depth",
+                        "generation",
+                        &run,
+                        1,
+                        1,
+                        &settings,
+                        generation,
+                        settings.request_limit(),
+                        false,
+                    )
+                    .unwrap();
+            }
+            let error = storage
+                .recap_reserve_with_limit(
+                    "depth",
+                    "generation",
+                    &run,
+                    1,
+                    1,
+                    &settings,
+                    generation,
+                    settings.request_limit(),
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(budget::code(&error), "RECAP_REQUEST_LIMIT");
+        }
     }
 
     #[test]

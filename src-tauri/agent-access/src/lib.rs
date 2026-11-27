@@ -10,6 +10,15 @@ pub mod mcp_contract;
 #[allow(dead_code)]
 #[path = "../../src/ml_protocol.rs"]
 mod ml_protocol;
+#[allow(dead_code)]
+#[path = "../../src/storage/ocr_blocks/codec.rs"]
+mod ocr_block_codec;
+#[allow(dead_code)]
+#[path = "../../src/storage/ocr_keys/wire.rs"]
+mod ocr_key_wire;
+#[allow(dead_code)]
+#[path = "../../src/ocr_layout.rs"]
+mod ocr_layout;
 #[path = "../../src/mcp_server/page.rs"]
 mod page;
 #[path = "../../src/pii/mod.rs"]
@@ -33,6 +42,7 @@ mod semantic_models;
 #[path = "../../src/sensitive_filter.rs"]
 pub mod sensitive_filter;
 mod source;
+pub use source::ocr_block_digest;
 #[cfg(test)]
 mod test_source;
 mod text_search;

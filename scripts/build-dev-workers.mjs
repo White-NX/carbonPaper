@@ -15,6 +15,7 @@ import {
   renameSync,
 } from 'node:fs';
 import path from 'node:path';
+import { stageDevelopmentSemanticRuntime } from './semantic-runtime-resources.mjs';
 
 const root = process.cwd();
 const tauriDir = path.join(root, 'src-tauri');
@@ -22,6 +23,10 @@ const profile = 'debug';
 const statePath = path.join(tauriDir, 'target', 'dev-workers-state.json');
 const force = process.argv.includes('--force');
 const appBoundDevelopment = process.env.CARBONPAPER_APP_BOUND_DEV === '1';
+
+// Repair runtime resources before checking the worker cache. Tauri's Windows
+// resource directory is target/<profile>, including with Cargo 1.100's layout.
+const semanticRuntimeOutputs = stageDevelopmentSemanticRuntime(root, profile);
 
 const rootWorkerOutputs = [
   path.join(tauriDir, 'target', profile, 'carbonpaper-ml.exe'),
@@ -33,6 +38,7 @@ const semanticOutputs = [
   path.join(tauriDir, 'semantic-worker', 'target', profile, 'carbonpaper-semantic-worker.exe'),
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-semantic-worker.exe'),
   path.join(tauriDir, 'target', profile, 'carbonpaper-semantic-worker.exe'),
+  ...semanticRuntimeOutputs,
 ];
 
 const rootWorkerPrebundleOutputs = [
@@ -57,6 +63,7 @@ function walkRustFiles(directory) {
 
 function rootInputFiles() {
   return [
+    path.join(root, 'rust-toolchain.toml'),
     path.join(tauriDir, 'Cargo.toml'),
     path.join(tauriDir, 'Cargo.lock'),
     path.join(tauriDir, 'build.rs'),
@@ -66,6 +73,7 @@ function rootInputFiles() {
     path.join(tauriDir, 'icons', 'icon.ico'),
     path.join(tauriDir, 'update-public-key.txt'),
     path.join(root, 'scripts', 'build-dev-workers.mjs'),
+    path.join(tauriDir, 'licenses', 'rapidocr-core.txt'),
     path.join(tauriDir, 'src', 'bin', 'ml.rs'),
     path.join(tauriDir, 'src', 'ann_format.rs'),
     path.join(tauriDir, 'src', 'ann_protocol.rs'),
@@ -87,9 +95,11 @@ function rootInputFiles() {
 
 function semanticInputFiles() {
   return [
+    path.join(root, 'rust-toolchain.toml'),
     path.join(tauriDir, 'semantic-worker', 'Cargo.toml'),
     path.join(tauriDir, 'semantic-worker', 'Cargo.lock'),
     path.join(root, 'scripts', 'build-semantic-ml.mjs'),
+    path.join(root, 'scripts', 'semantic-runtime-resources.mjs'),
     path.join(root, 'scripts', 'release-assets', 'onnxruntime-directml.json'),
     ...walkRustFiles(path.join(tauriDir, 'semantic-worker', 'src')),
     // The semantic worker imports these files with #[path] attributes.

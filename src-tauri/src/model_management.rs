@@ -219,7 +219,7 @@ fn insert_status_with_legacy_location(
     check_missing: impl Fn(&std::path::Path) -> Vec<String>,
 ) {
     let primary_missing = check_missing(primary_base);
-    let legacy_missing = legacy_base.map(|base| check_missing(base));
+    let legacy_missing = legacy_base.map(check_missing);
     let complete = primary_missing.is_empty()
         || legacy_missing
             .as_ref()
@@ -383,6 +383,10 @@ fn run_aria2_and_emit_blocking(
 /// - `download_path`：下载文件的目标根目录（文件将直接保存在此目录及其子目录中）
 /// - `files`：要下载的文件相对路径列表（相对于仓库根目录）
 /// - `concurrency`：最大并发下载数
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keeps the repository identity, download target and shared progress handle explicit."
+)]
 async fn perform_download_hf_repo(
     app: AppHandle,
     aria2_path: PathBuf,

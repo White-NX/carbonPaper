@@ -678,6 +678,8 @@ impl Context {
 impl Drop for Context {
     fn drop(&mut self) {
         // The controls have already been destroyed by WM_NCDESTROY.
+        // SAFETY: Context owns these GDI objects and deletes each valid handle
+        // once, after the controls that borrowed them have been destroyed.
         unsafe {
             if !self.font.get().is_invalid() {
                 let _ = DeleteObject(self.font.get());
@@ -747,6 +749,9 @@ pub(super) fn create(
     action: Box<dyn Fn(Action)>,
     authorized: Box<dyn Fn(ReadIdentity) -> bool>,
 ) -> std::result::Result<isize, String> {
+    // SAFETY: creation runs on the panel's UI thread. The boxed Context moves
+    // to window userdata and is reclaimed once by WM_NCDESTROY or an unattached
+    // creation failure; all descriptors and text buffers outlive their calls.
     unsafe {
         let instance = HINSTANCE(GetModuleHandleW(None).map_err(|e| e.to_string())?.0);
         let class = w!("CarbonPaperTrayPanel");
@@ -875,12 +880,16 @@ pub(super) fn create(
 
 pub(super) fn refresh(hwnd: isize) {
     if hwnd != 0 {
+        // SAFETY: UPDATE carries no pointers; the owning UI thread handles the
+        // refresh and a stale HWND simply fails to receive the message.
         unsafe {
             let _ = PostMessageW(handle(hwnd), UPDATE, WPARAM(0), LPARAM(0));
         }
     }
 }
 pub(super) fn show(hwnd: isize, anchor: (i32, i32)) -> std::result::Result<(), String> {
+    // SAFETY: SHOW copies scalar coordinates to the panel's UI thread; no
+    // borrowed memory or HWND ownership crosses the asynchronous message.
     unsafe {
         PostMessageW(
             handle(hwnd),
@@ -893,6 +902,8 @@ pub(super) fn show(hwnd: isize, anchor: (i32, i32)) -> std::result::Result<(), S
 }
 pub(super) fn hide(hwnd: isize) {
     if hwnd != 0 {
+        // SAFETY: HIDE has scalar arguments and is processed by the owning UI
+        // thread; an expired panel handle causes only a failed post.
         unsafe {
             let _ = PostMessageW(handle(hwnd), HIDE, WPARAM(0), LPARAM(0));
         }
@@ -900,6 +911,8 @@ pub(super) fn hide(hwnd: isize) {
 }
 pub(super) fn focus_after_unlock(hwnd: isize) {
     if hwnd != 0 {
+        // SAFETY: FOCUS carries no borrowed data and defers focus changes to
+        // the panel's UI thread without transferring its HWND ownership.
         unsafe {
             let _ = PostMessageW(handle(hwnd), FOCUS, WPARAM(0), LPARAM(0));
         }
@@ -907,6 +920,8 @@ pub(super) fn focus_after_unlock(hwnd: isize) {
 }
 pub(super) fn restore_after_authentication(hwnd: isize) {
     if hwnd != 0 {
+        // SAFETY: RESTORE_OWNER carries no pointers; the owning UI thread
+        // resolves its own context after receiving the queued notification.
         unsafe {
             let _ = PostMessageW(handle(hwnd), RESTORE_OWNER, WPARAM(0), LPARAM(0));
         }
@@ -916,6 +931,8 @@ pub(super) fn destroy(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
+    // SAFETY: only the owning UI thread destroys the panel. Other threads post
+    // a scalar destruction request, and no Rust pointer is retained by Win32.
     unsafe {
         if GetWindowThreadProcessId(handle(hwnd), None) == GetCurrentThreadId() {
             let _ = DestroyWindow(handle(hwnd));
@@ -1293,6 +1310,8 @@ mod tests {
                     )
                     .unwrap(),
                 );
+                // SAFETY: the fixture owns the parent HWND and all its controls
+                // on this UI thread; buffers outlive synchronous queries/messages.
                 unsafe {
                     let root = handle(window.0);
                     let primary = GetDlgItem(root, PAUSE as i32).unwrap();
@@ -1382,6 +1401,8 @@ mod tests {
                 )
                 .unwrap(),
             );
+            // SAFETY: TestWindow keeps the HWND, userdata Context and controls
+            // live on this UI thread; synchronous messages cannot outlive them.
             unsafe {
                 let root = handle(window.0);
                 let context = &*(GetWindowLongPtrW(root, GWLP_USERDATA) as *const Context);

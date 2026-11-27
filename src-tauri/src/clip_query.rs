@@ -7,7 +7,9 @@ use crate::clip_contract::{
 };
 use crate::ml_protocol::MlSemanticModel;
 use crate::semantic_runtime::SemanticRuntimeState;
-use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, ScoredSubject, StorageState};
+use crate::storage::{
+    BackgroundScreenshotSummary, DerivedIndexKind, ScoredSubject, SearchSortOrder, StorageState,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,13 +17,15 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
+mod cancellation;
 mod diagnostics;
+pub(crate) use cancellation::ClipQueryRequests;
 use diagnostics::{observe_query, query_stage, query_stage_async, QueryDiagnostics};
 
 /// Minimum cosine similarity for a hit, frozen by the M2.1 oracle
 /// (`clip_vector_search.min_similarity`). Cross-modal scores are low in
 /// absolute terms; this is the floor below which a match is noise.
-pub const CLIP_MIN_SIMILARITY: f32 = 0.32;
+pub const CLIP_MIN_SIMILARITY: f32 = 0.35;
 
 /// Timeout budget for text encoding, covering model load and worker wait.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(15);
@@ -241,6 +245,8 @@ pub struct ClipQueryRequest<'a> {
     start_time: Option<f64>,
     end_time: Option<f64>,
     include_ocr: bool,
+    sort_order: SearchSortOrder,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<'a> ClipQueryRequest<'a> {
@@ -261,6 +267,8 @@ impl<'a> ClipQueryRequest<'a> {
             start_time,
             end_time,
             include_ocr: true,
+            sort_order: SearchSortOrder::Relevance,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -275,6 +283,24 @@ impl<'a> ClipQueryRequest<'a> {
         self.categories = categories;
         self
     }
+
+    pub(crate) fn with_sort_order(mut self, sort_order: SearchSortOrder) -> Self {
+        self.sort_order = sort_order;
+        self
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = cancelled;
+        self
+    }
+}
+
+struct QueryCancellationGuard(Arc<AtomicBool>);
+
+impl Drop for QueryCancellationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// Shared search behavior; adapters own transport formats and privacy filtering.
@@ -282,6 +308,7 @@ pub async fn search(
     app: &AppHandle,
     request: ClipQueryRequest<'_>,
 ) -> Result<Vec<serde_json::Value>, String> {
+    let _cancellation = QueryCancellationGuard(request.cancelled.clone());
     match try_rust_clip_query(app, request).await {
         ClipQueryOutcome::Served(results) => Ok(results),
         ClipQueryOutcome::Unavailable(reason) => Err(format!("CLIP search unavailable: {reason}")),
@@ -331,8 +358,8 @@ async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> 
                 let empty = query_stage_async(&diagnostics, "empty_index_check", async {
                     Ok(tokio::task::spawn_blocking(move || {
                         storage
-                            .count_query_visible_embeddings(DerivedIndexKind::ClipImage)
-                            .map(|count| count == 0)
+                            .has_query_visible_embeddings(DerivedIndexKind::ClipImage)
+                            .map(|exists| !exists)
                             .unwrap_or(true)
                     })
                     .await
@@ -355,6 +382,7 @@ async fn try_rust_clip_query(app: &AppHandle, request: ClipQueryRequest<'_>) -> 
             observe_served();
             ClipQueryOutcome::Served(results)
         }
+        Err(error) if error == "query_cancelled" => ClipQueryOutcome::Unavailable(error),
         Err(error) => unavailable(&error),
     }
 }
@@ -379,7 +407,9 @@ async fn run_rust_clip_query(
         .clone();
     // Verify/decrypt an evicted persistent reader while the query text model
     // loads. Missing or damaged generations remain owned by the builder.
-    crate::clip_ann::ensure_reader_loaded(app);
+    if request.sort_order == SearchSortOrder::Relevance {
+        crate::clip_ann::ensure_reader_loaded(app);
+    }
 
     let embedding = query_stage_async(&diagnostics, "embedding", async {
         semantic
@@ -408,17 +438,19 @@ async fn run_rust_clip_query(
         ));
     }
 
-    query_stage_async(&diagnostics, "ann_arm", async {
-        crate::clip_ann::ensure_reader_loaded(app);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if !remaining.is_zero() {
-            let _ = ann_state
-                .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
-                .await;
-        }
-        Ok(())
-    })
-    .await?;
+    if request.sort_order == SearchSortOrder::Relevance {
+        query_stage_async(&diagnostics, "ann_arm", async {
+            crate::clip_ann::ensure_reader_loaded(app);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                let _ = ann_state
+                    .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
+                    .await;
+            }
+            Ok(())
+        })
+        .await?;
+    }
     diagnostics.ann_status(ann_state.search_status());
 
     // Preserve over-fetch and pagination so process/time filters still have a full page.
@@ -442,6 +474,7 @@ async fn run_rust_clip_query(
     let start_time = request.start_time;
     let end_time = request.end_time;
     let include_ocr = request.include_ocr;
+    let sort_order = request.sort_order;
 
     // Keep synchronous database/CNG work off the async runtime. Decrypt OCR after pagination.
     diagnostics.begin("queued");
@@ -453,43 +486,56 @@ async fn run_rust_clip_query(
             return Err("query_deadline_exceeded_before_scan".to_string());
         }
         let _foreground_db = query_stage(&scan_diagnostics, "database_wait", || {
-            Ok(scan_storage.foreground_db_read())
+            scan_storage.foreground_db_read()
         })?;
-        let ann_snapshot = match query_stage(&scan_diagnostics, "ann_snapshot", || {
-            ann_state.prepare_query_with_reason(&scan_storage, &query_vec, Some(deadline))
-        }) {
-            Ok((snapshot, reason)) => {
-                if snapshot.is_none() {
-                    scan_diagnostics.fallback(reason);
-                }
-                snapshot
-            }
-            Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
-            Err(_) => {
-                scan_diagnostics.fallback("ann_snapshot_failed");
-                ann_state.disarm();
-                None
-            }
-        };
-        let mut candidate_filter =
-            ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline)
-                .with_categories(&categories);
-        let filtered = search_candidates(
-            fetch,
-            target,
-            deadline,
-            |requested| {
-                app_ann_query(
-                    &ann_state,
-                    ann_snapshot.as_ref(),
-                    &scan_storage,
-                    &query_vec,
-                    requested,
+        let (filtered, page_offset) = if sort_order == SearchSortOrder::Newest {
+            scan_diagnostics.retrieval("chronological");
+            let page = query_stage(&scan_diagnostics, "chronological", || {
+                scan_storage.clip_image_chronological(crate::storage::ClipChronologicalRequest {
+                    query: &query_vec,
+                    limit,
+                    offset,
+                    process_names: &process_names,
+                    categories: &categories,
+                    start_time,
+                    end_time,
+                    min_similarity: CLIP_MIN_SIMILARITY,
                     deadline,
-                    &scan_diagnostics,
-                )
-            },
-            |scored| {
+                    cancelled: scan_diagnostics.cancelled.clone(),
+                    metrics: &scan_diagnostics.vectors,
+                })
+            })?;
+            (
+                page.into_iter()
+                    .map(|hit: crate::storage::ClipChronologicalHit| ClipHit {
+                        subject: hit.subject,
+                        summary: hit.summary,
+                        summary_complete: false,
+                    })
+                    .collect(),
+                0,
+            )
+        } else {
+            let ann_snapshot = match query_stage(&scan_diagnostics, "ann_snapshot", || {
+                ann_state.prepare_query_with_reason(&scan_storage, &query_vec, Some(deadline))
+            }) {
+                Ok((snapshot, reason)) => {
+                    if snapshot.is_none() {
+                        scan_diagnostics.fallback(reason);
+                    }
+                    snapshot
+                }
+                Err(error) if error.starts_with("query_deadline_exceeded") => return Err(error),
+                Err(_) => {
+                    scan_diagnostics.fallback("ann_snapshot_failed");
+                    ann_state.disarm();
+                    None
+                }
+            };
+            let mut candidate_filter =
+                ClipCandidateFilter::new(target, &process_names, start_time, end_time, deadline)
+                    .with_categories(&categories);
+            let filter_candidates = |scored| {
                 let filtered = candidate_filter.filter(scored, |hashes| {
                     query_stage(&scan_diagnostics, "candidate_metadata", || {
                         if process_names.is_empty() && categories.is_empty() {
@@ -501,29 +547,47 @@ async fn run_rust_clip_query(
                 })?;
                 scan_diagnostics.filtered(filtered.len());
                 Ok(filtered)
-            },
-            || {
-                scan_diagnostics.fallback_if_unset(
-                    if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
-                        "deep_pagination"
-                    } else {
-                        "filtered_candidates_insufficient"
-                    },
-                );
-                query_stage(&scan_diagnostics, "exact", || {
-                    app_exact_query(
+            };
+            let filtered = search_candidates(
+                fetch,
+                target,
+                deadline,
+                |requested| {
+                    app_ann_query(
+                        &ann_state,
                         ann_snapshot.as_ref(),
                         &scan_storage,
                         &query_vec,
-                        fetch,
+                        requested,
                         deadline,
                         &scan_diagnostics,
                     )
-                })
-            },
-        )?;
+                },
+                filter_candidates,
+                || {
+                    scan_diagnostics.fallback_if_unset(
+                        if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
+                            "deep_pagination"
+                        } else {
+                            "filtered_candidates_insufficient"
+                        },
+                    );
+                    query_stage(&scan_diagnostics, "exact", || {
+                        app_exact_query(
+                            ann_snapshot.as_ref(),
+                            &scan_storage,
+                            &query_vec,
+                            fetch,
+                            deadline,
+                            &scan_diagnostics,
+                        )
+                    })
+                },
+            )?;
+            (filtered, offset)
+        };
         scan_diagnostics.filtered(filtered.len());
-        let page = paginate(filtered, offset, limit);
+        let page = paginate_clip_hits(filtered, page_offset, limit, sort_order);
         let page = resolve_page_metadata(page, |ids| {
             query_stage(&scan_diagnostics, "metadata", || {
                 scan_storage
@@ -593,7 +657,12 @@ fn app_exact_query(
     });
     match snapshot
         .map(|snapshot| {
-            snapshot.exact_with_metrics(fetch, Some(deadline), Some(&diagnostics.vectors))
+            snapshot.exact_with_metrics(
+                fetch,
+                Some(deadline),
+                Some(&diagnostics.vectors),
+                Some(&diagnostics.cancelled),
+            )
         })
         .transpose()?
     {
@@ -606,6 +675,7 @@ fn app_exact_query(
             fetch,
             deadline,
             Some(diagnostics.vectors.clone()),
+            Some(diagnostics.cancelled.clone()),
         ),
     }
 }
@@ -850,7 +920,11 @@ fn resolve_page_metadata(
         .into_iter()
         .filter_map(|mut hit| {
             if !hit.summary_complete {
+                let timestamp = hit.summary.timestamp;
                 hit.summary = summaries.get(&hit.summary.id)?.clone();
+                // Keep the time that established this page's filtering/order
+                // while filling in the private metadata.
+                hit.summary.timestamp = timestamp;
                 hit.summary_complete = true;
             }
             Some(hit)
@@ -1016,39 +1090,23 @@ fn paginate<T>(rows: Vec<T>, offset: usize, limit: usize) -> Vec<T> {
     rows.into_iter().skip(offset).take(limit).collect()
 }
 
-/// The fixture uses the production SQL/CNG readers. `legacy` reproduces the
-/// pre-scalability metadata reads for an unfiltered request, after the #233 fix.
-#[cfg(test)]
-pub(crate) fn benchmark_hydration(
-    storage: &StorageState,
-    scored: Vec<ScoredSubject>,
+fn paginate_clip_hits(
+    mut rows: Vec<ClipHit>,
     offset: usize,
     limit: usize,
-    include_ocr: bool,
-    legacy: bool,
-) -> Result<Vec<serde_json::Value>, String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut filter = ClipCandidateFilter::new(offset + limit, &[], None, None, deadline);
-    let mut hits = filter.filter(scored, |keys| {
-        if legacy {
-            load_candidate_summaries(storage, keys, deadline)
-        } else {
-            storage.clip_candidate_metadata(keys, deadline)
-        }
-    })?;
-    if legacy {
-        for hit in &mut hits {
-            hit.summary_complete = true;
-        }
+    sort_order: SearchSortOrder,
+) -> Vec<ClipHit> {
+    if sort_order == SearchSortOrder::Newest {
+        rows.sort_by(|a, b| {
+            b.summary
+                .timestamp
+                .filter(|time| *time > 0)
+                .cmp(&a.summary.timestamp.filter(|time| *time > 0))
+                .then_with(|| a.summary.id.cmp(&b.summary.id))
+                .then_with(|| a.subject.subject_key.cmp(&b.subject.subject_key))
+        });
     }
-    let page = resolve_page_metadata(paginate(hits, offset, limit), |ids| {
-        storage
-            .get_screenshot_summaries_by_ids_silent_with_deadline(ids, Some(deadline))
-            .map_err(|error| error.to_string())
-    })?;
-    hydrate_page(page, 0, limit, deadline, |ids| {
-        load_page_texts(storage, ids, deadline, include_ocr)
-    })
+    paginate(rows, offset, limit)
 }
 
 #[cfg(test)]
@@ -1104,7 +1162,11 @@ mod tests {
             temp.path().to_path_buf(),
         ));
         let storage = StorageState::new(temp.path().to_path_buf(), credentials);
-        for (score, requires_read) in [(0.31, false), (0.32, true), (0.33, true)] {
+        for (score, requires_read) in [
+            (CLIP_MIN_SIMILARITY.next_down(), false),
+            (CLIP_MIN_SIMILARITY, true),
+            (CLIP_MIN_SIMILARITY.next_up(), true),
+        ] {
             let rows = vec![crate::storage::ScoredSubject {
                 subject_key: "unreadable".into(),
                 score,
@@ -1150,6 +1212,68 @@ mod tests {
             assert_eq!(rows[0]["ocr_text"], format!("ocr-{}", offset + 1));
             assert_eq!(rows[0]["metadata"]["screenshot_id"], (offset + 1) as i64);
         }
+    }
+
+    #[test]
+    fn newest_visual_pages_include_weaker_recent_matches_and_only_hydrate_page_text() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let page = |offset| {
+            let mut filter = ClipCandidateFilter::new(usize::MAX, &[], None, None, deadline);
+            let mut candidates = scored(400);
+            for (index, subject) in candidates.iter_mut().enumerate() {
+                subject.score = 1.0 - index as f32 / 1000.0;
+            }
+            candidates.push(ScoredSubject {
+                subject_key: "below-floor".into(),
+                score: 0.31,
+            });
+            let hits = filter
+                .filter(candidates, |keys| {
+                    assert!(!keys.iter().any(|key| key == "below-floor"));
+                    Ok(keys
+                        .iter()
+                        .map(|key| (key.clone(), summary_for_key(key)))
+                        .collect())
+                })
+                .unwrap();
+            let page = paginate_clip_hits(hits, offset, 10, SearchSortOrder::Newest);
+            hydrate_page(page, 0, 10, deadline, |ids| {
+                assert_eq!(ids.len(), 10);
+                Ok(HashMap::new())
+            })
+            .unwrap()
+        };
+        let ids = |rows: Vec<serde_json::Value>| {
+            rows.into_iter()
+                .map(|row| row["metadata"]["screenshot_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(page(0)), (391..=400).rev().collect::<Vec<_>>());
+        assert_eq!(ids(page(10)), (381..=390).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn newest_visual_ties_are_stable_and_unknown_times_stay_at_the_end() {
+        let mut rows: Vec<_> = [
+            (3, None),
+            (2, Some(100.0)),
+            (1, Some(100.0)),
+            (4, Some(0.0)),
+        ]
+        .into_iter()
+        .map(|(id, time)| {
+            let mut row = hit("code.exe", time);
+            row.summary.id = id;
+            row
+        })
+        .collect();
+        rows = paginate_clip_hits(rows, 0, 4, SearchSortOrder::Newest);
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| row.summary.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Shared SQLCipher connection setup and journal-mode diagnostics.
 
 use rusqlite::{Connection, OptionalExtension, Result};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -13,22 +13,50 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// that have not yielded their first row. Never leave a handler on a reused
 /// connection after returning to its owner.
 pub(super) struct QueryDeadline<'a> {
-    conn: &'a Connection,
-    deadline: Option<Instant>,
+    conn: &'a mut Connection,
+    interruptible: bool,
 }
 
 impl<'a> QueryDeadline<'a> {
-    pub(super) fn install(conn: &'a Connection, deadline: Option<Instant>) -> Result<Self> {
-        if let Some(deadline) = deadline {
-            conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+    pub(super) fn install(conn: &'a mut Connection, deadline: Option<Instant>) -> Result<Self> {
+        Self::install_with_cancellation(conn, deadline, None)
+    }
+
+    pub(super) fn install_with_cancellation(
+        conn: &'a mut Connection,
+        deadline: Option<Instant>,
+        cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Self> {
+        let interruptible = deadline.is_some() || cancelled.is_some();
+        if interruptible {
+            conn.progress_handler(
+                1000,
+                Some(move || {
+                    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                        || cancelled
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                }),
+            )?;
         }
-        Ok(Self { conn, deadline })
+        Ok(Self {
+            conn,
+            interruptible,
+        })
+    }
+}
+
+impl Deref for QueryDeadline<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn
     }
 }
 
 impl Drop for QueryDeadline<'_> {
     fn drop(&mut self) {
-        if self.deadline.is_some() {
+        if self.interruptible {
             let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
         }
     }
@@ -90,13 +118,13 @@ const SYNCHRONOUS_FULL: &str = "FULL";
 
 /// Minimum SQLite version carried by the SQLCipher bundle for this release.
 /// SQLite encodes versions as major * 1_000_000 + minor * 1_000 + patch.
-pub(crate) const MIN_SQLITE_VERSION: &str = "3.51.3";
-pub(crate) const MIN_SQLITE_VERSION_NUMBER: i64 = 3_051_003;
+pub(crate) const MIN_SQLITE_VERSION: &str = "3.54.1";
+pub(crate) const MIN_SQLITE_VERSION_NUMBER: i64 = 3_054_001;
 #[cfg(test)]
-pub(crate) const BUNDLED_SQLCIPHER_VERSION: &str = "4.14.0";
+pub(crate) const BUNDLED_SQLCIPHER_VERSION: &str = "4.20.0";
 #[cfg(test)]
 pub(crate) const BUNDLED_SQLITE_SOURCE_ID: &str =
-    "2026-03-13 10:38:09 737ae4a34738ffa0c3ff7f9bb18df914dd1cad163f28fd6b6e114a344fe6alt1";
+    "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6alt1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SqliteEngineIdentity {
@@ -122,8 +150,10 @@ pub(crate) struct WalCheckpointResult {
 #[derive(Default)]
 struct ActivityState {
     active_readers: usize,
+    foreground_readers: usize,
     active_writer: bool,
     waiting_writers: usize,
+    last_foreground_read_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -144,6 +174,8 @@ pub(crate) struct ActivityGate {
 }
 
 impl ActivityGate {
+    /// Reject new independent queries at the same admission lock used by
+    /// maintenance. Existing readers retain their permits and drain normally.
     pub(crate) fn try_read(&self, caller: &'static str) -> Option<ActivityReadGuard> {
         let mut state = self
             .inner
@@ -154,16 +186,27 @@ impl ActivityGate {
             return None;
         }
         state.active_readers += 1;
+        state.foreground_readers += 1;
+        state.last_foreground_read_at = Some(Instant::now());
         drop(state);
-
         Some(ActivityReadGuard {
             inner: Arc::clone(&self.inner),
             caller,
+            foreground: true,
             acquired_at: Instant::now(),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&self, caller: &'static str) -> ActivityReadGuard {
+        self.acquire_read(caller, true)
+    }
+
+    pub(crate) fn background_read(&self, caller: &'static str) -> ActivityReadGuard {
+        self.acquire_read(caller, false)
+    }
+
+    fn acquire_read(&self, caller: &'static str, foreground: bool) -> ActivityReadGuard {
         let mut state = self
             .inner
             .state
@@ -177,11 +220,16 @@ impl ActivityGate {
                 .unwrap_or_else(|error| error.into_inner());
         }
         state.active_readers += 1;
+        if foreground {
+            state.foreground_readers += 1;
+            state.last_foreground_read_at = Some(Instant::now());
+        }
         drop(state);
 
         ActivityReadGuard {
             inner: Arc::clone(&self.inner),
             caller,
+            foreground,
             acquired_at: Instant::now(),
         }
     }
@@ -229,11 +277,24 @@ impl ActivityGate {
             acquired_at: Instant::now(),
         })
     }
+
+    pub(super) fn has_recent_foreground_activity(&self, within: Duration) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.foreground_readers > 0
+            || state
+                .last_foreground_read_at
+                .is_some_and(|at| at.elapsed() < within)
+    }
 }
 
 pub(crate) struct ActivityReadGuard {
     inner: Arc<ActivityGateInner>,
     caller: &'static str,
+    foreground: bool,
     acquired_at: Instant,
 }
 
@@ -253,6 +314,10 @@ impl Drop for ActivityReadGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.active_readers = state.active_readers.saturating_sub(1);
+        if self.foreground {
+            state.foreground_readers = state.foreground_readers.saturating_sub(1);
+            state.last_foreground_read_at = Some(Instant::now());
+        }
         self.inner.changed.notify_all();
     }
 }
@@ -350,6 +415,14 @@ impl Deref for IndependentReadConnection {
     }
 }
 
+impl DerefMut for IndependentReadConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn
+            .as_mut()
+            .expect("independent connection is present until drop")
+    }
+}
+
 impl Drop for IndependentReadConnection {
     fn drop(&mut self) {
         // Close SQLite before `_activity` is released. Maintenance that wakes
@@ -398,6 +471,8 @@ pub(crate) fn configure_sqlcipher_connection(
 /// Apply the connection-local policy shared by primary and independent reads.
 pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<ConnectionStatus> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    super::layout::register_and_check(conn)?;
+    super::ocr_keys::register(conn)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     // Decrypted projections must never spill into SQLite temporary files or
     // be usable by a schema supplied from the public bootstrap database.
@@ -533,10 +608,12 @@ fn engine_compatibility_error(message: String) -> rusqlite::Error {
 /// shutting down the primary connection.
 pub(crate) fn preserve_wal_sidecars_on_close(conn: &Connection) -> Result<(), String> {
     let mut enabled = 1i32;
+    // SAFETY: `conn` keeps its SQLite handle live on this thread. This documented
+    // file control synchronously reads/writes the correctly typed i32 argument.
     let result = unsafe {
         rusqlite::ffi::sqlite3_file_control(
             conn.handle(),
-            b"main\0".as_ptr().cast(),
+            c"main".as_ptr(),
             rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
             (&mut enabled as *mut i32).cast(),
         )
@@ -618,7 +695,7 @@ mod tests {
         let result = unsafe {
             rusqlite::ffi::sqlite3_file_control(
                 conn.handle(),
-                b"vacuum_probe\0".as_ptr().cast(),
+                c"vacuum_probe".as_ptr(),
                 rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER,
                 (&mut file as *mut *mut rusqlite::ffi::sqlite3_file).cast(),
             )
@@ -963,6 +1040,22 @@ mod tests {
     }
 
     #[test]
+    fn background_readers_keep_maintenance_fencing_without_foreground_throttling() {
+        let gate = ActivityGate::default();
+        let background = gate.background_read("classification_cache_refresh");
+        assert!(!gate.has_recent_foreground_activity(Duration::from_secs(2)));
+        assert!(gate.try_write("maintenance").is_none());
+        drop(background);
+        assert!(!gate.has_recent_foreground_activity(Duration::from_secs(2)));
+        drop(gate.try_write("maintenance_after_background").unwrap());
+        let foreground = gate.read("image_query");
+        assert!(gate.has_recent_foreground_activity(Duration::from_secs(2)));
+        assert!(gate.try_write("maintenance").is_none());
+        drop(foreground);
+        assert!(gate.has_recent_foreground_activity(Duration::from_secs(2)));
+    }
+
+    #[test]
     fn maintenance_guard_drains_both_activity_domains() {
         let foreground = ActivityGate::default();
         let independent = ActivityGate::default();
@@ -1047,12 +1140,12 @@ mod tests {
 
     #[test]
     fn query_deadline_interrupts_sql_and_is_cleared_before_connection_reuse() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000)
                    SELECT sum(x) FROM n";
         {
-            let _guard = QueryDeadline::install(&conn, Some(Instant::now())).unwrap();
-            let error = conn
+            let guard = QueryDeadline::install(&mut conn, Some(Instant::now())).unwrap();
+            let error = guard
                 .query_row(sql, [], |row| row.get::<_, i64>(0))
                 .unwrap_err();
             assert_eq!(
@@ -1091,6 +1184,37 @@ mod tests {
                 || error.to_ascii_lowercase().contains("read-only")
                 || error.contains("effective mode is"),
             "diagnostic should preserve SQLite failure context: {error}"
+        );
+    }
+
+    #[test]
+    fn cancelled_sql_queries_remove_their_progress_handler_after_interrupting() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            worker_cancelled.store(true, Ordering::Release);
+        });
+        {
+            let guard =
+                QueryDeadline::install_with_cancellation(&mut conn, None, Some(cancelled)).unwrap();
+            let error = guard.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT SUM(x) FROM n",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::OperationInterrupted)
+            );
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT SUM(x) FROM n",
+                [], |row| row.get::<_, i64>(0),
+            ).unwrap(),
+            50_005_000
         );
     }
 }

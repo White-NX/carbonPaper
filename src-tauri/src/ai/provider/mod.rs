@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 
-use super::config::{ProviderKind, ResolvedProvider};
+use super::config::{ImageInput, ProviderKind, ResolvedProvider};
 
 /// How long a stream may stay silent before the request counts as stalled.
 /// Reasoning models can think for a while before the first token.
@@ -29,6 +29,10 @@ pub enum Message {
     // Replayed frontend history cannot supply system instructions.
     #[serde(skip_deserializing)]
     System(String),
+    /// Backend-supplied quoted context whose boundary can be cached separately
+    /// from the current user input. It carries no system-instruction authority.
+    #[serde(skip_deserializing)]
+    Context(String),
     User(String),
     Assistant {
         text: String,
@@ -39,6 +43,47 @@ pub enum Message {
         call_id: String,
         content: String,
     },
+    /// Only backend reads can supply pixels. Neither frontend history nor the
+    /// returned conversation transcript can serialize image bytes.
+    #[serde(skip)]
+    SnapshotImage {
+        handle: String,
+        call_id: String,
+        screenshot_id: i64,
+        image: ImagePayload,
+    },
+    /// Opaque backend cache handle, safe to replay through the frontend.
+    SnapshotImageRef {
+        handle: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    #[default]
+    High,
+    Original,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ImagePayload {
+    pub data: Arc<str>,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub detail: ImageDetail,
+}
+
+impl std::fmt::Debug for ImagePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImagePayload")
+            .field("mime_type", &self.mime_type)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("detail", &self.detail)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,14 +109,26 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     /// Retain tool schemas in the cached prefix when the last step must answer.
     pub disable_tools: bool,
+    /// Keep the API tool-choice mode unchanged for a controller-enforced final
+    /// answer. The caller must reject/decline any further tool calls itself.
+    /// Ordinary chat callers retain the explicit tool_choice=none behavior.
+    pub prompt_only_final: bool,
 }
 
 /// Use the actual protocol shape when budgeting, including tool schemas and
 /// provider-specific reasoning blocks. Credentials are never part of this body.
 pub(crate) fn request_body_for_estimate(kind: ProviderKind, request: &ChatRequest) -> Value {
+    // Count image dimensions separately; base64 is transport encoding rather
+    // than text input. Sharing pixel buffers also keeps tool steps inexpensive.
+    let mut request = request.clone();
+    for message in &mut request.messages {
+        if let Message::SnapshotImage { image, .. } = message {
+            image.data = Arc::from("");
+        }
+    }
     match kind {
-        ProviderKind::OpenaiCompatible => openai_compat::request_body("", request),
-        ProviderKind::Anthropic => anthropic::request_body("", request),
+        ProviderKind::OpenaiCompatible => openai_compat::request_body("", &request),
+        ProviderKind::Anthropic => anthropic::request_body("", &request),
     }
 }
 
@@ -114,6 +171,7 @@ pub enum ProviderError {
     Timeout,
     Cancelled,
     ContextLimit,
+    ImagesDisabled,
     InvalidResponse(String),
 }
 
@@ -129,6 +187,7 @@ impl ProviderError {
             Self::Timeout => "AI_TIMEOUT",
             Self::Cancelled => "AI_CANCELLED",
             Self::ContextLimit => "AI_CONTEXT_LIMIT",
+            Self::ImagesDisabled => "AI_IMAGES_DISABLED",
             Self::InvalidResponse(_) => "AI_INVALID_RESPONSE",
         }
     }
@@ -245,6 +304,14 @@ pub async fn complete(
     if cancel.is_cancelled() {
         return Err(ProviderError::Cancelled);
     }
+    if request
+        .messages
+        .iter()
+        .any(|m| matches!(m, Message::SnapshotImage { .. }))
+        && (!provider.allow_images || provider.image_input != ImageInput::Supported)
+    {
+        return Err(ProviderError::ImagesDisabled);
+    }
     let work = async {
         match provider.kind {
             ProviderKind::OpenaiCompatible => {
@@ -267,6 +334,108 @@ pub struct ConnectionTest {
     pub tool_calling: super::config::ToolCalling,
     pub error: Option<String>,
     pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageConnectionTest {
+    pub image_input: ImageInput,
+    pub error: Option<String>,
+    pub latency_ms: u64,
+}
+
+pub async fn test_image_input(provider: &ResolvedProvider) -> ImageConnectionTest {
+    let started = std::time::Instant::now();
+    let work = async {
+        let client = http_client().map_err(ProviderError::Network)?;
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            48,
+            48,
+            image::Rgb([20, 80, 220]),
+        ));
+        image
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .map_err(|_| {
+                ProviderError::InvalidResponse("Could not create a synthetic test image.".into())
+            })?;
+        let mut config = provider.clone();
+        // Explicitly testing a generated image does not grant screenshot access.
+        config.allow_images = true;
+        config.image_input = ImageInput::Supported;
+        let request = ChatRequest {
+            messages: vec![
+                Message::User("Name the dominant color of this image using one color word.".into()),
+                Message::SnapshotImage {
+                    handle: "image-probe".into(),
+                    call_id: "image-probe".into(),
+                    screenshot_id: 0,
+                    image: ImagePayload {
+                        data: Arc::from(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            bytes.into_inner(),
+                        )),
+                        mime_type: "image/png".into(),
+                        width: 48,
+                        height: 48,
+                        detail: ImageDetail::High,
+                    },
+                },
+            ],
+            max_tokens: Some(4096.min(provider.context_tokens / 2)),
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        complete(
+            &client,
+            &config,
+            &request,
+            &mut |_| {},
+            &Cancellation::default(),
+        )
+        .await
+    };
+    let result = tokio::time::timeout(Duration::from_secs(90), work)
+        .await
+        .unwrap_or(Err(ProviderError::Timeout));
+    let (image_input, error) = match result {
+        Ok(response)
+            if !response.truncated
+                && (response.text.to_lowercase().contains("blue")
+                    || response.text.contains('蓝')) =>
+        {
+            (ImageInput::Supported, None)
+        }
+        Ok(_) => (
+            ImageInput::Unknown,
+            Some("AI_INVALID_RESPONSE: Image understanding could not be confirmed.".into()),
+        ),
+        Err(error) => {
+            let text = error.to_string().to_lowercase();
+            let unsupported = matches!(error, ProviderError::BadRequest(_))
+                && (text.contains("image") || text.contains("vision"))
+                && [
+                    "not supported",
+                    "unsupported",
+                    "does not support",
+                    "only text",
+                ]
+                .iter()
+                .any(|word| text.contains(word));
+            (
+                if unsupported {
+                    ImageInput::Unsupported
+                } else {
+                    ImageInput::Unknown
+                },
+                Some(error.to_string()),
+            )
+        }
+    };
+    ImageConnectionTest {
+        image_input,
+        error,
+        latency_ms: started.elapsed().as_millis() as u64,
+    }
 }
 
 /// Checks that the endpoint answers, then whether its model calls tools.
@@ -346,6 +515,100 @@ mod tests {
     use crate::ai::config::{ProviderKind, ToolCalling};
     use axum::{http::HeaderMap, routing::post, Router};
 
+    fn image_request(data: &str) -> ChatRequest {
+        ChatRequest {
+            messages: vec![
+                Message::User("Read visual evidence.".into()),
+                Message::Assistant {
+                    text: String::new(),
+                    reasoning: Value::Null,
+                    tool_calls: vec![ToolCall {
+                        id: "read".into(),
+                        name: "view_snapshot".into(),
+                        arguments: "{}".into(),
+                    }],
+                },
+                Message::ToolResult {
+                    call_id: "read".into(),
+                    content: "{\"screenshot_id\":7}".into(),
+                },
+                Message::SnapshotImage {
+                    handle: "opaque-handle".into(),
+                    call_id: "read".into(),
+                    screenshot_id: 7,
+                    image: ImagePayload {
+                        data: Arc::from(data),
+                        mime_type: "image/png".into(),
+                        width: 1920,
+                        height: 768,
+                        detail: ImageDetail::High,
+                    },
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn images_follow_paired_tool_results_in_both_protocols_and_base64_is_not_text_budget() {
+        let request = image_request("synthetic-pixels");
+        let openai = openai_compat::request_body("gpt-6-astra", &request);
+        assert_eq!(openai["messages"][2]["role"], "tool");
+        assert_eq!(openai["messages"][3]["role"], "user");
+        assert_eq!(
+            openai["messages"][3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,synthetic-pixels"
+        );
+        assert_eq!(
+            openai["messages"][3]["content"][1]["image_url"]["detail"],
+            "high"
+        );
+        let anthropic = anthropic::request_body("claude", &request);
+        let user = anthropic["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(user["content"][0]["type"], "tool_result");
+        assert_eq!(user["content"][2]["type"], "image");
+        assert_eq!(user["content"][2]["source"]["media_type"], "image/png");
+        assert_eq!(user["content"][2]["source"]["data"], "synthetic-pixels");
+        for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
+            let estimate = super::super::context::estimated_input_tokens(kind, &request);
+            assert!(estimate > super::super::vision::estimated_image_tokens(1920, 768));
+            assert_eq!(
+                estimate,
+                super::super::context::estimated_input_tokens(
+                    kind,
+                    &image_request(&"x".repeat(100_000))
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_requests_require_both_permission_and_confirmed_capability() {
+        let request = image_request("synthetic-pixels");
+        let mut config = ResolvedProvider {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            image_input: ImageInput::Supported,
+            ..Default::default()
+        };
+        let client = http_client().unwrap();
+        let cancel = Cancellation::default();
+        let mut ignore = |_| {};
+        assert_eq!(
+            complete(&client, &config, &request, &mut ignore, &cancel)
+                .await
+                .unwrap_err(),
+            ProviderError::ImagesDisabled
+        );
+        config.allow_images = true;
+        config.image_input = ImageInput::Unknown;
+        assert_eq!(
+            complete(&client, &config, &request, &mut ignore, &cancel)
+                .await
+                .unwrap_err(),
+            ProviderError::ImagesDisabled
+        );
+    }
+
     #[test]
     fn forced_answers_retain_tool_schemas_and_system_prefix_in_both_protocols() {
         let mut request = ChatRequest {
@@ -417,6 +680,7 @@ mod tests {
             api_key: Some("secret".into()),
             tool_calling: ToolCalling::Unknown,
             context_tokens: super::super::config::DEFAULT_CONTEXT_TOKENS,
+            ..Default::default()
         }
     }
 

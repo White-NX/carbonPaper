@@ -1,13 +1,17 @@
 //! Row-level encryption/decryption helpers.
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_row_key_with_cng_silent, decrypt_with_master_key,
-    encrypt_with_exported_public_key, encrypt_with_master_key, load_public_key_from_file,
-    CredentialError,
+    decrypt_row_key_with_cng_silent, decrypt_with_master_key, encrypt_with_exported_public_key,
+    encrypt_with_master_key, load_public_key_from_file, CredentialError,
 };
 use rand::RngCore;
 
 use super::{BackgroundReadError, StorageState};
+
+pub(super) type RowKeyUnwrapper<'a> = dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError> + 'a;
+
+#[cfg(test)]
+use crate::credential_manager::decrypt_row_key_with_cng;
 
 impl StorageState {
     /// Zeroize sensitive data in memory to reduce risk of leakage.
@@ -45,6 +49,7 @@ impl StorageState {
         Ok((encrypted_data, encrypted_key))
     }
 
+    #[cfg(test)]
     pub(crate) fn decrypt_payload_with_row_key(
         &self,
         encrypted_data: &[u8],
@@ -82,7 +87,7 @@ impl StorageState {
     pub(crate) fn decrypt_payload_with_unwrap(
         encrypted_data: &[u8],
         encrypted_key: &[u8],
-        unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+        unwrap_row_key: &RowKeyUnwrapper<'_>,
     ) -> Result<Vec<u8>, BackgroundReadError> {
         let mut row_key = unwrap_row_key(encrypted_key).map_err(|error| match error {
             CredentialError::AuthRequired => BackgroundReadError::AuthRequired,

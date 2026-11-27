@@ -59,6 +59,21 @@ fn separator(c: char) -> Option<Separator> {
     }
 }
 
+pub(super) fn bank_card_fragment_len(text: &str) -> Option<usize> {
+    let mut digits = 0;
+    for ch in text.chars() {
+        if ascii_digit(ch).is_some() {
+            digits += 1;
+            if digits > 15 {
+                return None;
+            }
+        } else if !matches!(separator(ch), Some(Separator::Strong)) {
+            return None;
+        }
+    }
+    (digits >= 3).then_some(digits)
+}
+
 struct Group {
     /// Character indexes, end exclusive.
     start: usize,
@@ -258,12 +273,11 @@ fn build_group(chars: &[(usize, char)], i: usize, j: usize) -> Option<Group> {
         mapped: 0,
         noise: 0,
     };
-    for k in a..b {
-        let c = chars[k].1;
+    for (offset, &(_, c)) in chars[a..b].iter().enumerate() {
         if let Some(d) = ascii_digit(c) {
             group.canon.push(d);
             group.digits += 1;
-        } else if k == b - 1 && is_check_letter(c) {
+        } else if offset + 1 == b - a && is_check_letter(c) {
             group.canon.push(b'X');
         } else if let Some(d) = confusable_digit(c) {
             group.canon.push(d);
@@ -338,11 +352,10 @@ fn is_mobile(w: &Window, context: Context) -> bool {
         return true;
     }
     // "138 1234 5678" with one digit lost or added in one of its groups.
-    let slipped = match (len, w.lens.as_slice()) {
-        (10, [2, 4, 4] | [3, 3, 4] | [3, 4, 3]) => true,
-        (12, [3, 5, 4] | [3, 4, 5]) => true,
-        _ => false,
-    };
+    let slipped = matches!(
+        (len, w.lens.as_slice()),
+        (10, [2, 4, 4] | [3, 3, 4] | [3, 4, 3]) | (12, [3, 5, 4] | [3, 4, 5])
+    );
     if slipped && prefix && w.noise == 0 && w.mapped <= 1 {
         return true;
     }
@@ -512,12 +525,17 @@ fn luhn_ok(c: &[u8]) -> bool {
     sum % 10 == 0
 }
 
-/// Issuer prefixes of the card schemes seen in China.
-fn card_prefix_ok(c: &[u8]) -> bool {
+/// Issuer ranges for the grouped fallback when OCR breaks the checksum.
+fn grouped_card_issuer_ok(w: &Window) -> bool {
+    let c = w.canon.as_slice();
+    // Mastercard 2-series IINs span 222100–272099, with 16-digit PANs.
+    let mastercard_2_series = (15..=17).contains(&(c.len() + w.noise))
+        && c.get(..4)
+            .is_some_and(|prefix| (b"2221".as_slice()..=b"2720".as_slice()).contains(&prefix));
     matches!(
         c,
         [b'6', b'2', ..] | [b'4', ..] | [b'5', b'1'..=b'5', ..] | [b'3', b'4' | b'5' | b'7', ..]
-    )
+    ) || mastercard_2_series
 }
 
 /// Prefix and length combinations the schemes actually issue.
@@ -552,5 +570,9 @@ fn is_bank_card(w: &Window, context: Context) -> bool {
     let grouped = leading.len() >= 2
         && (off == 0
             || (off == 1 && leading.len() >= 3 && leading.iter().all(|&l| (3..=5).contains(&l))));
-    grouped && card_prefix_ok(c) && (15..=19).contains(&len) && w.digits >= 13 && w.noise <= 1
+    grouped
+        && (15..=19).contains(&len)
+        && w.digits >= 13
+        && w.noise <= 1
+        && grouped_card_issuer_ok(w)
 }

@@ -42,11 +42,9 @@ impl Drop for TestService {
 #[test]
 #[ignore = "requires administrator access; creates and deletes a unique, never-started test service"]
 fn existing_service_repair_reapplies_restart_policy() {
-    // SAFETY: IsUserAnAdmin only queries the current process token.
-    assert!(
-        unsafe { IsUserAnAdmin() }.as_bool(),
-        "run this test elevated"
-    );
+    // SAFETY: this only queries the caller's effective token and takes no pointers.
+    let administrator = unsafe { IsUserAnAdmin() }.as_bool();
+    assert!(administrator, "run this test elevated");
     let directory = tempfile::tempdir().expect("create test directory");
     // The service cannot execute code even if somebody attempts to start it.
     let missing_executable = directory.path().join("nonexistent-test-service.exe");
@@ -84,6 +82,52 @@ fn existing_service_repair_reapplies_restart_policy() {
 
     configure_named_service(&missing_executable, &fixture.name, &fixture.name)
         .expect("repair the existing service through the installer");
+
+    let context = crate::windows::update::CoordinatorContext::new().unwrap();
+    context
+        .with_permissions(|| {
+            assert!(fixture.open(SERVICE_START | SERVICE_QUERY_STATUS).is_ok());
+            for access in [SERVICE_STOP, SERVICE_CHANGE_CONFIG, 0x0004_0000] {
+                assert!(
+                    fixture.open(access).is_err(),
+                    "a restricted client must not receive service mutation rights"
+                );
+            }
+        })
+        .unwrap();
+
+    // Retain an ordinary client's START handle before maintenance changes SCM
+    // configuration. Revoking its ACL afterward would not revoke that handle.
+    {
+        let cached_client = context
+            .with_permissions(|| fixture.open(SERVICE_START | SERVICE_QUERY_STATUS).unwrap())
+            .unwrap();
+        let handle = fixture.open(MAINTENANCE_ACCESS).unwrap();
+        set_service_start_type(&handle, SERVICE_DEMAND_START).unwrap();
+        {
+            let mut maintenance = ServiceMaintenance::from_handle(handle).unwrap();
+            maintenance.pause().unwrap();
+            configure_named_service_with_start_type(
+                &missing_executable,
+                &fixture.name,
+                &fixture.name,
+                SERVICE_DISABLED,
+            )
+            .unwrap();
+            context
+                .with_permissions(|| {
+                    // SAFETY: this is the fixture's retained ordinary START handle;
+                    // the executable does not exist and can never execute code.
+                    let error = unsafe { StartServiceW(cached_client.0, None) }.unwrap_err();
+                    assert_eq!(error.code(), windows::core::HRESULT::from_win32(1058));
+                })
+                .unwrap();
+            assert_eq!(maintenance.start(), Err(BrokerError::Unavailable));
+        }
+        let restored = fixture.open(SERVICE_QUERY_CONFIG).unwrap();
+        assert_eq!(service_start_type(&restored).unwrap(), SERVICE_DEMAND_START);
+    }
+    configure_named_service(&missing_executable, &fixture.name, &fixture.name).unwrap();
 
     {
         let service = fixture

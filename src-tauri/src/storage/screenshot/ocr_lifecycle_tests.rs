@@ -3,6 +3,125 @@ use crate::credential_manager::CredentialManagerState;
 use std::sync::Arc;
 
 #[test]
+fn commit_retry_uses_a_final_image_after_a_database_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::storage::test_storage_with_schema(temp.path().into());
+    std::fs::create_dir_all(temp.path().join("screenshots")).unwrap();
+    std::fs::write(
+        temp.path().join("screenshots/retry.enc.pending"),
+        b"encrypted fixture",
+    )
+    .unwrap();
+    storage.db.lock().unwrap().as_ref().unwrap().execute_batch(
+        "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(1,'screenshots/retry.enc.pending','retry','pending');
+         CREATE TRIGGER reject_commit BEFORE UPDATE OF status ON screenshots BEGIN SELECT RAISE(ABORT,'forced failure'); END;",
+    ).unwrap();
+    assert!(storage
+        .commit_screenshot(1, None, None, None)
+        .unwrap_err()
+        .contains("forced failure"));
+    assert!(!temp.path().join("screenshots/retry.enc.pending").exists());
+    assert!(temp.path().join("screenshots/retry.enc").is_file());
+    storage
+        .db
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_commit")
+        .unwrap();
+    let committed = storage.commit_screenshot(1, None, None, None).unwrap();
+    assert_eq!(
+        committed.image_path.as_deref(),
+        Some("screenshots/retry.enc")
+    );
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT image_path FROM screenshots WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "screenshots/retry.enc"
+    );
+}
+
+#[test]
+fn failed_image_publication_does_not_mark_a_pending_record_committed() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::storage::test_storage_with_schema(temp.path().into());
+    storage.db.lock().unwrap().as_ref().unwrap().execute(
+        "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(1,'screenshots/missing.enc.pending','missing','pending')", [],
+    ).unwrap();
+    assert!(storage
+        .commit_screenshot(1, None, None, None)
+        .unwrap_err()
+        .contains("Failed to publish screenshot 1"));
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT status FROM screenshots WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "pending"
+    );
+}
+
+#[test]
+fn concurrent_commit_retries_never_write_back_a_pending_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Arc::new(crate::storage::test_storage_with_schema(temp.path().into()));
+    std::fs::create_dir_all(temp.path().join("screenshots")).unwrap();
+    std::fs::write(
+        temp.path().join("screenshots/concurrent.enc.pending"),
+        b"encrypted fixture",
+    )
+    .unwrap();
+    storage.db.lock().unwrap().as_ref().unwrap().execute(
+        "INSERT INTO screenshots(id,image_path,image_hash,status) VALUES(1,'screenshots/concurrent.enc.pending','concurrent','pending')", [],
+    ).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            storage.commit_screenshot(1, None, None, None).unwrap()
+        });
+        barrier.wait();
+        let second = storage.commit_screenshot(1, None, None, None).unwrap();
+        assert_eq!(
+            first.join().unwrap().image_path.as_deref(),
+            Some("screenshots/concurrent.enc")
+        );
+        assert_eq!(
+            second.image_path.as_deref(),
+            Some("screenshots/concurrent.enc")
+        );
+    });
+    assert_eq!(
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT image_path FROM screenshots WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "screenshots/concurrent.enc"
+    );
+}
+
+#[test]
 fn postprocess_retry_uses_bounded_exponential_backoff() {
     assert_eq!(ocr_postprocess_retry_decision(0), ("pending", Some(30), 1));
     assert_eq!(ocr_postprocess_retry_decision(1), ("pending", Some(60), 2));
@@ -306,6 +425,69 @@ fn ocr_delete_queue_drains_readable_rows_and_unblocks_screenshots() {
 }
 
 #[test]
+fn ocr_delete_queue_reads_only_the_bounded_batch_and_preserves_stale_entries() {
+    use rusqlite::functions::FunctionFlags;
+    use std::sync::atomic::AtomicUsize;
+
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+    credentials.set_foreground_state(true);
+    credentials.update_auth_time();
+    let storage = StorageState::new(temp.path().to_path_buf(), credentials);
+    let connection = Connection::open_in_memory().unwrap();
+    storage.init_tables(&connection).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO screenshots(id,image_path,image_hash) VALUES(1,'one.enc','one');
+         WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000)
+         INSERT INTO ocr_results(id,screenshot_id,text_hash,is_deleted)
+         SELECT id,1,'',CASE WHEN id IN (10,20) THEN 1 ELSE 0 END FROM ids;
+         INSERT INTO delete_queue_ocr(id) VALUES(10),(20),(10001);",
+        )
+        .unwrap();
+
+    // These legacy rows have no key reference. Count view evaluations rather
+    // than wall time so the regression detects a corpus scan on any machine.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed = reads.clone();
+    connection
+        .create_scalar_function(
+            "cp_ocr_key_ref",
+            9,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok(None::<Vec<u8>>)
+            },
+        )
+        .unwrap();
+    *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+
+    let first = storage.process_ocr_delete_queue_batch(2).unwrap();
+    assert_eq!(first.queue_rows, 2);
+    assert_eq!(first.deleted_rows, 2);
+    assert!(!first.queue_empty);
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+    let second = storage.process_ocr_delete_queue_batch(2).unwrap();
+    assert_eq!(second.stale_queue_rows, 1);
+    assert!(second.queue_empty);
+    assert_eq!(reads.load(Ordering::Relaxed), 2);
+    let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        guard
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ocr_results", [], |row| row
+                .get::<_, i64>(0),)
+            .unwrap(),
+        9998
+    );
+}
+
+#[test]
 fn ocr_delete_queue_preserves_other_ids_in_chunked_postings() {
     assert_readable_ocr_delete_queue_drains(true);
 }
@@ -398,7 +580,7 @@ fn assert_readable_ocr_delete_queue_drains(chunked: bool) {
             let posting = index.read(token_hash, chunked).unwrap().unwrap();
             assert_eq!(posting.bitmap, expected, "only the deleted row is unlinked");
             let probe = index
-                .probe(&[token_hash.clone()])
+                .probe(std::slice::from_ref(token_hash))
                 .unwrap()
                 .postings
                 .remove(0);
@@ -474,6 +656,38 @@ fn incremental_vacuum_exhausts_more_than_one_pragma_step() {
     assert!(result.stepped_pages > 1);
     assert!(result.reclaimed_pages > 1);
     assert!(result.freelist_after < result.freelist_before);
+
+    // A large requested cleanup now spans paced commits. It must eventually
+    // drain the freelist and release maintenance between every pair of cycles.
+    let mut cycles = 0;
+    loop {
+        assert!(storage
+            .try_database_maintenance("between_vacuum_cycles")
+            .is_some());
+        let result = storage.run_incremental_vacuum_if_idle(0, 500).unwrap();
+        if !result.attempted {
+            break;
+        }
+        assert!(result.requested_pages <= 64);
+        assert!(result.stepped_pages <= 64);
+        assert!(result.reclaimed_pages > 0);
+        cycles += 1;
+        assert!(
+            cycles < 20,
+            "bounded cycles must finish the 800-row fixture"
+        );
+    }
+    assert!(cycles > 1);
+    assert_eq!(
+        storage
+            .get_connection_named("vacuum_completed")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -506,6 +720,43 @@ fn clip_candidates_preserve_live_ids_and_optional_utc_timestamps_without_decrypt
         .clip_candidate_metadata(&keys, Instant::now())
         .unwrap_err()
         .starts_with("query_deadline_exceeded"));
+}
+
+#[test]
+fn clip_candidate_hash_batches_use_hash_seeks_with_and_without_statistics() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = crate::storage::test_storage_with_schema(temp.path().into());
+    let guard = storage.db.lock().unwrap();
+    let conn = guard.as_ref().unwrap();
+    let hashes: Vec<String> = (0..200).map(|id| format!("candidate-{id}")).collect();
+    for analyzed in [false, true] {
+        if analyzed {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        for sql in [
+            image_hash_mapping_sql(hashes.len()),
+            clip_candidate_metadata_sql(hashes.len()),
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(hashes.iter()), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_image_hash (image_hash=?)")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("idx_screenshots_deleted_created_at")),
+                "{plan:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -584,9 +835,16 @@ fn ocr_text_prefix_query_replays_insertion_order() {
             "CREATE TABLE ocr_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     screenshot_id INTEGER NOT NULL,
+                    text TEXT,
+                    text_hash TEXT NOT NULL DEFAULT '',
                     text_enc BLOB,
                     text_key_encrypted BLOB,
+                    confidence REAL,
                     box_x1 REAL, box_y1 REAL,
+                    box_x2 REAL, box_y2 REAL,
+                    box_x3 REAL, box_y3 REAL,
+                    box_x4 REAL, box_y4 REAL,
+                    created_at TEXT,
                     is_deleted INTEGER NOT NULL DEFAULT 0
                  );
                  -- Rows are listed in OCR engine order, which is the order the
@@ -603,6 +861,10 @@ fn ocr_text_prefix_query_replays_insertion_order() {
                     (8, X'05', X'00',  50.0, 99.0, 0);",
         )
         .expect("OCR ordering fixture");
+    connection
+        .execute_batch("CREATE TABLE app_metadata(key TEXT PRIMARY KEY,value TEXT);")
+        .unwrap();
+    crate::storage::ocr_keys::initialize(&connection).unwrap();
 
     let sql = ocr_text_prefix_query(2);
     let mut stmt = connection.prepare(&sql).expect("prefix query");

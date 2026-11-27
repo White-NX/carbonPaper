@@ -13,8 +13,18 @@ use std::{
     time::Duration,
 };
 
+// Own the worker before pipe and reader initialization can return an error.
+struct WorkerProcess(Child);
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 pub struct SemanticSmoke {
-    child: Child,
+    _child: WorkerProcess,
     input: ChildStdin,
     responses: Receiver<Result<MlResponse, String>>,
     vectors: Option<Vec<Vec<f32>>>,
@@ -29,7 +39,7 @@ impl SemanticSmoke {
         let root = PathBuf::from(root);
         let models = std::env::var_os("CARBONPAPER_SMART_CLUSTER_SMOKE_MODELS")
             .ok_or("Set CARBONPAPER_SMART_CLUSTER_SMOKE_MODELS to installed local models")?;
-        let mut child =
+        let mut child = WorkerProcess(
             Command::new(root.join("src-tauri/pre-bundle/carbonpaper-semantic-worker.exe"))
                 .arg("--models-root")
                 .arg(&models)
@@ -42,14 +52,16 @@ impl SemanticSmoke {
                 .stderr(Stdio::inherit())
                 .creation_flags(0x08000000)
                 .spawn()
-                .map_err(|e| e.to_string())?;
-        let input = child.stdin.take().ok_or("Worker stdin missing")?;
-        let output = child.stdout.take().ok_or("Worker stdout missing")?;
+                .map_err(|e| e.to_string())?,
+        );
+        let input = child.0.stdin.take().ok_or("Worker stdin missing")?;
+        let output = child.0.stdout.take().ok_or("Worker stdout missing")?;
         let (send, responses) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(output);
             loop {
-                let response = ml_protocol::read_response(&mut reader);
+                let response =
+                    ml_protocol::read_response(&mut reader).map_err(|error| error.to_string());
                 let failed = response.is_err();
                 if send.send(response).is_err() || failed {
                     break;
@@ -57,7 +69,7 @@ impl SemanticSmoke {
             }
         });
         let smoke = Self {
-            child,
+            _child: child,
             input,
             responses,
             vectors: None,
@@ -156,12 +168,5 @@ impl SemanticSmoke {
             MlResponse::ShuttingDown { request_id: 3 } => Ok(()),
             _ => Err("Unexpected semantic shutdown response".into()),
         }
-    }
-}
-
-impl Drop for SemanticSmoke {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
