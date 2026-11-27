@@ -18,6 +18,7 @@ import ClusterListHeader from './cluster/ClusterListHeader';
 import SmartClusterCreateView from './SmartClusterCreateView';
 import ResizableSplitPane from './ResizableSplitPane';
 import { Button } from './ui/Button';
+import { Banner } from './ui/Banner';
 import { ConfirmDialog } from './ConfirmDialog';
 
 function clusterName(cluster) {
@@ -681,39 +682,44 @@ export default function SmartClustersView({
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {unverifiableCount > 0 && (
-        <div className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-          <span className="text-[11px] text-amber-400">
-            {t(
-              'smartClusters.unverifiableThresholds',
-              { count: unverifiableCount },
-            )}
-          </span>
-        </div>
-      )}
+      <div className="shrink-0 space-y-3 border-b border-ide-border bg-ide-panel px-6 py-4">
+        <Banner tone="warning" title={t('smartClusters.deprecationTitle')}>
+          {t('smartClusters.deprecationNotice')}
+        </Banner>
+        {unverifiableCount > 0 && (
+          <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+            <span className="text-[11px] text-amber-400">
+              {t(
+                'smartClusters.unverifiableThresholds',
+                { count: unverifiableCount },
+              )}
+            </span>
+          </div>
+        )}
 
-      {error && (
-        <div className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-400" />
-          <span className="flex-1 break-all text-xs text-red-400">{error}</span>
-          <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
-            <X className="h-3 w-3" />
-          </button>
-        </div>
-      )}
+        {error && (
+          <div className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-400" />
+            <span className="flex-1 break-all text-xs text-red-400">{error}</span>
+            <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        )}
 
-      {drainFailed && (
-        <div
-          className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
-          title={workerStatus?.lastError || undefined}
-        >
-          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-          <span className="flex-1 break-all text-xs text-amber-300">
-            {t('smartClusters.processingFailedDetail')}
-          </span>
-        </div>
-      )}
+        {drainFailed && (
+          <div
+            className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+            title={workerStatus?.lastError || undefined}
+          >
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+            <span className="flex-1 break-all text-xs text-amber-300">
+              {t('smartClusters.processingFailedDetail')}
+            </span>
+          </div>
+        )}
+      </div>
 
       {/* Content */}
       <ResizableSplitPane

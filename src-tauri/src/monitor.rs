@@ -70,6 +70,19 @@ impl MonitorState {
         self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_IDLE
     }
 
+    /// Lightweight usage follows native user intent even when battery/game
+    /// policy or unavailable OCR models suppress the screenshot pipeline.
+    pub(crate) fn usage_recording_intended(&self) -> bool {
+        let policy = self
+            .automation
+            .policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !policy.manual_stop
+            && !policy.usage_paused()
+            && (policy.requested_start || get_monitor_autostart() || self.is_running())
+    }
+
     pub(crate) fn pause_until_ms(&self) -> Option<i64> {
         self.automation
             .policy
@@ -660,6 +673,9 @@ async fn apply_control(
 ) -> Result<String, String> {
     let state = app.state::<MonitorState>();
     let _control = state.control.lock().await;
+    if action == MonitorAction::TogglePause && !state.is_running() {
+        return Ok("Monitor stopped".into());
+    }
     if let MonitorAction::PauseFor(minutes) = action {
         if minutes == 0 || minutes > 24 * 60 || !state.is_running() {
             return Err("Invalid timed pause or monitor is not running".into());
@@ -682,7 +698,7 @@ async fn apply_control(
                 .state::<Arc<CaptureState>>()
                 .paused
                 .load(Ordering::SeqCst);
-            policy.user_action(action, paused);
+            policy.user_action(action, paused, state.is_running());
         }
         if action == MonitorAction::ExpireTimedPause {
             policy.expire_timed_pause();
@@ -739,11 +755,7 @@ async fn apply_control(
         }
         MonitorAction::TogglePause => {
             if state.is_running() {
-                let paused = app
-                    .state::<Arc<CaptureState>>()
-                    .paused
-                    .load(Ordering::SeqCst);
-                set_capture_paused(app, !paused)
+                set_capture_paused(app, initially_paused)
             } else {
                 Ok("Monitor stopped".into())
             }

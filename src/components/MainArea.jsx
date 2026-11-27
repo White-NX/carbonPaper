@@ -5,6 +5,7 @@ import { InspectorImage } from './InspectorImage';
 import DetailCard from './DetailCard';
 import SmartClustersView from './SmartClustersView';
 import RecapView from './recap/RecapView';
+import UsageStatistics from './usage/UsageStatistics';
 import { Image as ImageIcon, Loader2, Copy, Maximize2, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -141,6 +142,7 @@ export default function MainArea({
   onTimelineSearchChange,
   onSnapshotSaved,
   onNavigationGuardChange,
+  onViewUsageSnapshots,
 }) {
   const { t } = useTranslation();
   const [showOcrPanel, setShowOcrPanel] = useState(false);
@@ -431,6 +433,8 @@ export default function MainArea({
             }}
           />
         </div>
+
+        <UsageStatistics active={activeTab === 'usage-statistics'} isAuthenticated={isAuthenticated} onViewSnapshots={onViewUsageSnapshots} />
 
         <div className={`${activeTab === 'smart-cluster' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
           <SmartClustersView

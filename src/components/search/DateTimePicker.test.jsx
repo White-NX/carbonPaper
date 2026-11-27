@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DateTimePicker } from './DateTimePicker';
@@ -53,6 +53,31 @@ describe('DateTimePicker', () => {
     await user.keyboard('{Escape}');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Start' })).toHaveFocus();
+  });
+
+  it('keeps dates disabled until the visible range loads and retries a failed range', async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    let resolveFebruary;
+    const loadSelectableDates = vi.fn()
+      .mockReturnValueOnce(new Promise((resolve) => { resolveFebruary = resolve; }))
+      .mockRejectedValueOnce(new Error('unavailable'))
+      .mockResolvedValueOnce(['2026-01-29']);
+    render(<DateTimePicker dateOnly applyOnSelect label="Start" value="2026-02-17" onChange={onChange} loadSelectableDates={loadSelectableDates} />);
+    const picker = open();
+    expect(picker.getByRole('grid')).toHaveAttribute('aria-busy', 'true');
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-17') })).toBeDisabled();
+    await user.click(picker.getByRole('button', { name: 'dateTimePicker.previousMonth' }));
+    expect(picker.getByRole('alert')).toHaveTextContent('dateTimePicker.loadDatesFailed');
+    await act(async () => resolveFebruary(['2026-02-01', '2026-02-17']));
+    expect(picker.getByRole('gridcell', { name: dateName('2026-02-01') })).toBeDisabled();
+
+    await user.click(picker.getByRole('button', { name: 'common.retry' }));
+    const available = picker.getByRole('gridcell', { name: dateName('2026-01-29') });
+    await waitFor(() => expect(available).toHaveFocus());
+    expect(loadSelectableDates.mock.calls.at(-1)).toEqual(loadSelectableDates.mock.calls.at(-2));
+    await user.keyboard('{Enter}');
+    expect(onChange).toHaveBeenCalledExactlyOnceWith('2026-01-29');
   });
 
   it('opens beside the range panel and switches sides when the window narrows', () => {

@@ -85,6 +85,7 @@ mod storage_startup;
 mod task_error;
 mod tray_panel;
 mod updater;
+mod usage;
 pub use updater::verify_update_manifest_file;
 
 use analysis::AnalysisState;
@@ -648,6 +649,9 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 pub(crate) fn quit_from_tray(app: &tauri::AppHandle) {
     IS_QUITTING.store(true, Ordering::Relaxed);
     cancel_auto_lightweight_timer(app);
+    if let Some(usage) = app.try_state::<Arc<usage::UsageRuntime>>() {
+        usage.stop();
+    }
     if let Some(credentials) = app.try_state::<Arc<CredentialManagerState>>() {
         credentials.clear_all_cached_keys();
     }
@@ -866,6 +870,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(Arc::new(usage::UsageRuntime::default()))
         .manage(ai::AiRuntimeState::default())
         .manage(ai::recap::RecapRuntime::default())
         .manage(ai::recap::RecapSearchRuntime::default())
@@ -978,6 +983,7 @@ pub fn run() {
                 power::start_power_monitor(app.handle().clone());
                 idle::start_idle_monitor(app.handle().clone());
                 monitor::start_automation(app.handle().clone());
+                usage::start(app.handle().clone());
 
                 match native_messaging::sync_installed_extension() {
                     Ok(true) => tracing::info!("Browser extension synced to latest version"),
@@ -993,6 +999,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::usage::usage_get_day,
+            commands::usage::usage_get_recorded_dates,
+            commands::usage::usage_get_app_details,
+            commands::usage::usage_set_app_category,
             commands::utility::set_app_language,
             commands::utility::set_app_theme,
             commands::utility::tray_take_navigation,
@@ -1229,6 +1239,9 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                if let Some(usage) = app_handle.try_state::<Arc<usage::UsageRuntime>>() {
+                    usage.stop();
+                }
                 tray_panel::destroy(app_handle);
                 if let Some(scheduler) =
                     app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()

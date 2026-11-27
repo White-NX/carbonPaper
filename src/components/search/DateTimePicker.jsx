@@ -26,6 +26,11 @@ const monthOf = (date) => {
   result.setDate(1);
   return result;
 };
+const moveDay = (date, amount) => {
+  const result = new Date(date);
+  result.setDate(result.getDate() + amount);
+  return result;
+};
 const moveMonth = (date, amount) => {
   const result = monthOf(date);
   result.setMonth(result.getMonth() + amount);
@@ -40,7 +45,7 @@ const VIEWPORT_PADDING = 8;
 
 /** A local calendar with optional immediate date selection and confirmed date/time drafts. */
 export function DateTimePicker({ label, value, onChange, min, max, invalidMessage, anchorRef,
-  dateOnly = false, applyOnSelect = false, clearable = true, highlightedDates = [], highlightLabel, className = '' }) {
+  dateOnly = false, applyOnSelect = false, clearable = true, highlightedDates = [], highlightLabel, loadSelectableDates, className = '' }) {
   const { t, i18n } = useTranslation();
   const id = useId();
   const container = useRef(null);
@@ -54,6 +59,8 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
   const [focusDay, setFocusDay] = useState(() => dayOf(new Date()));
   const [hour, setHour] = useState('0');
   const [minute, setMinute] = useState('0');
+  const [availability, setAvailability] = useState(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const lower = parseValue(min);
   const upper = parseValue(max);
   const currentValue = parseValue(value);
@@ -67,12 +74,26 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
     ...(dateOnly ? {} : { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
   });
 
+  const first = moveDay(viewMonth, -((viewMonth.getDay() + 6) % 7));
+  const days = Array.from({ length: 42 }, (_, index) => moveDay(first, index));
+  const last = days.at(-1);
+  const rangeFirst = first.getFullYear() < 1 ? '0001-01-01' : dayKey(lower && lower > first ? lower : first);
+  const rangeLast = last.getFullYear() > 9999 ? '9999-12-31' : dayKey(upper && upper < last ? upper : last);
+  const rangeKey = `${rangeFirst}/${rangeLast}/${loadAttempt}`;
+  const visibleAvailability = availability?.key === rangeKey ? availability : null;
+  const loadingDates = Boolean(loadSelectableDates && !visibleAvailability);
+  const withinDateRange = (date) => date.getFullYear() >= 1 && date.getFullYear() <= 9999
+    && (!lower || date >= dayOf(lower)) && (!upper || date <= dayOf(upper));
+  const canSelect = (date) => withinDateRange(date)
+    && (!loadSelectableDates || visibleAvailability?.dates?.has(dayKey(date)));
+  const focusDate = !loadSelectableDates || (focusDay >= first && focusDay <= last && canSelect(focusDay)) ? focusDay
+    : days.find((date) => date.getMonth() === viewMonth.getMonth() && canSelect(date)) ?? days.find(canSelect);
+  const focusKey = focusDate ? dayKey(focusDate) : null;
+
   const close = () => {
     setOpen(false);
     trigger.current?.focus({ preventScroll: true });
   };
-  const canSelect = (date) => date.getFullYear() >= 1 && date.getFullYear() <= 9999
-    && (!lower || date >= dayOf(lower)) && (!upper || date <= dayOf(upper));
   const canViewMonth = (date) => date.getFullYear() >= 1 && date.getFullYear() <= 9999
     && (!lower || monthOf(date) >= monthOf(lower)) && (!upper || monthOf(date) <= monthOf(upper));
   const showMonth = (date) => {
@@ -91,9 +112,25 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
     setHour(pad(date.getHours()));
     setMinute(pad(date.getMinutes()));
     setPosition(null);
+    setAvailability(null);
     focusPending.current = true;
     setOpen(true);
   };
+
+  useEffect(() => {
+    if (!open || !loadSelectableDates) return undefined;
+    let current = true;
+    const load = async () => {
+      try {
+        const dates = new Set(await loadSelectableDates(rangeFirst, rangeLast));
+        if (current) setAvailability({ key: rangeKey, dates });
+      } catch {
+        if (current) setAvailability({ key: rangeKey, failed: true });
+      }
+    };
+    load();
+    return () => { current = false; };
+  }, [open, loadSelectableDates, rangeFirst, rangeLast, rangeKey]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -146,21 +183,23 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
 
   useLayoutEffect(() => {
     if (open && position && focusPending.current) {
-      popover.current?.querySelector('[data-date="' + dayKey(focusDay) + '"]')?.focus({ preventScroll: true });
-      focusPending.current = false;
+      const cell = focusKey && popover.current?.querySelector(`[data-date="${focusKey}"]:enabled`);
+      (cell || popover.current)?.focus({ preventScroll: true });
+      if (!loadingDates) focusPending.current = false;
     }
-  }, [open, focusDay, viewMonth, position]);
+  }, [open, focusDay, focusKey, viewMonth, position, loadingDates]);
 
   const draft = new Date(selected);
   const numericTime = /^\d{1,2}$/.test(hour) && Number(hour) <= 23 && /^\d{1,2}$/.test(minute) && Number(minute) <= 59;
   if (!dateOnly) draft.setHours(Number(hour), Number(minute), 0, 0);
   const validTime = dateOnly || (numericTime && draft.getHours() === Number(hour) && draft.getMinutes() === Number(minute)
     && dayKey(draft) === dayKey(selected));
-  const outOfRange = dateOnly ? !canSelect(draft) : (lower && draft < lower) || (upper && draft > upper);
+  const outOfRange = dateOnly ? !withinDateRange(draft) : (lower && draft < lower) || (upper && draft > upper);
+  const unavailableDraft = loadSelectableDates && !canSelect(dayOf(draft));
   const error = !validTime ? t('dateTimePicker.invalidTime')
     : outOfRange ? invalidMessage || t(dateOnly ? 'dateTimePicker.outOfDateRange' : 'dateTimePicker.outOfRange') : null;
   const applySelection = () => {
-    if (error) return;
+    if (error || unavailableDraft) return;
     onChange(dateOnly ? dayKey(draft) : localValue(draft));
     close();
   };
@@ -172,34 +211,40 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
     if (applyDateOnSelect) onChange(dayKey(date));
   };
   const navigateMonth = (amount) => {
-    const next = moveMonth(focusDay, amount);
+    const next = moveMonth(viewMonth, amount);
     if (!canViewMonth(next)) return;
     showMonth(next);
   };
   const calendarKeyDown = (event, date) => {
-    const next = new Date(date);
-    const weekDay = (next.getDay() + 6) % 7;
-    const days = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7, Home: -weekDay, End: 6 - weekDay };
-    if (event.key in days) next.setDate(next.getDate() + days[event.key]);
-    else if (event.key === 'PageUp' || event.key === 'PageDown') {
-      next.setTime(moveMonth(date, (event.key === 'PageUp' ? -1 : 1) * (event.shiftKey ? 12 : 1)).getTime());
-    } else return;
+    const weekDay = (date.getDay() + 6) % 7;
+    const steps = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7, Home: -weekDay, End: 6 - weekDay };
+    const page = event.key === 'PageUp' || event.key === 'PageDown';
+    if (!page && !(event.key in steps)) return;
     event.preventDefault();
     event.stopPropagation();
+    const monthBase = loadSelectableDates ? viewMonth : date;
+    let next = page ? moveMonth(monthBase, (event.key === 'PageUp' ? -1 : 1) * (event.shiftKey ? 12 : 1)) : moveDay(date, steps[event.key]);
+    if (loadSelectableDates) {
+      if (page) {
+        if (!canViewMonth(next)) return;
+        focusPending.current = true;
+        showMonth(next);
+        return;
+      }
+      const step = event.key === 'Home' ? 1 : event.key === 'End' ? -1 : steps[event.key];
+      const limit = event.key === 'Home' ? moveDay(date, 6 - weekDay) : event.key === 'End' ? moveDay(date, -weekDay) : step < 0 ? first : last;
+      while ((step < 0 ? next > limit : next < limit) && !canSelect(next)) next = moveDay(next, step);
+      if (next < first || next > last) return;
+    }
     if (!canSelect(next)) return;
     focusPending.current = true;
     setFocusDay(next);
-    setViewMonth(monthOf(next));
+    if (!loadSelectableDates) setViewMonth(monthOf(next));
   };
 
-  const first = monthOf(viewMonth);
-  first.setDate(1 - (first.getDay() + 6) % 7);
-  const days = Array.from({ length: 42 }, (_, index) => {
-    const date = new Date(first);
-    date.setDate(first.getDate() + index);
-    return date;
-  });
-  const today = dayKey(new Date());
+  const todayDate = dayOf(new Date());
+  const today = dayKey(todayDate);
+  const jumpToToday = loadSelectableDates && withinDateRange(todayDate) && (today < rangeFirst || today > rangeLast);
   const weekdayFormatter = new Intl.DateTimeFormat(locale, { weekday: 'short' });
   const monday = new Date(2024, 0, 1);
   const weekdays = Array.from({ length: 7 }, (_, index) => {
@@ -214,12 +259,15 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
   });
 
   const calendar = open && (
-    <div ref={popover} id={id} role="dialog" aria-label={label} aria-describedby={error ? id + '-error' : undefined}
+    <div ref={popover} id={id} role="dialog" tabIndex={-1} aria-label={label} aria-describedby={error ? id + '-error' : undefined}
       className={cn('fixed z-40 max-h-[calc(100vh-1rem)] max-w-[calc(100vw-1rem)] overflow-y-auto rounded-lg border border-ide-border bg-ide-panel p-3 text-ide-text shadow-xl custom-scrollbar',
         dateOnly ? 'w-[312px]' : 'w-[424px]')}
       style={position || { visibility: 'hidden' }}
       onBlur={(event) => {
         if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+      }}
+      onFocus={(event) => {
+        if (event.target !== event.currentTarget && !event.target.hasAttribute('data-date')) focusPending.current = false;
       }}
       onKeyDown={(event) => {
         if (event.key === 'Enter' && event.target.tagName === 'INPUT') {
@@ -257,7 +305,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
               disabled={!canViewMonth(moveMonth(viewMonth, 1))}
               icon={<ChevronRight className="h-4 w-4" />} />
           </div>
-          <div role="grid" aria-label={t('dateTimePicker.calendar')}>
+          <div role="grid" aria-label={t('dateTimePicker.calendar')} aria-busy={loadingDates || undefined}>
             <div role="row" className="grid grid-cols-7">
               {weekdays.map((day, index) => <span key={index} role="columnheader"
                 className="pb-1 text-center text-[10px] text-ide-muted">{day}</span>)}
@@ -270,7 +318,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
                 return <button type="button" role="gridcell" key={key} data-date={key}
                   aria-label={dayFormatter.format(date)} aria-selected={isSelected}
                   aria-describedby={isHighlighted && highlightLabel ? id + '-highlight' : undefined}
-                  disabled={!canSelect(date)} tabIndex={key === dayKey(focusDay) ? 0 : -1}
+                  disabled={!canSelect(date)} tabIndex={key === focusKey ? 0 : -1}
                   onKeyDown={(event) => calendarKeyDown(event, date)}
                   onClick={() => {
                     focusPending.current = true;
@@ -297,10 +345,21 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
         </div>}
       </div>
       {error && <p id={id + '-error'} role="alert" className="mt-2 text-[11px] text-ide-error">{error}</p>}
+      {loadingDates && <p role="status" className="mt-2 text-[11px] text-ide-muted">{t('dateTimePicker.loadingDates')}</p>}
+      {visibleAvailability?.failed && <div className="mt-2 flex items-center gap-2 text-[11px] text-ide-error">
+        <p role="alert">{t('dateTimePicker.loadDatesFailed')}</p>
+        <Button size="xs" onClick={() => { focusPending.current = true; setLoadAttempt((attempt) => attempt + 1); }}>{t('common.retry')}</Button>
+      </div>}
       <div className="mt-3 flex items-center gap-1">
         {clearable && <Button size="xs" variant="ghost" onClick={() => { onChange(''); close(); }}>{t('dateTimePicker.clear')}</Button>}
-        <Button size="xs" variant="ghost" disabled={!canSelect(dayOf(new Date()))} onClick={() => {
+        <Button size="xs" variant="ghost" disabled={!jumpToToday && !canSelect(todayDate)} onClick={() => {
           const now = new Date();
+          if (jumpToToday) {
+            focusPending.current = true;
+            showMonth(now);
+            setFocusDay(dayOf(now));
+            return;
+          }
           selectDate(dayOf(now));
           setHour(pad(now.getHours()));
           setMinute(pad(now.getMinutes()));
@@ -308,7 +367,7 @@ export function DateTimePicker({ label, value, onChange, min, max, invalidMessag
         {!applyDateOnSelect && <>
           <div className="flex-1" />
           <Button size="xs" onClick={close}>{t('common.cancel')}</Button>
-          <Button size="xs" variant="primary" onClick={applySelection} disabled={Boolean(error)}>{t('dateTimePicker.confirm')}</Button>
+          <Button size="xs" variant="primary" onClick={applySelection} disabled={Boolean(error || unavailableDraft)}>{t('dateTimePicker.confirm')}</Button>
         </>}
       </div>
     </div>

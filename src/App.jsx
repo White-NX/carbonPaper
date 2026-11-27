@@ -236,6 +236,13 @@ function App() {
     setActiveTab('preview');
   }), [navigate, setHighlightedEventId, setSelectedEvent, setTimelineJump]);
 
+  const viewUsageSnapshots = useCallback((timestampMs) => navigate(() => {
+    if (!Number.isSafeInteger(timestampMs)) return;
+    clearSelection();
+    setTimelineJump({ time: timestampMs, ts: Date.now() });
+    setActiveTab('preview');
+  }), [navigate, clearSelection, setTimelineJump]);
+
   const handleSearchSubmit = ({ query }) => {
     navigate(() => {
       setActiveTab('advanced-search');
@@ -396,6 +403,7 @@ function App() {
               onCopyText={handleCopyText}
               onSnapshotSaved={refreshEditedSnapshot}
               onNavigationGuardChange={handleNavigationGuardChange}
+              onViewUsageSnapshots={viewUsageSnapshots}
             />
             </>}
           </div>

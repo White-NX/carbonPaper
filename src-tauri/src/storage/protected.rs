@@ -594,6 +594,27 @@ impl ProtectedStorage {
         self.write_key(purpose)?.seal(identity, bytes)
     }
 
+    /// Domain-separated catalog lookup without exposing titles, URLs or paths.
+    pub(super) fn usage_token(&self, domain: &str, bytes: &[u8]) -> Result<String, String> {
+        use hmac::{Hmac, Mac};
+        let key = self.write_key("metadata")?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.bytes())
+            .map_err(|_| "Invalid usage catalog key")?;
+        mac.update(b"CarbonPaper-Usage-v1:");
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(bytes);
+        Ok(format!(
+            "{}:{}",
+            key.id,
+            hex::encode(mac.finalize().into_bytes())
+        ))
+    }
+
+    pub(super) fn open_usage(&self, identity: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        self.open("metadata", identity, bytes)
+    }
+
     fn resume_ann_key(&self, id: &str) -> Result<Arc<CipherKey>, String> {
         let record = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());

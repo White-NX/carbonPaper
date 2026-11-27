@@ -22,6 +22,36 @@ async fn capture_power_policy_reaches_startup_watches_without_leaking_to_manual_
     assert!(manual_watch.check(&SemanticRuntimeState::new()).is_ok());
 }
 
+#[tokio::test]
+async fn application_execution_watch_stops_on_fullscreen_revocation_and_foreground_search() {
+    let state = Arc::new(SemanticRuntimeState::new());
+    let lease = ExecutionLease::new("usage_classification", ExecutionProfile::Idle, 100);
+    let watch = background_policy::EXECUTION
+        .scope(lease.clone(), async {
+            RequestWatch::new(Instant::now() + Duration::from_secs(5))
+        })
+        .await;
+    assert!(watch.check(&state).is_ok());
+    lease.revoke("waiting_for_fullscreen");
+    assert!(matches!(
+        watch.check(&state),
+        Err(TaskError::Paused("waiting_for_fullscreen"))
+    ));
+
+    let successor = ExecutionLease::new("usage_classification", ExecutionProfile::Idle, 100);
+    let watch = background_policy::EXECUTION
+        .scope(successor.clone(), async {
+            RequestWatch::new(Instant::now() + Duration::from_secs(5))
+        })
+        .await;
+    let _search = state.foreground_lease();
+    assert!(matches!(
+        watch.check(&state),
+        Err(TaskError::Paused("foreground_request"))
+    ));
+    assert_eq!(successor.reason(), Some("foreground_request"));
+}
+
 #[test]
 fn index_status_covers_scheduler_waits_and_ignores_automatic_work() {
     use crate::index_progress::IndexRunProgress;
